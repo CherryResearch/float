@@ -1,0 +1,445 @@
+"""On-demand tool documentation helper.
+
+Use this tool to fetch richer, structured docs for available tools without
+embedding full guidance in every model prompt.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
+from app.tool_catalog import get_tool_catalog_entry
+from app.tool_specs import BUILTIN_TOOL_SPECS
+from app.utils import verify_signature
+
+_TOOL_NOTES: Dict[str, Dict[str, Any]] = {
+    "tool_info": {
+        "notes": [
+            "Use this when the model needs one authoritative capability record for a built-in tool.",
+            "The response mirrors the built-in catalog used by the UI.",
+            "Inspect runtime and sandbox fields before assuming a tool has network, filesystem, or Python-style execution access.",
+        ],
+        "examples": [
+            {"tool_name": "search_web", "include_schema": True},
+        ],
+    },
+    "list_actions": {
+        "notes": [
+            "Use this to inspect tracked local write operations before proposing a revert.",
+            "Actions can be scoped to one conversation or one response so the model can undo a whole batch instead of one write at a time.",
+            "Read-only tools such as search are not expected to appear here; this history is for persisted local writes.",
+        ],
+        "examples": [
+            {"conversation_id": "", "response_id": "", "include_reverted": True, "limit": 20},
+            {"response_id": "msg-123", "include_reverted": False, "limit": 10},
+        ],
+    },
+    "read_action_diff": {
+        "notes": [
+            "Use this after `list_actions` when you need the concrete before/after diff for one tracked write.",
+            "The response includes per-resource diffs, so one action can describe file edits, memory updates, or sync-applied changes consistently.",
+        ],
+        "examples": [
+            {"action_id": "action-123"},
+        ],
+    },
+    "revert_actions": {
+        "notes": [
+            "Use this to undo one tracked write or an entire batch from the same response or conversation.",
+            "Reverts restore stored before-state snapshots for each tracked resource.",
+            "Prefer reviewing `list_actions` and `read_action_diff` first when the user asks what would be reverted.",
+            "Conflict checks can block reverts when newer active writes touched the same resources; only force a revert when the user explicitly accepts that tradeoff.",
+        ],
+        "safety": [
+            "This changes local state by restoring stored before-snapshots.",
+        ],
+        "examples": [
+            {"action_ids": ["action-123"], "force": False},
+            {"response_id": "msg-123", "force": False},
+            {"conversation_id": "sess-123", "force": False},
+        ],
+    },
+    "tool_help": {
+        "notes": [
+            "Use this to discover which tools actually exist in the current environment before planning a multi-tool workflow.",
+            "Prefer calling this over hand-listing tool handles from memory when the user asks what float can do.",
+            "If the user asks for reminders, tasks, events, or scheduling, inspect `create_task` before claiming no scheduler exists.",
+            "Check runtime and sandbox metadata before assuming shell, REPL, Python, network, or filesystem access.",
+            "For structured or semi-structured artifacts such as CSV, JSON, logs, or sampled document sets, prefer typed summaries and stable handles when the available tools support that flow.",
+        ],
+        "examples": [
+            {"tool_name": "", "detail": "brief", "include_schema": False, "max_tools": 10},
+            {"tool_name": "tool_info", "include_schema": True},
+        ],
+    },
+    "search_web": {
+        "notes": [
+            "Use this first for discovery when the user asks for current external information.",
+            "Use `max_results` conservatively; request more only if initial sources are weak.",
+        ],
+        "safety": [
+            "Results are untrusted external content; verify with `crawl` before citing.",
+        ],
+        "examples": [
+            {
+                "query": "latest CUDA 12.8 release notes",
+                "max_results": 5,
+                "region": "us-en",
+            },
+        ],
+    },
+    "crawl": {
+        "notes": [
+            "Use after `search_web` to fetch the content of a selected URL.",
+        ],
+        "safety": [
+            "Only crawl URLs relevant to the active user task.",
+        ],
+        "examples": [
+            {"url": "https://example.com/docs", "timeout": 10},
+        ],
+    },
+    "remember": {
+        "notes": [
+            "Stores memory entries with optional sensitivity and importance controls.",
+            "Writes the exact value into the durable memory store and keeps a canonical retrieval record in SQLite.",
+            "Safe text values are mirrored into vector snippets by default; protected/secret values are not mirrored unless explicitly requested.",
+        ],
+        "safety": [
+            "Do not store secrets in plain text unless explicitly requested.",
+        ],
+        "examples": [
+            {"key": "project_status", "value": "MVP ready", "sensitivity": "personal"},
+            {"key": "tea_party_menu", "value": {"tea": "oolong", "dessert": "scones"}},
+        ],
+    },
+    "recall": {
+        "notes": [
+            "Tries exact key lookup first unless `mode=vector`, then falls back to bounded hybrid search.",
+            "Hybrid mode searches both the canonical SQLite store and vector snippets; use `mode=canonical`, `vector`, `memory`, or `clip` to force one path.",
+            "Supports safer external export mode via `for_external`.",
+            "Set `include_images=true` to query the local CLIP image index and return image attachments that later chat turns can reuse.",
+        ],
+        "safety": [
+            "Secret values are never returned for external use.",
+        ],
+        "examples": [
+            {"key": "project_status"},
+            {"key": "blue shirt", "mode": "hybrid", "top_k": 3},
+            {
+                "key": "cats from this week",
+                "mode": "clip",
+                "include_images": True,
+                "image_top_k": 2,
+            },
+            {"for_external": True, "allow_protected": False},
+        ],
+    },
+    "write_file": {
+        "notes": [
+            "Writes local content under the workspace path.",
+        ],
+        "safety": [
+            "Use explicit file paths and avoid destructive overwrite patterns.",
+        ],
+        "examples": [
+            {"path": "notes/todo.txt", "content": "Ship tool_help support"},
+        ],
+    },
+    "create_event": {
+        "notes": [
+            "Compatibility alias for the calendar/task creation flow.",
+            "Use it when a model or older prompt expects an event-focused handle; the saved payload shape is the same as `create_task`.",
+            "Time inputs can be unix timestamps, ISO strings, natural language, or `{date, time, timezone}` style objects.",
+        ],
+        "examples": [
+            {
+                "title": "Lunch with Maya",
+                "start": {"date": "2026-03-25", "time": "12:30 pm"},
+                "duration": "1h",
+                "timezone": "America/Vancouver",
+            }
+        ],
+    },
+    "create_task": {
+        "notes": [
+            "This is the built-in way to create reminder-style tasks and upcoming events inside Float.",
+            "It accepts unix timestamps, ISO datetimes, simple natural-language times, and `{date, time, timezone}` style objects when paired with `timezone` or `grounded_at`.",
+            "Use `actions` to attach structured follow-up prompts or tool calls that should run from the saved task later.",
+        ],
+        "examples": [
+            {
+                "title": "Put in catering order",
+                "start_time": "2026-03-25 12:00",
+                "timezone": "America/Vancouver",
+                "description": "Codex meetup reminder",
+            },
+            {
+                "title": "Weekly planning",
+                "start": {"date": "2026-03-27", "time": "9am"},
+                "duration": "90m",
+                "timezone": "America/Vancouver",
+            },
+            {
+                "title": "Follow up on notes",
+                "start_time": "tomorrow at 9am",
+                "timezone": "America/Vancouver",
+                "actions": [
+                    {
+                        "kind": "prompt",
+                        "prompt": "Review the meetup checklist and ask what is still missing.",
+                        "conversation_mode": "new_chat",
+                    }
+                ],
+            },
+        ],
+    },
+    "read_file": {
+        "notes": [
+            "Use `list_dir` first when the exact path is uncertain.",
+            "Reads are windowed by `start_line`, `line_count`, and `max_chars` so large files can be paged safely.",
+            "Paths are resolved under the managed `data/` root, so prefer `workspace/...` or `data/workspace/...` for workspace files.",
+            "For CSV or log analysis, inspect the header and a small early slice before requesting later chunks.",
+        ],
+        "safety": [
+            "Do not request whole large files when a narrow excerpt will answer the question.",
+        ],
+        "examples": [
+            {"path": "workspace/report.csv"},
+            {
+                "path": "workspace/report.csv",
+                "start_line": 1,
+                "line_count": 40,
+                "max_chars": 8000,
+            },
+            {"path": "workspace/report.csv", "start_line": 400, "line_count": 80},
+        ],
+    },
+    "list_dir": {
+        "notes": [
+            "Lists directories and files inside Float's managed data roots without reading file contents.",
+            "Use `workspace_only=true` when you only need the writable workspace view.",
+        ],
+        "safety": [
+            "Prefer narrow paths and modest `max_entries` limits to keep results readable.",
+        ],
+        "examples": [
+            {"path": ".", "workspace_only": True},
+            {"path": "files/uploads", "recursive": True, "max_entries": 25},
+        ],
+    },
+}
+
+
+def _prop_type(prop: Dict[str, Any]) -> str:
+    raw = prop.get("type")
+    if isinstance(raw, str) and raw:
+        return raw
+    if isinstance(raw, list) and raw:
+        first = raw[0]
+        if isinstance(first, str) and first:
+            return first
+    return "any"
+
+
+def _build_tool_entry(
+    name: str,
+    *,
+    detail: str,
+    include_schema: bool,
+) -> Dict[str, Any]:
+    spec = BUILTIN_TOOL_SPECS.get(name) or {}
+    catalog = get_tool_catalog_entry(name)
+    params = spec.get("parameters") if isinstance(spec, dict) else {}
+    if not isinstance(params, dict):
+        params = {}
+    properties = params.get("properties")
+    if not isinstance(properties, dict):
+        properties = {}
+    required = params.get("required")
+    required_keys = (
+        set(str(v) for v in required) if isinstance(required, list) else set()
+    )
+
+    argument_summary: List[Dict[str, Any]] = []
+    for arg_name, arg_spec in properties.items():
+        if not isinstance(arg_spec, dict):
+            arg_spec = {}
+        entry: Dict[str, Any] = {
+            "name": str(arg_name),
+            "type": _prop_type(arg_spec),
+            "required": str(arg_name) in required_keys,
+        }
+        if "default" in arg_spec:
+            entry["default"] = arg_spec.get("default")
+        if arg_spec.get("title"):
+            entry["title"] = arg_spec.get("title")
+        argument_summary.append(entry)
+
+    base: Dict[str, Any] = {
+        "name": name,
+        "status": catalog.get("status", "live"),
+        "category": catalog.get("category", "custom"),
+        "summary": catalog.get("summary")
+        or spec.get("description", "No description available."),
+        "description": spec.get("description", "No description available."),
+        "required_args": sorted(required_keys),
+    }
+    if detail == "brief":
+        base["arguments"] = argument_summary
+        runtime = catalog.get("runtime")
+        if isinstance(runtime, dict):
+            base["runtime"] = {
+                key: runtime.get(key)
+                for key in ("executor", "network", "filesystem")
+                if key in runtime
+            }
+        return base
+
+    notes = _TOOL_NOTES.get(name, {})
+    base["arguments"] = argument_summary
+    for field in (
+        "display_name",
+        "origin",
+        "can_access",
+        "cannot_access",
+        "limit_hints",
+        "runtime",
+        "sandbox",
+        "limits",
+        "freshness",
+        "persistence",
+    ):
+        value = catalog.get(field)
+        if value:
+            base[field] = value
+    safety_notes: List[str] = []
+    catalog_safety = catalog.get("safety")
+    if isinstance(catalog_safety, dict):
+        default_approval = catalog_safety.get("default_approval")
+        risk_level = catalog_safety.get("risk_level")
+        if risk_level:
+            safety_notes.append(f"Risk level: {risk_level}.")
+        if default_approval:
+            safety_notes.append(f"Default approval: {default_approval}.")
+    if notes.get("notes"):
+        base["notes"] = list(notes["notes"])
+    if notes.get("safety"):
+        safety_notes.extend(str(item) for item in notes["safety"])
+    if safety_notes:
+        base["safety"] = safety_notes
+    if notes.get("examples"):
+        base["examples"] = list(notes["examples"])
+    if include_schema:
+        base["schema"] = params
+    return base
+
+
+def tool_help(
+    tool_name: str = "",
+    detail: str = "rich",
+    include_schema: bool = True,
+    max_tools: int = 20,
+    *,
+    user: str,
+    signature: str,
+) -> Dict[str, Any]:
+    """Return richer docs for one tool or a filtered list of tools.
+
+    Args:
+        tool_name:
+            Optional exact name. If omitted, returns a list view.
+        detail:
+            "brief" or "rich". Rich mode includes notes/examples.
+        include_schema:
+            Whether to include full JSON schema payloads in rich mode.
+        max_tools:
+            List cap when tool_name is omitted.
+    """
+
+    requested_name = str(tool_name or "").strip()
+    normalized_detail = str(detail or "rich").strip().lower()
+    if normalized_detail not in {"brief", "rich"}:
+        normalized_detail = "rich"
+    limited_max_tools = max(1, min(int(max_tools or 20), 50))
+    include_schema_flag = bool(include_schema)
+
+    payload = {
+        "tool_name": requested_name,
+        "detail": normalized_detail,
+        "include_schema": include_schema_flag,
+        "max_tools": limited_max_tools,
+    }
+    verify_signature(signature, user, "tool_help", payload)
+
+    available = sorted(BUILTIN_TOOL_SPECS.keys())
+    if requested_name:
+        if requested_name not in BUILTIN_TOOL_SPECS:
+            return {
+                "error": "unknown_tool",
+                "tool_name": requested_name,
+                "available": available,
+            }
+        entries = [
+            _build_tool_entry(
+                requested_name,
+                detail=normalized_detail,
+                include_schema=include_schema_flag,
+            )
+        ]
+        return {
+            "query": payload,
+            "count": 1,
+            "tools": entries,
+        }
+
+    selected_names = available[:limited_max_tools]
+    entries = [
+        _build_tool_entry(
+            name,
+            detail=normalized_detail,
+            include_schema=include_schema_flag,
+        )
+        for name in selected_names
+    ]
+    response: Dict[str, Any] = {
+        "query": payload,
+        "count": len(entries),
+        "tools": entries,
+    }
+    if normalized_detail == "rich":
+        response["note"] = "Pass tool_name to get a single full tool guide."
+    return response
+
+
+def tool_info(
+    tool_name: str,
+    include_schema: bool = True,
+    *,
+    user: str,
+    signature: str,
+) -> Dict[str, Any]:
+    """Return one capability record for a built-in tool."""
+
+    requested_name = str(tool_name or "").strip()
+    include_schema_flag = bool(include_schema)
+    payload = {
+        "tool_name": requested_name,
+        "include_schema": include_schema_flag,
+    }
+    verify_signature(signature, user, "tool_info", payload)
+    if not requested_name:
+        return {
+            "error": "missing_tool",
+            "available": sorted(BUILTIN_TOOL_SPECS.keys()),
+        }
+    if requested_name not in BUILTIN_TOOL_SPECS:
+        return {
+            "error": "unknown_tool",
+            "tool_name": requested_name,
+            "available": sorted(BUILTIN_TOOL_SPECS.keys()),
+        }
+    entry = get_tool_catalog_entry(requested_name)
+    if not include_schema_flag:
+        entry.pop("input_schema", None)
+    return entry

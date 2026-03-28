@@ -1,0 +1,173 @@
+:root {
+  /* Base palette (light) — pulled back toward the stored Float palette with stronger contrast */
+  --color-white: #ffffff;
+  --color-soft-white: #eef8f0;
+  --color-mint-green: #6ddf8a;
+  --color-pear-green: #1f9d39;
+  --color-black: #101725;
+  --color-purple: #5f18bc;
+  --color-purple-deep: #341163;
+  --color-indigo: #390892;
+  --color-lavender: #ece2f8;
+  --color-lavender-dark: #b59fd7;
+  --color-petrol: #081626;
+  --color-violet-glow: #b083e8;
+
+  /* Fewer, broader layers keep the backdrop smoother and cheaper to render */
+  --gradient-background:
+    radial-gradient(
+      1200px 640px at 14% 12%,
+      color-mix(in oklab, var(--color-lavender) 42%, transparent),
+      transparent 68%
+    ),
+    radial-gradient(
+      980px 560px at 86% 18%,
+      color-mix(in oklab, var(--color-mint-green) 18%, transparent),
+      transparent 72%
+    ),
+    linear-gradient(
+      180deg,
+      color-mix(in oklab, var(--color-soft-white) 92%, var(--color-white) 8%),
+      color-mix(in oklab, var(--color-lavender) 18%, var(--color-soft-white) 82%)
+    );
+
+  /* Semantic tokens */
+  --color-background-primary: var(--gradient-background);
+  --color-background-secondary: #f8fbf7;
+  --color-surface: var(--color-white);
+  --color-text: var(--color-black);
+  --color-primary: var(--color-purple);
+  --color-primary-dark: var(--color-purple-deep);
+  --color-accent: var(--color-pear-green);
+  --color-success: var(--color-mint-green);
+  --color-success-dark: var(--color-pear-green);
+  --color-border: color-mix(in oklab, var(--color-lavender-dark) 52%, #cbd5e1 48%);
+  --color-text-muted: #4f5f74;
+  --color-neutral: color-mix(in oklab, var(--color-soft-white) 82%, var(--color-lavender) 18%);
+  --color-error: #c62828;
+
+  /* Typography & spacing */
+  --font-stack: Inter, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+  --space-xs: 0.25rem;
+  --space-sm: 0.5rem;
+  --space-md: 1rem;
+  --space-lg: 1.5rem;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
+  --shadow-md: 0 8px 24px rgba(15, 23, 42, 0.12);
+
+  /* Glassmorphism tokens — clearer edges on light */
+  --glass-tint: rgba(255, 255, 255, 0.72);
+  --glass-tint-strong: rgba(255, 255, 255, 0.82);
+  --glass-border: rgba(16, 23, 37, 0.16);
+  --glass-shadow: 0 10px 30px rgba(27, 36, 68, 0.1), 0 22px 44px rgba(91, 60, 155, 0.1);
+  --glass-sheen: linear-gradient(134deg, rgba(255, 255, 255, 0.16) 0%, rgba(255, 255, 255, 0.05) 36%, rgba(255, 255, 255, 0.01) 62%, transparent 76%);
+  --glass-sheen-strong: linear-gradient(130deg, rgba(255, 255, 255, 0.2) 0%, rgba(255, 255, 255, 0.08) 32%, rgba(255, 255, 255, 0.02) 58%, rgba(255, 255, 255, 0.1) 94%);
+
+  /* Global custom scrollbar — thin, rounded, lavender→mint thumb */
+  --scrollbar-size: 8px; /* thin */
+  --scrollbar-thumb-color: color-mix(in oklab, var(--color-lavender-dark) 54%, var(--color-mint-green) 46%);
+  --scrollbar-thumb-hover-color: color-mix(in oklab, var(--color-purple) 32%, var(--color-pear-green) 68%);
+  --scrollbar-track-color: color-mix(in oklab, var(--color-soft-white) 62%, var(--color-lavender) 38%);
+}
+
+body.dark-mode {
+  --gradient-background:
+    radial-gradient(
+      1400px 760px at -6% 24%,
+      color-mix(in oklab, var(--color-indigo) 42%, rgba(2, 4, 12, 0.58)),
+      transparent 74%
+    ),
+    radial-gradient(
+      1200px 700px at 108% 18%,
+      color-mix(in oklab, var(--color-violet-glow) 34%, rgba(29, 8, 52, 0.48)),
+      transparent 76%
+    ),
+    radial-gradient(
+      1100px 700px at 48% 118%,
+      color-mix(in oklab, var(--color-pear-green) 14%, rgba(0, 0, 0, 0.34)),
+      transparent 80%
+    ),
+    linear-gradient(180deg, rgba(7, 10, 22, 0.98), rgba(3, 5, 14, 0.96));
+  --color-background-primary: var(--gradient-background);
+  --color-background-secondary: color-mix(in oklab, var(--color-black) 74%, var(--color-purple-deep) 26%);
+  --color-surface: color-mix(in oklab, var(--color-black) 82%, var(--color-purple) 18%);
+  --color-text: var(--color-white);
+  --color-primary: color-mix(in oklab, var(--color-violet-glow) 72%, var(--color-lavender) 28%);
+  --color-primary-dark: var(--color-lavender);
+  --color-accent: color-mix(in oklab, var(--color-mint-green) 78%, var(--color-lavender) 22%);
+  --color-success: var(--color-mint-green);
+  --color-success-dark: var(--color-pear-green);
+  --color-border: color-mix(in oklab, var(--color-lavender) 32%, rgba(8, 12, 30, 0.68));
+  --color-text-muted: color-mix(in oklab, #dbe3f7 66%, #7b86a9 34%);
+  --color-neutral: color-mix(in oklab, var(--color-black) 84%, var(--color-purple-deep) 16%);
+  --color-error: color-mix(in oklab, #ff8a8a 78%, #7f1d1d 22%);
+
+  /* Glassmorphism tokens for dark mode */
+  --glass-tint: rgba(8, 11, 24, 0.84);
+  --glass-tint-strong: rgba(6, 8, 18, 0.92);
+  --glass-border: color-mix(in oklab, var(--color-lavender) 28%, rgba(8, 12, 30, 0.72));
+  --glass-shadow: 0 22px 56px rgba(1, 4, 12, 0.78), 0 12px 28px rgba(51, 14, 81, 0.24);
+  --glass-sheen: linear-gradient(134deg, rgba(255, 255, 255, 0.16) 0%, rgba(255, 255, 255, 0.05) 34%, rgba(255, 255, 255, 0.015) 60%, transparent 78%);
+  --glass-sheen-strong: linear-gradient(124deg, rgba(255, 255, 255, 0.24) 0%, rgba(255, 255, 255, 0.08) 34%, rgba(255, 255, 255, 0.02) 60%, rgba(255, 255, 255, 0.1) 94%);
+
+  --scrollbar-thumb-color: color-mix(in oklab, var(--color-primary) 54%, var(--color-indigo) 46%);
+  --scrollbar-thumb-hover-color: color-mix(in oklab, var(--color-primary-dark) 56%, var(--color-primary) 44%);
+  --scrollbar-track-color: color-mix(in oklab, var(--color-petrol) 74%, var(--color-black) 26%);
+}
+
+/* Dark-mode defaults for plain form controls to avoid white boxes */
+body.dark-mode input,
+body.dark-mode select,
+body.dark-mode textarea {
+  background: color-mix(in oklab, var(--color-lavender) 14%, var(--color-black) 86%);
+  color: var(--color-white);
+  border-color: color-mix(in oklab, var(--color-lavender) 35%, var(--color-black) 65%);
+}
+
+body.dark-mode input::placeholder,
+body.dark-mode textarea::placeholder {
+  color: color-mix(in oklab, var(--color-lavender) 65%, var(--color-white) 35%);
+  opacity: 0.6;
+}
+
+body.dark-mode a {
+  color: var(--color-primary);
+}
+
+body.dark-mode a:hover {
+  color: var(--color-primary-dark);
+}
+
+/* Firefox */
+html,
+body {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb-color) var(--scrollbar-track-color);
+}
+
+/* Chromium / Safari */
+*::-webkit-scrollbar {
+  width: var(--scrollbar-size);
+  height: var(--scrollbar-size);
+}
+
+*::-webkit-scrollbar-track {
+  background: var(--scrollbar-track-color);
+}
+
+*::-webkit-scrollbar-thumb {
+  background-color: var(--scrollbar-thumb-color);
+  border-radius: 9999px; /* fully rounded */
+  transition: background-color 120ms ease;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background-color: var(--scrollbar-thumb-hover-color, var(--scrollbar-thumb-color));
+}
+
+/* Corner for two-dimensional scroll areas */
+*::-webkit-scrollbar-corner {
+  background: var(--scrollbar-track-color);
+}

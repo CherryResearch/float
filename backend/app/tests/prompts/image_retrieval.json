@@ -1,0 +1,11 @@
+[
+  [
+    {"role": "user", "content": "Show me a picture of the Eiffel Tower."},
+    {"role": "assistant", "content": "[tool: image_search {\"query\": \"Eiffel Tower\"}]"},
+    {"role": "assistant", "content": "[image: eiffel.jpg]"}
+  ],
+  [
+    {"role": "user", "content": "Describe the image."},
+    {"role": "assistant", "content": "It is the Eiffel Tower at sunset."}
+  ]
+]

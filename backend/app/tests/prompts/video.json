@@ -1,0 +1,14 @@
+[
+  {"role": "user", "content": "Load the video clip from dashcam.mp4"},
+  {"role": "assistant", "content": "[tool: load_video {\"video\": \"dashcam.mp4\"}]"},
+  {"role": "user", "content": "Describe the first scene"},
+  {"role": "assistant", "content": "Daytime street with light traffic."},
+  {"role": "user", "content": "Track the blue truck across frames"},
+  {"role": "assistant", "content": "[tool: track_object {\"object\": \"blue truck\"}]"},
+  {"role": "user", "content": "How many frames show pedestrians?"},
+  {"role": "assistant", "content": "[tool: count_frames {\"label\": \"pedestrian\"}]"},
+  {"role": "user", "content": "Summarize the video in two sentences"},
+  {"role": "assistant", "content": "Summary of events in two sentences"},
+  {"role": "user", "content": "Thank you"},
+  {"role": "assistant", "content": "Video test complete"}
+]

@@ -1,0 +1,52 @@
+[
+  [
+    {"role": "user", "content": "Hey assistant, can you hear me?"},
+    {"role": "assistant", "content": "Yes, I hear you loud and clear."}
+  ],
+  [
+    {"role": "user", "content": "What's the weather in Paris today?"},
+    {"role": "assistant", "content": "[tool: weather {\"location\": \"Paris\"}]"},
+    {"role": "assistant", "content": "It's rainy in Paris. Speaking now."}
+  ],
+  [
+    {"role": "user", "content": "I need directions to the science museum."},
+    {"role": "assistant", "content": "[tool: navigation {\"destination\": \"science museum\"}]"},
+    {"role": "user", "content": "Read those directions aloud."},
+    {"role": "assistant", "content": "Streaming the directions now."}
+  ],
+  [
+    {"role": "user", "content": "Remember that my appointment is at 3 PM."},
+    {"role": "assistant", "content": "[tool: remember {\"appointment\": \"3 PM\"}]"},
+    {"role": "user", "content": "When is my appointment?"},
+    {"role": "assistant", "content": "[tool: recall {\"key\": \"appointment\"}]"},
+    {"role": "assistant", "content": "Your appointment is at 3 PM, said out loud."}
+  ],
+  [
+    {"role": "user", "content": "Translate 'good night' to Spanish and say it."},
+    {"role": "assistant", "content": "[tool: translate {\"text\": \"good night\", \"to\": \"es\"}]"},
+    {"role": "assistant", "content": "Buenas noches."}
+  ],
+  [
+    {"role": "user", "content": "Set a timer for 10 minutes and confirm verbally."},
+    {"role": "assistant", "content": "[tool: set_timer {\"duration\": 600}]"},
+    {"role": "assistant", "content": "Timer set for ten minutes."}
+  ],
+  [
+    {"role": "user", "content": "Play something relaxing."},
+    {"role": "assistant", "content": "[tool: play_music {\"genre\": \"ambient\"}]"},
+    {"role": "assistant", "content": "Enjoying some ambient tunes."}
+  ],
+  [
+    {"role": "user", "content": "Take a quick voice note: 'Call Alice tomorrow'."},
+    {"role": "assistant", "content": "[tool: transcribe_note {\"note\": \"Call Alice tomorrow\"}]"},
+    {"role": "assistant", "content": "Voice note saved."}
+  ],
+  [
+    {"role": "user", "content": "Recap our conversation out loud."},
+    {"role": "assistant", "content": "You asked for weather, directions, reminders, translations, timers, music, and notes."}
+  ],
+  [
+    {"role": "user", "content": "Thanks, that's all for now."},
+    {"role": "assistant", "content": "Happy to help, ending voice session."}
+  ]
+]

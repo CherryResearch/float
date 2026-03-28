@@ -1,0 +1,10 @@
+[
+  [
+    {"role": "user", "content": "[audio:sample.wav]"},
+    {"role": "assistant", "content": "Transcribed audio: hello world."}
+  ],
+  [
+    {"role": "user", "content": "Can you summarize that audio?"},
+    {"role": "assistant", "content": "It said 'hello world'."}
+  ]
+]

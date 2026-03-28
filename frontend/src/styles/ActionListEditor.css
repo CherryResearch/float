@@ -1,0 +1,165 @@
+.actions-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.actions-editor-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.actions-editor-header h4 {
+  margin: 0;
+  font-size: 0.95rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+}
+
+.actions-editor-meta {
+  font-size: 0.8rem;
+  color: var(--color-text-muted);
+  text-align: right;
+}
+
+.actions-editor-add {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.actions-editor-add input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 80%, transparent);
+  background: color-mix(in oklab, var(--glass-tint) 88%, transparent);
+  color: var(--color-text);
+}
+
+.actions-editor-add button {
+  border: none;
+  border-radius: 10px;
+  padding: 8px 12px;
+  cursor: pointer;
+  background: color-mix(in oklab, var(--color-accent) 26%, var(--glass-tint) 74%);
+  color: var(--color-text);
+}
+
+.actions-editor-add button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.actions-editor-empty {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--color-text-muted);
+}
+
+.actions-editor-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.actions-editor-item {
+  border: 1px solid color-mix(in oklab, var(--glass-border) 70%, transparent);
+  border-radius: 14px;
+  background: color-mix(in oklab, var(--glass-tint) 90%, transparent);
+  overflow: hidden;
+}
+
+.actions-editor-item-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  background: color-mix(in oklab, var(--glass-tint) 84%, transparent);
+}
+
+.actions-editor-expand {
+  border: none;
+  background: transparent;
+  color: var(--color-text);
+  cursor: pointer;
+  font-size: 0.95rem;
+}
+
+.actions-editor-item-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 0.9rem;
+  color: var(--color-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.actions-editor-item-controls {
+  display: inline-flex;
+  gap: 6px;
+}
+
+.actions-editor-item-controls button {
+  border: 1px solid color-mix(in oklab, var(--glass-border) 70%, transparent);
+  background: color-mix(in oklab, var(--glass-tint) 88%, transparent);
+  color: var(--color-text);
+  border-radius: 8px;
+  padding: 4px 8px;
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
+.actions-editor-item-controls button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.actions-editor-item-body {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.actions-editor-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.actions-editor-field > span {
+  font-size: 0.8rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+}
+
+.actions-editor-field input,
+.actions-editor-field select,
+.actions-editor-field textarea {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 80%, transparent);
+  background: color-mix(in oklab, var(--glass-tint) 88%, transparent);
+  color: var(--color-text);
+}
+
+.actions-editor-field textarea {
+  resize: vertical;
+}
+
+.actions-editor-hint {
+  font-size: 0.76rem;
+  color: var(--color-text-muted);
+  line-height: 1.35;
+}

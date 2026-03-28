@@ -1,0 +1,22 @@
+[
+  {"role": "user", "content": "Transcribe this clip"},
+  {"role": "assistant", "content": "[tool: speech_to_text {\"audio\": \"clip1.wav\"}]"},
+  {"role": "user", "content": "Read the transcript aloud"},
+  {"role": "assistant", "content": "[tool: text_to_speech {\"text\": \"The clip says hello\"}]"},
+  {"role": "user", "content": "Play relaxing music"},
+  {"role": "assistant", "content": "[tool: play_audio {\"file\": \"relax.mp3\"}]"},
+  {"role": "user", "content": "Do you hear any noise in this recording?"},
+  {"role": "assistant", "content": "[tool: detect_noise {\"audio\": \"room.wav\"}]"},
+  {"role": "user", "content": "Generate a 440Hz tone"},
+  {"role": "assistant", "content": "[tool: synth_tone {\"frequency\": 440}]"},
+  {"role": "user", "content": "Save that tone as tone.wav"},
+  {"role": "assistant", "content": "[tool: save_audio {\"name\": \"tone.wav\"}]"},
+  {"role": "user", "content": "Convert it to mp3 format"},
+  {"role": "assistant", "content": "[tool: convert_audio {\"source\": \"tone.wav\", \"format\": \"mp3\"}]"},
+  {"role": "user", "content": "Play the mp3 file"},
+  {"role": "assistant", "content": "[tool: play_audio {\"file\": \"tone.mp3\"}]"},
+  {"role": "user", "content": "What's the duration of tone.mp3?"},
+  {"role": "assistant", "content": "[tool: audio_info {\"file\": \"tone.mp3\"}]"},
+  {"role": "user", "content": "Great, summarize the audio test."},
+  {"role": "assistant", "content": "Audio tool demo complete."}
+]

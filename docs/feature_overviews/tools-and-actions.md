@@ -1,0 +1,5 @@
+tools are the controlled actions float can take instead of only replying with text. A tool might search the web, read or write a file in a managed area, save a memory, inspect threads, or create a task. The idea is to let float do one bounded job at a time rather than pretending to have acted when it has only described an action.
+
+For the user, this turns float from a conversational assistant into something that can actually move work forward. It can look something up, keep a note, fetch something already stored, or set up a next step while still making that action visible enough for a person to review. The best version of this feature feels capable without feeling hidden or slippery.
+
+The current tool set is mixed on purpose: some tools are fully live, some are older compatibility aliases, and a few are still stubs or future-facing. Approvals still matter, write-capable tools are sandboxed to managed project areas rather than the whole desktop, and the older compatibility surfaces should not be read as equal in maturity to the core built-ins. The public references for the current shipped surface are `docs/api_reference.md` and `docs/architecture_map.md`.

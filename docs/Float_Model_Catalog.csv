@@ -1,0 +1,39 @@
+Type,Name,Link,File Size,Quantization,Local VRAM (GB),Hosted VRAM (GB),"Licensing: api, self, distribution?"
+Turn Detection,LiveKit built-in,https://github.com/livekit/agents/tree/main/livekit-plugins/livekit-plugins-turn-detector,N/A,N/A,0,0,
+Turn Detection,smart-turn,https://github.com/pipecat-ai/smart-turn,N/A,N/A,0,0,
+ASR (Speech-to-Text),Whisper.cpp,https://github.com/ggerganov/whisper.cpp,500 MB (small.en); ,ggml 4-bit/8-bit,0.2,,
+ASR (Speech-to-Text),Whisper.cpp,https://huggingface.co/openai/whisper-large-v3-turbo,2 gb ,ggml 4-bit/8-bit,,,api or self
+ASR (Speech-to-Text),Vosk,https://github.com/alphacep/vosk-api,50 MB (small model),N/A,0,,
+ASR (Speech-to-Text),Voxtral (local),https://huggingface.co/mistralai/Voxtral-Mini-3B-2507 ; https://huggingface.co/mistralai/Voxtral-Small-24B-2507,,unknown,<2,,
+TTS (Text-to-Speech),Coqui TTS,https://github.com/coqui-ai/TTS,3.5 GB,"fp16, 8-bit",4,4,
+TTS (Text-to-Speech),Piper,https://github.com/rhasspy/piper,100 MB,N/A,1,1,
+TTS (Text-to-Speech),Kitten,https://github.com/KittenML/KittenTTS.git,light,N/A,25mb,0,,local
+Speech-to-Speech (S2S),Openai live voice,,varies,unknown,<2,,api
+LLM (Language Models),Mistral 7B,https://huggingface.co/mistralai/Mistral-7B-v0.1 ; https://huggingface.co/mistralai/Mistral-Small-Instruct-2409,3.5 GB (4-bit),4-bit,7,44,self
+LLM (Language Models),Mistral Large,https://huggingface.co/mistralai/Mistral-Large-Instruct-2411,250gb,BF16,,240,api or SELF
+LLM (Language Models),Google Gemma 3, API
+LLM (Language Models),Google Gemini,https://cloud.google.com/vertex-ai/docs/generative-ai/models/gemini,N/A,N/A,na,128,api
+LLM (Language Models),OpenAI GPT-5, API
+LLM (Language Models),OpenAI GPT-OSS-20b
+LLM (Language Models),OpenAI GPT-OSS-120b
+VLM (Vision Language Models),Google Paligemma 2.7B / 2 28b,https://huggingface.co/google/paligemma-2.7b ; https://huggingface.co/google/paligemma2-28b-mix-448/tree/main,5.5 GB (4-bit),4-bit,12,48,
+VLM (Vision Language Models),OpenAI Vision (GPT-4o),https://platform.openai.com/docs/guides/vision,N/A,N/A,,0,
+VLM (Vision Language Models),OpenAI GPT-5 Nano (Captioning),https://platform.openai.com/docs/models#gpt-5-nano,N/A,N/A,,0,api
+VLM (Vision Language Models),Pixtral small,https://huggingface.co/mistralai/Pixtral-12B-2409,25,4-bit,12,,self
+VLM (Vision Language Models),Pixtral,https://huggingface.co/mistralai/Pixtral-Large-Instruct-2411,>200 gb,,,80+,api or self 
+CV (Computer Vision),OpenCV,https://github.com/opencv/opencv,N/A,N/A,0,0,
+CV (Computer Vision),Mediapipe,https://github.com/google/mediapipe,N/A,N/A,0,0,
+CV (Computer Vision),Google Vision API,https://cloud.google.com/vision,N/A,N/A,,0,api
+Embeddings (Text),Sentence-Transformers,https://www.sbert.net/,1 GB,N/A,2,,yes
+Embeddings (Text),OpenAI Embeddings API,https://platform.openai.com/docs/guides/embeddings,N/A,N/A,,0,api
+Embeddings (Multimodal),CLIP (ViT-B/32),https://github.com/openai/CLIP,300 MB,N/A,4,4,
+Embeddings (Multimodal),OpenAI CLIP via GPT-4o,https://platform.openai.com/docs/guides/vision,N/A,N/A,,0,
+Embeddings (Multimodal),Google Gemini Embeddings,https://cloud.google.com/vertex-ai/docs/generative-ai/models/gemini,N/A,N/A,,0,
+Observational Context (Visual),OpenCV Frame Capture,https://github.com/opencv/opencv,N/A,N/A,0,0,
+Observational Context (Visual),Screen Capture Scripts,https://github.com/lelouch77/opencv-screen-capture,N/A,N/A,0,0,
+Observational Context (Audio),Whisper Embedding,https://github.com/ggerganov/whisper.cpp,500 MB,ggml quant,0.2,,
+Observational Context (Audio),Voxtral Embedding,https://voxtral.ai,varies,unknown,<2,,
+Tool Calls / API Tooling,MCP Schema,https://github.com/CherryResearch/float/tree/main/app/schemas.py,N/A,N/A,0,0,
+Tool Calls / API Tooling,API Proxy Wrapper,https://github.com/CherryResearch/float/blob/main/frontend/src/api.js,N/A,N/A,0,0,
+Memory & World Modeling,Weaviate,https://github.com/semi-technologies/weaviate,N/A,N/A,0,0,
+Memory & World Modeling,SQLite,https://www.sqlite.org,N/A,N/A,0,0,

@@ -1,0 +1,90 @@
+.week-view {
+  overflow-x: auto;
+}
+
+.week-table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+.week-table th,
+.week-table td {
+  border: 1px solid var(--color-border);
+  padding: clamp(4px, 0.6vw, 8px);
+  vertical-align: top;
+}
+
+.week-table th {
+  background: var(--color-background-secondary);
+}
+
+.hour-label {
+  width: clamp(48px, 6vw, 72px);
+  font-size: clamp(0.7rem, 1vw, 0.9rem);
+  color: var(--color-text-muted);
+}
+
+.week-cell {
+  min-width: clamp(100px, 14vw, 160px);
+  height: clamp(44px, 6vh, 72px);
+  cursor: pointer;
+}
+
+.week-cell .note {
+  background: var(--color-primary);
+  color: #fff;
+  padding: 2px 4px;
+  border-radius: var(--radius-sm);
+  margin-bottom: 2px;
+  font-size: clamp(0.7rem, 1vw, 0.85rem);
+}
+
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2400; /* above TopBar/AppBar (raised) */
+}
+
+.modal {
+  background: var(--color-surface);
+  padding: var(--space-md);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  min-width: 300px;
+}
+
+.modal form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-sm);
+}
+
+.modal-actions button {
+  padding: var(--space-xs) var(--space-sm);
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.modal-actions .btn-primary {
+  background: var(--color-primary);
+  color: var(--color-white);
+}
+
+.modal-actions .btn-secondary {
+  background: var(--color-background-secondary);
+  color: var(--color-text);
+}

@@ -1,0 +1,5 @@
+### - frontend
+pip-tools #not sure where this should be installed for deployability but yeah
+jinja2
+pyvis
+# i think this file needs to be deleted but i might be wrong. delete this and other comments if not.

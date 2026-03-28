@@ -1,0 +1,59 @@
+# Python files
+*.pyc
+__pycache__/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Input/output directories
+input/
+output/
+
+# Environment variables
+.env
+
+# Logs
+logs/
+backend/logs/
+*.log
+backend/.chroma/
+backend/models/
+
+# IDE-specific files
+.idea/
+.vscode/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Node.js
+node_modules/
+dist/
+
+# Project data
+/data/
+/float/data/*
+.dev_state.json
+data/threads/
+summary.json
+conversations/
+models/
+test_logs.json
+user_settings.json
+devices.json
+*.env
+.cache_smoketest
+blobs/
+
+# Local test/tool temp artifacts
+.precommit-cache/
+.pytest_tmp/
+.tmp_pytest/
+.tmp_pytest_run/
+.tmp_manual_data/
+
+# Internal/private project notes
+docs/internal/

@@ -1,0 +1,5 @@
+device sync and streaming is the planned layer that would let float feel continuous across more than one device. The basic idea is that calendars, knowledge, and live sessions should not stay trapped on one machine if the user wants float to move with them.
+
+In plain language, this is the feature that would let a desktop, laptop, or other personal device share state and sometimes share a live session too. It matters because float is designed as a persistent assistant, and persistence feels incomplete if it breaks every time the user changes devices.
+
+The trusted-device sync slice is real enough to treat as an alpha preview now, not just a hidden roadmap note, but the broader streaming and multi-device story is still unfinished. Current limits are mostly around copy polish, workspace ergonomics, and the fact that this is not yet a background-sync or generic public-gateway system. The public references for the current shipped surface are `README.md`, `docs/data_directory.md`, and `docs/api_reference.md`.

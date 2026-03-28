@@ -1,0 +1,8 @@
+{
+  "name": "float-root",
+  "private": true,
+  "workspaces": ["frontend"],
+  "scripts": {
+    "dev": "poetry run float"
+  }
+}

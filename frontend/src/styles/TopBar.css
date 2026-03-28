@@ -1,0 +1,362 @@
+/* TopBar component styling */
+:root {
+  --topbar-control-width: clamp(104px, 12vw, 140px);
+  --topbar-mode-chip-width: 84px; /* widest mode label: "server" */
+  --topbar-approval-chip-width: 52px; /* widest approval label: "high" */
+}
+
+.topbar-appbar {
+  margin-bottom: var(--space-md);
+  background: transparent;
+  box-shadow: none;
+  border-bottom: none;
+  /* Ensure TopBar layers above sidebars */
+  z-index: 2000;
+}
+
+.topbar-toolbar {
+  padding: 0;
+  pointer-events: none;
+}
+
+.topbar-content {
+  width: 100%;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-sm) var(--space-md);
+  min-height: var(--topbar-height);
+  pointer-events: auto;
+}
+
+.topbar-left {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  /* Allow the session name to shrink and ellipsize within grid */
+  min-width: 0;
+}
+
+.topbar-title {
+  margin: 0;
+  font-size: 1.25rem;
+  flex: 0 0 auto;
+}
+
+.topbar-link {
+  color: inherit;
+  text-decoration: none;
+}
+
+.session-name {
+  color: var(--color-text-muted);
+  font-size: 0.875rem;
+  /* Single-line ellipsis in the TopBar */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  max-width: 48ch;
+  flex: 1 1 auto;
+}
+
+.topbar-tabs {
+  /* Center column handled by grid; keep content intrinsic */
+  margin-left: 0;
+  justify-self: center;
+}
+
+.topbar-tabs .MuiTab-root {
+  text-transform: lowercase;
+  min-height: 36px;
+  border-radius: 999px;
+  transition: color 140ms ease, background-color 140ms ease;
+}
+
+.topbar-tabs .MuiTab-root.Mui-selected {
+  color: var(--color-pear-green);
+  background: color-mix(in oklab, var(--color-mint-green) 28%, var(--color-white) 72%);
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--color-pear-green) 28%, var(--glass-border) 72%);
+}
+
+.topbar-tabs .MuiTabs-indicator {
+  background-color: var(--color-pear-green);
+  height: 3px;
+  border-radius: 999px;
+}
+
+.topbar-tabs .MuiTab-root:hover {
+  background-color: color-mix(in oklab, var(--color-mint-green) 16%, transparent);
+  color: var(--color-pear-green);
+}
+
+body.dark-mode .topbar-tabs .MuiTab-root.Mui-selected {
+  color: var(--color-white);
+  background: color-mix(in oklab, var(--color-lavender) 18%, rgba(255, 255, 255, 0.02));
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--color-primary) 48%, transparent);
+}
+
+body.dark-mode .topbar-tabs .MuiTabs-indicator {
+  background-color: var(--color-primary);
+}
+
+body.dark-mode .topbar-tabs .MuiTab-root:hover {
+  background-color: color-mix(in oklab, var(--color-lavender) 40%, transparent);
+  color: var(--color-primary);
+}
+
+/* Center the main tabs (chat, knowledge, settings) within the top bar */
+.topbar-tabs .MuiTabs-flexContainer {
+  justify-content: center;
+}
+
+@media (max-width: 900px) {
+  /* On narrower screens, prefer start alignment for better scroll behavior */
+  .topbar-tabs .MuiTabs-flexContainer {
+    justify-content: flex-start;
+  }
+}
+
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  justify-content: flex-end;
+  flex-wrap: nowrap;
+}
+
+.status-indicator {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  border-radius: var(--radius-sm);
+  padding: 2px;
+  cursor: pointer;
+  color: inherit;
+  text-decoration: none;
+}
+
+/* Keep model select and server URL input visually identical in width/size */
+.topbar-actions .model-select,
+.topbar-actions .server-ip-input,
+.topbar-mobile-controls-row .model-select,
+.topbar-mobile-controls-row .server-ip-input {
+  background: var(--glass-tint);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+  color: var(--color-text);
+  padding: 4px 8px;
+  height: 28px;
+  font-size: 0.85rem;
+  display: block;
+  margin: 0;
+  box-sizing: border-box;
+  flex: 0 0 var(--topbar-control-width);
+  width: var(--topbar-control-width);
+  min-width: var(--topbar-control-width);
+  max-width: var(--topbar-control-width);
+}
+
+.topbar-actions .model-select,
+.topbar-mobile-controls-row .model-select {
+  text-overflow: ellipsis;
+}
+
+/* Small status indicator to the left of backend selector */
+.status-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  display: inline-block;
+  box-shadow: 0 0 0 1px var(--glass-border), 0 0 8px rgba(0,0,0,0.08);
+}
+.status-dot.ok { background: var(--color-success); }
+.status-dot.warn { background: #fbbf24; /* amber-400 */ }
+.status-dot.err { background: var(--color-error); }
+
+/* Circular theme toggle with hover like sidebar buttons */
+.topbar-theme-toggle {
+  width: 32px;
+  height: 32px;
+  border-radius: 9999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid color-mix(in oklab, var(--color-primary) 22%, var(--glass-border) 78%);
+  cursor: pointer;
+  background-color: color-mix(in oklab, var(--color-lavender) 78%, var(--color-white) 22%);
+  color: var(--color-primary-dark);
+  box-shadow: 0 8px 20px rgba(63, 39, 118, 0.12);
+  transition: transform 120ms ease, box-shadow 120ms ease, opacity 120ms ease;
+}
+body.dark-mode .topbar-theme-toggle {
+  background-color: color-mix(in oklab, var(--color-primary) 58%, rgba(255, 255, 255, 0.08));
+  color: var(--color-white);
+  border-color: color-mix(in oklab, var(--color-primary) 42%, var(--glass-border) 58%);
+}
+.topbar-theme-toggle:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 20px rgba(0,0,0,0.18);
+  background-color: color-mix(in oklab, var(--color-lavender) 56%, var(--color-primary) 44%);
+}
+
+body.dark-mode .topbar-theme-toggle:hover {
+  background-color: color-mix(in oklab, var(--color-primary) 72%, rgba(255, 255, 255, 0.08));
+}
+
+.topbar-mobile-menu-toggle {
+  border: 1px solid color-mix(in oklab, var(--color-primary) 28%, var(--glass-border) 72%);
+}
+
+.topbar-mobile-menu-icon {
+  font-size: 0.85rem;
+  line-height: 1;
+  transform: translateY(1px);
+  transition: transform 140ms ease;
+}
+
+.topbar-mobile-menu-toggle.open .topbar-mobile-menu-icon {
+  transform: translateY(-1px) rotate(180deg);
+}
+
+.topbar-mobile-controls-wrap {
+  width: min(var(--center-rail-max), 100%);
+  margin: 6px auto 0;
+  padding: 0 12px;
+  pointer-events: auto;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.topbar-mobile-controls-popover {
+  margin: 0;
+  width: auto;
+  max-width: 100%;
+  background:
+    var(--glass-sheen),
+    linear-gradient(
+      180deg,
+      color-mix(in oklab, var(--glass-tint) 38%, transparent),
+      color-mix(in oklab, var(--glass-tint) 20%, transparent)
+    );
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--glass-shadow);
+  backdrop-filter: blur(18px) saturate(185%);
+  -webkit-backdrop-filter: blur(18px) saturate(185%);
+  overflow-x: auto;
+  scrollbar-width: none;
+  padding: 8px 10px;
+}
+
+.topbar-mobile-controls-popover::-webkit-scrollbar {
+  display: none;
+}
+
+.topbar-mobile-controls-row {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  width: max-content;
+  min-width: 0;
+}
+
+/* Chip toggles: one word; let width fit content */
+.chip {
+  background: linear-gradient(180deg, var(--glass-tint-strong), transparent);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
+  backdrop-filter: saturate(160%) blur(12px);
+  -webkit-backdrop-filter: saturate(160%) blur(12px);
+  cursor: pointer;
+  height: 28px;
+  border-radius: 999px;
+  padding: 0 8px;
+  font-size: 0.85rem;
+  color: var(--color-text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+  text-transform: lowercase;
+  transition: transform 140ms ease, box-shadow 140ms ease, background-color 140ms ease, color 140ms ease;
+}
+.chip:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 20px rgba(0,0,0,0.18);
+  background: color-mix(in oklab, var(--color-lavender) 45%, transparent);
+}
+
+body.dark-mode .chip {
+  background: color-mix(in oklab, var(--color-lavender) 24%, transparent);
+  border-color: color-mix(in oklab, var(--color-lavender) 42%, var(--glass-border) 58%);
+  color: var(--color-white);
+}
+
+body.dark-mode .chip:hover {
+  background: color-mix(in oklab, var(--color-violet-glow) 38%, transparent);
+}
+/* Keep chip widths stable so status dots and controls do not shift by mode/value */
+.backend-chip {
+  box-sizing: border-box;
+  flex: 0 0 var(--topbar-mode-chip-width);
+  width: var(--topbar-mode-chip-width);
+  min-width: var(--topbar-mode-chip-width);
+  max-width: var(--topbar-mode-chip-width);
+}
+
+.approval-chip {
+  box-sizing: border-box;
+  flex: 0 0 var(--topbar-approval-chip-width);
+  width: var(--topbar-approval-chip-width);
+  min-width: var(--topbar-approval-chip-width);
+  max-width: var(--topbar-approval-chip-width);
+}
+
+@media (max-width: 900px) {
+  .session-name {
+    display: none;
+  }
+
+  .topbar-tabs {
+    overflow-x: auto;
+  }
+}
+
+/* Compact TopBar controls on narrow/portrait screens */
+@media (max-width: 600px), (orientation: portrait) and (max-width: 900px) {
+  :root {
+    --topbar-control-width: clamp(80px, 42vw, 104px);
+    --topbar-mode-chip-width: 72px;
+    --topbar-approval-chip-width: 48px;
+  }
+  .topbar-content { min-height: var(--topbar-height); height: auto; padding: 4px 10px; gap: 4px; }
+  .topbar-left { gap: 8px; }
+  .topbar-title { font-size: 1.1rem; }
+  .topbar-tabs .MuiTab-root {
+    min-height: 32px;
+    min-width: 60px;
+    padding: 0 8px;
+    font-size: 0.8rem;
+  }
+  .topbar-actions {
+    flex-wrap: nowrap;
+    gap: 4px;
+    overflow: visible;
+  }
+  .topbar-mobile-controls-wrap {
+    margin-top: 4px;
+    padding: 0 8px;
+  }
+  .topbar-mobile-controls-popover {
+    padding: 6px 8px;
+  }
+  .chip { height: 26px; padding: 0 6px; font-size: 0.8rem; }
+  .topbar-actions select,
+  .topbar-actions .server-ip-input,
+  .topbar-mobile-controls-row select,
+  .topbar-mobile-controls-row .server-ip-input { height: 26px; font-size: 0.8rem; padding: 2px 6px; }
+  .topbar-theme-toggle { width: 28px; height: 28px; }
+}

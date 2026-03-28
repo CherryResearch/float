@@ -1,0 +1,141 @@
+name: float
+
+services:
+  backend:
+    image: float/backend:latest
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+      args:
+        POETRY_EXTRAS: workers
+        PYTHON_BASE: ${PYTHON_BASE:-mcr.microsoft.com/devcontainers/python:3.12}
+        PYTHON_RUNTIME_BASE: ${PYTHON_RUNTIME_BASE:-mcr.microsoft.com/devcontainers/python:3.12}
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://user:pass@db:5432/floatdb}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    volumes:
+      - ./backend:/app/backend
+      - backend-logs:/app/logs
+    networks:
+      - float-net
+
+  worker:
+    image: float/backend:latest
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+      args:
+        POETRY_EXTRAS: workers
+        PYTHON_BASE: ${PYTHON_BASE:-mcr.microsoft.com/devcontainers/python:3.12}
+        PYTHON_RUNTIME_BASE: ${PYTHON_RUNTIME_BASE:-mcr.microsoft.com/devcontainers/python:3.12}
+    depends_on:
+      backend:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/0}
+    command: ["python", "worker.py"]
+    working_dir: /app/backend
+    volumes:
+      - ./backend:/app/backend
+    networks:
+      - float-net
+
+  frontend:
+    image: float/frontend:latest
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+      args:
+        NODE_BASE: ${NODE_BASE:-mcr.microsoft.com/devcontainers/javascript-node:20}
+        NGINX_BASE: ${NGINX_BASE:-mcr.microsoft.com/oss/nginx/nginx:1.25-alpine}
+    ports:
+      - "5173:80"
+    depends_on:
+      backend:
+        condition: service_started
+    environment:
+      VITE_BACKEND_URL: ${VITE_BACKEND_URL:-http://localhost:8000}
+    profiles:
+      - ui
+    networks:
+      - float-net
+
+  weaviate:
+    image: ${WEAVIATE_IMAGE:-cr.weaviate.io/semitechnologies/weaviate:latest}
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
+    ports:
+      - "8080:8080"
+      - "50051:50051"
+    volumes:
+      - weaviate-data:/var/lib/weaviate
+    profiles:
+      - rag
+    networks:
+      - float-net
+
+  redis:
+    image: ${REDIS_IMAGE:-public.ecr.aws/docker/library/redis:7-alpine}
+    ports:
+      - "6380:6379"
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - redis-data:/data
+    networks:
+      - float-net
+
+  db:
+    image: ${POSTGRES_IMAGE:-public.ecr.aws/docker/library/postgres:14}
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pass}
+      POSTGRES_DB: ${POSTGRES_DB:-floatdb}
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"${POSTGRES_USER:-user}\" -d \"${POSTGRES_DB:-floatdb}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    networks:
+      - float-net
+
+networks:
+  float-net:
+    driver: bridge
+
+volumes:
+  backend-logs:
+  db-data:
+  redis-data:
+  weaviate-data:

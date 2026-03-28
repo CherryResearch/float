@@ -1,0 +1,54 @@
+.tool-review-btn,
+.tool-action-btn {
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: none;
+  font-size: 0.7rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  background: color-mix(in oklab, var(--glass-tint) 88%, transparent);
+  color: var(--color-text);
+  cursor: pointer;
+  transition: transform 120ms ease, box-shadow 120ms ease, opacity 120ms ease;
+}
+
+.tool-review-btn {
+  background: color-mix(in oklab, var(--color-lavender) 55%, transparent);
+}
+
+.tool-action-btn.accept {
+  background: color-mix(in oklab, var(--color-mint-green) 45%, transparent);
+  color: color-mix(in oklab, var(--color-black) 30%, var(--color-white) 70%);
+}
+
+.tool-action-btn.deny {
+  background: color-mix(in oklab, var(--color-error) 35%, transparent);
+  color: color-mix(in oklab, var(--color-white) 75%, var(--color-black) 25%);
+}
+
+.tool-action-btn.edit {
+  background: color-mix(in oklab, var(--color-purple) 26%, transparent);
+  color: color-mix(in oklab, var(--color-white) 80%, var(--color-black) 20%);
+}
+
+.tool-action-btn.continue {
+  background: color-mix(in oklab, var(--color-lavender) 40%, var(--glass-tint) 60%);
+  color: var(--color-text);
+}
+
+.tool-action-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.tool-review-btn:hover,
+.tool-action-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.12);
+}
+
+.tool-review-btn:focus-visible,
+.tool-action-btn:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}

@@ -1,0 +1,57 @@
+[
+  [
+    {"role": "user", "content": "I want to keep track of ideas."},
+    {"role": "user", "content": "Let's name the file brainstorm.txt."},
+    {"role": "user", "content": "Start it with '1. Build a treehouse.'"},
+    {"role": "assistant", "content": "[tool: write_file {\"path\": \"brainstorm.txt\", \"content\": \"1. Build a treehouse.\"}]"},
+    {"role": "assistant", "content": "Brainstorm note created."}
+  ],
+  [
+    {"role": "user", "content": "I'm always forgetting the lab door code. It's 8452; can you remember that?"},
+    {"role": "assistant", "content": "[tool: write_file {\"path\": \"lab.txt\", \"content\": \"8452\"}]"},
+    {"role": "user", "content": "What's the code again?"},
+    {"role": "assistant", "content": "[tool: read_file {\"path\": \"lab.txt\"}]"},
+    {"role": "assistant", "content": "The lab door code is 8452."}
+  ],
+  [
+    {"role": "user", "content": "Could you note my favorite quote?"},
+    {"role": "assistant", "content": "Sure, what is it?"},
+    {"role": "user", "content": "\"Knowledge speaks, but wisdom listens.\" Save it somewhere."},
+    {"role": "assistant", "content": "[tool: write_file {\"path\": \"assets/quotes.txt\", \"content\": \"Knowledge speaks, but wisdom listens.\"}]"},
+    {"role": "assistant", "content": "Stored your quote."}
+  ],
+  [
+    {"role": "user", "content": "Read what's in assets/quotes.txt."},
+    {"role": "assistant", "content": "[tool: read_file {\"path\": \"assets/quotes.txt\"}]"},
+    {"role": "assistant", "content": "It says \"Knowledge speaks, but wisdom listens.\""}
+  ],
+  [
+    {"role": "user", "content": "Delete assets/quotes.txt; I don't need it anymore."},
+    {"role": "assistant", "content": "[tool: delete_file {\"path\": \"assets/quotes.txt\"}]"},
+    {"role": "assistant", "content": "File removed."}
+  ],
+  [
+    {"role": "user", "content": "What files are in this folder now?"},
+    {"role": "assistant", "content": "[tool: list_dir {\"path\": \"./\"}]"},
+    {"role": "assistant", "content": "That's everything in the directory."}
+  ],
+  [
+    {"role": "user", "content": "Fetch the homepage of example.com for me."},
+    {"role": "assistant", "content": "[tool: crawl {\"url\": \"https://example.com\"}]"},
+    {"role": "assistant", "content": "Fetched the page content."}
+  ],
+  [
+    {"role": "user", "content": "Open the project documentation in the browser."},
+    {"role": "assistant", "content": "[tool: open_url {\"url\": \"https://project.local/docs\"}]"},
+    {"role": "assistant", "content": "Documentation opened."}
+  ],
+  [
+    {"role": "user", "content": "Create tasks.txt with two lines: 'call mom' and 'buy milk'."},
+    {"role": "assistant", "content": "[tool: write_file {\"path\": \"tasks.txt\", \"content\": \"call mom\\nbuy milk\"}]"},
+    {"role": "assistant", "content": "Task list saved."}
+  ],
+  [
+    {"role": "user", "content": "Summarize what we did with tools today."},
+    {"role": "assistant", "content": "We created notes, remembered the lab code, handled a quote file, managed files and directories, fetched web content, opened docs, and saved a task list."}
+  ]
+]

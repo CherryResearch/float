@@ -1,0 +1,108 @@
+/* src/styles.css */
+
+/* Reset some default browser styles */
+body {
+    margin: 0;
+    padding: 0;
+    font-family: var(--font-stack);
+    background: var(--gradient-background);
+    background-repeat: no-repeat;
+    background-size: cover;
+    background-attachment: fixed;
+    color: var(--color-text);
+  }
+
+  /* Main App Container */
+  #app {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: space-between;
+    height: 100vh;
+    padding: var(--space-md);
+  }
+
+  /* Chat Box Styles */
+  .chat-container {
+    flex: 1;
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    border-radius: 10px;
+    background: var(--color-background-secondary);
+    overflow: hidden;
+  }
+
+  /* Chat Messages */
+  .message {
+    padding: var(--space-sm) var(--space-md);
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .message.user {
+    text-align: right;
+    background-color: var(--color-primary);
+  }
+
+  .message.float {
+    text-align: left;
+    background-color: var(--color-background-secondary);
+  }
+
+  /* Input Box */
+  .input-box {
+    display: flex;
+    padding: var(--space-sm);
+    margin: var(--space-sm);
+    background: var(--glass-tint);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-md);
+  }
+
+  .input-box input {
+    flex: 1;
+    padding: var(--space-sm);
+    border: 1px solid var(--color-border);
+    border-radius: 5px;
+    font-size: 1rem;
+    font-family: var(--font-stack);
+  }
+
+  .input-box textarea {
+    flex: 1;
+    padding: var(--space-sm);
+    border: 1px solid var(--color-border);
+    border-radius: 5px;
+    font-size: 1rem;
+    resize: vertical;
+    font-family: var(--font-stack);
+  }
+
+  .input-box button {
+    margin-left: var(--space-sm);
+    padding: var(--space-sm) var(--space-md);
+    background-color: var(--color-primary-dark);
+    color: white;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+    font-family: var(--font-stack);
+  }
+
+  .input-box button:hover {
+    background-color: var(--color-primary);
+  }
+
+  /* Visualization Tab */
+  .visualization-container {
+    flex: 1;
+    width: 100%;
+    max-width: 800px;
+    margin-top: 1rem;
+    border-radius: 10px;
+    background: var(--glass-tint);
+    border: 1px solid var(--color-border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }

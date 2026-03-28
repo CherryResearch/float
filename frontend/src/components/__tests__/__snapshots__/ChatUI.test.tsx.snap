@@ -1,0 +1,215 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`ChatUI snapshots > renders after exiting live mode 1`] = `
+<DocumentFragment>
+  <div
+    class="chat-ui"
+  >
+    <div
+      class="chat-history"
+      data-testid="chat-history"
+    >
+      <p>
+        Chat history
+      </p>
+    </div>
+    <div
+      class="entry-area"
+    >
+      <input
+        placeholder="Type..."
+        type="text"
+      />
+      <button
+        aria-label="Speech to text"
+        class="stt-mic"
+      >
+        🎤
+      </button>
+      <div
+        class="live-controls"
+      >
+        <button
+          aria-label="Toggle theme"
+          class="theme-toggle"
+        >
+          Dark Mode
+        </button>
+        <button
+          aria-label="Activate live mode"
+          class="live-mode-btn"
+        >
+          Live Mode
+        </button>
+        <div
+          class="media-toggles"
+        >
+          <button
+            aria-label="Mute microphone"
+            class="toggle-mic"
+            disabled=""
+          >
+            Mic On
+          </button>
+          <button
+            aria-label="Disable camera"
+            class="toggle-camera"
+          >
+            Cam On
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</DocumentFragment>
+`;
+
+exports[`ChatUI snapshots > renders default view 1`] = `
+<DocumentFragment>
+  <div
+    class="chat-ui"
+  >
+    <div
+      class="chat-history"
+      data-testid="chat-history"
+    >
+      <p>
+        Chat history
+      </p>
+    </div>
+    <div
+      class="entry-area"
+    >
+      <input
+        placeholder="Type..."
+        type="text"
+      />
+      <button
+        aria-label="Speech to text"
+        class="stt-mic"
+      >
+        🎤
+      </button>
+      <div
+        class="live-controls"
+      >
+        <button
+          aria-label="Toggle theme"
+          class="theme-toggle"
+        >
+          Dark Mode
+        </button>
+        <button
+          aria-label="Activate live mode"
+          class="live-mode-btn"
+        >
+          Live Mode
+        </button>
+        <div
+          class="media-toggles"
+        >
+          <button
+            aria-label="Mute microphone"
+            class="toggle-mic"
+            disabled=""
+          >
+            Mic On
+          </button>
+          <button
+            aria-label="Disable camera"
+            class="toggle-camera"
+          >
+            Cam On
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</DocumentFragment>
+`;
+
+exports[`ChatUI snapshots > renders live mode active 1`] = `
+<DocumentFragment>
+  <div
+    class="chat-ui"
+  >
+    <div
+      class="live-mode"
+      data-testid="live-mode"
+    >
+      <div
+        class="video-feed"
+      >
+        Video Feed
+      </div>
+      <button
+        aria-label="Send picture"
+        class="send-picture"
+      >
+        📷
+      </button>
+      <button
+        aria-label="Exit live mode"
+        class="exit-live"
+      >
+        X
+      </button>
+      <audio
+        autoplay=""
+        playsinline=""
+      />
+      <p
+        class="live-status"
+      >
+        Live (OpenAI Realtime)
+      </p>
+    </div>
+    <div
+      class="entry-area"
+    >
+      <input
+        placeholder="Type..."
+        type="text"
+      />
+      <button
+        aria-label="Speech to text"
+        class="stt-mic"
+      >
+        🎤
+      </button>
+      <div
+        class="live-controls"
+      >
+        <button
+          aria-label="Toggle theme"
+          class="theme-toggle"
+        >
+          Dark Mode
+        </button>
+        <button
+          aria-label="Activate live mode"
+          class="live-mode-btn"
+        >
+          Live Mode
+        </button>
+        <div
+          class="media-toggles"
+        >
+          <button
+            aria-label="Mute microphone"
+            class="toggle-mic"
+          >
+            Mic On
+          </button>
+          <button
+            aria-label="Disable camera"
+            class="toggle-camera"
+          >
+            Cam On
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</DocumentFragment>
+`;

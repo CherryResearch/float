@@ -1,0 +1,15 @@
+provider: livekit
+models:
+  speech:
+    api: https://api.speech.example.com
+    local: http://localhost:9000
+    stt_model: whisper-1
+    tts_model: tts-1
+    voice_model: alloy
+  vision:
+    api: https://api.vision.example.com
+    local: http://localhost:9001
+    clip_model: clip-vit-base-patch32
+  llm:
+    api: https://api.llm.example.com
+    local: http://localhost:9002

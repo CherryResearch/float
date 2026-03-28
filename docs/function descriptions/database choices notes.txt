@@ -1,0 +1,14 @@
+Comparison: ChromaDB + PostgreSQL vs. Weaviate + SQLite
+Feature ChromaDB + PostgreSQL   Weaviate + SQLite
+Ease of Setup   Moderate (two systems)  Easy (Weaviate + lightweight SQLite)
+Scalability     High    High for Weaviate, limited for SQLite
+Vector Search   Native in ChromaDB      Native in Weaviate
+Graph-Like Queries      JSONB/PostGIS in PostgreSQL     Native in Weaviate
+Tabular Data Handling   Robust SQL (PostgreSQL) Basic with SQLite
+Deployment Complexity   Moderate to high        Low to moderate
+
+txtai exists as well.
+
+Harmonization (legacy):
+Previous approach joined ChromaDB vectors with PostgreSQL JSONB metadata.
+As of 2025-08-23, Float uses Weaviate for vectors and a SQLite graph store, deprecating the ChromaDB/PostgreSQL combo.
