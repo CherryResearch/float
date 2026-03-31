@@ -1,5 +1,5 @@
 import React from "react";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import "@testing-library/jest-dom";
 import { vi } from "vitest";
@@ -56,12 +56,25 @@ const baseState = {
   ramSwap: false,
   apiModels: ["gpt-4o-mini"],
   apiModel: "gpt-4o-mini",
+  visualTheme: "spring",
+  workflowProfile: "default",
+  captureRetentionDays: 7,
+  captureDefaultSensitivity: "personal",
+  captureAllowModelRawImageAccess: true,
+  captureAllowSummaryFallback: true,
+  enabledWorkflowModules: ["computer_use"],
 };
 
 let settingsResponse;
 
-const renderWithState = (stateOverrides = {}) => {
-  const setState = vi.fn();
+const renderWithState = (options = {}) => {
+  const normalized =
+    options && (Object.prototype.hasOwnProperty.call(options, "stateOverrides") ||
+      Object.prototype.hasOwnProperty.call(options, "setState"))
+      ? options
+      : { stateOverrides: options };
+  const stateOverrides = normalized.stateOverrides || {};
+  const setState = normalized.setState || vi.fn();
   const state = { ...baseState, ...stateOverrides };
   return render(
     <MemoryRouter>
@@ -80,6 +93,7 @@ describe("Settings tools browser", () => {
       model: "gpt-4o-mini",
       transformer_model: "gpt-oss-20b",
       static_model: "gpt-4o-mini",
+      visual_theme: "spring",
       stt_model: "whisper-1",
       tts_model: "tts-1",
       voice_model: "alloy",
@@ -98,8 +112,56 @@ describe("Settings tools browser", () => {
           data: {
             tool_resolution_notifications: true,
             action_history_retention_days: 7,
+            capture_retention_days: 7,
+            capture_default_sensitivity: "personal",
+            capture_allow_model_raw_image_access: true,
+            capture_allow_summary_fallback: true,
+            default_workflow: "default",
+            enabled_workflow_modules: ["computer_use"],
             sync_link_to_source_device: false,
             sync_source_namespace: "",
+          },
+        });
+      }
+      if (url === "/api/workflows/catalog") {
+        return Promise.resolve({
+          data: {
+            workflows: [
+              {
+                id: "default",
+                label: "Default",
+                description: "Balanced reasoning with normal tool access and moderate latency.",
+                preferred_continue: "mini_execution",
+              },
+              {
+                id: "architect_planner",
+                label: "Architect / Planner",
+                description: "Planning-first workflow.",
+                preferred_continue: "mini_execution",
+              },
+              {
+                id: "mini_execution",
+                label: "Mini Execution",
+                description: "Short execution bursts.",
+                preferred_continue: "mini_execution",
+              },
+            ],
+            modules: [
+              {
+                id: "computer_use",
+                label: "Computer Use",
+                description: "Browser and desktop observation plus direct UI actions.",
+                status: "live",
+              },
+              {
+                id: "camera_capture",
+                label: "Camera Capture",
+                description: "Still-image capture from a connected camera via the client.",
+                status: "experimental",
+              },
+            ],
+            addons: [],
+            addons_root: "data/modules/addons",
           },
         });
       }
@@ -121,13 +183,68 @@ describe("Settings tools browser", () => {
               {
                 id: "open_url",
                 display_name: "Open URL",
-                status: "stub",
+                status: "legacy",
                 category: "web",
                 origin: "builtin",
-                summary: "Placeholder browser-open tool.",
+                summary: "Legacy alias for browser navigation through the shared computer runtime.",
+                runtime: { executor: "backend_python", network: true, filesystem: false },
+                can_access: ["browser navigation requests routed through the computer runtime"],
+                limit_hints: ["Legacy alias; prefer computer.navigate for new work."],
+              },
+              {
+                id: "computer.observe",
+                display_name: "Observe Computer",
+                status: "live",
+                category: "computer",
+                origin: "builtin",
+                summary: "Capture a screenshot and summary for the current session.",
+                runtime: { executor: "backend_python", network: false, filesystem: true },
+                can_access: ["computer session screenshots and metadata"],
+                limit_hints: ["Requires an active computer session."],
+              },
+              {
+                id: "computer.act",
+                display_name: "Act On Computer",
+                status: "live",
+                category: "computer",
+                origin: "builtin",
+                summary: "Apply one or more browser or desktop actions.",
                 runtime: { executor: "backend_python", network: false, filesystem: false },
-                can_access: ["the provided URL string only"],
-                limit_hints: ["Stub behavior only; no browser handoff yet."],
+                can_access: ["the active computer session only"],
+                limit_hints: ["Mutating actions require approval."],
+              },
+              {
+                id: "computer.navigate",
+                display_name: "Navigate Browser",
+                status: "live",
+                category: "computer",
+                origin: "builtin",
+                summary: "Navigate the active browser computer session.",
+                runtime: { executor: "backend_python", network: true, filesystem: false },
+                can_access: ["the active browser session only"],
+                limit_hints: ["Requires an active browser session."],
+              },
+              {
+                id: "computer.windows.list",
+                display_name: "List Windows",
+                status: "experimental",
+                category: "computer",
+                origin: "builtin",
+                summary: "List visible desktop windows.",
+                runtime: { executor: "backend_python", network: false, filesystem: false },
+                can_access: ["visible desktop windows on the host"],
+                limit_hints: ["Windows runtime only."],
+              },
+              {
+                id: "computer.app.launch",
+                display_name: "Launch Desktop App",
+                status: "experimental",
+                category: "computer",
+                origin: "builtin",
+                summary: "Launch a desktop application in the Windows runtime.",
+                runtime: { executor: "backend_python", network: false, filesystem: false },
+                can_access: ["allowed desktop applications on the host"],
+                limit_hints: ["Windows runtime only."],
               },
             ],
           },
@@ -208,7 +325,7 @@ describe("Settings tools browser", () => {
     expect(screen.getByText("D:/float/data/workspace")).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Filter tools"), {
-      target: { value: "stub" },
+      target: { value: "legacy" },
     });
 
     await waitFor(() => {
@@ -274,6 +391,64 @@ describe("Settings tools browser", () => {
     });
   });
 
+  it("saves capture retention and workflow defaults", async () => {
+    const setState = vi.fn();
+    renderWithState({
+      stateOverrides: {
+        workflowProfile: "default",
+        enabledWorkflowModules: ["computer_use"],
+      },
+      setState,
+    });
+
+    expect(await screen.findByRole("heading", { name: /capture & workflows/i })).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText(/how long transient captures are kept/i), {
+      target: { value: "14" },
+    });
+    fireEvent.change(screen.getByLabelText(/default capture sensitivity/i), {
+      target: { value: "protected" },
+    });
+    fireEvent.click(screen.getByLabelText(/allow raw image access for supported models/i));
+    fireEvent.change(screen.getByLabelText(/default workflow profile/i), {
+      target: { value: "mini_execution" },
+    });
+
+    const cameraModuleCard = screen
+      .getByText("Camera Capture", { selector: "strong" })
+      .closest("label");
+    fireEvent.click(cameraModuleCard.querySelector('input[type="checkbox"]'));
+    fireEvent.click(screen.getByRole("button", { name: /save capture defaults/i }));
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith("/api/user-settings", {
+        capture_retention_days: 14,
+        capture_default_sensitivity: "protected",
+        capture_allow_model_raw_image_access: false,
+        capture_allow_summary_fallback: true,
+        default_workflow: "mini_execution",
+        enabled_workflow_modules: ["computer_use", "camera_capture"],
+      });
+    });
+    expect(setState).toHaveBeenCalled();
+    expect(
+      await screen.findByText(/capture and workflow defaults saved/i),
+    ).toBeInTheDocument();
+  });
+
+  it("summarizes browser and Windows computer-use tools in settings", async () => {
+    renderWithState();
+
+    expect(await screen.findByText("Computer use")).toBeInTheDocument();
+    expect(screen.getByText("Browser tools: 4")).toBeInTheDocument();
+    expect(screen.getByText("Windows tools: 2")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /Windows desktop control is available as an experimental runtime/i,
+      ),
+    ).toBeInTheDocument();
+  });
+
   it("saves the work history retention window", async () => {
     renderWithState();
 
@@ -303,16 +478,52 @@ describe("Settings tools browser", () => {
     expect(
       screen.getByRole("combobox", { name: /where tool details appear/i }),
     ).toHaveValue("console");
+    const displayModeSelect = screen.getByRole("combobox", {
+      name: /where tool details appear/i,
+    });
     expect(
       screen.getByRole("combobox", { name: /when a tool link is clicked in chat/i }),
     ).toHaveValue("inline");
-    expect(screen.getByRole("option", { name: "Agent console" })).toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "Inline in chat" })).toBeInTheDocument();
+    expect(within(displayModeSelect).getByRole("option", { name: "Agent console" })).toBeInTheDocument();
+    expect(within(displayModeSelect).getByRole("option", { name: "Inline in chat" })).toBeInTheDocument();
+    expect(within(displayModeSelect).getByRole("option", { name: "Both" })).toBeInTheDocument();
+    expect(within(displayModeSelect).getByRole("option", { name: "Auto" })).toBeInTheDocument();
     expect(
       screen.getByText(
         /Current behavior: clicking a tool link opens the agent console because tool details are set to appear there\./i,
       ),
     ).toBeInTheDocument();
+  }, 10000);
+
+  it("offers a visual theme selector in settings", async () => {
+    const ThemeHarness = () => {
+      const [state, setState] = React.useState({
+        ...baseState,
+        visualTheme: "spring",
+      });
+      return (
+        <MemoryRouter>
+          <GlobalContext.Provider value={{ state, setState }}>
+            <Settings />
+          </GlobalContext.Provider>
+        </MemoryRouter>
+      );
+    };
+
+    render(<ThemeHarness />);
+
+    const select = await screen.findByLabelText("Visual theme");
+    expect(select).toHaveValue("spring");
+    expect(screen.getByRole("option", { name: "Spring" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Cappucino" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Sunset Citrus" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Midnight Plum" })).toBeInTheDocument();
+
+    fireEvent.change(select, { target: { value: "sunset-citrus" } });
+
+    await waitFor(() => {
+      expect(select).toHaveValue("sunset-citrus");
+    });
   });
 
   it("explains when inline tool links expand chat cards", async () => {
@@ -325,6 +536,39 @@ describe("Settings tools browser", () => {
     expect(
       screen.getByText(
         /Current behavior: clicking a tool link expands the matching inline tool card in chat\./i,
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("explains both mode without hiding the console timeline", async () => {
+    renderWithState({
+      toolDisplayMode: "both",
+      toolLinkBehavior: "inline",
+    });
+
+    expect(await screen.findByText("Built-in tools")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /Current behavior: clicking a tool link expands the matching inline tool card in chat, and the agent console still keeps the same tool activity available\./i,
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("explains auto mode as selected-message and streaming aware", async () => {
+    renderWithState({
+      toolDisplayMode: "auto",
+      toolLinkBehavior: "console",
+    });
+
+    expect(await screen.findByText("Built-in tools")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /Auto keeps tool details inline for the selected or highlighted message, and while the current response is streaming\./i,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /Current behavior: clicking a tool link focuses the matching item in the agent console, while auto mode still shows inline cards for the active or streaming message\./i,
       ),
     ).toBeInTheDocument();
   });
@@ -552,7 +796,7 @@ describe("Settings tools browser", () => {
     });
     expect(await screen.findByText(/Pull complete\./i)).toBeInTheDocument();
     expect(screen.getByText(/Stored under laptop\//i)).toBeInTheDocument();
-  });
+  }, 10000);
 
   it("saves sync defaults from the settings panel", async () => {
     renderWithState();

@@ -26,9 +26,26 @@ def test_tool_catalog_endpoint_returns_builtin_metadata(tmp_path, monkeypatch):
 
     open_url = next((tool for tool in tools if tool.get("id") == "open_url"), None)
     assert open_url is not None
-    assert open_url["status"] == "stub"
+    assert open_url["status"] == "legacy"
     assert open_url["category"] == "web"
     assert open_url["origin"] == "builtin"
+    assert any(
+        "browser" in str(item).lower() for item in open_url.get("can_access", [])
+    )
+
+    computer_observe = next(
+        (tool for tool in tools if tool.get("id") == "computer.observe"),
+        None,
+    )
+    assert computer_observe is not None
+    assert computer_observe["status"] == "live"
+    assert computer_observe["category"] == "computer"
+    assert computer_observe["safety"]["default_approval"] == "confirm"
+
+    shell_exec = next((tool for tool in tools if tool.get("id") == "shell.exec"), None)
+    assert shell_exec is not None
+    assert shell_exec["category"] == "system"
+    assert shell_exec["persistence"]["writes_state"] is True
 
     list_dir = next((tool for tool in tools if tool.get("id") == "list_dir"), None)
     assert list_dir is not None
@@ -45,11 +62,15 @@ def test_tool_catalog_endpoint_returns_builtin_metadata(tmp_path, monkeypatch):
     assert read_file["limits"]["max_line_count"] == 1000
     assert read_file["limits"]["default_max_chars"] == 12000
     assert read_file["limits"]["max_chars"] == 20000
-    list_actions = next((tool for tool in tools if tool.get("id") == "list_actions"), None)
+    list_actions = next(
+        (tool for tool in tools if tool.get("id") == "list_actions"), None
+    )
     assert list_actions is not None
     assert list_actions["category"] == "history"
     assert list_actions["persistence"]["writes_state"] is False
-    revert_actions = next((tool for tool in tools if tool.get("id") == "revert_actions"), None)
+    revert_actions = next(
+        (tool for tool in tools if tool.get("id") == "revert_actions"), None
+    )
     assert revert_actions is not None
     assert revert_actions["category"] == "history"
     assert revert_actions["persistence"]["writes_state"] is True
@@ -103,3 +124,6 @@ def test_tool_limits_endpoint_returns_roots_and_caps(tmp_path, monkeypatch):
     assert payload["roots"]["workspace"].endswith("/workspace")
     assert payload["limits"]["list_dir_max_entries"] == 200
     assert payload["limits"]["tool_help_max_tools"] == 50
+    assert payload["limits"]["computer_default_width"] == 1280
+    assert payload["limits"]["computer_default_height"] == 720
+    assert payload["limits"]["shell_exec_timeout_seconds"] == 20

@@ -317,16 +317,22 @@ const ToolEditorModal = ({
       return {
         mode: currentMode,
         model: state.localModel || state.transformerModel || state.apiModel || "",
+        workflow: state.workflowProfile || "default",
       };
     }
     if (currentMode === "server") {
       return {
         mode: currentMode,
         model: state.transformerModel || state.apiModel || "",
+        workflow: state.workflowProfile || "default",
       };
     }
     if (currentMode === "api") {
-      return { mode: currentMode, model: state.apiModel || "" };
+      return {
+        mode: currentMode,
+        model: state.apiModel || "",
+        workflow: state.workflowProfile || "default",
+      };
     }
     return {
       mode: currentMode || state.backendMode || "api",
@@ -335,11 +341,15 @@ const ToolEditorModal = ({
         state.transformerModel ||
         state.localModel ||
         "",
+      workflow: state.workflowProfile || "default",
     };
   };
   const initialContinue = resolveContinueTarget(state.backendMode);
   const [continueMode, setContinueMode] = useState(initialContinue.mode);
   const [continueModel, setContinueModel] = useState(initialContinue.model);
+  const [continueWorkflow] = useState(
+    initialContinue.workflow || state.workflowProfile || "default",
+  );
   const normalizedContinueMode = (
     continueMode ||
     initialContinue.mode ||
@@ -825,6 +835,7 @@ const ToolEditorModal = ({
       continueTarget: {
         mode: normalizedContinueMode,
         model: continueModel,
+        workflow: continueWorkflow || state.workflowProfile || "default",
       },
     });
   };

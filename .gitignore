@@ -36,7 +36,6 @@ dist/
 # Project data
 /data/
 /float/data/*
-.dev_state.json
 data/threads/
 summary.json
 conversations/
@@ -54,6 +53,3 @@ blobs/
 .tmp_pytest/
 .tmp_pytest_run/
 .tmp_manual_data/
-
-# Internal/private project notes
-docs/internal/

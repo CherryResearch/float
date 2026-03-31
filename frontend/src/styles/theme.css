@@ -1,39 +1,55 @@
 :root {
-  /* Base palette (light) — pulled back toward the stored Float palette with stronger contrast */
-  --color-white: #ffffff;
-  --color-soft-white: #eef8f0;
-  --color-mint-green: #6ddf8a;
-  --color-pear-green: #1f9d39;
-  --color-black: #101725;
-  --color-purple: #5f18bc;
-  --color-purple-deep: #341163;
-  --color-indigo: #390892;
-  --color-lavender: #ece2f8;
-  --color-lavender-dark: #b59fd7;
-  --color-petrol: #081626;
-  --color-violet-glow: #b083e8;
+  /* Theme slots. Spring is the default; JS can replace these for custom themes. */
+  --theme-c1-light: #f3f0ff;
+  --theme-c1-med: #5f18bc;
+  --theme-c1-dark: #341163;
+  --theme-c2-light: #86efac;
+  --theme-c2-med: #16a34a;
+  --theme-c2-dark: #166534;
+  --theme-very-light: #ffffff;
+  --theme-very-dark: #101725;
 
-  /* Fewer, broader layers keep the backdrop smoother and cheaper to render */
+  /* Legacy semantic palette, derived from the theme slots above. */
+  --color-white: var(--theme-very-light);
+  --color-soft-white: color-mix(in oklab, var(--theme-very-light) 84%, var(--theme-c1-light) 16%);
+  --color-mint-green: var(--theme-c2-light);
+  --color-pear-green: var(--theme-c2-med);
+  --color-black: var(--theme-very-dark);
+  --color-purple: var(--theme-c1-med);
+  --color-purple-deep: var(--theme-c1-dark);
+  --color-indigo: color-mix(in oklab, var(--theme-c1-dark) 88%, var(--theme-very-dark) 12%);
+  --color-lavender: var(--theme-c1-light);
+  --color-lavender-dark: color-mix(in oklab, var(--theme-c1-light) 60%, var(--theme-c1-med) 40%);
+  --color-petrol: color-mix(in oklab, var(--theme-very-dark) 84%, var(--theme-c1-dark) 16%);
+  --color-violet-glow: color-mix(in oklab, var(--theme-c1-light) 68%, var(--theme-very-light) 32%);
+  --theme-c1-glow: color-mix(in oklab, var(--theme-c1-light) 72%, var(--theme-very-light) 28%);
+  --theme-c2-glow: color-mix(in oklab, var(--theme-c2-light) 72%, var(--theme-very-light) 28%);
+  --theme-c1-shadow: color-mix(in oklab, var(--theme-c1-dark) 88%, var(--theme-very-dark) 12%);
+  --theme-c2-shadow: color-mix(in oklab, var(--theme-c2-dark) 84%, var(--theme-c1-dark) 16%);
+  --theme-warm-black: color-mix(in oklab, var(--theme-very-dark) 88%, var(--theme-c1-dark) 12%);
+  --theme-warm-shadow: color-mix(in oklab, var(--theme-c1-dark) 72%, var(--theme-very-dark) 28%);
+
+  /* Fewer, broader layers keep the backdrop smoother and cheaper to render. */
   --gradient-background:
     radial-gradient(
       1200px 640px at 14% 12%,
-      color-mix(in oklab, var(--color-lavender) 42%, transparent),
+      color-mix(in oklab, var(--theme-c1-light) 42%, transparent),
       transparent 68%
     ),
     radial-gradient(
       980px 560px at 86% 18%,
-      color-mix(in oklab, var(--color-mint-green) 18%, transparent),
+      color-mix(in oklab, var(--theme-c2-light) 18%, transparent),
       transparent 72%
     ),
     linear-gradient(
       180deg,
-      color-mix(in oklab, var(--color-soft-white) 92%, var(--color-white) 8%),
-      color-mix(in oklab, var(--color-lavender) 18%, var(--color-soft-white) 82%)
+      color-mix(in oklab, var(--theme-very-light) 92%, var(--theme-c1-light) 8%),
+      color-mix(in oklab, var(--theme-c1-light) 18%, var(--theme-very-light) 82%)
     );
 
   /* Semantic tokens */
   --color-background-primary: var(--gradient-background);
-  --color-background-secondary: #f8fbf7;
+  --color-background-secondary: color-mix(in oklab, var(--theme-very-light) 92%, var(--theme-c1-light) 8%);
   --color-surface: var(--color-white);
   --color-text: var(--color-black);
   --color-primary: var(--color-purple);
@@ -41,9 +57,9 @@
   --color-accent: var(--color-pear-green);
   --color-success: var(--color-mint-green);
   --color-success-dark: var(--color-pear-green);
-  --color-border: color-mix(in oklab, var(--color-lavender-dark) 52%, #cbd5e1 48%);
-  --color-text-muted: #4f5f74;
-  --color-neutral: color-mix(in oklab, var(--color-soft-white) 82%, var(--color-lavender) 18%);
+  --color-border: color-mix(in oklab, var(--theme-c1-light) 52%, #cbd5e1 48%);
+  --color-text-muted: color-mix(in oklab, var(--theme-c1-dark) 44%, var(--theme-very-dark) 56%);
+  --color-neutral: color-mix(in oklab, var(--theme-very-light) 82%, var(--theme-c1-light) 18%);
   --color-error: #c62828;
 
   /* Typography & spacing */
@@ -57,78 +73,82 @@
   --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
   --shadow-md: 0 8px 24px rgba(15, 23, 42, 0.12);
 
-  /* Glassmorphism tokens — clearer edges on light */
+  /* Glassmorphism tokens - clearer edges on light */
   --glass-tint: rgba(255, 255, 255, 0.72);
   --glass-tint-strong: rgba(255, 255, 255, 0.82);
   --glass-border: rgba(16, 23, 37, 0.16);
-  --glass-shadow: 0 10px 30px rgba(27, 36, 68, 0.1), 0 22px 44px rgba(91, 60, 155, 0.1);
+  --glass-shadow: 0 10px 30px color-mix(in oklab, var(--theme-warm-black) 78%, transparent), 0 22px 44px color-mix(in oklab, var(--theme-c1-shadow) 18%, transparent);
   --glass-sheen: linear-gradient(134deg, rgba(255, 255, 255, 0.16) 0%, rgba(255, 255, 255, 0.05) 36%, rgba(255, 255, 255, 0.01) 62%, transparent 76%);
   --glass-sheen-strong: linear-gradient(130deg, rgba(255, 255, 255, 0.2) 0%, rgba(255, 255, 255, 0.08) 32%, rgba(255, 255, 255, 0.02) 58%, rgba(255, 255, 255, 0.1) 94%);
 
-  /* Global custom scrollbar — thin, rounded, lavender→mint thumb */
+  /* Global custom scrollbar - thin, rounded, themed thumb */
   --scrollbar-size: 8px; /* thin */
-  --scrollbar-thumb-color: color-mix(in oklab, var(--color-lavender-dark) 54%, var(--color-mint-green) 46%);
-  --scrollbar-thumb-hover-color: color-mix(in oklab, var(--color-purple) 32%, var(--color-pear-green) 68%);
-  --scrollbar-track-color: color-mix(in oklab, var(--color-soft-white) 62%, var(--color-lavender) 38%);
+  --scrollbar-thumb-color: color-mix(in oklab, var(--theme-c1-light) 54%, var(--theme-c2-med) 46%);
+  --scrollbar-thumb-hover-color: color-mix(in oklab, var(--theme-c1-med) 32%, var(--theme-c2-med) 68%);
+  --scrollbar-track-color: color-mix(in oklab, var(--theme-very-light) 62%, var(--theme-c1-light) 38%);
 }
 
 body.dark-mode {
   --gradient-background:
     radial-gradient(
       1400px 760px at -6% 24%,
-      color-mix(in oklab, var(--color-indigo) 42%, rgba(2, 4, 12, 0.58)),
+      color-mix(in oklab, var(--theme-c1-dark) 58%, var(--theme-warm-black)),
       transparent 74%
     ),
     radial-gradient(
       1200px 700px at 108% 18%,
-      color-mix(in oklab, var(--color-violet-glow) 34%, rgba(29, 8, 52, 0.48)),
+      color-mix(in oklab, var(--theme-c2-med) 34%, var(--theme-warm-black)),
       transparent 76%
     ),
     radial-gradient(
       1100px 700px at 48% 118%,
-      color-mix(in oklab, var(--color-pear-green) 14%, rgba(0, 0, 0, 0.34)),
+      color-mix(in oklab, var(--theme-c2-dark) 14%, var(--theme-warm-black)),
       transparent 80%
     ),
-    linear-gradient(180deg, rgba(7, 10, 22, 0.98), rgba(3, 5, 14, 0.96));
+    linear-gradient(
+      180deg,
+      color-mix(in oklab, var(--theme-very-dark) 98%, var(--theme-c1-dark) 2%),
+      color-mix(in oklab, var(--theme-very-dark) 96%, var(--theme-c2-dark) 4%)
+    );
   --color-background-primary: var(--gradient-background);
-  --color-background-secondary: color-mix(in oklab, var(--color-black) 74%, var(--color-purple-deep) 26%);
-  --color-surface: color-mix(in oklab, var(--color-black) 82%, var(--color-purple) 18%);
+  --color-background-secondary: color-mix(in oklab, var(--theme-very-dark) 74%, var(--theme-c1-dark) 26%);
+  --color-surface: color-mix(in oklab, var(--theme-very-dark) 82%, var(--theme-c2-dark) 18%);
   --color-text: var(--color-white);
-  --color-primary: color-mix(in oklab, var(--color-violet-glow) 72%, var(--color-lavender) 28%);
-  --color-primary-dark: var(--color-lavender);
-  --color-accent: color-mix(in oklab, var(--color-mint-green) 78%, var(--color-lavender) 22%);
-  --color-success: var(--color-mint-green);
-  --color-success-dark: var(--color-pear-green);
-  --color-border: color-mix(in oklab, var(--color-lavender) 32%, rgba(8, 12, 30, 0.68));
-  --color-text-muted: color-mix(in oklab, #dbe3f7 66%, #7b86a9 34%);
-  --color-neutral: color-mix(in oklab, var(--color-black) 84%, var(--color-purple-deep) 16%);
+  --color-primary: color-mix(in oklab, var(--theme-c2-light) 72%, var(--theme-very-light) 28%);
+  --color-primary-dark: color-mix(in oklab, var(--theme-c2-med) 72%, var(--theme-c2-light) 28%);
+  --color-accent: color-mix(in oklab, var(--theme-c1-light) 74%, var(--theme-c2-light) 26%);
+  --color-success: var(--theme-c2-med);
+  --color-success-dark: var(--theme-c2-dark);
+  --color-border: color-mix(in oklab, var(--theme-c2-light) 32%, var(--theme-warm-black));
+  --color-text-muted: color-mix(in oklab, var(--theme-c1-light) 66%, var(--theme-c1-dark) 34%);
+  --color-neutral: color-mix(in oklab, var(--theme-very-dark) 84%, var(--theme-c1-dark) 16%);
   --color-error: color-mix(in oklab, #ff8a8a 78%, #7f1d1d 22%);
 
   /* Glassmorphism tokens for dark mode */
-  --glass-tint: rgba(8, 11, 24, 0.84);
-  --glass-tint-strong: rgba(6, 8, 18, 0.92);
-  --glass-border: color-mix(in oklab, var(--color-lavender) 28%, rgba(8, 12, 30, 0.72));
-  --glass-shadow: 0 22px 56px rgba(1, 4, 12, 0.78), 0 12px 28px rgba(51, 14, 81, 0.24);
+  --glass-tint: color-mix(in oklab, var(--theme-warm-black) 84%, var(--theme-c1-dark) 16%);
+  --glass-tint-strong: color-mix(in oklab, var(--theme-warm-black) 92%, var(--theme-c2-dark) 8%);
+  --glass-border: color-mix(in oklab, var(--theme-c2-light) 28%, var(--theme-warm-black));
+  --glass-shadow: 0 22px 56px color-mix(in oklab, var(--theme-warm-black) 86%, transparent), 0 12px 28px color-mix(in oklab, var(--theme-c2-shadow) 18%, transparent);
   --glass-sheen: linear-gradient(134deg, rgba(255, 255, 255, 0.16) 0%, rgba(255, 255, 255, 0.05) 34%, rgba(255, 255, 255, 0.015) 60%, transparent 78%);
   --glass-sheen-strong: linear-gradient(124deg, rgba(255, 255, 255, 0.24) 0%, rgba(255, 255, 255, 0.08) 34%, rgba(255, 255, 255, 0.02) 60%, rgba(255, 255, 255, 0.1) 94%);
 
-  --scrollbar-thumb-color: color-mix(in oklab, var(--color-primary) 54%, var(--color-indigo) 46%);
-  --scrollbar-thumb-hover-color: color-mix(in oklab, var(--color-primary-dark) 56%, var(--color-primary) 44%);
-  --scrollbar-track-color: color-mix(in oklab, var(--color-petrol) 74%, var(--color-black) 26%);
+  --scrollbar-thumb-color: color-mix(in oklab, var(--theme-c2-light) 54%, var(--theme-c1-dark) 46%);
+  --scrollbar-thumb-hover-color: color-mix(in oklab, var(--theme-c2-med) 56%, var(--theme-c2-light) 44%);
+  --scrollbar-track-color: color-mix(in oklab, var(--theme-very-dark) 74%, var(--theme-c1-dark) 26%);
 }
 
 /* Dark-mode defaults for plain form controls to avoid white boxes */
 body.dark-mode input,
 body.dark-mode select,
 body.dark-mode textarea {
-  background: color-mix(in oklab, var(--color-lavender) 14%, var(--color-black) 86%);
+  background: color-mix(in oklab, var(--theme-c2-light) 12%, var(--theme-very-dark) 88%);
   color: var(--color-white);
-  border-color: color-mix(in oklab, var(--color-lavender) 35%, var(--color-black) 65%);
+  border-color: color-mix(in oklab, var(--theme-c2-light) 34%, var(--theme-very-dark) 66%);
 }
 
 body.dark-mode input::placeholder,
 body.dark-mode textarea::placeholder {
-  color: color-mix(in oklab, var(--color-lavender) 65%, var(--color-white) 35%);
+  color: color-mix(in oklab, var(--theme-c2-light) 65%, var(--theme-very-light) 35%);
   opacity: 0.6;
 }
 

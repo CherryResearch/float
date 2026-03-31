@@ -43,11 +43,16 @@ def test_tool_specs_endpoint_returns_schemas(tmp_path, monkeypatch):
     assert "top_k" in recall_props
     assert "include_images" in recall_props
     assert "image_top_k" in recall_props
-    tool_help = next((t for t in tools if t.get("name") == "tool_help"), None)
-    assert tool_help is not None
-    help_props = tool_help["parameters"].get("properties") or {}
+    help_tool = next((t for t in tools if t.get("name") == "help"), None)
+    assert help_tool is not None
+    help_props = help_tool["parameters"].get("properties") or {}
     assert "tool_name" in help_props
     assert "detail" in help_props
+    tool_help = next((t for t in tools if t.get("name") == "tool_help"), None)
+    assert tool_help is not None
+    tool_help_props = tool_help["parameters"].get("properties") or {}
+    assert "tool_name" in tool_help_props
+    assert "detail" in tool_help_props
     tool_info = next((t for t in tools if t.get("name") == "tool_info"), None)
     assert tool_info is not None
     tool_info_props = tool_info["parameters"].get("properties") or {}
@@ -59,7 +64,9 @@ def test_tool_specs_endpoint_returns_schemas(tmp_path, monkeypatch):
     assert "conversation_id" in list_actions_props
     assert "response_id" in list_actions_props
     assert "include_reverted" in list_actions_props
-    read_action_diff = next((t for t in tools if t.get("name") == "read_action_diff"), None)
+    read_action_diff = next(
+        (t for t in tools if t.get("name") == "read_action_diff"), None
+    )
     assert read_action_diff is not None
     assert read_action_diff["parameters"].get("required") == ["action_id"]
     revert_actions = next((t for t in tools if t.get("name") == "revert_actions"), None)
@@ -101,4 +108,22 @@ def test_tool_specs_endpoint_returns_schemas(tmp_path, monkeypatch):
     assert read_file_props["line_count"]["maximum"] == 1000
     assert read_file_props["max_chars"]["default"] == 12000
     assert read_file_props["max_chars"]["maximum"] == 20000
+    computer_observe = next(
+        (t for t in tools if t.get("name") == "computer.observe"),
+        None,
+    )
+    assert computer_observe is not None
+    computer_observe_props = computer_observe["parameters"].get("properties") or {}
+    assert "session_id" in computer_observe_props
+    computer_act = next((t for t in tools if t.get("name") == "computer.act"), None)
+    assert computer_act is not None
+    computer_act_props = computer_act["parameters"].get("properties") or {}
+    assert "actions" in computer_act_props
+    assert computer_act["parameters"].get("required") == ["session_id", "actions"]
+    shell_exec = next((t for t in tools if t.get("name") == "shell.exec"), None)
+    assert shell_exec is not None
+    assert shell_exec["parameters"].get("required") == ["command"]
+    patch_apply = next((t for t in tools if t.get("name") == "patch.apply"), None)
+    assert patch_apply is not None
+    assert patch_apply["parameters"].get("required") == ["path", "content"]
     assert all(tool.get("name") != "decay_memories" for tool in tools)

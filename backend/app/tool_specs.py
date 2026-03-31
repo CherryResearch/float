@@ -30,9 +30,9 @@ _SENSITIVITY_ENUM = ["mundane", "public", "personal", "protected", "secret"]
 
 
 BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
-    "tool_help": _spec(
-        "tool_help",
-        "Return richer guidance for tools, including argument details and examples.",
+    "help": _spec(
+        "help",
+        "List available tools or inspect one tool with compact defaults.",
         {
             "type": "object",
             "additionalProperties": False,
@@ -46,17 +46,59 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                     "type": "string",
                     "title": "Detail level",
                     "enum": ["brief", "rich"],
-                    "default": "rich",
+                    "default": "brief",
                 },
                 "include_schema": {
                     "type": "boolean",
                     "title": "Include full schema",
-                    "default": True,
+                    "default": False,
                 },
                 "max_tools": {
                     "type": "integer",
                     "title": "Maximum tools in list mode",
-                    "default": 20,
+                    "default": 8,
+                    "minimum": 1,
+                    "maximum": 50,
+                },
+            },
+        },
+        metadata={
+            "ui": {
+                "tool_name": {
+                    "placeholder": "computer.session.start",
+                },
+                "include_schema": {"advanced": True},
+                "max_tools": {"advanced": True},
+            }
+        },
+    ),
+    "tool_help": _spec(
+        "tool_help",
+        "Return tool guidance for one tool or a filtered list of tools.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "tool_name": {
+                    "type": "string",
+                    "title": "Tool name (optional)",
+                    "default": "",
+                },
+                "detail": {
+                    "type": "string",
+                    "title": "Detail level",
+                    "enum": ["brief", "rich"],
+                    "default": "brief",
+                },
+                "include_schema": {
+                    "type": "boolean",
+                    "title": "Include full schema",
+                    "default": False,
+                },
+                "max_tools": {
+                    "type": "integer",
+                    "title": "Maximum tools in list mode",
+                    "default": 8,
                     "minimum": 1,
                     "maximum": 50,
                 },
@@ -234,7 +276,7 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
     ),
     "open_url": _spec(
         "open_url",
-        "Open a URL (placeholder / stub).",
+        "Open a URL through the browser computer runtime.",
         {
             "type": "object",
             "additionalProperties": False,
@@ -242,6 +284,265 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                 "url": {"type": "string", "title": "URL"},
             },
             "required": ["url"],
+        },
+    ),
+    "computer.session.start": _spec(
+        "computer.session.start",
+        "Start or reuse a computer-use session.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "runtime": {
+                    "type": "string",
+                    "enum": ["browser", "windows"],
+                    "default": "browser",
+                },
+                "session_id": {"type": "string", "title": "Session ID", "default": ""},
+                "start_url": {"type": "string", "title": "Start URL", "default": ""},
+                "width": {
+                    "type": "integer",
+                    "title": "Display width",
+                    "default": 1280,
+                    "minimum": 320,
+                    "maximum": 3840,
+                },
+                "height": {
+                    "type": "integer",
+                    "title": "Display height",
+                    "default": 720,
+                    "minimum": 240,
+                    "maximum": 2160,
+                },
+            },
+        },
+    ),
+    "computer.session.stop": _spec(
+        "computer.session.stop",
+        "Stop a computer-use session.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "session_id": {"type": "string", "title": "Session ID"},
+            },
+            "required": ["session_id"],
+        },
+    ),
+    "computer.observe": _spec(
+        "computer.observe",
+        "Capture a screenshot and summary of the current computer session.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "session_id": {"type": "string", "title": "Session ID"},
+            },
+            "required": ["session_id"],
+        },
+    ),
+    "computer.act": _spec(
+        "computer.act",
+        "Apply click, type, scroll, keypress, wait, or navigation actions.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "session_id": {"type": "string", "title": "Session ID"},
+                "actions": {
+                    "type": "array",
+                    "title": "Actions",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": True,
+                        "properties": {
+                            "type": {"type": "string", "title": "Action type"},
+                            "x": {"type": "integer", "title": "X"},
+                            "y": {"type": "integer", "title": "Y"},
+                            "button": {"type": "string", "title": "Button"},
+                            "text": {"type": "string", "title": "Text"},
+                            "keys": {
+                                "type": ["string", "array"],
+                                "title": "Keys",
+                            },
+                            "delta_x": {"type": "integer", "title": "Delta X"},
+                            "delta_y": {"type": "integer", "title": "Delta Y"},
+                            "ms": {"type": "integer", "title": "Wait (ms)"},
+                            "url": {"type": "string", "title": "URL"},
+                            "app": {"type": "string", "title": "App"},
+                            "window_title": {
+                                "type": "string",
+                                "title": "Window title",
+                            },
+                        },
+                        "required": ["type"],
+                    },
+                },
+            },
+            "required": ["session_id", "actions"],
+        },
+    ),
+    "computer.navigate": _spec(
+        "computer.navigate",
+        "Navigate a browser computer-use session to a URL.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "session_id": {"type": "string", "title": "Session ID"},
+                "url": {"type": "string", "title": "URL"},
+            },
+            "required": ["session_id", "url"],
+        },
+    ),
+    "computer.windows.list": _spec(
+        "computer.windows.list",
+        "List visible Windows desktop windows.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "session_id": {"type": "string", "title": "Session ID"},
+            },
+            "required": ["session_id"],
+        },
+    ),
+    "computer.windows.focus": _spec(
+        "computer.windows.focus",
+        "Focus a Windows desktop window by title.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "session_id": {"type": "string", "title": "Session ID"},
+                "window_title": {"type": "string", "title": "Window title"},
+            },
+            "required": ["session_id", "window_title"],
+        },
+    ),
+    "computer.app.launch": _spec(
+        "computer.app.launch",
+        "Launch a desktop application in the Windows runtime.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "session_id": {"type": "string", "title": "Session ID"},
+                "app": {"type": "string", "title": "Executable or app"},
+                "args": {
+                    "type": "array",
+                    "title": "Arguments",
+                    "items": {"type": "string"},
+                },
+            },
+            "required": ["session_id", "app"],
+        },
+    ),
+    "camera.capture": _spec(
+        "camera.capture",
+        "Capture a still image from a connected client camera and return it as a transient capture.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {},
+        },
+    ),
+    "capture.list": _spec(
+        "capture.list",
+        "List recent transient captures from computer, camera, or screen sources.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "title": "Source filter",
+                    "enum": ["", "computer", "camera", "screen"],
+                    "default": "",
+                },
+            },
+        },
+    ),
+    "capture.promote": _spec(
+        "capture.promote",
+        "Promote a transient capture into durable attachment storage.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "capture_id": {"type": "string", "title": "Capture ID"},
+            },
+            "required": ["capture_id"],
+        },
+    ),
+    "capture.delete": _spec(
+        "capture.delete",
+        "Delete a transient capture from the cache.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "capture_id": {"type": "string", "title": "Capture ID"},
+            },
+            "required": ["capture_id"],
+        },
+    ),
+    "shell.exec": _spec(
+        "shell.exec",
+        "Run a shell command on the host and capture stdout/stderr.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "command": {"type": "string", "title": "Command"},
+                "cwd": {"type": "string", "title": "Working directory", "default": ""},
+                "timeout_seconds": {
+                    "type": "integer",
+                    "title": "Timeout (seconds)",
+                    "default": 20,
+                    "minimum": 1,
+                    "maximum": 300,
+                },
+            },
+            "required": ["command"],
+        },
+    ),
+    "patch.apply": _spec(
+        "patch.apply",
+        "Write or append text content to a local file.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "path": {"type": "string", "title": "Path"},
+                "content": {"type": "string", "title": "Content"},
+                "mode": {
+                    "type": "string",
+                    "title": "Mode",
+                    "enum": ["replace", "append", "create"],
+                    "default": "replace",
+                },
+            },
+            "required": ["path", "content"],
+        },
+        metadata={"ui": {"content": {"multiline": True, "rows": 8}}},
+    ),
+    "mcp.call": _spec(
+        "mcp.call",
+        "Call an MCP endpoint by server and method name.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "server": {"type": "string", "title": "MCP server"},
+                "method": {"type": "string", "title": "Method"},
+                "arguments": {
+                    "type": "object",
+                    "title": "Arguments",
+                    "additionalProperties": True,
+                },
+            },
+            "required": ["server", "method"],
         },
     ),
     "read_file": _spec(

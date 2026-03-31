@@ -44,26 +44,31 @@ def _migrate_legacy_conversations(*, legacy_dir: Path, target_dir: Path) -> None
     """Best-effort migrate repo-root conversations into the `data/` tree.
 
     This only runs when the user has not explicitly set `FLOAT_CONV_DIR` and
-    the target directory appears empty.
+    copies only files that are missing from the target tree.
     """
     try:
         if legacy_dir.resolve() == target_dir.resolve():
             return
         if not legacy_dir.exists() or not legacy_dir.is_dir():
             return
-        candidates = list(legacy_dir.glob("*.json"))
+        candidates = [path for path in legacy_dir.rglob("*.json") if path.is_file()]
         if not candidates:
             return
         target_dir.mkdir(parents=True, exist_ok=True)
         for src in candidates:
-            dest = target_dir / src.name
+            try:
+                relative = src.relative_to(legacy_dir)
+            except Exception:
+                relative = Path(src.name)
+            dest = target_dir / relative
             if dest.exists():
                 continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
             try:
-                src.replace(dest)
+                shutil.copy2(str(src), str(dest))
             except Exception:
                 try:
-                    shutil.move(str(src), str(dest))
+                    shutil.copyfile(str(src), str(dest))
                 except Exception:
                     continue
     except Exception:

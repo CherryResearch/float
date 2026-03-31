@@ -1,6 +1,8 @@
 from ..base_services import LLMService, MemoryManager, ModelContext, RAGHandler
 from .action_history_service import ActionHistoryService
 from .calendar_import import parse_google_calendar, parse_ics
+from .capture_service import CaptureService, get_capture_service, set_capture_service
+from .computer_service import ComputerService, get_computer_service, set_computer_service
 from .langextract_service import LangExtractService
 from .livekit_service import LiveKitService
 from .sync_service import SyncService
@@ -19,6 +21,8 @@ __all__ = [
     "LiveKitService",
     "LangExtractService",
     "ActionHistoryService",
+    "CaptureService",
+    "ComputerService",
     "MemoryManager",
     "ModelContext",
     "RAGHandler",
@@ -27,4 +31,8 @@ __all__ = [
     "TTSService",
     "parse_google_calendar",
     "parse_ics",
+    "get_capture_service",
+    "set_capture_service",
+    "get_computer_service",
+    "set_computer_service",
 ]

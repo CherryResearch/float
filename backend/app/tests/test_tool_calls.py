@@ -3,7 +3,13 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from app.base_services import LLMService, ModelContext, MemoryManager  # noqa: E402
+from app.base_services import (  # noqa: E402
+    LLMService,
+    MemoryManager,
+    ModelContext,
+    _convert_tools_for_openai,
+    _extract_native_responses_tool_calls,
+)
 from app.tools import memory as memory_tools  # noqa: E402
 from app.utils import generate_signature  # noqa: E402
 
@@ -91,7 +97,10 @@ def test_inline_tool_payload_parsed(monkeypatch):
                     "content": json.dumps(
                         {
                             "tool": "memory.save",
-                            "params": {"text": "chlorophyll makes plants green", "namespace": "facts"},
+                            "params": {
+                                "text": "chlorophyll makes plants green",
+                                "namespace": "facts",
+                            },
                         }
                     )
                 }
@@ -102,7 +111,10 @@ def test_inline_tool_payload_parsed(monkeypatch):
     result = svc._generate_via_api("hi", ModelContext())
     assert result["text"] == "[[tool_call:0]]"
     assert result["tools_used"] == [
-        {"name": "memory.save", "args": {"text": "chlorophyll makes plants green", "namespace": "facts"}}
+        {
+            "name": "memory.save",
+            "args": {"text": "chlorophyll makes plants green", "namespace": "facts"},
+        }
     ]
     assert result["metadata"].get("inline_tool_payload")
 
@@ -153,8 +165,51 @@ def test_harmony_tool_call_parsed(monkeypatch):
     }
     svc = _make_service(monkeypatch, payload)
     result = svc._generate_via_api("hi", ModelContext())
-    assert result["tools_used"] == [{"name": "recall", "args": {"key": "tea_party_plans"}}]
+    assert result["tools_used"] == [
+        {"name": "recall", "args": {"key": "tea_party_plans"}}
+    ]
     assert "[[tool_call:0]]" in result["text"]
+
+
+def test_convert_tools_for_openai_preserves_native_computer_tool():
+    tools = [
+        {
+            "type": "computer_use_preview",
+            "display_width": 1280,
+            "display_height": 720,
+            "environment": "browser",
+        }
+    ]
+
+    converted = _convert_tools_for_openai(tools)
+
+    assert converted == tools
+
+
+def test_extract_native_responses_tool_calls_parses_computer_call():
+    payload = {
+        "output": [
+            {
+                "type": "computer_call",
+                "call_id": "call-computer-1",
+                "action": {"type": "click", "x": 18, "y": 44},
+            }
+        ]
+    }
+
+    tools_used = _extract_native_responses_tool_calls(payload)
+
+    assert tools_used == [
+        {
+            "name": "computer.act",
+            "args": {
+                "session_id": "call-computer-1",
+                "actions": [{"type": "click", "x": 18, "y": 44}],
+                "native_call_id": "call-computer-1",
+            },
+            "native": payload["output"][0],
+        }
+    ]
 
 
 def test_legacy_memory_save_tool(monkeypatch):
@@ -168,7 +223,9 @@ def test_legacy_memory_save_tool(monkeypatch):
     }
     signature = generate_signature("tester", "memory.save", args)
     try:
-        result = memory_tools.legacy_memory_save(user="tester", signature=signature, **args)
+        result = memory_tools.legacy_memory_save(
+            user="tester", signature=signature, **args
+        )
     finally:
         memory_tools.set_manager(None)
     assert result["status"] == "ok"

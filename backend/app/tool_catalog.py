@@ -50,12 +50,30 @@ def _entry(
 
 
 _BUILTIN_TOOL_CATALOG: Dict[str, Dict[str, Any]] = {
+    "help": _entry(
+        category="help",
+        summary="List tools or inspect one tool with compact defaults.",
+        description=(
+            "Returns lean built-in tool guidance so the model can verify a capability "
+            "without pulling full schemas unless requested."
+        ),
+        runtime={"executor": "backend_python", "network": False, "filesystem": False},
+        limits={"max_tools": 50},
+        freshness={"type": "local_metadata"},
+        persistence={"writes_state": False},
+        safety={"risk_level": "low", "default_approval": "auto"},
+        can_access=["built-in tool metadata and argument schemas"],
+        cannot_access=["network, files, browser state, or user secrets"],
+        limit_hints=[
+            "Defaults are brief, schema-free, and capped for lower token usage."
+        ],
+    ),
     "tool_help": _entry(
         category="help",
         summary="Explain available tools, arguments, and examples.",
         description=(
-            "Returns structured documentation for built-in tools and can list "
-            "multiple tools in either brief or rich mode."
+            "Returns structured documentation for built-in tools. Prefer `help` "
+            "for the lean default experience; this alias remains available for compatibility."
         ),
         runtime={"executor": "backend_python", "network": False, "filesystem": False},
         limits={"max_tools": 50},
@@ -176,19 +194,198 @@ _BUILTIN_TOOL_CATALOG: Dict[str, Dict[str, Any]] = {
     ),
     "open_url": _entry(
         category="web",
-        summary="Placeholder browser-open tool.",
+        summary="Legacy browser-open alias backed by the computer runtime.",
         description=(
-            "This is still a stub: it confirms the requested URL string but does "
-            "not open a real browser or fetch page contents."
+            "Compatibility alias that starts or reuses the shared browser computer "
+            "session and navigates it to the requested URL."
         ),
-        status="stub",
+        status="legacy",
+        runtime={"executor": "backend_python", "network": True, "filesystem": True},
+        freshness={"type": "live_runtime"},
+        persistence={"writes_state": True, "stores_output": True},
+        safety={"risk_level": "medium", "default_approval": "confirm"},
+        can_access=["browser navigation and browser screenshots"],
+        cannot_access=["private accounts unless separately authenticated in-session"],
+        limit_hints=["Prefer `computer.navigate` for new prompts."],
+    ),
+    "computer.session.start": _entry(
+        category="computer",
+        summary="Start or reuse a browser or Windows desktop control session.",
+        runtime={"executor": "backend_python", "network": True, "filesystem": True},
+        persistence={"writes_state": True, "stores_output": True},
+        freshness={"type": "live_runtime"},
+        safety={"risk_level": "medium", "default_approval": "confirm"},
+        can_access=["browser state or Windows desktop state, depending on runtime"],
+        cannot_access=["durable session recovery across backend restarts"],
+        limit_hints=["Sessions are process-local in v1."],
+    ),
+    "computer.session.stop": _entry(
+        category="computer",
+        summary="Stop a browser or Windows desktop control session.",
+        runtime={"executor": "backend_python", "network": False, "filesystem": True},
+        persistence={"writes_state": True, "stores_output": True},
+        freshness={"type": "live_runtime"},
+        safety={"risk_level": "medium", "default_approval": "confirm"},
+        can_access=["the targeted computer session"],
+        cannot_access=["other sessions unless explicitly addressed"],
+    ),
+    "computer.observe": _entry(
+        category="computer",
+        summary="Capture a screenshot and runtime metadata from the active session.",
+        runtime={"executor": "backend_python", "network": False, "filesystem": True},
+        persistence={"writes_state": False, "stores_output": True},
+        freshness={"type": "live_runtime"},
+        safety={"risk_level": "medium", "default_approval": "confirm"},
+        can_access=["current URL or active window title and screenshots"],
+        cannot_access=["DOM extraction or OCR-rich element inspection in v1"],
+        limit_hints=["Observation returns image attachments for follow-up turns."],
+    ),
+    "computer.act": _entry(
+        category="computer",
+        summary="Apply clicks, typing, keypresses, scrolling, waiting, or navigation actions.",
+        runtime={"executor": "backend_python", "network": True, "filesystem": True},
+        persistence={"writes_state": True, "stores_output": True},
+        freshness={"type": "live_runtime"},
+        safety={"risk_level": "high", "default_approval": "confirm"},
+        can_access=["the active browser or desktop session and its screenshots"],
+        cannot_access=[
+            "hidden desktop automation features not supported by the selected runtime"
+        ],
+        limit_hints=["Action batches are executed sequentially."],
+    ),
+    "computer.navigate": _entry(
+        category="computer",
+        summary="Navigate the active browser session to a URL.",
+        runtime={"executor": "backend_python", "network": True, "filesystem": True},
+        persistence={"writes_state": True, "stores_output": True},
+        freshness={"type": "live_runtime"},
+        safety={"risk_level": "high", "default_approval": "confirm"},
+        can_access=["live browser navigation and screenshots"],
+        cannot_access=["desktop app launch or window focus"],
+    ),
+    "computer.windows.list": _entry(
+        category="computer",
+        summary="List visible Windows desktop windows.",
         runtime={"executor": "backend_python", "network": False, "filesystem": False},
-        freshness={"type": "none"},
         persistence={"writes_state": False},
-        safety={"risk_level": "low", "default_approval": "confirm"},
-        can_access=["the provided URL string only"],
-        cannot_access=["real browser state, page content, network fetches, or files"],
-        limit_hints=["Stub behavior only; no browser handoff yet."],
+        freshness={"type": "live_runtime"},
+        safety={"risk_level": "medium", "default_approval": "confirm"},
+        can_access=["visible Windows desktop window titles"],
+        cannot_access=["non-Windows hosts or unavailable pywinauto environments"],
+    ),
+    "computer.windows.focus": _entry(
+        category="computer",
+        summary="Focus a Windows desktop window by title.",
+        runtime={"executor": "backend_python", "network": False, "filesystem": False},
+        persistence={"writes_state": True, "stores_output": True},
+        freshness={"type": "live_runtime"},
+        safety={"risk_level": "high", "default_approval": "confirm"},
+        can_access=["focus changes on a Windows desktop window"],
+        cannot_access=["window element inspection or drag-and-drop in v1"],
+    ),
+    "computer.app.launch": _entry(
+        category="computer",
+        summary="Launch a desktop application in the Windows runtime.",
+        runtime={"executor": "backend_python", "network": False, "filesystem": False},
+        persistence={"writes_state": True, "stores_output": True},
+        freshness={"type": "live_runtime"},
+        safety={"risk_level": "high", "default_approval": "confirm"},
+        can_access=["desktop app launch on Windows"],
+        cannot_access=["sandboxed isolation in v1"],
+    ),
+    "camera.capture": _entry(
+        category="capture",
+        summary="Capture a still image from a connected client camera.",
+        status="experimental",
+        runtime={"executor": "client_browser", "network": False, "filesystem": True},
+        persistence={"writes_state": True, "stores_output": True},
+        freshness={"type": "live_client_state"},
+        safety={"risk_level": "low", "default_approval": "auto"},
+        can_access=[
+            "a camera exposed to the connected UI client after user permission"
+        ],
+        cannot_access=[
+            "backend-only environments with no camera-capable client attached"
+        ],
+        limit_hints=[
+            "The capture is transient by default and follows the configured capture retention policy."
+        ],
+    ),
+    "capture.list": _entry(
+        category="capture",
+        summary="List recent transient captures from computer, camera, or screen sources.",
+        runtime={"executor": "backend_python", "network": False, "filesystem": True},
+        persistence={"writes_state": False, "stores_output": True},
+        freshness={"type": "live_filesystem"},
+        safety={"risk_level": "low", "default_approval": "auto"},
+        can_access=["transient capture metadata and capture content URLs"],
+        cannot_access=[
+            "durable attachments unless a capture has already been promoted"
+        ],
+    ),
+    "capture.promote": _entry(
+        category="capture",
+        summary="Promote a transient capture into durable attachment storage.",
+        runtime={"executor": "backend_python", "network": False, "filesystem": True},
+        persistence={"writes_state": True, "stores_output": True},
+        freshness={"type": "live_filesystem"},
+        safety={"risk_level": "high", "default_approval": "confirm"},
+        can_access=["transient captures and durable attachment storage"],
+        cannot_access=[
+            "automatic memory graph linking beyond stored attachment metadata in v1"
+        ],
+        limit_hints=[
+            "Promotion preserves the transient capture and creates a durable attachment reference."
+        ],
+    ),
+    "capture.delete": _entry(
+        category="capture",
+        summary="Delete a transient capture from the cache.",
+        runtime={"executor": "backend_python", "network": False, "filesystem": True},
+        persistence={"writes_state": True, "stores_output": True},
+        freshness={"type": "live_filesystem"},
+        safety={"risk_level": "high", "default_approval": "confirm"},
+        can_access=["transient capture files and metadata"],
+        cannot_access=[
+            "durable attachments that were already promoted from the capture"
+        ],
+    ),
+    "shell.exec": _entry(
+        category="system",
+        summary="Run a host shell command and capture stdout/stderr.",
+        runtime={"executor": "backend_python", "network": True, "filesystem": True},
+        persistence={"writes_state": True, "stores_output": True},
+        freshness={"type": "live_runtime"},
+        safety={"risk_level": "high", "default_approval": "confirm"},
+        can_access=["the host shell environment and current filesystem permissions"],
+        cannot_access=["any sandbox narrower than the current Float host process"],
+        limit_hints=[
+            "Command output is clipped to the last 12,000 characters per stream."
+        ],
+    ),
+    "patch.apply": _entry(
+        category="system",
+        summary="Write or append text content to a local file.",
+        runtime={"executor": "backend_python", "network": False, "filesystem": True},
+        persistence={"writes_state": True, "stores_output": True},
+        freshness={"type": "live_filesystem"},
+        safety={"risk_level": "high", "default_approval": "confirm"},
+        can_access=["local text file writes at the requested path"],
+        cannot_access=["binary patch application or structural diff merges in v1"],
+        limit_hints=[
+            "Current implementation is a text write helper, not a git-style patch engine."
+        ],
+    ),
+    "mcp.call": _entry(
+        category="integration",
+        summary="Call an MCP endpoint when a bridge is configured.",
+        status="experimental",
+        runtime={"executor": "backend_python", "network": True, "filesystem": False},
+        persistence={"writes_state": False},
+        freshness={"type": "runtime_dependent"},
+        safety={"risk_level": "medium", "default_approval": "confirm"},
+        can_access=["configured MCP bridges only"],
+        cannot_access=["arbitrary remote procedure calls without a configured bridge"],
     ),
     "read_file": _entry(
         category="files",
@@ -394,8 +591,20 @@ def _display_name(tool_name: str) -> str:
         "list_actions": "List Actions",
         "read_action_diff": "Read Action Diff",
         "revert_actions": "Revert Actions",
+        "help": "Help",
         "tool_help": "Tool Help",
         "open_url": "Open URL",
+        "computer.session.start": "Computer Session Start",
+        "computer.session.stop": "Computer Session Stop",
+        "computer.observe": "Computer Observe",
+        "computer.act": "Computer Act",
+        "computer.navigate": "Computer Navigate",
+        "computer.windows.list": "Computer Windows List",
+        "computer.windows.focus": "Computer Windows Focus",
+        "computer.app.launch": "Computer App Launch",
+        "shell.exec": "Shell Exec",
+        "patch.apply": "Patch Apply",
+        "mcp.call": "MCP Call",
         "read_file": "Read File",
         "list_dir": "List Directory",
         "write_file": "Write File",
@@ -504,10 +713,14 @@ def get_tool_limits(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
             "list_dir_max_entries": 200,
             "tool_help_max_tools": 50,
             "recall_max_top_k": 10,
+            "computer_default_width": 1280,
+            "computer_default_height": 720,
+            "shell_exec_timeout_seconds": 20,
         },
         "notes": [
             "File reads are sandboxed to the data root.",
             "File writes are sandboxed to the workspace root.",
+            "Computer sessions are process-local and screenshots are stored under data/files/screenshots/computer_use/.",
             "Tool limits reflect current built-in behavior and may be narrower than future custom-tool plans.",
         ],
     }

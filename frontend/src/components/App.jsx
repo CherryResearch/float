@@ -12,6 +12,7 @@ import AgentConsole from "./AgentConsole";
 import Settings from "./Settings";
 import Visualization from "./Visualization";
 import KnowledgeViewer from "./KnowledgeViewer";
+import WriteHistoryPage from "./WriteHistoryPage";
 import "../styles/App.css";
 import { GlobalContext } from "../main";
 import DevPanel from "./DevPanel";
@@ -21,7 +22,11 @@ import Notifications from "./Notifications";
 import ErrorBoundary from "./ErrorBoundary";
 import NotFound from "./NotFound";
 import axios from "axios";
-import { buildToolContinuationSignature } from "../utils/toolContinuations";
+import {
+  buildToolContinuationSignature,
+  hasMatchingToolContinuationSignature,
+} from "../utils/toolContinuations";
+import { mergeContinuationText } from "../utils/continuationText";
 import {
   handleUnifiedPress,
   supportsHoverInteractions,
@@ -30,19 +35,6 @@ import {
 const MAX_AGENT_EVENTS = 20;
 const EMPTY_GLOBAL_STATE = Object.freeze({});
 const NOOP_SET_STATE = () => {};
-const CONTINUATION_PLACEHOLDER_PATTERNS = [
-  /^Requested\s+tools?\b/i,
-  /^Tool results:/i,
-  /^Tool results are available\./i,
-  /^I couldn't finish the continuation from tool results\./i,
-];
-
-const isContinuationPlaceholderText = (value) => {
-  const trimmed = String(value || "").trim();
-  if (!trimmed) return false;
-  return CONTINUATION_PLACEHOLDER_PATTERNS.some((pattern) => pattern.test(trimmed));
-};
-
 const looksLikeUuid = (value) =>
   typeof value === "string" &&
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
@@ -609,6 +601,7 @@ const AppContent = () => {
   const autoAcceptedToolIdsByMessageRef = useRef(new Map());
   const autoResolvedToolsByMessageRef = useRef(new Map());
   const autoContinuingMessageIdsRef = useRef(new Set());
+  const autoContinuationSignaturesByMessageRef = useRef(new Map());
 
   useEffect(() => {
     if (typeof document === "undefined") return;
@@ -720,6 +713,7 @@ const AppContent = () => {
     autoAcceptedToolIdsByMessageRef.current = new Map();
     autoResolvedToolsByMessageRef.current = new Map();
     autoContinuingMessageIdsRef.current = new Set();
+    autoContinuationSignaturesByMessageRef.current = new Map();
   }, [state.sessionId]);
 
   const agentList = useMemo(
@@ -1046,6 +1040,22 @@ const AppContent = () => {
               map.set(msgId, existing);
             };
 
+            const consumeAutoContinueBatch = (msgId, readyIds) => {
+              if (!msgId || !Array.isArray(readyIds) || !readyIds.length) return;
+              const accepted = autoAcceptedToolIdsByMessageRef.current.get(msgId);
+              const resolved = autoResolvedToolsByMessageRef.current.get(msgId);
+              readyIds.forEach((id) => {
+                accepted?.delete(id);
+                resolved?.delete(id);
+              });
+              if (accepted && !accepted.size) {
+                autoAcceptedToolIdsByMessageRef.current.delete(msgId);
+              }
+              if (resolved && !resolved.size) {
+                autoResolvedToolsByMessageRef.current.delete(msgId);
+              }
+            };
+
             if (toolId && messageId && autoAcceptedToolIdsRef.current.has(toolId)) {
               rememberAcceptedTool(messageId, toolId);
             }
@@ -1135,8 +1145,40 @@ const AppContent = () => {
               if (!batch) return;
 
               const { readyIds, toolPayload } = batch;
+              const toolContinueSignature = buildToolContinuationSignature(toolPayload);
+              const semanticToolContinueSignature = buildToolContinuationSignature(
+                toolPayload,
+                { includeIds: false },
+              );
+              const priorSignatures =
+                autoContinuationSignaturesByMessageRef.current.get(messageId) || new Set();
+              const currentMessage = Array.isArray(stateRef.current?.conversation)
+                ? stateRef.current.conversation.find((msg) => msg && msg.id === messageId)
+                : null;
+              const alreadyContinued =
+                !!(
+                  semanticToolContinueSignature &&
+                  priorSignatures.has(semanticToolContinueSignature)
+                ) ||
+                hasMatchingToolContinuationSignature(currentMessage?.metadata, toolPayload) ||
+                hasMatchingToolContinuationSignature(currentMessage?.metadata, toolPayload, {
+                  includeIds: false,
+                });
+              if (alreadyContinued) {
+                readyIds.forEach((id) => autoContinuedToolIdsRef.current.add(id));
+                consumeAutoContinueBatch(messageId, readyIds);
+                return;
+              }
+
               autoContinuingMessageIdsRef.current.add(messageId);
               readyIds.forEach((id) => autoContinuedToolIdsRef.current.add(id));
+              if (semanticToolContinueSignature) {
+                priorSignatures.add(semanticToolContinueSignature);
+                autoContinuationSignaturesByMessageRef.current.set(
+                  messageId,
+                  priorSignatures,
+                );
+              }
               const thinkingValue = thinkingModeRef.current || "auto";
               const thinkingPayload =
                 thinkingValue === "auto" ? {} : { thinking: thinkingValue };
@@ -1147,7 +1189,6 @@ const AppContent = () => {
                   : mode === "server"
                     ? transformerModelRef.current || apiModelRef.current
                     : apiModelRef.current;
-              const toolContinueSignature = buildToolContinuationSignature(toolPayload);
 
               axios
                 .post("/api/chat/continue", {
@@ -1172,16 +1213,11 @@ const AppContent = () => {
                     const mIdx = updated.findIndex((m) => m && m.id === messageId);
                     if (mIdx !== -1) {
                       const existingText = updated[mIdx]?.text || "";
-                      const existingTrimmed = String(existingText || "").trim();
-                      const placeholder = isContinuationPlaceholderText(existingTrimmed);
-                      const joined =
-                        placeholder && aiContinuation
-                          ? aiContinuation
-                          : existingText && existingTrimmed
-                            ? aiContinuation
-                              ? `${existingText}\n\n${aiContinuation}`.trim()
-                              : existingText
-                            : aiContinuation;
+                      const joined = mergeContinuationText(
+                        existingText,
+                        aiContinuation,
+                        updated[mIdx]?.metadata,
+                      );
                       const existingTools = Array.isArray(updated[mIdx]?.tools)
                         ? [...updated[mIdx].tools]
                         : [];
@@ -1229,6 +1265,13 @@ const AppContent = () => {
                           ...(toolContinueSignature && !md?.tool_continue_signature
                             ? { tool_continue_signature: toolContinueSignature }
                             : {}),
+                          ...(semanticToolContinueSignature &&
+                          !md?.tool_continue_semantic_signature
+                            ? {
+                                tool_continue_semantic_signature:
+                                  semanticToolContinueSignature,
+                              }
+                            : {}),
                         },
                       };
                       if (typeof continuationThought === "string" && continuationThought.trim()) {
@@ -1250,16 +1293,9 @@ const AppContent = () => {
                     if (aiContinuation) {
                       if (hist.length && hist[hist.length - 1].role === "ai") {
                         const last = hist[hist.length - 1].text || "";
-                        const lastTrimmed = String(last || "").trim();
-                        const placeholder = isContinuationPlaceholderText(lastTrimmed);
                         hist[hist.length - 1] = {
                           role: "ai",
-                          text:
-                            placeholder && aiContinuation
-                              ? aiContinuation
-                              : last && lastTrimmed
-                                ? `${last}\n\n${aiContinuation}`.trim()
-                                : aiContinuation,
+                          text: mergeContinuationText(last, aiContinuation),
                         };
                       } else {
                         hist.push({ role: "ai", text: aiContinuation });
@@ -1286,18 +1322,7 @@ const AppContent = () => {
                     return { ...prev, conversation: updated, history: hist };
                   });
 
-                  const accepted = autoAcceptedToolIdsByMessageRef.current.get(messageId);
-                  const resolved = autoResolvedToolsByMessageRef.current.get(messageId);
-                  readyIds.forEach((id) => {
-                    accepted?.delete(id);
-                    resolved?.delete(id);
-                  });
-                  if (accepted && !accepted.size) {
-                    autoAcceptedToolIdsByMessageRef.current.delete(messageId);
-                  }
-                  if (resolved && !resolved.size) {
-                    autoResolvedToolsByMessageRef.current.delete(messageId);
-                  }
+                  consumeAutoContinueBatch(messageId, readyIds);
                 })
                 .catch((err) => {
                   console.error("Auto-continue failed", err);
@@ -1556,6 +1581,17 @@ const AppContent = () => {
                 }
               />
               <Route path="/settings" element={<Settings />} />
+              <Route
+                path="/work-history"
+                element={
+                  <WriteHistoryPage
+                    actions={actionHistory}
+                    backendReady={backendReady}
+                    loading={agentsLoading}
+                    onRefresh={fetchAgentSnapshot}
+                  />
+                }
+              />
               <Route path="/visualization" element={<Visualization />} />
               <Route path="/knowledge" element={<KnowledgeViewer />} />
               {state.devMode && <Route path="/dev" element={<DevPanel />} />}

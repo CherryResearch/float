@@ -1,0 +1,17 @@
+.work-history-page {
+  max-width: var(--center-rail-max);
+}
+
+.work-history-page-actions {
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.work-history-page-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+  color: var(--color-black);
+}

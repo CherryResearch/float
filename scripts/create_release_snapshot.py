@@ -49,6 +49,7 @@ OPTIONAL_PATHS = {
 
 EXCLUDED_PARTS = {
     ".cache_smoketest",
+    ".chroma",
     ".git",
     ".pytest_cache",
     ".venv",

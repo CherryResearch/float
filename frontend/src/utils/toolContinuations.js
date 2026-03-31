@@ -31,16 +31,21 @@ const fnv1a = (input) => {
   return hash.toString(16).padStart(8, "0");
 };
 
-export const buildToolContinuationSignature = (tools) => {
+export const buildToolContinuationSignature = (tools, options = {}) => {
+  const includeIds = options?.includeIds !== false;
   const normalized = (Array.isArray(tools) ? tools : [])
     .filter((tool) => tool && typeof tool === "object")
     .map((tool) => ({
-      id:
-        tool.id !== null && typeof tool.id !== "undefined"
-          ? String(tool.id)
-          : tool.request_id !== null && typeof tool.request_id !== "undefined"
-            ? String(tool.request_id)
-            : null,
+      ...(includeIds
+        ? {
+            id:
+              tool.id !== null && typeof tool.id !== "undefined"
+                ? String(tool.id)
+                : tool.request_id !== null && typeof tool.request_id !== "undefined"
+                  ? String(tool.request_id)
+                  : null,
+          }
+        : {}),
       name:
         typeof tool.name === "string"
           ? tool.name.trim()
@@ -56,7 +61,7 @@ export const buildToolContinuationSignature = (tools) => {
         ? stableValue(tool.result)
         : null,
     }))
-    .filter((tool) => tool.id || tool.name);
+    .filter((tool) => (includeIds ? tool.id || tool.name : tool.name));
   if (!normalized.length) return "";
   try {
     return fnv1a(JSON.stringify(normalized));
@@ -65,14 +70,25 @@ export const buildToolContinuationSignature = (tools) => {
   }
 };
 
-export const hasMatchingToolContinuationSignature = (metadata, tools) => {
+export const hasMatchingToolContinuationSignature = (
+  metadata,
+  tools,
+  options = {},
+) => {
   if (!metadata || typeof metadata !== "object" || metadata.unresolved_tool_loop) {
     return false;
   }
-  const current = buildToolContinuationSignature(tools);
+  const includeIds = options?.includeIds !== false;
+  const metadataKey =
+    typeof options?.metadataKey === "string" && options.metadataKey.trim()
+      ? options.metadataKey.trim()
+      : includeIds
+        ? "tool_continue_signature"
+        : "tool_continue_semantic_signature";
+  const current = buildToolContinuationSignature(tools, { includeIds });
   const saved =
-    typeof metadata.tool_continue_signature === "string"
-      ? metadata.tool_continue_signature.trim().toLowerCase()
+    typeof metadata[metadataKey] === "string"
+      ? metadata[metadataKey].trim().toLowerCase()
       : "";
   return Boolean(current && saved && current === saved);
 };

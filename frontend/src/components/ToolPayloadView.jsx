@@ -58,6 +58,24 @@ const getString = (value) =>
 const getNumber = (value) =>
   typeof value === "number" && Number.isFinite(value) ? value : null;
 
+const basenameFromPath = (value) => {
+  if (typeof value !== "string") return "";
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  const parts = trimmed.split(/[\\/]/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : "";
+};
+
+const screenshotUrlFromPath = (value) => {
+  const name = basenameFromPath(value);
+  return name ? `/api/computer/screenshots/${encodeURIComponent(name)}` : "";
+};
+
+const captureUrlFromId = (value) => {
+  const captureId = getString(value);
+  return captureId ? `/api/captures/${encodeURIComponent(captureId)}/content` : "";
+};
+
 const domainFromUrl = (url) => {
   if (!url || typeof url !== "string") return "";
   try {
@@ -113,6 +131,103 @@ const extractSearchPayload = (payload, toolName) => {
     warning,
     items,
     hasResults: items.length > 0,
+  };
+};
+
+const getPreferredAttachment = (payload, data, session) => {
+  const candidates = [
+    payload?.attachment,
+    Array.isArray(payload?.attachments) ? payload.attachments[0] : null,
+    Array.isArray(payload?.image_attachments) ? payload.image_attachments[0] : null,
+    data?.attachment,
+    Array.isArray(data?.attachments) ? data.attachments[0] : null,
+    Array.isArray(data?.image_attachments) ? data.image_attachments[0] : null,
+    session?.attachment,
+  ];
+  return candidates.find((item) => isPlainObject(item)) || null;
+};
+
+export const extractComputerPayload = (payload, toolName) => {
+  const label = typeof toolName === "string" ? toolName.toLowerCase() : "";
+  if (!payload || typeof payload !== "object") return null;
+  if (!label.startsWith("computer.") && label !== "open_url") return null;
+  const data = isPlainObject(payload.data) ? payload.data : payload;
+  const session =
+    (isPlainObject(payload.session) && payload.session) ||
+    (isPlainObject(data.session) && data.session) ||
+    null;
+  const baseAttachment = getPreferredAttachment(payload, data, session);
+  const summary = getString(payload.summary || data.summary || "");
+  const currentUrl = getString(
+    data.current_url || session?.current_url || payload.current_url || "",
+  );
+  const activeWindow = getString(
+    data.active_window || session?.active_window || payload.active_window || "",
+  );
+  const runtime = getString(
+    data.runtime || session?.runtime || payload.runtime || "",
+  );
+  const sessionId = getString(
+    data.id ||
+      data.session_id ||
+      session?.id ||
+      session?.session_id ||
+      payload.id ||
+      payload.session_id ||
+      "",
+  );
+  const lastScreenshotPath = getString(
+    data.last_screenshot_path ||
+      session?.last_screenshot_path ||
+      payload.last_screenshot_path ||
+      "",
+  );
+  const captureId = getString(
+    baseAttachment?.capture_id ||
+      data.capture_id ||
+      session?.capture_id ||
+      payload.capture_id ||
+      "",
+  );
+  const derivedAttachment = (() => {
+    if (baseAttachment) return { ...baseAttachment };
+    const captureUrl = captureUrlFromId(captureId);
+    if (captureUrl) {
+      return {
+        url: captureUrl,
+        name: captureId,
+        capture_id: captureId,
+      };
+    }
+    const screenshotUrl = screenshotUrlFromPath(lastScreenshotPath);
+    if (screenshotUrl) {
+      return {
+        url: screenshotUrl,
+        name: basenameFromPath(lastScreenshotPath) || "screenshot.png",
+      };
+    }
+    return null;
+  })();
+  if (
+    !derivedAttachment &&
+    !summary &&
+    !currentUrl &&
+    !activeWindow &&
+    !sessionId &&
+    !runtime
+  ) {
+    return null;
+  }
+  return {
+    attachment: derivedAttachment,
+    summary,
+    currentUrl,
+    activeWindow,
+    runtime,
+    sessionId,
+    lastScreenshotPath,
+    captureId,
+    session,
   };
 };
 
@@ -216,11 +331,61 @@ const renderSearchResults = (search) => {
   );
 };
 
+const renderComputerPayload = (computer, onOpenComputerSession = null) => (
+  <div className="tool-computer-card">
+    {computer.attachment?.url && (
+      <a
+        className="tool-computer-link"
+        href={computer.attachment.url}
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        <img
+          src={computer.attachment.url}
+          alt={computer.attachment.name || "Computer screenshot"}
+          className="tool-computer-image"
+          loading="lazy"
+        />
+      </a>
+    )}
+    {computer.summary && (
+      <div className="tool-computer-summary">{computer.summary}</div>
+    )}
+    {(computer.sessionId || computer.runtime) && (
+      <div className="tool-computer-session-meta">
+        {computer.sessionId && <span>session {computer.sessionId}</span>}
+        {computer.runtime && <span>{computer.runtime}</span>}
+      </div>
+    )}
+    {(computer.currentUrl || computer.activeWindow) && (
+      <div className="tool-computer-meta">
+        {computer.currentUrl && <span>{computer.currentUrl}</span>}
+        {computer.activeWindow && <span>{computer.activeWindow}</span>}
+      </div>
+    )}
+    {typeof onOpenComputerSession === "function" &&
+      computer.runtime === "browser" &&
+      computer.sessionId && (
+      <button
+        type="button"
+        className="tool-computer-expand-btn"
+        onClick={() => onOpenComputerSession(computer)}
+      >
+        expand browser
+      </button>
+    )}
+  </div>
+);
+
 export const summarizeToolPayload = (value, toolName = null) => {
   const normalized = normalizeToolPayload(value);
   if (normalized === null || typeof normalized === "undefined") return "";
   const { payload, message } = unwrapToolOutcome(normalized);
   if (message) return message;
+  const computer = extractComputerPayload(payload, toolName);
+  if (computer) {
+    return computer.summary || computer.currentUrl || computer.activeWindow || "computer update";
+  }
   const search = extractSearchPayload(payload, toolName);
   if (search && (search.query || search.items.length)) {
     const label = search.query ? `Search: ${search.query}` : "Search results";
@@ -241,22 +406,26 @@ const ToolPayloadView = ({
   toolName,
   compact = false,
   label = null,
+  onOpenComputerSession = null,
 }) => {
   const normalized = normalizeToolPayload(value);
   if (normalized === null || typeof normalized === "undefined") return null;
   const { payload, status, ok, message } = unwrapToolOutcome(normalized);
   const search = extractSearchPayload(payload, toolName);
+  const computer = extractComputerPayload(payload, toolName);
   const statusKey = status ? String(status).toLowerCase() : "";
   const showStatus = !!status;
   const classes = [
     "tool-payload",
     `tool-payload-${kind}`,
     compact ? "compact" : "",
+    computer?.attachment?.url ? "tool-payload-has-media" : "",
   ]
     .filter(Boolean)
     .join(" ");
 
   const content = (() => {
+    if (computer) return renderComputerPayload(computer, onOpenComputerSession);
     if (search) return renderSearchResults(search);
     if (Array.isArray(payload)) return renderArrayPayload(payload);
     if (isPlainObject(payload)) return renderKeyValueList(payload);

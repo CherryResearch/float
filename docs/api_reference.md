@@ -1,167 +1,232 @@
-# API Reference
+# Float Stack – OpenAI Responses API × MCP SDK Cheat‑Sheet
+_A human- & machine-readable reference for the **Float** AI assistant._
 
-This document is the thin public endpoint reference for the current alpha snapshot.
-It is intentionally narrower than an internal route dump or design note.
+> Dependencies are managed with Poetry. Run `poetry install` to set up all core and optional dependencies (see `pyproject.toml` and `poetry.lock`).
+<small>Last updated 2025‑07‑21 (PDT)</small>
 
-Status labels used below:
+---
+## 1 OpenAI Responses API (streaming‑first)
+> Modern alternative to `chat/completions`; chunked streaming, deltas, and built‑in function‑call signals.
+```bash
+pip install openai
+```
+```python
+import openai, time
+openai.api_key = "<OPENAI_KEY>"
 
-- `Alpha public`: part of the normal user-facing product surface today.
-- `Alpha preview`: present and usable, but still early enough that copy, flow, or edge-case behavior may change.
-- `Dev-only`: intended for development, diagnostics, or manual verification rather than ordinary use.
-- `Planned`: mentioned for context elsewhere, but not part of the current public contract.
+def stream_chat(messages):
+    resp = openai.Responses.create(model="gpt-4o", stream=True, messages=messages)
+    for chunk in resp:                        # iterable JSON payloads
+        delta = chunk["choices"][0]["delta"]
+        if "content" in delta:
+            yield delta["content"]
+```
+Robust retry wrapper:
+```python
+from openai.error import RateLimitError, OpenAIError
 
-## Notes
+def robust_stream(msgs, tries=3):
+    for i in range(tries):
+        try: yield from stream_chat(msgs); return
+        except RateLimitError: time.sleep(2**i)
+        except OpenAIError as e: raise RuntimeError(e)
+```
 
-- Endpoint paths below are shown with the `/api` prefix used by the app.
-- This file documents the current surface, not every internal helper route.
-- Planned routes are called out explicitly so they are not mistaken for active behavior.
+---
+## 2 Model Context Protocol (MCP) Python‑SDK
+> Declarative agent protocol—manage *contexts*, stream events, and tool calls.
+```bash
+pip install mcp-client
+```
+```python
+from mcp.client import MCPClient, Context
+client = MCPClient()            # env: MCP_SERVER_URL / API_TOKEN
+ctx = Context(system_prompt="You are Float AI.",
+              tools=[{"name":"search","description":"web search",
+                      "parameters":{"q":str}}])
+ctx.add_message("user", "Weather in Paris?")
+for ev in client.chat(ctx, stream=True):
+    if ev.type == "message": print(ev.content,end="")
+    elif ev.type == "tool_call":
+        res = my_search(ev.parameters["q"])
+        client.send_tool_result(ctx.id, ev.name, res)
+```
+`ev.type ∈ {message, tool_call, function_result}`.
 
-## Chat and Conversations
+---
+## 3 Integration Skeleton (FloatService)
+```python
+class FloatService:
+    def __init__(self, api_key, mcp_url, mode="api"):
+        import openai
+        from transformers import pipeline
+        openai.api_key = api_key
+        self.client = MCPClient(base_url=mcp_url)
+        self.mode = mode                # 'api' | 'local' | 'dynamic'
+        self.local_pipe = pipeline(
+            "text-generation",
+            model="mistralai/Mistral-7B-Instruct-v0.2",
+            device_map="auto",
+            max_new_tokens=256,
+        )
 
-### `Alpha public`
+    def _llm_stream(self, messages):
+        if self.mode == "api":
+            yield from robust_stream(messages)
+        elif self.mode == "local":
+            prompt = messages[0]["content"]
+            for chunk in self.local_pipe(prompt, stream=True, return_full_text=False):
+                yield chunk["generated_text"]
+        else:
+            raise NotImplementedError
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `POST` | `/api/chat` | Submit a chat turn in the selected runtime mode. |
-| `POST` | `/api/chat/continue` | Continue after tool results, approvals, or recoverable tool errors. |
-| `GET` | `/api/conversations` | List saved conversations and folders. |
-| `GET` | `/api/conversations/{name:path}` | Load one conversation by path-like name. |
-| `POST` | `/api/conversations/{name:path}` | Save or overwrite a conversation by path-like name. |
-| `POST` | `/api/conversations/{name:path}/rename` | Rename a conversation. |
-| `DELETE` | `/api/conversations/{name:path}` | Delete a conversation. |
-| `POST` | `/api/conversations/import` | Import conversation data from supported export formats. |
-| `GET` | `/api/conversations/{name:path}/export` | Export one conversation in a supported format. |
-| `GET` | `/api/conversations/export-all` | Export all conversations as a bundle. |
+    def chat(self, prompt):
+        msgs = [{"role":"user","content":prompt}]
+        yield from self._llm_stream(msgs)
+```
 
-### `Alpha preview`
+---
+## 4 Datastores & Embeddings
+> **Weaviate** for vector search + **SQLite** for relational / graph tables.
+```python
+import weaviate
+client = weaviate.connect_to_local()
+emb = EmbeddingService("mixedbread-ai/bert-base-sentence")
+vec = emb.embed("Paris weather")
+client.data_object.create({"text": "Paris weather"}, "Memory", vector=vec)
+```
+Minimal extraction and embedding:
+```python
+from app.services import LangExtractService
+from app.utils.embedding import EmbeddingService
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/api/conversations/reveal/{name:path}` | Ask the host to reveal a conversation in the local filesystem when supported. |
-| `POST` | `/api/conversations/import/preview` | Preview a conversation import before applying it. |
-| `GET` | `/api/conversations/{name:path}/suggest-name` | Return an automatically suggested conversation name. |
+lx = LangExtractService("Key facts", [])
+items = lx.from_text("Alice met Bob in Paris.")
+vec = EmbeddingService().embed_text(items[0]["text"])
+```
+Schema snapshot:
+| Table | Purpose |
+|---|---|
+| `messages` | raw chat (id, role, content, ts, session) |
+| `memory_vectors` | id, embedding (pgvector), json metadata |
+| `graph_edges` | subject → predicate → object |
 
-## Knowledge, Memory, and Files
+---
+## 5 Tool Definition Schema
+```python
+{
+  "name": "search",
+  "description": "web search",
+  "parameters": {"q": "string"},
+  "requires_approval": false
+}
+```
+*When MCP emits a* `tool_call`, *match by `name`, execute, then return with* `client.send_tool_result()`.
 
-### `Alpha public`
+---
+## 6 Tool Endpoints
+Register a built‑in tool then invoke it:
+```bash
+curl -X POST /tools/register -d '{"name":"read_file"}'
+curl -X POST /tools/invoke -d '{"name":"read_file","args":{"path":"notes.txt"}}'
+```
+Both endpoints return JSON results; `/tools/invoke` responds with `{"result": {"status": "invoked", "ok": true, "message": null, "data": "<tool output>"}}`.
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/api/memory` | List stored memories. |
-| `POST` | `/api/memory/{key}` | Create or update a memory entry by key. |
-| `DELETE` | `/api/memory/{key}` | Delete a memory entry by key. |
-| `GET` | `/api/knowledge/list` | List knowledge items and related metadata. |
-| `POST` | `/api/knowledge/add` | Add text or file-backed knowledge to the store. |
-| `GET` | `/api/knowledge/query` | Query the knowledge store and retrieval layer. |
-| `GET` | `/api/knowledge/file/{doc_id}` | Serve a local knowledge file through the backend. |
-| `GET` | `/api/knowledge/reveal/{doc_id}` | Reveal a local knowledge file in the host filesystem when supported. |
-| `GET` | `/api/attachments` | List attachments known to the app. |
-| `POST` | `/api/attachments/upload` | Upload an attachment through the backend-managed storage path. |
+---
+## 7 Background Jobs (Celery)
+```python
+from tasks import celery_app
 
-### `Alpha preview`
+@celery_app.task
+def long_search(query):
+    return my_search(query)
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/api/memory/graph` | Return the current memory / graph visualization payload. |
-| `POST` | `/api/memory/search` | Search memories directly by query. |
-| `GET` | `/api/threads/summary` | Return the current thread summary state used by the Threads UI. |
-| `POST` | `/api/threads/generate` | Generate or refresh semantic threads. |
-| `POST` | `/api/threads/search` | Search within generated thread structures. |
-| `POST` | `/api/threads/rename` | Rename or relabel generated thread groups. |
+# in tool handler
+job = long_search.delay(ev.parameters["q"])
+client.send_tool_result(ctx.id, ev.name, job.get())
+```
+Celery broker = Redis, results backend = PostgreSQL.
 
-## Tools and Agent Console
+---
+## 8 Operational Security
+*   AES‑256‑GCM encrypts serialized memories at rest (`crypto.py`).
+*   Keys stored in Google KMS; loaded at process start via Vault‑agent.
+*   API keys masked before logging; PII redaction helper in `utils.sec`.
 
-### `Alpha public`
+---
+## 9 UI Integration Hooks
+| Endpoint | Emits | Used in React UI |
+|---|---|---|
+| `/stream/responses` | SSE chunks from OpenAI | chat pane |
+| `/stream/thoughts` | SSE of LLM thoughts & tool logs | agent console |
+| `/agents/console` | JSON snapshot of active agents/tasks | agent console |
+| `/events/mcp` | WebSocket of MCP events | tool sidebar |
+All streams send `{event:"delta", data:"…"}` objects for progressive rendering.
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/api/tools` | List built-in tool metadata. |
-| `GET` | `/api/tools/specs` | Return the current tool schema/spec payload used by the frontend. |
-| `POST` | `/tools/register` | Register an allowed built-in tool for invocation. |
-| `POST` | `/tools/invoke` | Invoke a registered tool. |
-| `GET` | `/api/agents/console` | Load the current Agent Console snapshot. |
-| `GET` | `/api/stream/thoughts` | Stream thought/tool activity for the Agent Console. |
+---
+## 10 Transformer Model API
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/transformers/models` | list available GPT-OSS/transformers models |
+| `POST /api/transformers/generate` | generate text with a selected transformer model |
+Example request:
+```bash
+curl -X POST /api/transformers/generate \
+     -H 'Content-Type: application/json' \
+     -d '{"model":"mistralai/Mistral-7B-Instruct-v0.2","prompt":"hi"}'
+```
 
-### `Alpha preview`
+---
+## 11  Reference Links
+- OpenAI Responses announcement: <https://community.openai.com/t/introducing-the-responses-api/1140929>
+- Responses API docs: <https://platform.openai.com/docs/api-reference/responses>
+- MCP tutorial: <https://modelcontextprotocol.io/tutorials/building-mcp-with-llms>
+- MCP Python SDK: <https://github.com/modelcontextprotocol/python-sdk>
+- Example agents: <https://github.com/evalstate/fast-agent>, <https://github.com/Abiorh001/mcp_omni_connect>
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/api/tools/catalog` | Return tool catalog metadata used by the UI. |
-| `GET` | `/api/tools/catalog/{tool_name}` | Return one tool catalog entry. |
-| `GET` | `/api/tools/limits` | Return current tool/runtime limit metadata. |
-| `POST` | `/tools/propose` | Submit a tool action that requires review. |
-| `POST` | `/tools/decision` | Approve, edit, or reject a proposed tool action. |
-| `POST` | `/tools/schedule` | Schedule a tool action for later execution. |
+---
 
-## Calendar and Scheduling
+## 12 Harmony Message Format
+Float adopts the [Harmony envelope](https://github.com/openai/harmony) for structured
+messages.  Each message's ``content`` is a list of typed parts.  Use the
+`openai-harmony` utilities to render and parse Harmony tokens:
 
-### `Alpha public`
+```python
+from openai_harmony import (
+    Conversation,
+    HarmonyEncodingName,
+    Message,
+    Role,
+    load_harmony_encoding,
+)
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/api/calendar/events` | List calendar events and tasks. |
-| `GET` | `/api/calendar/events/{event_id}` | Load one event or task. |
-| `POST` | `/api/calendar/events/{event_id}` | Update an event or task. |
-| `DELETE` | `/api/calendar/events/{event_id}` | Delete an event or task. |
-| `POST` | `/api/calendar/events/{event_id}/prompt` | Run or queue the reminder/prompt action for one event. |
-| `POST` | `/api/calendar/events/{event_id}/run` | Execute an event-linked action directly. |
-| `POST` | `/api/calendar/reminders/flush` | Trigger reminder catch-up used by the UI on load. |
+# Build a conversation and render it to tokens
+conv = Conversation(messages=[
+    Message.from_role_and_content(Role.USER, "Ping?")
+])
+enc = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+request_tokens = enc.render_conversation_for_completion(conv, Role.ASSISTANT)
 
-## Settings, Models, and Runtime
+# ...send request_tokens to a model and obtain response_tokens...
+response_tokens = enc.render(
+    Message.from_role_and_content(Role.ASSISTANT, "Pong!")
+)
+msgs = enc.parse_messages_from_completion_tokens(response_tokens)
+print(msgs[-1].content[0].text)
+```
 
-### `Alpha public`
+Serialized HTTP payloads look like:
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/api/settings` | Read persisted runtime and UI settings. |
-| `POST` | `/api/settings` | Update persisted runtime and UI settings. |
-| `GET` | `/api/openai/models` | Probe the configured OpenAI-compatible provider for model inventory. |
-| `GET` | `/api/transformers/models` | List available direct local transformer models. |
+```json
+{
+  "role": "user",
+  "content": [{"type": "text", "text": "Ping?"}]
+}
+```
 
-### `Alpha preview`
+When calling ``LLMService.generate`` set ``response_format="harmony"`` to request
+Harmony-formatted responses.
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/api/rag/status` | Return retrieval / embedding runtime status for the knowledge UI. |
-| `GET` | `/api/models/registered` | Return the local registered-model list. |
-| `POST` | `/api/models/registered` | Add a local registered-model alias. |
-| `DELETE` | `/api/models/registered/{alias}` | Remove a local registered-model alias. |
+---
 
-## Voice and Live Streaming
-
-### `Alpha preview`
-
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `POST` | `/api/voice/tts` | Generate speech audio through the configured TTS path. |
-| `POST` | `/api/voice/connect` | Bootstrap a live voice session. In OpenAI Realtime mode this returns the browser-facing connection details; in LiveKit mode it returns the fallback room/token flow. |
-| `POST` | `/api/voice/stream` | Legacy or fallback worker-backed voice stream endpoint. |
-
-### `Dev-only`
-
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/api/test-prompts` | List built-in test prompts used from the development panel. |
-| `POST` | `/api/test-prompts/{name}` | Execute one built-in development test prompt. |
-
-## Trusted-Device Sync
-
-### `Alpha preview`
-
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `GET` | `/api/sync/overview` | Return current device, visibility, and saved/paired peer state. |
-| `POST` | `/api/sync/pair` | Pair this device with a trusted peer using the current pairing flow. |
-| `POST` | `/api/sync/plan` | Preview pull/push differences before applying sync changes. |
-| `POST` | `/api/sync/apply` | Apply a selected pull/push sync action. |
-| `POST` | `/api/sync/manifest` | Exchange sync manifests between trusted peers. |
-| `POST` | `/api/sync/export` | Export selected sync data for a trusted peer. |
-| `POST` | `/api/sync/ingest` | Ingest approved sync data from a trusted peer. |
-
-## Planned, Not Current
-
-These are mentioned elsewhere in public docs for context, but should not be treated as active public API guarantees:
-
-- `/api/stream/responses` for assistant text deltas
-- broader live session handoff beyond the current voice bootstrap flow
-- background or gateway-style sync beyond the current trusted-device preview model
+*Last updated 2025‑07‑21 (PDT).*&nbsp;

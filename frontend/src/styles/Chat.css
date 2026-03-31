@@ -14,9 +14,9 @@
     /* Glass panel */
     background:
       var(--glass-sheen),
-      linear-gradient(135deg, rgba(34, 197, 94, 0.08), transparent 56%),
-      radial-gradient(720px 380px at 12% -10%, rgba(255, 255, 255, 0.12), transparent 70%),
-      radial-gradient(760px 420px at 88% 120%, rgba(79, 70, 229, 0.07), transparent 74%),
+      linear-gradient(135deg, color-mix(in oklab, var(--theme-c2-med) 10%, transparent), transparent 56%),
+      radial-gradient(720px 380px at 12% -10%, color-mix(in oklab, var(--theme-very-light) 12%, transparent), transparent 70%),
+      radial-gradient(760px 420px at 88% 120%, color-mix(in oklab, var(--theme-c1-dark) 12%, transparent), transparent 74%),
       color-mix(in oklab, var(--glass-tint) 36%, transparent);
     backdrop-filter: saturate(170%) blur(15px);
     -webkit-backdrop-filter: saturate(160%) blur(16px);
@@ -28,12 +28,12 @@
 body.dark-mode .chat-container {
     background:
       var(--glass-sheen-strong),
-      linear-gradient(145deg, rgba(79, 70, 229, 0.1), transparent 58%),
-      radial-gradient(960px 520px at 12% -8%, color-mix(in oklab, var(--color-purple) 8%, transparent), transparent 78%),
-      radial-gradient(960px 520px at 92% 120%, rgba(79, 70, 229, 0.09), transparent 82%),
-      linear-gradient(188deg, rgba(6, 8, 20, 0.52), rgba(3, 4, 12, 0.34)),
+      linear-gradient(145deg, color-mix(in oklab, var(--theme-c2-med) 12%, transparent), transparent 58%),
+      radial-gradient(960px 520px at 12% -8%, color-mix(in oklab, var(--theme-c1-dark) 10%, transparent), transparent 78%),
+      radial-gradient(960px 520px at 92% 120%, color-mix(in oklab, var(--theme-c2-med) 10%, transparent), transparent 82%),
+      linear-gradient(188deg, color-mix(in oklab, var(--theme-warm-black) 88%, transparent), color-mix(in oklab, var(--theme-c1-dark) 66%, transparent)),
       color-mix(in oklab, var(--glass-tint-strong) 14%, transparent);
-    border-color: color-mix(in oklab, var(--color-lavender) 50%, var(--glass-border) 50%);
+    border-color: color-mix(in oklab, var(--theme-c2-med) 30%, var(--glass-border) 70%);
     background-attachment: fixed;
 }
 
@@ -276,11 +276,11 @@ body.dark-mode .user-msg {
     background:
       linear-gradient(
         140deg,
-        color-mix(in oklab, var(--color-indigo) 30%, transparent),
-        color-mix(in oklab, var(--color-violet-glow) 18%, transparent)
+        color-mix(in oklab, var(--theme-c1-dark) 30%, transparent),
+        color-mix(in oklab, var(--theme-c2-light) 18%, transparent)
       ),
       color-mix(in oklab, var(--glass-tint) 74%, var(--color-black) 26%);
-    border-color: color-mix(in oklab, var(--color-violet-glow) 42%, var(--glass-border) 58%);
+    border-color: color-mix(in oklab, var(--theme-c2-med) 30%, var(--glass-border) 70%);
     backdrop-filter: blur(7px) saturate(152%);
     -webkit-backdrop-filter: blur(7px) saturate(152%);
 }
@@ -414,7 +414,7 @@ body.dark-mode .user-msg {
 
 .msg-action-chip:hover:not(:disabled) {
   transform: translateY(-1px);
-  box-shadow: 0 8px 16px rgba(0, 0, 0, 0.12);
+  box-shadow: 0 8px 16px color-mix(in oklab, var(--theme-warm-black) 72%, transparent);
 }
 
 .msg-action-chip.retry {
@@ -528,7 +528,7 @@ body.dark-mode .user-msg {
 
 .tool-collapse-btn:hover {
   transform: translateY(-1px);
-  box-shadow: 0 6px 14px rgba(0,0,0,0.12);
+  box-shadow: 0 6px 14px color-mix(in oklab, var(--theme-warm-black) 76%, transparent);
   background: color-mix(in oklab, var(--color-lavender) 35%, transparent);
 }
 
@@ -1351,21 +1351,21 @@ body.dark-mode .composer-resize-edge::before {
 .chat-settings-trigger {
   width: var(--input-action-size);
   height: var(--input-action-size);
-  border: 1px solid color-mix(in oklab, var(--color-violet-glow) 34%, var(--glass-border) 66%);
+  border: 1px solid color-mix(in oklab, var(--theme-c2-med) 34%, var(--glass-border) 66%);
   background:
     linear-gradient(
       180deg,
       color-mix(in oklab, var(--glass-tint-strong) 88%, transparent),
-      color-mix(in oklab, var(--color-lavender) 16%, transparent)
+      color-mix(in oklab, var(--theme-c1-glow) 16%, transparent)
     ),
     color-mix(in oklab, var(--glass-tint) 84%, transparent);
-  color: color-mix(in oklab, var(--color-purple) 64%, var(--color-purple-deep) 36%);
+  color: color-mix(in oklab, var(--theme-c1-dark) 64%, var(--theme-c2-med) 36%);
   border-radius: 50%;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  box-shadow: 0 10px 24px rgba(91, 60, 155, 0.12);
+  box-shadow: 0 10px 24px color-mix(in oklab, var(--theme-c1-shadow) 22%, transparent);
   transition: transform 120ms ease, box-shadow 120ms ease, filter 120ms ease;
 }
 
@@ -1390,7 +1390,7 @@ body.dark-mode .composer-resize-edge::before {
   box-shadow: var(--glass-shadow);
   backdrop-filter: blur(18px) saturate(160%);
   -webkit-backdrop-filter: blur(18px) saturate(160%);
-  z-index: 1400;
+  z-index: 3200;
 }
 
 .chat-settings-list,
@@ -1610,16 +1610,16 @@ body.dark-mode .input-actions .send-btn.is-stopping {
   width: var(--input-action-size);
   height: var(--input-action-size);
   padding: 0;
-  border: 1px solid color-mix(in oklab, var(--color-violet-glow) 34%, var(--glass-border) 66%);
+  border: 1px solid color-mix(in oklab, var(--theme-c2-med) 34%, var(--glass-border) 66%);
   background:
     linear-gradient(
       180deg,
       color-mix(in oklab, var(--glass-tint-strong) 88%, transparent),
-      color-mix(in oklab, var(--color-lavender) 16%, transparent)
+      color-mix(in oklab, var(--theme-c1-glow) 16%, transparent)
     ),
     color-mix(in oklab, var(--glass-tint) 84%, transparent);
-  color: color-mix(in oklab, var(--color-purple) 64%, var(--color-purple-deep) 36%);
-  box-shadow: 0 10px 24px rgba(91, 60, 155, 0.12);
+  color: color-mix(in oklab, var(--theme-c1-dark) 64%, var(--theme-c2-med) 36%);
+  box-shadow: 0 10px 24px color-mix(in oklab, var(--theme-c1-shadow) 22%, transparent);
 }
 
 .input-actions .action-icon.visual-stream-toggle.is-live-option {
@@ -1919,21 +1919,21 @@ body.dark-mode .input-actions .stop-chip {
 .close-entry {
   width: var(--input-action-size);
   height: var(--input-action-size);
-  border: 1px solid color-mix(in oklab, var(--color-violet-glow) 34%, var(--glass-border) 66%);
+  border: 1px solid color-mix(in oklab, var(--theme-c2-med) 34%, var(--glass-border) 66%);
   background:
     linear-gradient(
       180deg,
       color-mix(in oklab, var(--glass-tint-strong) 88%, transparent),
-      color-mix(in oklab, var(--color-lavender) 16%, transparent)
+      color-mix(in oklab, var(--theme-c1-glow) 16%, transparent)
     ),
     color-mix(in oklab, var(--glass-tint) 84%, transparent);
-  color: color-mix(in oklab, var(--color-purple) 64%, var(--color-purple-deep) 36%);
+  color: color-mix(in oklab, var(--theme-c1-dark) 64%, var(--theme-c2-med) 36%);
   border-radius: 50%;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  box-shadow: 0 10px 24px rgba(91, 60, 155, 0.12);
+  box-shadow: 0 10px 24px color-mix(in oklab, var(--theme-c1-shadow) 22%, transparent);
   pointer-events: auto;
   transition: transform 120ms ease, box-shadow 120ms ease, filter 120ms ease;
 }
@@ -1982,32 +1982,32 @@ body.dark-mode .open-entry-btn {
 body.dark-mode .chat-settings-trigger,
 body.dark-mode .input-actions .action-icon,
 body.dark-mode .close-entry {
-  border-color: color-mix(in oklab, var(--color-violet-glow) 42%, var(--glass-border) 58%);
+  border-color: color-mix(in oklab, var(--theme-c2-med) 36%, var(--glass-border) 64%);
   background:
     linear-gradient(
       180deg,
-      color-mix(in oklab, var(--color-indigo) 30%, transparent),
-      color-mix(in oklab, var(--color-purple) 18%, transparent)
+      color-mix(in oklab, var(--theme-c1-dark) 30%, transparent),
+      color-mix(in oklab, var(--theme-c2-med) 18%, transparent)
     ),
     color-mix(in oklab, var(--glass-tint) 88%, transparent);
-  color: color-mix(in oklab, var(--color-violet-glow) 74%, var(--color-purple) 26%);
+  color: color-mix(in oklab, var(--theme-c2-light) 74%, var(--theme-c1-dark) 26%);
   box-shadow:
-    0 10px 24px rgba(27, 12, 58, 0.24),
-    0 0 0 1px color-mix(in oklab, var(--color-violet-glow) 16%, transparent);
+    0 10px 24px color-mix(in oklab, var(--theme-c1-shadow) 28%, transparent),
+    0 0 0 1px color-mix(in oklab, var(--theme-c2-light) 16%, transparent);
 }
 
 body.dark-mode .input-actions .composer-action-row-top {
-  border-color: color-mix(in oklab, var(--color-violet-glow) 30%, var(--glass-border) 70%);
+  border-color: color-mix(in oklab, var(--theme-c2-med) 28%, var(--glass-border) 72%);
   background:
     linear-gradient(
       180deg,
-      color-mix(in oklab, var(--color-indigo) 26%, transparent),
-      color-mix(in oklab, var(--color-purple) 12%, transparent)
+      color-mix(in oklab, var(--theme-c1-dark) 26%, transparent),
+      color-mix(in oklab, var(--theme-c2-med) 12%, transparent)
     ),
-    color-mix(in oklab, var(--color-black) 26%, var(--glass-tint) 74%);
+    color-mix(in oklab, var(--theme-warm-black) 26%, var(--glass-tint) 74%);
   box-shadow:
-    0 10px 22px rgba(7, 4, 20, 0.34),
-    0 0 0 1px color-mix(in oklab, var(--color-violet-glow) 10%, transparent);
+    0 10px 22px color-mix(in oklab, var(--theme-warm-black) 74%, transparent),
+    0 0 0 1px color-mix(in oklab, var(--theme-c2-light) 10%, transparent);
 }
 
 /* Small/portrait: nearly full width and compact controls */

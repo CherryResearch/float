@@ -31,7 +31,6 @@ def test_chat_rehydrates_context(monkeypatch, tmp_path):
     )
 
     from app import routes
-    from app.services import LLMService
     from app.base_services import ModelContext
 
     # Reset contexts to ensure rehydrate kicks in
@@ -39,7 +38,9 @@ def test_chat_rehydrates_context(monkeypatch, tmp_path):
 
     captured = {}
 
-    def fake_generate(prompt, session_id=None, model=None, attachments=None, context=None, **kwargs):
+    def fake_generate(
+        prompt, session_id=None, model=None, attachments=None, context=None, **kwargs
+    ):
         captured["context"] = context
         return {"text": "ok", "thought": "", "tools_used": [], "metadata": {}}
 
@@ -47,10 +48,56 @@ def test_chat_rehydrates_context(monkeypatch, tmp_path):
 
     app = importlib.import_module("app.main").app
     client = TestClient(app)
-    resp = client.post("/chat", json={"message": "new message", "session_id": "sess", "use_rag": False})
+    resp = client.post(
+        "/chat", json={"message": "new message", "session_id": "sess", "use_rag": False}
+    )
     assert resp.status_code == 200
     ctx = captured.get("context")
     assert ctx is not None
     # Expect historical messages to be present before the new turn
     assert any(msg["content"] == "hello from history" for msg in ctx.messages)
     assert any(msg["content"] == "previous reply" for msg in ctx.messages)
+
+
+def test_chat_rehydrate_strips_inline_tool_placeholders(monkeypatch, tmp_path):
+    monkeypatch.setenv("FLOAT_CONV_DIR", str(tmp_path))
+    conv_store = importlib.import_module("app.utils.conversation_store")
+    importlib.reload(conv_store)
+
+    conv_store.save_conversation(
+        "sess",
+        [
+            {
+                "role": "ai",
+                "text": "Checking tools first.[[tool_call:0]][[tool_call:1]] Then I will browse.",
+            },
+        ],
+    )
+
+    from app import routes
+    from app.base_services import ModelContext
+
+    routes.llm_service.contexts = {"default": ModelContext(system_prompt="")}
+    captured = {}
+
+    def fake_generate(
+        prompt, session_id=None, model=None, attachments=None, context=None, **kwargs
+    ):
+        captured["context"] = context
+        return {"text": "ok", "thought": "", "tools_used": [], "metadata": {}}
+
+    monkeypatch.setattr(routes.llm_service, "generate", fake_generate)
+
+    app = importlib.import_module("app.main").app
+    client = TestClient(app)
+    resp = client.post(
+        "/chat", json={"message": "continue", "session_id": "sess", "use_rag": False}
+    )
+    assert resp.status_code == 200
+    ctx = captured.get("context")
+    assert ctx is not None
+    assert any(
+        msg["content"] == "Checking tools first. Then I will browse."
+        for msg in ctx.messages
+    )
+    assert all("[[tool_call:" not in msg["content"] for msg in ctx.messages)

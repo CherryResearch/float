@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 from typing import List, Optional
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 # Resolve the repository root from this file location so config loading is stable
 # even when the backend is launched from inside `backend/`.
@@ -32,10 +32,39 @@ def get_dotenv_path() -> Path:
     return (REPO_ROOT / ".env").resolve()
 
 
+def _safe_dotenv_values(path: Path) -> dict:
+    try:
+        if not path.exists():
+            return {}
+        values = dotenv_values(path)
+        return values if isinstance(values, dict) else {}
+    except Exception:
+        return {}
+
+
+def _is_legacy_conversations_override(value: Optional[str]) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    try:
+        resolved = _resolve_repo_relative_path(raw)
+    except Exception:
+        return False
+    legacy_targets = {
+        (REPO_ROOT / "conversations").resolve(),
+        (REPO_ROOT / "test_conversations").resolve(),
+        (REPO_ROOT / "backend" / "conversations").resolve(),
+        (REPO_ROOT / "backend" / "test_conversations").resolve(),
+    }
+    return resolved in legacy_targets
+
+
 DOTENV_PATH = get_dotenv_path()
 LEGACY_DOTENV_PATH = (REPO_ROOT / "backend" / ".env").resolve()
 LEGACY_DOTENV_LOADED = False
 
+_root_dotenv_values = _safe_dotenv_values(DOTENV_PATH)
+_preexisting_conv_dir = os.getenv("FLOAT_CONV_DIR")
 load_dotenv(dotenv_path=DOTENV_PATH, override=False)
 # Backwards compatibility: some installs stored settings in `backend/.env` when
 # running the API from that working directory. Load it as a non-overriding
@@ -44,15 +73,30 @@ load_dotenv(dotenv_path=DOTENV_PATH, override=False)
 if not os.getenv("FLOAT_ENV_FILE"):
     try:
         if LEGACY_DOTENV_PATH.exists() and LEGACY_DOTENV_PATH != DOTENV_PATH:
+            legacy_values = _safe_dotenv_values(LEGACY_DOTENV_PATH)
             load_dotenv(dotenv_path=LEGACY_DOTENV_PATH, override=False)
             LEGACY_DOTENV_LOADED = True
+            root_has_conv_dir = bool(
+                str(_root_dotenv_values.get("FLOAT_CONV_DIR") or "").strip()
+            )
+            if (
+                _preexisting_conv_dir is None
+                and not root_has_conv_dir
+                and _is_legacy_conversations_override(
+                    legacy_values.get("FLOAT_CONV_DIR")
+                )
+            ):
+                # Legacy `backend/.env` often hard-coded `./conversations`, which
+                # now points users back at the old repo-root store. Drop only that
+                # stale fallback so the newer `data/conversations` default wins.
+                os.environ.pop("FLOAT_CONV_DIR", None)
     except Exception:
         pass
 
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 DEFAULT_OPENAI_API_URL = OPENAI_RESPONSES_URL
-DEFAULT_OPENAI_MODEL = "gpt-5"
+DEFAULT_OPENAI_MODEL = "gpt-5.4"
 
 DEFAULT_DATA_DIR = (REPO_ROOT / "data").resolve()
 DEFAULT_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -427,13 +471,23 @@ def load_config():
                 "float's personality is light, clever, and helpful. "
                 "Do not rely on memory or stale examples when describing the runtime, tools, or limits. "
                 "The built-ins currently exposed here are: crawl (fetch one URL), search_web (structured search results), "
-                "open_url (stub only), list_dir, read_file, write_file, create_task, generate_threads, "
-                "read_threads_summary, remember, recall, list_actions, read_action_diff, revert_actions, tool_help, and tool_info. "
-                "Use tool_help to list or verify available tools and tool_info to inspect one tool's purpose, arguments, "
-                "sandbox, and limits. "
-                "If you are not already certain a capability exists, call tool_help before saying it does not exist. "
+                "open_url (legacy alias for browser navigation), computer.observe, computer.act, computer.navigate, "
+                "computer.windows.list, computer.windows.focus, computer.app.launch, camera.capture, capture.list, capture.promote, capture.delete, "
+                "shell.exec, patch.apply, mcp.call, "
+                "list_dir, read_file, write_file, create_task, generate_threads, read_threads_summary, remember, recall, "
+                "list_actions, read_action_diff, revert_actions, help, tool_help, and tool_info. "
+                "Use help to list or verify available tools; pass tool_name when you need one focused guide. "
+                "tool_help remains as a compatibility alias, and tool_info can still return one capability record with sandbox and limit details. "
+                "If you are not already certain a capability exists, call help before saying it does not exist. "
                 "If the user asks for reminders, tasks, events, or scheduled follow-ups, prefer create_task instead of "
                 "claiming scheduling is unavailable. "
+                "For browser or desktop control, prefer the computer tools over pretending to browse manually; "
+                "start with computer.session.start, then reuse its session_id for computer.navigate, computer.observe, or computer.act; "
+                "computer.app.launch requires an existing session_id and is not the first step for browser runtime. "
+                "observe captures the current state, navigate changes browser location, act performs input steps, "
+                "camera.capture requests a client-side still image, capture.list/capture.promote/capture.delete manage transient captures, "
+                "and the windows/app tools cover the narrow desktop workflow when available. "
+                "Captures are transient by default and are pruned after the configured retention window unless promoted. "
                 "For local files, use list_dir to discover paths first, then use read_file with narrow windows. "
                 "read_file is limited to paths under data/, returns bounded excerpts via start_line, line_count, and "
                 "max_chars, and should not be used to pull whole large files into context. "
@@ -441,11 +495,13 @@ def load_config():
                 "data/workspace/. "
                 "For tracked local writes, use list_actions to inspect revertible actions, read_action_diff to inspect one stored diff, "
                 "and revert_actions to undo one action or a batch from the same response or conversation. "
+                "Check help/tool_info before assuming shell execution, patch editing, MCP server access, or desktop actions are enabled, "
+                "and respect approvals for mutating or higher-risk actions. "
                 "Treat CSV as only one example of a broader artifact-analysis pattern: for tables, JSON, logs, or mixed "
                 "local collections, prefer typed working summaries and stable handles over replaying raw rows or chunks "
                 "whenever the available tools support that flow. "
                 "If a plan would benefit from code execution or a Python-like REPL, verify that a sandboxed runtime is "
-                "actually present in tool_help/tool_info output before assuming it exists; if it does exist, respect "
+                "actually present in help/tool_info output before assuming it exists; if it does exist, respect "
                 "its sandbox, venv/project, and persistence limits. "
                 "Invoke tools using structured JSON, or following the harmony format e.g. "
                 '{"tool":"remember","args":{"key":"lab", "value":"1234"}}. '

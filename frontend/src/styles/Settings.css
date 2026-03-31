@@ -53,6 +53,20 @@
   border-radius: 4px;
   cursor: pointer;
 }
+
+.settings-container a.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 20px;
+  padding: 10px 20px;
+  border: 1px solid var(--color-mint-green);
+  border-radius: 4px;
+  background-color: var(--color-pear-green);
+  color: var(--color-black);
+  text-decoration: none;
+  box-sizing: border-box;
+}
 .settings-container button:disabled {
   opacity: 0.6;
   cursor: not-allowed;

@@ -108,3 +108,17 @@ def test_streaming_prefers_first_output_source(monkeypatch):
     out = _run_stream(monkeypatch, lines)
     assert out and out.get("text") == "Hello"
     assert out.get("thought") == "Think"
+
+
+def test_streaming_dedupes_repeated_scalar_response_text_within_chunk(monkeypatch):
+    lines = _build_sse_lines(
+        {
+            "type": "response.output_text.delta",
+            "output_text": "I will use the computer tools.",
+            "delta": {"text": "I will use the computer tools."},
+            "message": {"content": "I will use the computer tools."},
+        }
+    )
+
+    out = _run_stream(monkeypatch, lines)
+    assert out and out.get("text") == "I will use the computer tools."

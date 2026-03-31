@@ -173,6 +173,7 @@ def test_dynamic_server_start_stop(monkeypatch):
     svc.stop_dynamic_server()
     assert proc.terminated and proc.waited
 
+
 def test_local_runtime_status_reports_transformers_backend(monkeypatch):
     tokenizer = DummyTokenizer()
     model = DummyModel()
@@ -204,7 +205,9 @@ def test_generate_api_inlines_native_image_parts_for_supported_models(monkeypatc
         )
 
     monkeypatch.setattr("app.base_services.http_session.post", fake_post)
-    monkeypatch.setattr("app.base_services.load_blob", lambda _content_hash: b"img-bytes")
+    monkeypatch.setattr(
+        "app.base_services.load_blob", lambda _content_hash: b"img-bytes"
+    )
 
     svc = LLMService(
         mode="api",
@@ -381,7 +384,9 @@ def test_generate_api_merges_attachments_when_prompt_is_sequence(monkeypatch):
         )
 
     monkeypatch.setattr("app.base_services.http_session.post", fake_post)
-    monkeypatch.setattr("app.base_services.load_blob", lambda _content_hash: b"img-bytes")
+    monkeypatch.setattr(
+        "app.base_services.load_blob", lambda _content_hash: b"img-bytes"
+    )
 
     svc = LLMService(
         mode="api",
@@ -408,6 +413,5 @@ def test_generate_api_merges_attachments_when_prompt_is_sequence(monkeypatch):
     messages = captured["payload"]["messages"]
     trailing = messages[-1]["content"]
     assert any(
-        isinstance(part, dict) and part.get("type") == "image_url"
-        for part in trailing
+        isinstance(part, dict) and part.get("type") == "image_url" for part in trailing
     )

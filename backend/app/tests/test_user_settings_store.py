@@ -24,10 +24,17 @@ def test_user_settings_persist(client, tmp_path, monkeypatch):
         "history": ["sess-1"],
         "approval_level": "auto",
         "theme": "dark",
+        "visual_theme": "cappucino",
         "user_timezone": "America/New_York",
         "live_transcript_enabled": False,
         "live_camera_default_enabled": True,
         "tool_resolution_notifications": False,
+        "capture_retention_days": 14,
+        "capture_default_sensitivity": "protected",
+        "capture_allow_model_raw_image_access": False,
+        "capture_allow_summary_fallback": True,
+        "default_workflow": "mini_execution",
+        "enabled_workflow_modules": ["computer_use", "camera_capture"],
     }
     r = client.post("/user-settings", json=payload)
     assert r.status_code == 200
@@ -49,15 +56,26 @@ def test_user_settings_persist(client, tmp_path, monkeypatch):
     assert data["live_transcript_enabled"] is False
     assert data["live_camera_default_enabled"] is True
     assert data["tool_resolution_notifications"] is False
+    assert data["capture_retention_days"] == 14
+    assert data["capture_default_sensitivity"] == "protected"
+    assert data["capture_allow_model_raw_image_access"] is False
+    assert data["capture_allow_summary_fallback"] is True
+    assert data["default_workflow"] == "mini_execution"
+    assert data["enabled_workflow_modules"] == ["computer_use", "camera_capture"]
 
     r2 = client.get("/user-settings")
     assert r2.status_code == 200
     assert r2.json()["history"] == ["sess-1"]
     assert r2.json()["system_prompt_custom"] == ""
+    assert r2.json()["visual_theme"] == "cappucino"
     assert r2.json()["user_timezone"] == "America/New_York"
     assert r2.json()["live_transcript_enabled"] is False
     assert r2.json()["live_camera_default_enabled"] is True
     assert r2.json()["tool_resolution_notifications"] is False
+    assert r2.json()["capture_retention_days"] == 14
+    assert r2.json()["capture_default_sensitivity"] == "protected"
+    assert r2.json()["default_workflow"] == "mini_execution"
+    assert r2.json()["enabled_workflow_modules"] == ["computer_use", "camera_capture"]
 
 
 def test_user_settings_default_tool_review_notifications_enabled(tmp_path, monkeypatch):
@@ -69,3 +87,4 @@ def test_user_settings_default_tool_review_notifications_enabled(tmp_path, monke
 
     data = user_settings.load_settings()
     assert data["tool_resolution_notifications"] is True
+    assert data["visual_theme"] == "spring"

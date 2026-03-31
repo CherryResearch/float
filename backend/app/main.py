@@ -216,11 +216,16 @@ try:
     action_history_service = services.ActionHistoryService(config)
     logger.info("ActionHistoryService initialized.")
 
+    computer_service = services.ComputerService(config)
+    services.set_computer_service(computer_service)
+    logger.info("ComputerService initialized.")
+
     app.state.memory_manager = memory_manager
     app.state.rag_handler = rag_handler
     app.state.livekit_service = livekit_service
     app.state.sync_service = sync_service
     app.state.action_history_service = action_history_service
+    app.state.computer_service = computer_service
     # Broadcast stream so multiple consumers (main UI, dev panel, etc.) all see events.
     app.state.thought_broker = EventBroker(max_history=750, subscriber_queue_size=300)
     # Legacy attribute kept for older code paths; do not consume directly.

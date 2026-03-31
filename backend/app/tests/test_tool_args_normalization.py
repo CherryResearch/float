@@ -77,9 +77,19 @@ def test_tool_help_defaults_are_applied():
 
     args = normalize_tool_args("tool_help", {})
     assert args["tool_name"] == ""
-    assert args["detail"] == "rich"
-    assert args["include_schema"] is True
-    assert args["max_tools"] == 20
+    assert args["detail"] == "brief"
+    assert args["include_schema"] is False
+    assert args["max_tools"] == 8
+
+
+def test_help_defaults_are_applied():
+    from app.utils.tool_args import normalize_tool_args
+
+    args = normalize_tool_args("help", {})
+    assert args["tool_name"] == ""
+    assert args["detail"] == "brief"
+    assert args["include_schema"] is False
+    assert args["max_tools"] == 8
 
 
 def test_list_dir_defaults_are_applied():

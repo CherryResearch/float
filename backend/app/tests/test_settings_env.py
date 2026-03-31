@@ -158,6 +158,14 @@ def test_load_config_includes_weaviate_settings(monkeypatch):
     assert cfg["auto_start_weaviate"] is True
 
 
+def test_legacy_conversations_override_detection():
+    from app import config as app_config
+
+    assert app_config._is_legacy_conversations_override("./conversations") is True
+    assert app_config._is_legacy_conversations_override("conversations") is True
+    assert app_config._is_legacy_conversations_override("./data/conversations") is False
+
+
 def test_default_system_prompt_mentions_artifact_summaries_and_runtime_checks():
     from app import config as app_config
 
@@ -168,5 +176,5 @@ def test_default_system_prompt_mentions_artifact_summaries_and_runtime_checks():
     assert "list_dir" in prompt
     assert "typed working summaries" in prompt
     assert "sandboxed runtime" in prompt
-    assert "tool_help/tool_info output" in prompt
+    assert "help/tool_info output" in prompt
     assert "before saying it does not exist" in prompt

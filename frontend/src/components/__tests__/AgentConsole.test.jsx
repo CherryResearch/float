@@ -216,6 +216,135 @@ describe("AgentConsole", () => {
     expect(await screen.findByText(/Approved sync from Pear\./i)).toBeInTheDocument();
   });
 
+  it("keeps sync reviews collapsed by default during active runs and lets the user expand them", async () => {
+    const now = Date.now() / 1000;
+
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled
+        onStreamToggle={() => {}}
+        agents={[
+          {
+            id: "agent-1",
+            label: "browser-agent",
+            status: "active",
+            updatedAt: now,
+            events: [],
+          },
+        ]}
+        syncReviews={{
+          pending: [
+            {
+              id: "review-1",
+              status: "pending",
+              source_label: "Pear",
+              created_at: now,
+              requested_section_labels: ["Knowledge"],
+            },
+          ],
+          recent: [],
+        }}
+        onSelectMessage={() => {}}
+        backendReady
+        onRefreshAgents={() => {}}
+      />,
+    );
+
+    expect(await screen.findByRole("heading", { name: /sync inbox/i })).toBeInTheDocument();
+    expect(screen.queryByText("Pear", { selector: "strong" })).not.toBeInTheDocument();
+
+    const expandButton = screen.getByRole("button", { name: /expand sync inbox/i });
+    expect(expandButton).toHaveTextContent("+");
+
+    fireEvent.click(expandButton);
+
+    expect(await screen.findByText("Pear", { selector: "strong" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /collapse sync inbox/i }),
+    ).toHaveTextContent("-");
+  });
+
+  it("does not auto-scroll the console when the user has moved away from the bottom", async () => {
+    const now = Date.now() / 1000;
+    const setState = vi.fn();
+    const state = { ...baseGlobalState };
+    const scrollToSpy = vi.fn();
+
+    const { container, rerender } = render(
+      <MemoryRouter>
+        <GlobalContext.Provider value={{ state, setState }}>
+          <AgentConsole
+            collapsed={false}
+            onToggle={() => {}}
+            streamEnabled
+            onStreamToggle={() => {}}
+            agents={[
+              {
+                id: "agent-1",
+                label: "browser-agent",
+                status: "active",
+                updatedAt: now,
+                events: [{ type: "thought", content: "one", timestamp: now }],
+              },
+            ]}
+            onSelectMessage={() => {}}
+            backendReady
+            onRefreshAgents={() => {}}
+          />
+        </GlobalContext.Provider>
+      </MemoryRouter>,
+    );
+
+    const body = container.querySelector(".agent-console-body");
+    if (!body) {
+      throw new Error("agent console body not found");
+    }
+    Object.defineProperty(body, "clientHeight", { configurable: true, value: 300 });
+    Object.defineProperty(body, "scrollHeight", { configurable: true, value: 1000 });
+    Object.defineProperty(body, "scrollTo", { configurable: true, value: scrollToSpy });
+
+    await act(async () => {
+      body.scrollTop = 100;
+      fireEvent.scroll(body);
+    });
+
+    scrollToSpy.mockClear();
+
+    await act(async () => {
+      rerender(
+        <MemoryRouter>
+          <GlobalContext.Provider value={{ state, setState }}>
+            <AgentConsole
+              collapsed={false}
+              onToggle={() => {}}
+              streamEnabled
+              onStreamToggle={() => {}}
+              agents={[
+                {
+                  id: "agent-1",
+                  label: "browser-agent",
+                  status: "active",
+                  updatedAt: now + 1,
+                  events: [
+                    { type: "thought", content: "one", timestamp: now },
+                    { type: "thought", content: "two", timestamp: now + 1 },
+                  ],
+                },
+              ]}
+              onSelectMessage={() => {}}
+              backendReady
+              onRefreshAgents={() => {}}
+            />
+          </GlobalContext.Provider>
+        </MemoryRouter>,
+      );
+    });
+
+    expect(scrollToSpy).not.toHaveBeenCalled();
+  });
+
   it("integrates tracked writes into matching tool rows and supports revert controls", async () => {
     const now = Date.now() / 1000;
     const agents = [
@@ -417,6 +546,48 @@ describe("AgentConsole", () => {
     expect(screen.getByText(/That undo restored 15 of 54 tracked items\./i)).toBeInTheDocument();
   });
 
+  it("lets individual write items minimize, hide, and restore inside write history", () => {
+    const ts = Date.parse("2026-03-24T23:38:00Z") / 1000;
+    const actions = [
+      {
+        id: "action-1",
+        kind: "write",
+        name: "write_file",
+        summary: "Draft reply",
+        status: "applied",
+        created_at_ts: ts,
+        item_count: 1,
+        revertible: true,
+        response_id: "response-1",
+        response_label: "response 1",
+        conversation_id: "sess-123",
+        conversation_label: "Current chat",
+      },
+    ];
+
+    render(
+      <MemoryRouter>
+        <ActionHistoryPanel actions={actions} backendReady={false} onRefresh={() => {}} />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText(/draft reply/i)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /minimize draft reply/i }));
+    expect(screen.getByRole("button", { name: /expand draft reply/i })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /hide draft reply/i }));
+    expect(screen.queryByText(/draft reply/i)).not.toBeInTheDocument();
+
+    const showHiddenButton = screen.getByRole("button", {
+      name: /show hidden write items/i,
+    });
+    expect(showHiddenButton).toHaveTextContent("show hidden (1)");
+
+    fireEvent.click(showHiddenButton);
+    expect(screen.getByText(/draft reply/i)).toBeInTheDocument();
+  });
+
   it("auto-continues once after accepting a tool (non-auto mode)", async () => {
     const now = Date.now() / 1000;
     const agents = [
@@ -491,6 +662,163 @@ describe("AgentConsole", () => {
         }),
       );
     });
+  });
+
+  it("auto-resolves client camera tools in high approval mode and continues the batch", async () => {
+    const now = Date.now() / 1000;
+    const stopTrack = vi.fn();
+    const originalCreateElement = document.createElement.bind(document);
+    const createElementSpy = vi
+      .spyOn(document, "createElement")
+      .mockImplementation((tagName, options) => {
+        if (String(tagName).toLowerCase() === "video") {
+          return {
+            playsInline: false,
+            muted: false,
+            srcObject: null,
+            readyState: 2,
+            videoWidth: 640,
+            videoHeight: 480,
+            play: vi.fn().mockResolvedValue(undefined),
+            onloadedmetadata: null,
+          };
+        }
+        if (String(tagName).toLowerCase() === "canvas") {
+          return {
+            width: 0,
+            height: 0,
+            getContext: vi.fn().mockReturnValue({ drawImage: vi.fn() }),
+            toBlob: (callback) =>
+              callback(new Blob(["camera"], { type: "image/png" })),
+          };
+        }
+        return originalCreateElement(tagName, options);
+      });
+    Object.defineProperty(globalThis.navigator, "mediaDevices", {
+      configurable: true,
+      value: {
+        getUserMedia: vi.fn().mockResolvedValue({
+          getTracks: () => [{ stop: stopTrack }],
+        }),
+      },
+    });
+
+    axios.post.mockImplementation((url, payload) => {
+      if (url === "/api/captures/upload") {
+        return Promise.resolve({
+          data: {
+            capture_id: "capture-1",
+            source: "camera",
+            transient: true,
+            url: "/api/captures/capture-1/content",
+          },
+        });
+      }
+      if (url === "/api/tools/client-resolve") {
+        return Promise.resolve({
+          data: {
+            status: "invoked",
+            result: {
+              status: "invoked",
+              ok: true,
+              message: "Captured camera image.",
+              data: { capture_id: "capture-1" },
+            },
+          },
+        });
+      }
+      if (url === "/api/chat/continue") {
+        return Promise.resolve({
+          data: {
+            message: "continued",
+            metadata: { tool_continue_signature: "sig-1" },
+          },
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled
+        onStreamToggle={() => {}}
+        agents={[
+          {
+            id: "agent-camera",
+            label: "camera-agent",
+            status: "pending",
+            updatedAt: now,
+            events: [
+              {
+                type: "tool",
+                name: "camera.capture",
+                args: {},
+                status: "proposed",
+                timestamp: now,
+                id: "proposal-camera-1",
+                chain_id: "msg-camera-1",
+                message_id: "msg-camera-1",
+                session_id: "sess-123",
+              },
+            ],
+          },
+        ]}
+        onSelectMessage={() => {}}
+        backendReady
+        onRefreshAgents={() => {}}
+      />,
+      {
+        stateOverrides: {
+          approvalLevel: "high",
+          conversation: [
+            {
+              id: "msg-camera-1",
+              role: "ai",
+              text: "Need a camera frame.",
+              metadata: { tool_response_pending: true },
+              tools: [
+                {
+                  id: "proposal-camera-1",
+                  name: "camera.capture",
+                  args: {},
+                  status: "proposed",
+                },
+              ],
+            },
+          ],
+        },
+      },
+    );
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith(
+        "/api/tools/client-resolve",
+        expect.objectContaining({
+          request_id: "proposal-camera-1",
+          status: "invoked",
+        }),
+      );
+    });
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith(
+        "/api/chat/continue",
+        expect.objectContaining({
+          session_id: "sess-123",
+          message_id: "msg-camera-1",
+          tools: [
+            expect.objectContaining({
+              id: "proposal-camera-1",
+              name: "camera.capture",
+              status: "invoked",
+            }),
+          ],
+        }),
+      );
+    });
+    expect(stopTrack).toHaveBeenCalled();
+    createElementSpy.mockRestore();
   });
 
   it("shows a continue button for resolved tool batches in the console", async () => {
@@ -570,6 +898,114 @@ describe("AgentConsole", () => {
         expect.objectContaining({
           session_id: "sess-123",
           message_id: "msg-1",
+        }),
+      );
+    });
+  });
+
+  it("opens a browser session popup from computer tool results and refreshes through computer.observe", async () => {
+    const now = Date.now() / 1000;
+
+    axios.post.mockImplementation((url) => {
+      if (url === "/api/tools/invoke") {
+        return Promise.resolve({
+          data: {
+            result: {
+              status: "invoked",
+              ok: true,
+              data: {
+                summary: "Refreshed browser state",
+                session: {
+                  id: "browser-session-1",
+                  runtime: "browser",
+                  width: 1280,
+                  height: 720,
+                },
+                attachment: {
+                  url: "/api/captures/capture-2/content",
+                  name: "capture-2.png",
+                },
+              },
+            },
+          },
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled
+        onStreamToggle={() => {}}
+        agents={[
+          {
+            id: "agent-browser",
+            label: "browser-agent",
+            status: "active",
+            updatedAt: now,
+            events: [
+              {
+                type: "tool",
+                name: "computer.observe",
+                args: { session_id: "browser-session-1" },
+                status: "invoked",
+                timestamp: now,
+                id: "browser-tool-1",
+                chain_id: "msg-browser-1",
+                message_id: "msg-browser-1",
+                session_id: "sess-123",
+                result: {
+                  status: "invoked",
+                  ok: true,
+                  data: {
+                    summary: "Captured browser state",
+                    session: {
+                      id: "browser-session-1",
+                      runtime: "browser",
+                      width: 1280,
+                      height: 720,
+                    },
+                    current_url: "https://example.com",
+                    attachment: {
+                      url: "/api/captures/capture-1/content",
+                      name: "capture-1.png",
+                    },
+                  },
+                },
+              },
+            ],
+          },
+        ]}
+        onSelectMessage={() => {}}
+        backendReady
+        onRefreshAgents={() => {}}
+      />,
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: /expand activity details/i }),
+    );
+    fireEvent.click(screen.getAllByRole("button", { name: /expand browser/i }).at(-1));
+
+    const dialog = await screen.findByRole("dialog", {
+      name: /browser session controls/i,
+    });
+    expect(within(dialog).getByDisplayValue("https://example.com")).toBeInTheDocument();
+    expect(within(dialog).getByAltText("capture-1.png")).toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: /^refresh$/i }));
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith(
+        "/api/tools/invoke",
+        expect.objectContaining({
+          name: "computer.observe",
+          args: { session_id: "browser-session-1" },
+          message_id: "msg-browser-1",
+          chain_id: "msg-browser-1",
+          session_id: "sess-123",
         }),
       );
     });
@@ -971,12 +1407,62 @@ describe("AgentConsole", () => {
     expect(screen.queryByRole("heading", { name: /calendar-sync/i })).not.toBeInTheDocument();
 
     const showHiddenButton = screen.getByRole("button", {
-      name: /show hidden agent cards/i,
+      name: /show hidden console cards/i,
     });
     expect(showHiddenButton).toHaveTextContent("show hidden (1)");
 
     fireEvent.click(showHiddenButton);
     expect(await screen.findByRole("heading", { name: /calendar-sync/i })).toBeInTheDocument();
+  });
+
+  it("lets standalone write history minimize and restore from the hidden console button", async () => {
+    const actions = [
+      {
+        id: "action-1",
+        conversation_id: "sess-123",
+        conversation_label: "Current chat",
+        response_id: "msg-1234",
+        response_label: "response 1234",
+        kind: "write",
+        name: "write_file",
+        summary: "Draft reply",
+        status: "applied",
+        created_at_ts: Date.now() / 1000,
+        revertible: true,
+      },
+    ];
+
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled={false}
+        onStreamToggle={() => {}}
+        agents={[]}
+        actions={actions}
+        onSelectMessage={() => {}}
+        backendReady
+        onRefreshAgents={() => {}}
+      />,
+    );
+
+    expect(await screen.findByRole("heading", { name: /write history/i })).toBeInTheDocument();
+    expect(screen.getByText(/draft reply/i)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /minimize write history/i }));
+    expect(screen.getByRole("button", { name: /expand write history/i })).toBeInTheDocument();
+    expect(screen.queryByText(/draft reply/i)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /hide write history/i }));
+    expect(screen.queryByRole("heading", { name: /write history/i })).not.toBeInTheDocument();
+
+    const showHiddenButton = screen.getByRole("button", {
+      name: /show hidden console cards/i,
+    });
+    expect(showHiddenButton).toHaveTextContent("show hidden (1)");
+
+    fireEvent.click(showHiddenButton);
+    expect(await screen.findByRole("heading", { name: /write history/i })).toBeInTheDocument();
   });
 
   it("explains when tool details move inline and hides duplicate tool rows", async () => {
@@ -1029,5 +1515,56 @@ describe("AgentConsole", () => {
     ).toBeInTheDocument();
     expect(screen.getAllByText("Still working").length).toBeGreaterThan(0);
     expect(screen.queryByText("calendar.lookup")).not.toBeInTheDocument();
+  });
+
+  it("keeps tool rows visible in auto mode", async () => {
+    const now = Date.now() / 1000;
+    const agents = [
+      {
+        id: "agent-auto-tools",
+        label: "calendar-sync",
+        status: "pending",
+        updatedAt: now,
+        events: [
+          {
+            type: "tool",
+            name: "calendar.lookup",
+            args: { query: "today" },
+            status: "invoked",
+            timestamp: now,
+          },
+          {
+            type: "thought",
+            content: "Still working",
+            timestamp: now + 1,
+          },
+        ],
+      },
+    ];
+
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled={false}
+        onStreamToggle={() => {}}
+        agents={agents}
+        onSelectMessage={() => {}}
+        backendReady
+        onRefreshAgents={() => {}}
+      />,
+      {
+        stateOverrides: {
+          toolDisplayMode: "auto",
+        },
+      },
+    );
+
+    expect(await screen.findByText("calendar.lookup")).toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        /Tool details are inline in chat\. The console is showing thoughts, messages, and tasks only\./i,
+      ),
+    ).not.toBeInTheDocument();
   });
 });

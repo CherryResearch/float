@@ -53,12 +53,12 @@ body.dark-mode .sidebar {
   background:
     linear-gradient(
       var(--sidebar-light-angle),
-      rgba(6, 8, 20, 0.1) 0%,
+      color-mix(in oklab, var(--theme-warm-black) 10%, transparent) 0%,
       transparent 76%
     ),
     linear-gradient(
       142deg,
-      color-mix(in oklab, var(--color-purple) 18%, rgba(12, 45, 80, 0.14)) 0%,
+      color-mix(in oklab, var(--theme-c2-med) 18%, var(--theme-warm-black)) 0%,
       transparent 78%
     ),
     var(--glass-sheen-strong),
@@ -75,11 +75,11 @@ body.dark-mode .sidebar {
   background:
     linear-gradient(
       135deg,
-      color-mix(in oklab, var(--color-lavender) 90%, var(--color-white) 10%),
-      color-mix(in oklab, var(--color-violet-glow) 24%, var(--color-lavender) 76%)
+      color-mix(in oklab, var(--theme-c2-glow) 18%, var(--color-white) 82%),
+      color-mix(in oklab, var(--theme-c2-med) 24%, var(--theme-c1-glow) 76%)
     );
-  color: color-mix(in oklab, var(--color-purple-deep) 74%, var(--color-purple) 26%);
-  border: 1px solid color-mix(in oklab, var(--color-violet-glow) 42%, var(--glass-border) 58%);
+  color: color-mix(in oklab, var(--theme-c1-dark) 74%, var(--theme-c2-med) 26%);
+  border: 1px solid color-mix(in oklab, var(--theme-c2-med) 36%, var(--glass-border) 64%);
   cursor: pointer;
   width: 28px;
   height: 28px;
@@ -88,7 +88,7 @@ body.dark-mode .sidebar {
   align-items: center;
   justify-content: center;
   box-shadow:
-    0 10px 24px rgba(91, 60, 155, 0.18),
+    0 10px 24px color-mix(in oklab, var(--theme-c1-shadow) 24%, transparent),
     0 0 0 1px color-mix(in oklab, var(--glass-border) 58%, transparent);
   backdrop-filter: blur(12px) saturate(160%);
   -webkit-backdrop-filter: blur(12px) saturate(160%);
@@ -99,13 +99,13 @@ body.dark-mode .collapse-btn {
   background:
     linear-gradient(
       135deg,
-      color-mix(in oklab, var(--color-lavender) 90%, var(--color-white) 10%),
-      color-mix(in oklab, var(--color-violet-glow) 28%, var(--color-lavender) 72%)
+      color-mix(in oklab, var(--theme-c2-glow) 18%, var(--color-white) 82%),
+      color-mix(in oklab, var(--theme-c2-med) 28%, var(--theme-c1-glow) 72%)
     );
-  color: color-mix(in oklab, var(--color-purple-deep) 72%, var(--color-purple) 28%);
-  border-color: color-mix(in oklab, var(--color-violet-glow) 48%, var(--glass-border) 52%);
+  color: color-mix(in oklab, var(--theme-c1-dark) 72%, var(--theme-c2-med) 28%);
+  border-color: color-mix(in oklab, var(--theme-c2-med) 40%, var(--glass-border) 60%);
   box-shadow:
-    0 10px 24px rgba(40, 19, 78, 0.24),
+    0 10px 24px color-mix(in oklab, var(--theme-c1-shadow) 28%, transparent),
     0 0 0 1px color-mix(in oklab, var(--glass-border) 52%, transparent);
 }
 
@@ -1909,6 +1909,37 @@ body.dark-mode .history-toggle button.active {
   gap: 12px;
 }
 
+.action-history-header-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.action-history-title {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.action-history-title-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.action-history-panel.compact {
+  gap: 6px;
+}
+
+.action-history-panel.compact .action-history-header {
+  align-items: center;
+}
+
 .action-history-header h3,
 .action-group-header h4 {
   margin: 0;
@@ -1976,8 +2007,22 @@ body.dark-mode .history-toggle button.active {
   background: color-mix(in oklab, var(--glass-tint) 92%, transparent);
 }
 
+.action-row.compact {
+  gap: 4px;
+  padding: 7px 10px;
+}
+
+.action-row-top {
+  flex-wrap: wrap;
+}
+
+.action-row.compact .action-row-top {
+  align-items: center;
+}
+
 .action-row-copy {
   display: flex;
+  flex: 1 1 260px;
   flex-direction: column;
   gap: 4px;
   min-width: 0;
@@ -1995,6 +2040,13 @@ body.dark-mode .history-toggle button.active {
   margin: 0;
   font-size: 0.84rem;
   color: var(--color-text);
+}
+
+.action-row.compact .action-row-summary {
+  max-width: min(100%, 44ch);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .action-row-reference,
@@ -2018,6 +2070,9 @@ body.dark-mode .history-toggle button.active {
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
+  flex: 0 0 auto;
+  justify-content: flex-end;
+  max-width: 100%;
 }
 
 .action-diff-panel {
@@ -3281,7 +3336,7 @@ body.dark-mode .history-toggle button.active {
 
 body.dark-mode .task-composer-nudges button {
   background: color-mix(in oklab, var(--glass-tint-strong, rgba(9, 11, 24, 0.82)) 80%, transparent);
-  border-color: color-mix(in oklab, var(--color-indigo, #390892) 40%, var(--glass-border) 60%);
+  border-color: color-mix(in oklab, var(--theme-c1-dark, #130a01) 40%, var(--glass-border) 60%);
   color: var(--color-white);
 }
 

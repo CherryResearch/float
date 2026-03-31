@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict
 from . import actions as action_tools
 from . import browser
 from . import calendar as calendar_tools
-from . import crawler, local_files, memory, threads
+from . import computer_tools, crawler, local_files, memory, threads
 from . import tool_help as help_tools
 
 if TYPE_CHECKING:  # pragma: no cover - circular import safe guard
@@ -17,6 +17,21 @@ BUILTIN_TOOLS: Dict[str, Callable[..., Any]] = {
     "crawl": crawler.crawl,
     "search_web": crawler.search_web,
     "open_url": browser.open_url,
+    "computer.session.start": computer_tools.computer_session_start,
+    "computer.session.stop": computer_tools.computer_session_stop,
+    "computer.observe": computer_tools.computer_observe,
+    "computer.act": computer_tools.computer_act,
+    "computer.navigate": computer_tools.computer_navigate,
+    "computer.windows.list": computer_tools.computer_windows_list,
+    "computer.windows.focus": computer_tools.computer_windows_focus,
+    "computer.app.launch": computer_tools.computer_app_launch,
+    "camera.capture": computer_tools.camera_capture,
+    "capture.list": computer_tools.capture_list,
+    "capture.promote": computer_tools.capture_promote,
+    "capture.delete": computer_tools.capture_delete,
+    "shell.exec": computer_tools.shell_exec,
+    "patch.apply": computer_tools.patch_apply,
+    "mcp.call": computer_tools.mcp_call,
     "read_file": local_files.read_file,
     "list_dir": local_files.list_dir,
     "write_file": local_files.write_file,
@@ -30,6 +45,7 @@ BUILTIN_TOOLS: Dict[str, Callable[..., Any]] = {
     "list_actions": action_tools.list_actions,
     "read_action_diff": action_tools.read_action_diff,
     "revert_actions": action_tools.revert_actions,
+    "help": help_tools.help_tool,
     "tool_help": help_tools.tool_help,
     "tool_info": help_tools.tool_info,
 }
@@ -44,6 +60,7 @@ def register_builtin_tools(manager: "MemoryManager") -> None:
 __all__ = [
     "crawler",
     "browser",
+    "computer_tools",
     "calendar_tools",
     "local_files",
     "threads",

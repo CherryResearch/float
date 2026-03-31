@@ -55,6 +55,8 @@ from app.utils.harmony import Message, Role  # envelope utilities (shimmed)
 _TRANSFORMERS_COMPONENTS_LOADED = False
 _AUTO_MODEL_FOR_CAUSAL_LM = None
 _AUTO_TOKENIZER = None
+AutoModelForCausalLM = None
+AutoTokenizer = None
 _TRANSFORMERS_ATTN_LOADED = False
 _FLASH_ATTN_AVAILABLE_FN = None
 _TORCH_SDPA_AVAILABLE_FN = None
@@ -66,6 +68,13 @@ def _get_transformers_components():
     global _TRANSFORMERS_COMPONENTS_LOADED
     global _AUTO_MODEL_FOR_CAUSAL_LM
     global _AUTO_TOKENIZER
+    global AutoModelForCausalLM
+    global AutoTokenizer
+    if AutoModelForCausalLM is not None or AutoTokenizer is not None:
+        _AUTO_MODEL_FOR_CAUSAL_LM = AutoModelForCausalLM
+        _AUTO_TOKENIZER = AutoTokenizer
+        _TRANSFORMERS_COMPONENTS_LOADED = True
+        return _AUTO_MODEL_FOR_CAUSAL_LM, _AUTO_TOKENIZER
     if not _TRANSFORMERS_COMPONENTS_LOADED:
         try:  # pragma: no cover - optional dependency
             from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -76,6 +85,8 @@ def _get_transformers_components():
             _AUTO_MODEL_FOR_CAUSAL_LM = None
             _AUTO_TOKENIZER = None
         _TRANSFORMERS_COMPONENTS_LOADED = True
+    AutoModelForCausalLM = _AUTO_MODEL_FOR_CAUSAL_LM
+    AutoTokenizer = _AUTO_TOKENIZER
     return _AUTO_MODEL_FOR_CAUSAL_LM, _AUTO_TOKENIZER
 
 
@@ -145,8 +156,8 @@ from workers.multimodal import (
 )
 
 from . import config as app_config
-from .tool_catalog import get_tool_catalog_entry
 from .model_registry import resolve_model_alias
+from .tool_catalog import get_tool_catalog_entry
 from .utils import memory_store, verify_signature
 from .utils.local_model_registry import resolve_registered_model_path
 from .utils.time_resolution import normalize_temporal_references
@@ -239,9 +250,29 @@ def _model_supports_native_images(model_name: Any) -> bool:
 def _convert_tools_for_openai(tools: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Convert Float tool definitions into the shape expected by OpenAI APIs."""
     converted: List[Dict[str, Any]] = []
+    native_passthrough_types = {
+        "computer",
+        "computer_use_preview",
+        "shell",
+        "apply_patch",
+        "mcp",
+    }
     for tool in tools or []:
         if not isinstance(tool, dict):
             continue
+        tool_type = str(tool.get("type") or "").strip().lower()
+        if tool_type in native_passthrough_types and not tool.get("name"):
+            native_payload = dict(tool)
+            native_payload.pop("native", None)
+            native_payload.pop("metadata", None)
+            converted.append(native_payload)
+            continue
+        native_payload = tool.get("native")
+        if isinstance(native_payload, dict):
+            native_type = str(native_payload.get("type") or "").strip().lower()
+            if native_type in native_passthrough_types:
+                converted.append(dict(native_payload))
+                continue
         name_raw = tool.get("name")
         try:
             name = str(name_raw).strip()
@@ -278,6 +309,113 @@ def _convert_tools_for_openai(tools: Sequence[Dict[str, Any]]) -> List[Dict[str,
             tool_entry["function"]["description"] = description
         converted.append(tool_entry)
     return converted
+
+
+def _contains_native_openai_tool(tool_definitions: Sequence[Dict[str, Any]]) -> bool:
+    native_types = {
+        "computer",
+        "computer_use_preview",
+        "shell",
+        "apply_patch",
+        "mcp",
+    }
+    for tool in tool_definitions or []:
+        if not isinstance(tool, dict):
+            continue
+        tool_type = str(tool.get("type") or "").strip().lower()
+        if tool_type in native_types and "function" not in tool:
+            return True
+    return False
+
+
+def _native_tool_name_from_output_type(output_type: str) -> Optional[str]:
+    mapping = {
+        "computer_call": "computer.act",
+        "shell_call": "shell.exec",
+        "apply_patch_call": "patch.apply",
+        "mcp_call": "mcp.call",
+    }
+    return mapping.get(str(output_type or "").strip().lower())
+
+
+def _normalize_native_tool_args(payload: Dict[str, Any]) -> Dict[str, Any]:
+    output_type = str(payload.get("type") or "").strip().lower()
+    if output_type == "computer_call":
+        action = payload.get("action")
+        if isinstance(action, dict):
+            return {
+                "session_id": str(
+                    payload.get("session_id")
+                    or payload.get("call_id")
+                    or payload.get("id")
+                    or ""
+                ).strip(),
+                "actions": [dict(action)],
+                "native_call_id": payload.get("call_id") or payload.get("id"),
+            }
+        if isinstance(payload.get("actions"), list):
+            return {
+                "session_id": str(
+                    payload.get("session_id")
+                    or payload.get("call_id")
+                    or payload.get("id")
+                    or ""
+                ).strip(),
+                "actions": [
+                    dict(item)
+                    for item in payload.get("actions") or []
+                    if isinstance(item, dict)
+                ],
+                "native_call_id": payload.get("call_id") or payload.get("id"),
+            }
+    if output_type == "shell_call":
+        return {
+            "command": payload.get("command") or payload.get("input") or "",
+            "timeout_seconds": payload.get("timeout_seconds") or 20,
+            "cwd": payload.get("cwd") or "",
+            "native_call_id": payload.get("call_id") or payload.get("id"),
+        }
+    if output_type == "apply_patch_call":
+        return {
+            "path": payload.get("path") or "",
+            "content": payload.get("patch") or payload.get("content") or "",
+            "mode": payload.get("mode") or "replace",
+            "native_call_id": payload.get("call_id") or payload.get("id"),
+        }
+    if output_type == "mcp_call":
+        return {
+            "server": payload.get("server") or "",
+            "method": payload.get("method") or payload.get("name") or "",
+            "arguments": payload.get("arguments")
+            if isinstance(payload.get("arguments"), dict)
+            else {},
+            "native_call_id": payload.get("call_id") or payload.get("id"),
+        }
+    return {}
+
+
+def _extract_native_responses_tool_calls(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    tools_used: List[Dict[str, Any]] = []
+    output = data.get("output")
+    if not isinstance(output, list):
+        response_obj = data.get("response")
+        if isinstance(response_obj, dict):
+            output = response_obj.get("output")
+    if not isinstance(output, list):
+        return tools_used
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        name = _native_tool_name_from_output_type(item.get("type") or "")
+        if not name:
+            continue
+        args = _normalize_native_tool_args(item)
+        if name == "computer.act" and not args.get("actions"):
+            continue
+        if name in {"shell.exec", "patch.apply"} and not args:
+            continue
+        tools_used.append({"name": name, "args": args, "native": dict(item)})
+    return tools_used
 
 
 def _resolve_hf_snapshot_path(
@@ -1580,7 +1718,7 @@ class LLMService:
         def _process_stream_payload(
             payload: Any,
             default_thought: bool = False,
-            _seen: Optional[Set[int]] = None,
+            _seen: Optional[Set[Any]] = None,
         ) -> None:
             if payload is None:
                 return
@@ -1593,6 +1731,12 @@ class LLMService:
                 text_value = payload.strip("\x00")
                 if not text_value:
                     return
+                if _seen is None:
+                    _seen = set()
+                text_marker = ("text", bool(default_thought), text_value)
+                if text_marker in _seen:
+                    return
+                _seen.add(text_marker)
                 handler = _emit_thought if default_thought else _append_text
                 handler(text_value)
                 return
@@ -1601,10 +1745,10 @@ class LLMService:
             if _seen is None:
                 _seen = set()
             if isinstance(payload, dict):
-                obj_id = id(payload)
-                if obj_id in _seen:
+                obj_marker = ("obj", id(payload))
+                if obj_marker in _seen:
                     return
-                _seen.add(obj_id)
+                _seen.add(obj_marker)
                 payload_type = payload.get("type")
                 payload_channel = payload.get("channel")
                 thought_default = (
@@ -2869,9 +3013,14 @@ class LLMService:
         allow_responses_stream = (
             True if allow_responses_stream is None else bool(allow_responses_stream)
         )
+        native_tools_present = _contains_native_openai_tool(tool_definitions)
         streaming_enabled = bool(stream_consumer) and (
             allow_responses_stream or not url.endswith(suffix_resp)
         )
+        if native_tools_present and url.endswith(suffix_resp):
+            # Keep native Responses tools on the non-streaming path until output-item
+            # streaming is normalized into Float's proposal lifecycle.
+            streaming_enabled = False
         if use_server:
             try:
                 log_llm_server_event(
@@ -3261,6 +3410,9 @@ class LLMService:
                 )
 
         tools_used: List[Dict[str, Any]] = []
+
+        if url.endswith(suffix_resp):
+            tools_used.extend(_extract_native_responses_tool_calls(data))
 
         # Safely parse tool calls if present in chat-completions style responses
         tool_calls = message.get("tool_calls", []) if isinstance(message, dict) else []
@@ -5042,7 +5194,9 @@ class MemoryManager:
                     if isinstance(tool_entry.get("persistence"), dict)
                     else {}
                 )
-                should_journal = bool(persistence.get("writes_state")) and name != "revert_actions"
+                should_journal = (
+                    bool(persistence.get("writes_state")) and name != "revert_actions"
+                )
             except Exception:
                 should_journal = False
         if should_journal:

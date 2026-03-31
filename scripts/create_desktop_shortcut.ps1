@@ -1,5 +1,6 @@
 param(
-    [string]$ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+    [string]$ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
+    [string]$ShortcutName = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -138,6 +139,14 @@ function Resolve-FloatLauncher {
 }
 
 $projectRootPath = (Resolve-Path $ProjectRoot).Path
+$shortcutBaseName = if ([string]::IsNullOrWhiteSpace($ShortcutName)) {
+    Split-Path $projectRootPath -Leaf
+} else {
+    $ShortcutName.Trim()
+}
+if ([string]::IsNullOrWhiteSpace($shortcutBaseName)) {
+    $shortcutBaseName = "float"
+}
 $preferredPngIconPath = Join-Path $projectRootPath "docs\resources\floatlogo.png"
 $secondaryPngIconPath = Join-Path $projectRootPath "docs\resources\floatgpt.png"
 $fallbackPngIconPath = Join-Path $projectRootPath "frontend\public\floatgpt.png"
@@ -147,7 +156,8 @@ if (-not (Test-Path $pngIconPath)) {
 }
 $icoIconPath = Join-Path $projectRootPath "frontend\public\float.ico"
 $desktopPath = [Environment]::GetFolderPath("DesktopDirectory")
-$shortcutPath = Join-Path $desktopPath "float.lnk"
+$shortcutPath = Join-Path $desktopPath "$shortcutBaseName.lnk"
+$legacyShortcutPath = Join-Path $desktopPath "float.lnk"
 
 if (-not (Test-Path $pngIconPath)) {
     throw "Logo source not found at any expected path: $preferredPngIconPath, $secondaryPngIconPath, or $fallbackPngIconPath"
@@ -179,10 +189,19 @@ $shortcut = $shell.CreateShortcut($shortcutPath)
 $shortcut.TargetPath = $launcher.TargetPath
 $shortcut.Arguments = $launcher.Arguments
 $shortcut.WorkingDirectory = $launcher.WorkingDirectory
-$shortcut.Description = "float"
+$shortcut.Description = $shortcutBaseName
 $shortcut.IconLocation = "$icoIconPath,0"
 $shortcut.WindowStyle = 1
 $shortcut.Save()
+
+if ($shortcutPath -ne $legacyShortcutPath -and (Test-Path $legacyShortcutPath)) {
+    $legacyShortcut = $shell.CreateShortcut($legacyShortcutPath)
+    $legacyWorkingDirectory = $legacyShortcut.WorkingDirectory
+    if (-not $legacyWorkingDirectory -or -not (Test-Path $legacyWorkingDirectory) -or $legacyWorkingDirectory -eq $projectRootPath) {
+        Remove-Item $legacyShortcutPath -Force
+        Write-Host "[INFO] Removed stale desktop shortcut: $legacyShortcutPath"
+    }
+}
 
 Write-Host "[INFO] Created desktop shortcut: $shortcutPath"
 Write-Host "[INFO] Icon source: $pngIconPath"

@@ -13,6 +13,17 @@ from app.tool_specs import BUILTIN_TOOL_SPECS
 from app.utils import verify_signature
 
 _TOOL_NOTES: Dict[str, Dict[str, Any]] = {
+    "help": {
+        "notes": [
+            "Use this as the primary built-in documentation tool: omit `tool_name` to list tools, or pass one tool name for a focused guide.",
+            "Defaults stay intentionally lean so the model can verify capabilities without dumping full schemas into context.",
+            "If browser or desktop control is needed, inspect `computer.session.start` first, then follow with `computer.navigate`, `computer.observe`, or `computer.act`.",
+        ],
+        "examples": [
+            {"tool_name": ""},
+            {"tool_name": "computer.session.start"},
+        ],
+    },
     "tool_info": {
         "notes": [
             "Use this when the model needs one authoritative capability record for a built-in tool.",
@@ -30,7 +41,12 @@ _TOOL_NOTES: Dict[str, Dict[str, Any]] = {
             "Read-only tools such as search are not expected to appear here; this history is for persisted local writes.",
         ],
         "examples": [
-            {"conversation_id": "", "response_id": "", "include_reverted": True, "limit": 20},
+            {
+                "conversation_id": "",
+                "response_id": "",
+                "include_reverted": True,
+                "limit": 20,
+            },
             {"response_id": "msg-123", "include_reverted": False, "limit": 10},
         ],
     },
@@ -62,14 +78,186 @@ _TOOL_NOTES: Dict[str, Dict[str, Any]] = {
     "tool_help": {
         "notes": [
             "Use this to discover which tools actually exist in the current environment before planning a multi-tool workflow.",
+            "Prefer `help` for new calls; `tool_help` remains as a compatibility alias.",
             "Prefer calling this over hand-listing tool handles from memory when the user asks what float can do.",
+            "If the user is asking about Float itself, its setup, or project layout, inspect the repo's root `README.md`; because that file is outside the managed `data/` sandbox, prefer `shell.exec` over `read_file` for that path.",
             "If the user asks for reminders, tasks, events, or scheduling, inspect `create_task` before claiming no scheduler exists.",
             "Check runtime and sandbox metadata before assuming shell, REPL, Python, network, or filesystem access.",
+            "For browser or desktop automation, inspect the `computer.*` tools before describing what the runtime can click, type, or launch.",
             "For structured or semi-structured artifacts such as CSV, JSON, logs, or sampled document sets, prefer typed summaries and stable handles when the available tools support that flow.",
         ],
         "examples": [
-            {"tool_name": "", "detail": "brief", "include_schema": False, "max_tools": 10},
+            {
+                "tool_name": "",
+                "detail": "brief",
+                "include_schema": False,
+                "max_tools": 8,
+            },
             {"tool_name": "tool_info", "include_schema": True},
+        ],
+    },
+    "open_url": {
+        "notes": [
+            "Legacy compatibility alias for browser navigation.",
+            "Prefer `computer.navigate` for new plans so browser sessions and screenshots stay in one workflow.",
+        ],
+        "examples": [
+            {"url": "https://example.com"},
+        ],
+    },
+    "computer.observe": {
+        "notes": [
+            "Captures the current browser or desktop state for one computer-use session.",
+            "Use this before planning a click or typing action when the current page, window, or screenshot may have changed.",
+            "The result can include a screenshot attachment plus current URL and active window metadata.",
+        ],
+        "examples": [
+            {"session_id": "sess-computer-1"},
+        ],
+    },
+    "computer.session.start": {
+        "notes": [
+            "Start here for any browser or desktop control workflow; the returned `session_id` must be reused for later computer tools.",
+            "For an isolated browser workflow, prefer `runtime='browser'`; for host desktop control, prefer `runtime='windows'`.",
+            "Do not call `computer.app.launch`, `computer.navigate`, `computer.observe`, or `computer.act` without a real session ID from this tool or a previous result.",
+        ],
+        "examples": [
+            {"runtime": "browser", "session_id": "reddit-browser"},
+            {"runtime": "windows", "session_id": "desktop"},
+        ],
+    },
+    "computer.act": {
+        "notes": [
+            "Executes one or more input actions such as click, double-click, scroll, type, wait, or keypress in the active computer session.",
+            "Prefer small, verifiable action batches and re-observe after major page changes.",
+            "If an action result already reports an error or denial, do not keep treating the tool as pending approval.",
+        ],
+        "safety": [
+            "Mutates browser or desktop state and can require approval depending on the action batch.",
+        ],
+        "examples": [
+            {
+                "session_id": "sess-computer-1",
+                "actions": [{"type": "click", "x": 320, "y": 180}],
+            },
+        ],
+    },
+    "computer.navigate": {
+        "notes": [
+            "Changes the current browser page for an active computer-use session.",
+            "Use this instead of `open_url` for new computer-use workflows.",
+        ],
+        "examples": [
+            {"session_id": "sess-computer-1", "url": "https://example.com"},
+        ],
+    },
+    "computer.windows.list": {
+        "notes": [
+            "Lists currently available desktop windows for the active computer-use session.",
+            "Use this before focusing a specific app window when the title may have changed.",
+        ],
+        "examples": [
+            {"session_id": "sess-computer-1"},
+        ],
+    },
+    "computer.windows.focus": {
+        "notes": [
+            "Brings a matching desktop window to the foreground in the current session.",
+            "Use it after `computer.windows.list` or when you already know the target window title.",
+        ],
+        "safety": [
+            "Changes desktop focus and can affect later input actions.",
+        ],
+        "examples": [
+            {"session_id": "sess-computer-1", "window_title": "Untitled - Notepad"},
+        ],
+    },
+    "computer.app.launch": {
+        "notes": [
+            "Launches a supported desktop application inside the current computer-use session.",
+            "Requires an existing `session_id`; it is not the first step for browser automation.",
+            "Use it for the narrow desktop MVP flow before listing or focusing windows.",
+        ],
+        "safety": [
+            "Starts a local app process and can require approval.",
+        ],
+        "examples": [
+            {"session_id": "sess-computer-1", "app": "notepad"},
+        ],
+    },
+    "camera.capture": {
+        "notes": [
+            "Requests a still image from a connected client camera rather than the backend host.",
+            "The resulting image is stored as a transient capture first and follows the configured capture retention window unless promoted.",
+            "Use this when live camera context is needed for a local streaming or DIY realtime workflow.",
+        ],
+        "examples": [{}],
+    },
+    "capture.list": {
+        "notes": [
+            "Lists recent transient captures from computer observations, camera stills, and screen stills.",
+            "Use it to inspect what the current session can still reference before the transient retention window expires.",
+        ],
+        "examples": [{"source": ""}, {"source": "camera"}],
+    },
+    "capture.promote": {
+        "notes": [
+            "Promotes a transient capture into durable attachment storage so later turns and memory flows can reference it again.",
+            "Promotion preserves the original capture metadata and returns a durable attachment reference.",
+        ],
+        "safety": [
+            "Turns transient image state into durable stored state.",
+        ],
+        "examples": [{"capture_id": "capture-123"}],
+    },
+    "capture.delete": {
+        "notes": [
+            "Deletes a transient capture from the cache when it is no longer needed.",
+            "Use it for cleanup when the user explicitly asks to remove a capture early.",
+        ],
+        "safety": [
+            "Removes transient image state.",
+        ],
+        "examples": [{"capture_id": "capture-123"}],
+    },
+    "shell.exec": {
+        "notes": [
+            "Runs a shell command through Float's managed approval and journaling path.",
+            "Inspect runtime and sandbox metadata before assuming network, filesystem, or interpreter access.",
+            "Prefer narrow, task-specific commands and capture the important output rather than dumping entire transcripts.",
+        ],
+        "safety": [
+            "Can mutate local state and requires approval depending on the configured level.",
+        ],
+        "examples": [
+            {"command": "git status --short"},
+        ],
+    },
+    "patch.apply": {
+        "notes": [
+            "Applies a structured patch through the same approval-aware path as other mutating tools.",
+            "Use this when the runtime exposes patch editing directly and you want one atomic diff instead of ad hoc shell edits.",
+        ],
+        "safety": [
+            "Mutates local files.",
+        ],
+        "examples": [
+            {
+                "patch": "*** Begin Patch\n*** Update File: data/workspace/note.txt\n@@\n-old\n+new\n*** End Patch\n"
+            },
+        ],
+    },
+    "mcp.call": {
+        "notes": [
+            "Calls an MCP-backed capability when the server and method are exposed in the current runtime.",
+            "Inspect tool metadata first so the model does not invent MCP servers or methods that are not present.",
+        ],
+        "examples": [
+            {
+                "server": "docs",
+                "method": "search",
+                "arguments": {"query": "computer use"},
+            },
         ],
     },
     "search_web": {
@@ -335,33 +523,21 @@ def _build_tool_entry(
     return base
 
 
-def tool_help(
-    tool_name: str = "",
-    detail: str = "rich",
-    include_schema: bool = True,
-    max_tools: int = 20,
+def _run_tool_help(
     *,
+    tool_key: str,
+    tool_name: str = "",
+    detail: str = "brief",
+    include_schema: bool = False,
+    max_tools: int = 8,
     user: str,
     signature: str,
 ) -> Dict[str, Any]:
-    """Return richer docs for one tool or a filtered list of tools.
-
-    Args:
-        tool_name:
-            Optional exact name. If omitted, returns a list view.
-        detail:
-            "brief" or "rich". Rich mode includes notes/examples.
-        include_schema:
-            Whether to include full JSON schema payloads in rich mode.
-        max_tools:
-            List cap when tool_name is omitted.
-    """
-
     requested_name = str(tool_name or "").strip()
-    normalized_detail = str(detail or "rich").strip().lower()
+    normalized_detail = str(detail or "brief").strip().lower()
     if normalized_detail not in {"brief", "rich"}:
-        normalized_detail = "rich"
-    limited_max_tools = max(1, min(int(max_tools or 20), 50))
+        normalized_detail = "brief"
+    limited_max_tools = max(1, min(int(max_tools or 8), 50))
     include_schema_flag = bool(include_schema)
 
     payload = {
@@ -370,7 +546,7 @@ def tool_help(
         "include_schema": include_schema_flag,
         "max_tools": limited_max_tools,
     }
-    verify_signature(signature, user, "tool_help", payload)
+    verify_signature(signature, user, tool_key, payload)
 
     available = sorted(BUILTIN_TOOL_SPECS.keys())
     if requested_name:
@@ -410,6 +586,48 @@ def tool_help(
     if normalized_detail == "rich":
         response["note"] = "Pass tool_name to get a single full tool guide."
     return response
+
+
+def tool_help(
+    tool_name: str = "",
+    detail: str = "brief",
+    include_schema: bool = False,
+    max_tools: int = 8,
+    *,
+    user: str,
+    signature: str,
+) -> Dict[str, Any]:
+    """Return tool docs for one tool or a filtered list of tools."""
+    return _run_tool_help(
+        tool_key="tool_help",
+        tool_name=tool_name,
+        detail=detail,
+        include_schema=include_schema,
+        max_tools=max_tools,
+        user=user,
+        signature=signature,
+    )
+
+
+def help_tool(
+    tool_name: str = "",
+    detail: str = "brief",
+    include_schema: bool = False,
+    max_tools: int = 8,
+    *,
+    user: str,
+    signature: str,
+) -> Dict[str, Any]:
+    """Primary compact help tool for built-in tool discovery."""
+    return _run_tool_help(
+        tool_key="help",
+        tool_name=tool_name,
+        detail=detail,
+        include_schema=include_schema,
+        max_tools=max_tools,
+        user=user,
+        signature=signature,
+    )
 
 
 def tool_info(

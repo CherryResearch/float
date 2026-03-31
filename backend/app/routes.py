@@ -13,6 +13,7 @@ import os
 import re
 import time
 import shutil
+import threading
 import textwrap
 import zipfile
 from datetime import datetime, timezone
@@ -27,11 +28,20 @@ from urllib.parse import quote, urlparse
 from app import config as app_config, hooks
 from app import tools
 from app.agents.engine import get_engine
-from app.models import ChatRequest, ChatResponse, Attachment
+from app.models import ChatRequest, ChatResponse, Attachment, ComputerConfig
 from app.models import ModelContext as ContextSchema
 from app.models import Tool
 from app.schemas import CalendarEvent, MemoryUpdateRequest
-from app.services import LangExtractService, LiveKitService, LLMService, TTSService
+from app.services import (
+    CaptureService,
+    ComputerService,
+    LangExtractService,
+    LiveKitService,
+    LLMService,
+    TTSService,
+    get_capture_service,
+    get_computer_service,
+)
 from app.services import (
     ModelContext as ServiceContext,
     parse_google_calendar,
@@ -122,6 +132,17 @@ from app.utils.blob_store import (
 from celery.result import AsyncResult
 from app.utils.hardware import torch_cuda_diagnostics
 from app.utils.tokenizer import CustomTokenizer
+from app.workflow_profiles import (
+    CLIENT_RESOLUTION_TOOLS,
+    approval_allows_auto,
+    capture_policy_prompt,
+    continue_transition_allowed,
+    resolve_modules,
+    resolve_workflow_name,
+    resolve_workflow_profile,
+    workflow_catalog_payload,
+    workflow_prompt,
+)
 
 try:
     # Prefer top-level import when available
@@ -194,7 +215,7 @@ from starlette.concurrency import run_in_threadpool
 # startup latency. We import it lazily inside the endpoints that use it.
 import subprocess
 import sys
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 from uuid import uuid4
 from app.utils.telemetry import get_request_id
 from app.utils.event_broker import BrokerEvent, EventBroker
@@ -238,6 +259,48 @@ from app.model_registry import (
 
 logger = logging.getLogger(__name__)
 
+
+OPENAI_MODELS_CACHE_TTL_SECONDS = 15 * 60
+_openai_models_cache: Dict[str, Dict[str, Any]] = {}
+_openai_models_cache_lock = threading.Lock()
+
+
+def _openai_models_cache_key(base_url: str, api_key: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(base_url.strip().encode("utf-8"))
+    digest.update(b"\n")
+    digest.update(api_key.strip().encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _get_cached_openai_models(base_url: str, api_key: str) -> Optional[List[str]]:
+    cache_key = _openai_models_cache_key(base_url, api_key)
+    now = time.monotonic()
+    with _openai_models_cache_lock:
+        stale_keys = [
+            key
+            for key, entry in _openai_models_cache.items()
+            if now - float(entry.get("fetched_at", 0.0))
+            >= OPENAI_MODELS_CACHE_TTL_SECONDS
+        ]
+        for key in stale_keys:
+            _openai_models_cache.pop(key, None)
+        entry = _openai_models_cache.get(cache_key)
+        if not entry:
+            return None
+        models = entry.get("models", [])
+        return list(models) if isinstance(models, list) else None
+
+
+def _store_cached_openai_models(base_url: str, api_key: str, models: List[str]) -> None:
+    cache_key = _openai_models_cache_key(base_url, api_key)
+    with _openai_models_cache_lock:
+        _openai_models_cache[cache_key] = {
+            "models": list(models),
+            "fetched_at": time.monotonic(),
+        }
+
+
 router = APIRouter()
 llm_service = LLMService()
 livekit_service = LiveKitService(app_config.load_config())
@@ -278,6 +341,7 @@ def _notifications_buffer():
 
 
 _MAX_AGENT_HISTORY = 120
+_TOOL_PLACEHOLDER_RE = re.compile(r"\[\[tool_call:\d+\]\]")
 
 
 def _ensure_agent_console_state(app) -> dict:
@@ -293,6 +357,151 @@ def _ensure_agent_console_state(app) -> dict:
 def _get_action_history_service(app):
     service = getattr(app.state, "action_history_service", None)
     return service if service is not None else None
+
+
+def _get_computer_service(app) -> ComputerService:
+    service = getattr(app.state, "computer_service", None)
+    if isinstance(service, ComputerService):
+        return service
+    config_payload = getattr(app.state, "config", None)
+    service = get_computer_service(
+        config_payload if isinstance(config_payload, dict) else None
+    )
+    app.state.computer_service = service
+    return service
+
+
+async def _invoke_registered_tool_in_thread(
+    app,
+    *,
+    name: str,
+    user: str,
+    signature: str,
+    action_context: Optional[Dict[str, Any]] = None,
+    args: Optional[Dict[str, Any]] = None,
+):
+    manager = getattr(app.state, "memory_manager", None)
+    if manager is None:
+        raise RuntimeError("memory manager not available")
+    tool_args = dict(args or {})
+    return await run_in_threadpool(
+        manager.invoke_tool,
+        name,
+        user=user,
+        signature=signature,
+        _action_context=action_context,
+        **tool_args,
+    )
+
+
+def _get_capture_service(app) -> CaptureService:
+    service = getattr(app.state, "capture_service", None)
+    if isinstance(service, CaptureService):
+        return service
+    config_payload = getattr(app.state, "config", None)
+    service = get_capture_service(
+        config_payload if isinstance(config_payload, dict) else None
+    )
+    app.state.capture_service = service
+    return service
+
+
+def _capture_policy_settings() -> Dict[str, Any]:
+    settings_payload = user_settings.load_settings()
+    try:
+        retention_days = max(
+            0, int(settings_payload.get("capture_retention_days") or 7)
+        )
+    except Exception:
+        retention_days = 7
+    sensitivity = (
+        str(settings_payload.get("capture_default_sensitivity") or "personal")
+        .strip()
+        .lower()
+        or "personal"
+    )
+    return {
+        "retention_days": retention_days,
+        "default_sensitivity": sensitivity,
+        "allow_raw_image_access": bool(
+            settings_payload.get("capture_allow_model_raw_image_access", True)
+        ),
+        "allow_summary_fallback": bool(
+            settings_payload.get("capture_allow_summary_fallback", True)
+        ),
+    }
+
+
+def _default_workflow_name() -> str:
+    settings_payload = user_settings.load_settings()
+    return resolve_workflow_name(settings_payload.get("default_workflow"))
+
+
+def _default_enabled_modules() -> List[str]:
+    settings_payload = user_settings.load_settings()
+    modules = settings_payload.get("enabled_workflow_modules")
+    return [str(item).strip() for item in (modules or []) if str(item).strip()]
+
+
+def _approval_level_setting() -> str:
+    settings_payload = user_settings.load_settings()
+    return str(settings_payload.get("approval_level") or "all").strip().lower() or "all"
+
+
+def _computer_request_config(
+    payload: Optional[ComputerConfig],
+) -> Optional[Dict[str, Any]]:
+    if payload is None or not payload.enabled:
+        return None
+    display = payload.display if isinstance(payload.display, object) else None
+    width = getattr(display, "width", 1280) if display is not None else 1280
+    height = getattr(display, "height", 720) if display is not None else 720
+    return {
+        "enabled": True,
+        "runtime": str(payload.runtime or "browser").strip() or "browser",
+        "session_id": str(payload.session_id or "").strip() or None,
+        "start_url": str(payload.start_url or "").strip() or None,
+        "allowed_domains": [
+            str(item) for item in (payload.allowed_domains or []) if str(item).strip()
+        ],
+        "allowed_apps": [
+            str(item) for item in (payload.allowed_apps or []) if str(item).strip()
+        ],
+        "native_tool_type": str(payload.native_tool_type or "").strip() or None,
+        "display": {"width": int(width), "height": int(height)},
+    }
+
+
+def _workflow_request_config(
+    workflow_name: Optional[str],
+    requested_modules: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    resolved_name = resolve_workflow_name(workflow_name or _default_workflow_name())
+    modules = resolve_modules(
+        resolved_name,
+        list(_default_enabled_modules()) + list(requested_modules or []),
+    )
+    return {
+        "name": resolved_name,
+        "profile": resolve_workflow_profile(resolved_name),
+        "modules": modules,
+    }
+
+
+def _inject_session_into_tool_args(
+    tool: Dict[str, Any], session_id: Optional[str]
+) -> Dict[str, Any]:
+    if not isinstance(tool, dict):
+        return tool
+    name = str(tool.get("name") or "").strip().lower()
+    if not session_id or not name.startswith("computer."):
+        return tool
+    args = tool.get("args") if isinstance(tool.get("args"), dict) else {}
+    if args.get("session_id"):
+        return tool
+    patched = dict(tool)
+    patched["args"] = {**args, "session_id": session_id}
+    return patched
 
 
 def _current_request_id() -> Optional[str]:
@@ -333,6 +542,35 @@ def _lookup_message_runtime_hints(
                 mode_hint = raw_mode.strip()
         break
     return model_hint, mode_hint
+
+
+def _lookup_message_workflow(
+    session_id: Optional[str],
+    message_id: Optional[str],
+) -> Optional[str]:
+    if not session_id or not message_id:
+        return None
+    try:
+        conv = conversation_store.load_conversation(session_id)
+    except Exception:
+        return None
+    if not isinstance(conv, list):
+        return None
+    for item in conv:
+        if not isinstance(item, dict) or item.get("id") != message_id:
+            continue
+        meta = item.get("metadata") or {}
+        if not isinstance(meta, dict):
+            return None
+        workflow_meta = meta.get("workflow")
+        if isinstance(workflow_meta, dict):
+            name = str(workflow_meta.get("name") or "").strip()
+            return name or None
+        if isinstance(workflow_meta, str):
+            name = workflow_meta.strip()
+            return name or None
+        return None
+    return None
 
 
 def _build_action_context(
@@ -995,6 +1233,266 @@ def _pending_tool_placeholder_text(tools_used: Any) -> str:
     return f"Requested {noun} " + ", ".join(descriptors) + ". Awaiting approval."
 
 
+def _sanitize_context_message_text(text: Any) -> str:
+    if not isinstance(text, str):
+        return ""
+    cleaned = _TOOL_PLACEHOLDER_RE.sub("", text)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _tool_resolution_status(status_value: Any) -> str:
+    status_key = str(status_value or "").strip().lower()
+    if status_key in {"canceled", "cancelled"}:
+        return "cancelled"
+    if status_key in {"denied", "rejected"}:
+        return "denied"
+    if status_key in {"error", "failed", "failure"}:
+        return "error"
+    if status_key in {"timeout", "timed_out"}:
+        return "timeout"
+    if status_key in {
+        "invoked",
+        "ok",
+        "success",
+        "succeeded",
+        "complete",
+        "completed",
+    }:
+        return "invoked"
+    if status_key in {"pending", "proposed"}:
+        return status_key
+    return status_key or "proposed"
+
+
+def _tool_requires_resolution(tool: Dict[str, Any]) -> bool:
+    return _tool_resolution_status(tool.get("status")) in {"pending", "proposed"}
+
+
+def _tools_require_resolution(tools_used: Any) -> bool:
+    if not isinstance(tools_used, list):
+        return False
+    return any(
+        isinstance(tool, dict) and _tool_requires_resolution(tool)
+        for tool in tools_used
+    )
+
+
+def _compact_tool_result_text(value: Any, limit: int = 160) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    compact = " ".join(text.split())
+    if len(compact) > limit:
+        return compact[: max(0, limit - 3)].rstrip() + "..."
+    return compact
+
+
+def _tool_result_summary_excerpt(result_value: Any) -> Optional[str]:
+    if isinstance(result_value, str):
+        return _compact_tool_result_text(result_value)
+    if not isinstance(result_value, dict):
+        return None
+
+    for key in ("error", "detail", "message", "summary", "text"):
+        excerpt = _compact_tool_result_text(result_value.get(key))
+        if excerpt:
+            return excerpt
+
+    wrapped = result_value.get("data")
+    if isinstance(wrapped, dict):
+        for key in ("error", "detail", "message", "summary", "text"):
+            excerpt = _compact_tool_result_text(wrapped.get(key))
+            if excerpt:
+                return excerpt
+        count_value = wrapped.get("count")
+        if isinstance(count_value, int):
+            return f"count={count_value}"
+    if isinstance(wrapped, list) and wrapped:
+        return f"{len(wrapped)} item(s)"
+    return None
+
+
+def _tool_prompt_args_excerpt(args_value: Any, *, max_parts: int = 4) -> Optional[str]:
+    if not isinstance(args_value, dict):
+        return None
+    preferred_keys = [
+        "session_id",
+        "runtime",
+        "url",
+        "app",
+        "tool_name",
+        "query",
+        "key",
+        "window_title",
+        "path",
+    ]
+    parts: list[str] = []
+    seen: set[str] = set()
+    ordered_keys = preferred_keys + sorted(str(key) for key in args_value.keys())
+    for key in ordered_keys:
+        if key in seen or key not in args_value:
+            continue
+        seen.add(key)
+        value = args_value.get(key)
+        if value in (None, "", [], {}):
+            continue
+        if key == "actions" and isinstance(value, list):
+            parts.append(f"actions={len(value)}")
+        elif isinstance(value, bool):
+            parts.append(f"{key}={'true' if value else 'false'}")
+        elif isinstance(value, (int, float)):
+            parts.append(f"{key}={value}")
+        elif isinstance(value, str):
+            compact = " ".join(value.split())
+            if len(compact) > 40:
+                compact = compact[:37].rstrip() + "..."
+            parts.append(f"{key}={compact}")
+        elif isinstance(value, list):
+            parts.append(f"{key}={len(value)} item(s)")
+        elif isinstance(value, dict):
+            named_value = value.get("id") or value.get("name") or value.get("title")
+            if isinstance(named_value, str) and named_value.strip():
+                parts.append(f"{key}={named_value.strip()}")
+            else:
+                parts.append(f"{key}=object")
+        if len(parts) >= max_parts:
+            break
+    return ", ".join(parts) if parts else None
+
+
+def _tool_prompt_result_excerpt(tool_name: str, result_value: Any) -> Optional[str]:
+    normalized_name = _normalize_tool_name(tool_name)
+    if normalized_name in {"tool_help", "help"} and isinstance(result_value, dict):
+        wrapped = (
+            result_value.get("data")
+            if isinstance(result_value.get("data"), dict)
+            else result_value
+        )
+        tools = wrapped.get("tools") if isinstance(wrapped, dict) else None
+        count_value = wrapped.get("count") if isinstance(wrapped, dict) else None
+        if isinstance(tools, list) and tools:
+            names = [
+                str(item.get("name") or "").strip()
+                for item in tools
+                if isinstance(item, dict) and str(item.get("name") or "").strip()
+            ]
+            names = names[:4]
+            if names:
+                count_text = (
+                    str(count_value)
+                    if isinstance(count_value, int) and count_value > 0
+                    else str(len(tools))
+                )
+                return f"returned {count_text} tool(s): {', '.join(names)}"
+    return _tool_result_summary_excerpt(result_value)
+
+
+def _tool_events_prompt_lines(tool_events: Any, *, max_lines: int = 6) -> list[str]:
+    if not isinstance(tool_events, list):
+        return []
+    lines: list[str] = []
+    for tool in tool_events:
+        if not isinstance(tool, dict):
+            continue
+        name = _normalize_tool_name(tool.get("name")) or "tool"
+        status_key = _tool_resolution_status(tool.get("status"))
+        args_text = _tool_prompt_args_excerpt(tool.get("args"))
+        result_text = _tool_prompt_result_excerpt(name, tool.get("result"))
+        line_parts = [name]
+        if status_key:
+            line_parts.append(f"status={status_key}")
+        if args_text:
+            line_parts.append(f"args=({args_text})")
+        if result_text:
+            line_parts.append(f"outcome={result_text}")
+        lines.append(" ".join(line_parts))
+    if len(lines) > max_lines:
+        extra = len(lines) - max_lines
+        lines = lines[:max_lines] + [f"... {extra} more tool event(s)"]
+    return lines
+
+
+def _tool_outcome_summary_lines(tools_used: Any, *, max_lines: int = 4) -> list[str]:
+    if not isinstance(tools_used, list):
+        return []
+    lines: list[str] = []
+    for tool in tools_used:
+        if not isinstance(tool, dict):
+            continue
+        name = _normalize_tool_name(tool.get("name")) or "tool"
+        status_key = _tool_resolution_status(tool.get("status"))
+        excerpt = _tool_result_summary_excerpt(tool.get("result"))
+        if status_key == "invoked":
+            line = f"{name}: {excerpt}" if excerpt else f"{name}: invoked"
+        elif status_key in {"error", "timeout", "denied", "cancelled"}:
+            line = f"{name}: {status_key}"
+            if excerpt:
+                line = f"{line} - {excerpt}"
+        elif status_key in {"pending", "proposed"}:
+            line = f"{name}: awaiting approval"
+        else:
+            line = f"{name}: {excerpt}" if excerpt else name
+        lines.append(line)
+    if len(lines) > max_lines:
+        extra = len(lines) - max_lines
+        lines = lines[:max_lines] + [f"... {extra} more step(s)"]
+    return lines
+
+
+def _resolved_tool_summary_text(tools_used: Any) -> str:
+    lines = _tool_outcome_summary_lines(tools_used)
+    if not lines:
+        return "Tool results are available."
+    return "Tool results:\n" + "\n".join(f"- {line}" for line in lines)
+
+
+def _looks_like_computer_use_request(message: Any) -> bool:
+    text = " ".join(str(message or "").lower().split())
+    if not text:
+        return False
+    phrases = (
+        "take control of my computer",
+        "take control of the computer",
+        "control my computer",
+        "control the computer",
+        "use my computer",
+        "use the computer",
+        "computer use",
+        "desktop session",
+        "focus chrome",
+        "google chrome tab",
+        "browser tab",
+        "switch to tab",
+        "switch tabs",
+        "click on",
+        "type into",
+        "inspect the screen",
+        "check the screen",
+    )
+    return any(phrase in text for phrase in phrases)
+
+
+def _computer_use_session_guidance() -> str:
+    return (
+        "Computer-use guidance: before calling computer.observe, computer.act, "
+        "computer.navigate, computer.windows.list, computer.windows.focus, or "
+        "computer.app.launch, first call computer.session.start or reuse an "
+        "existing session ID from a prior result. For local desktop control, "
+        "prefer runtime='windows' with a stable session_id such as 'desktop'; "
+        "for isolated browser automation, prefer runtime='browser'. Reuse the "
+        "returned session_id for every follow-up computer tool call, and do not "
+        "invent fallback session IDs such as 'default' unless you created them. "
+        "For browser tasks, the usual order is: computer.session.start -> "
+        "computer.navigate -> computer.observe -> computer.act. "
+        "computer.app.launch requires an existing session_id and is not the first "
+        "step for browser runtime. Before tool results arrive, describe the plan "
+        "briefly and do not claim navigation, screenshots, embeds, or picture-in-picture "
+        "succeeded unless a successful tool result confirms them."
+    )
+
+
 def _existing_tool_signatures_for_message(
     app, session_id: str | None, message_id: str | None
 ) -> set[str]:
@@ -1069,6 +1567,7 @@ async def _register_tool_proposals(
         setattr(request.app.state, "pending_tools", registry)
 
     emitted: list[dict[str, Any]] = []
+    approval_level = _approval_level_setting()
     known_signatures = _existing_tool_signatures_for_message(
         request.app, session_id, message_id
     )
@@ -1111,6 +1610,8 @@ async def _register_tool_proposals(
         tool_payload["name"] = tool_name
         tool_payload["args"] = tool_args
         tool_payload["status"] = "proposed"
+        if approval_allows_auto(approval_level, tool_name):
+            tool_payload["approval"] = "auto"
         emitted.append(tool_payload)
 
         try:
@@ -1164,7 +1665,44 @@ async def _register_tool_proposals(
             message_id=message_id,
             request_id=proposal_id,
         )
-    _emit_tool_resolution_notification(request.app, proposals=emitted)
+        if (
+            approval_allows_auto(approval_level, tool_name)
+            and tool_name not in CLIENT_RESOLUTION_TOOLS
+        ):
+            try:
+                auto_result = await decide_tool(
+                    request,
+                    ToolDecision(
+                        request_id=proposal_id,
+                        decision="accept",
+                        args=tool_args,
+                        name=tool_name,
+                        session_id=session_id,
+                        message_id=message_id,
+                        chain_id=message_id or session_id,
+                    ),
+                )
+                resolved_status = str(auto_result.get("status") or "").strip().lower()
+                if resolved_status:
+                    tool_payload["status"] = resolved_status
+                if "result" in auto_result:
+                    tool_payload["result"] = auto_result.get("result")
+            except Exception:
+                logger.warning(
+                    "Auto-approval failed for tool %s (session=%s message=%s)",
+                    tool_name,
+                    session_id,
+                    message_id,
+                    exc_info=True,
+                )
+    _emit_tool_resolution_notification(
+        request.app,
+        proposals=[
+            item
+            for item in emitted
+            if str(item.get("status") or "").strip().lower() == "proposed"
+        ],
+    )
     return emitted
 
 
@@ -3026,6 +3564,216 @@ async def stop_dynamic_server():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/computer/capabilities")
+async def computer_capabilities(request: Request) -> Dict[str, Any]:
+    return _get_computer_service(request.app).capabilities()
+
+
+@router.post("/computer/sessions")
+async def create_computer_session(
+    request: Request,
+    payload: ComputerConfig,
+) -> Dict[str, Any]:
+    if not payload.enabled:
+        raise HTTPException(status_code=400, detail="computer.enabled must be true")
+    service = _get_computer_service(request.app)
+    created = await run_in_threadpool(
+        service.start_session,
+        runtime=payload.runtime,
+        session_id=payload.session_id,
+        start_url=payload.start_url,
+        width=payload.display.width,
+        height=payload.display.height,
+        metadata={
+            "allowed_domains": list(payload.allowed_domains or []),
+            "allowed_apps": list(payload.allowed_apps or []),
+        },
+    )
+    return {"session": created}
+
+
+@router.get("/computer/sessions/{session_id}")
+async def get_computer_session(request: Request, session_id: str) -> Dict[str, Any]:
+    session = _get_computer_service(request.app).get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Computer session not found")
+    return {"session": session}
+
+
+@router.delete("/computer/sessions/{session_id}")
+async def delete_computer_session(request: Request, session_id: str) -> Dict[str, Any]:
+    try:
+        return await run_in_threadpool(
+            _get_computer_service(request.app).stop_session,
+            session_id,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.get("/computer/screenshots/{filename}")
+async def get_computer_screenshot(request: Request, filename: str):
+    service = _get_computer_service(request.app)
+    target = (service.store.screenshot_root / Path(filename).name).resolve()
+    try:
+        target.relative_to(service.store.screenshot_root.resolve())
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid screenshot path")
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Screenshot not found")
+    return FileResponse(target)
+
+
+@router.get("/workflows/catalog")
+async def workflows_catalog():
+    return workflow_catalog_payload()
+
+
+class CapturePromotePayload(BaseModel):
+    memory_refs: List[str] = []
+
+
+@router.get("/captures")
+async def captures_list(request: Request, source: Optional[str] = None):
+    service = _get_capture_service(request.app)
+    captures = service.list_captures(source=source)
+    return {"captures": captures, "count": len(captures)}
+
+
+@router.post("/captures/upload")
+async def captures_upload(
+    request: Request,
+    file: UploadFile = UploadFileType(...),
+    source: str = Form(default="camera"),
+    sensitivity: Optional[str] = Form(default=None),
+):
+    if not str(file.content_type or "").lower().startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image captures are supported")
+    data = await file.read()
+    if len(data) > MAX_UPLOAD_SIZE:
+        raise HTTPException(status_code=400, detail="File too large")
+    service = _get_capture_service(request.app)
+    descriptor = service.create_capture_from_bytes(
+        data,
+        filename=Path(file.filename or "capture.png").name,
+        source=str(source or "camera").strip().lower() or "camera",
+        content_type=str(file.content_type or "image/png"),
+        capture_source=str(source or "camera").strip().lower() or "camera",
+        sensitivity=sensitivity,
+    )
+    return descriptor
+
+
+@router.get("/captures/{capture_id}")
+async def capture_get(request: Request, capture_id: str):
+    service = _get_capture_service(request.app)
+    capture = service.get_capture(capture_id)
+    if capture is None:
+        raise HTTPException(status_code=404, detail="Capture not found")
+    return {"capture": capture}
+
+
+@router.get("/captures/{capture_id}/content")
+async def capture_content(request: Request, capture_id: str):
+    service = _get_capture_service(request.app)
+    target = service.capture_path(capture_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="Capture not found")
+    return FileResponse(target)
+
+
+@router.post("/captures/{capture_id}/promote")
+async def capture_promote(
+    request: Request,
+    capture_id: str,
+    payload: CapturePromotePayload,
+    background_tasks: BackgroundTasks,
+):
+    service = _get_capture_service(request.app)
+    capture = service.get_capture(capture_id)
+    if capture is None:
+        raise HTTPException(status_code=404, detail="Capture not found")
+    existing_ref = capture.get("attachment_ref")
+    if isinstance(existing_ref, dict) and existing_ref.get("content_hash"):
+        promoted = service.mark_promoted(
+            capture_id,
+            attachment_ref=existing_ref,
+            memory_refs=list(payload.memory_refs or []),
+        )
+        return {"capture": promoted, "attachment": existing_ref}
+    target = service.capture_path(capture_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="Capture not found")
+    data = target.read_bytes()
+    filename = str(capture.get("filename") or target.name).strip() or target.name
+    content_type = (
+        str(capture.get("content_type") or "image/png").strip() or "image/png"
+    )
+    asset_info = put_asset(
+        data,
+        filename=filename,
+        origin="captured",
+    )
+    content_hash = asset_info["content_hash"]
+    url = f"/api/attachments/{content_hash}/{filename}"
+    uploaded_at = (
+        datetime.now(tz=timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    _write_attachment_meta(
+        content_hash,
+        {
+            "filename": filename,
+            "content_type": content_type,
+            "size": len(data),
+            "uploaded_at": uploaded_at,
+            "origin": "captured",
+            "relative_path": asset_info.get("relative_path"),
+            "path": asset_info.get("path"),
+            "capture_source": capture.get("capture_source") or capture.get("source"),
+            "capture_id": capture_id,
+            "capture_sensitivity": capture.get("sensitivity"),
+            "caption_status": "pending",
+            "index_status": "indexing",
+        },
+    )
+    background_tasks.add_task(
+        _index_uploaded_attachment,
+        data,
+        filename=filename,
+        content_type=content_type,
+        url=url,
+        content_hash=content_hash,
+    )
+    attachment_ref = {
+        "content_hash": content_hash,
+        "filename": filename,
+        "content_type": content_type,
+        "size": len(data),
+        "url": url,
+        "uploaded_at": uploaded_at,
+        "origin": "captured",
+        "relative_path": asset_info.get("relative_path"),
+    }
+    promoted = service.mark_promoted(
+        capture_id,
+        attachment_ref=attachment_ref,
+        memory_refs=list(payload.memory_refs or []),
+    )
+    return {"capture": promoted, "attachment": attachment_ref}
+
+
+@router.delete("/captures/{capture_id}")
+async def capture_delete(request: Request, capture_id: str):
+    service = _get_capture_service(request.app)
+    try:
+        return service.delete_capture(capture_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Capture not found")
+
+
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: Request, chat_request: ChatRequest):
     """
@@ -3056,7 +3804,9 @@ async def chat(request: Request, chat_request: ChatRequest):
                 history = conversation_store.load_conversation(session_name)
                 for entry in history:
                     role = entry.get("role")
-                    text = entry.get("text") or entry.get("content")
+                    text = _sanitize_context_message_text(
+                        entry.get("text") or entry.get("content")
+                    )
                     if not role or not text:
                         continue
                     meta = entry.get("metadata") or {}
@@ -3105,6 +3855,19 @@ async def chat(request: Request, chat_request: ChatRequest):
         metadata = {
             "timestamp": now_ts,
             "iso_timestamp": iso_timestamp,
+        }
+        workflow_config = _workflow_request_config(
+            chat_request.workflow,
+            chat_request.modules,
+        )
+        capture_policy = _capture_policy_settings()
+        metadata["workflow"] = {
+            "name": workflow_config["name"],
+            "modules": list(workflow_config["modules"]),
+        }
+        metadata["capture_policy"] = {
+            "retention_days": capture_policy["retention_days"],
+            "default_sensitivity": capture_policy["default_sensitivity"],
         }
         if incoming_attachments:
             metadata["attachments"] = incoming_attachments
@@ -3656,6 +4419,92 @@ async def chat(request: Request, chat_request: ChatRequest):
             tools=list(context.tools),
             metadata=dict(context.metadata),
         )
+        generation_ctx.metadata["workflow"] = {
+            "name": workflow_config["name"],
+            "modules": list(workflow_config["modules"]),
+        }
+        generation_ctx.metadata["capture_policy"] = dict(capture_policy)
+        generation_ctx.add_message(
+            "system",
+            workflow_prompt(
+                workflow_config["name"],
+                modules=workflow_config["modules"],
+            ),
+            metadata={"workflow": workflow_config["name"], "ephemeral": True},
+        )
+        generation_ctx.add_message(
+            "system",
+            capture_policy_prompt(
+                retention_days=int(capture_policy["retention_days"]),
+                default_sensitivity=str(capture_policy["default_sensitivity"]),
+                raw_image_access=bool(capture_policy["allow_raw_image_access"]),
+                summary_fallback=bool(capture_policy["allow_summary_fallback"]),
+            ),
+            metadata={"capture_policy": dict(capture_policy), "ephemeral": True},
+        )
+        computer_request = _computer_request_config(chat_request.computer)
+        computer_session: Optional[Dict[str, Any]] = None
+        if (
+            "computer_use" in workflow_config["modules"]
+            and not computer_request
+            and _looks_like_computer_use_request(chat_request.message)
+        ):
+            generation_ctx.add_message(
+                "system",
+                _computer_use_session_guidance(),
+                metadata={"computer_use_guidance": True, "ephemeral": True},
+            )
+        if computer_request:
+            computer_service = _get_computer_service(request.app)
+            computer_session = await run_in_threadpool(
+                computer_service.ensure_session,
+                runtime=computer_request["runtime"],
+                session_id=computer_request["session_id"],
+                start_url=computer_request["start_url"],
+                width=computer_request["display"]["width"],
+                height=computer_request["display"]["height"],
+                metadata={
+                    "allowed_domains": computer_request["allowed_domains"],
+                    "allowed_apps": computer_request["allowed_apps"],
+                    "chat_session": session_name,
+                    "message_id": message_id,
+                },
+            )
+            generation_ctx.metadata["computer"] = {
+                "enabled": True,
+                "runtime": computer_session.get("runtime"),
+                "session_id": computer_session.get("id"),
+                "start_url": computer_request["start_url"],
+            }
+            model_hint = str(chat_request.model or "").strip().lower()
+            include_native = bool(
+                mode_used == "api"
+                and (
+                    str(computer_request.get("native_tool_type") or "").strip()
+                    or model_hint.startswith("computer-use")
+                    or model_hint.startswith("computer_use")
+                )
+            )
+            generation_ctx.tools.extend(
+                computer_service.build_chat_tools(
+                    session_id=str(computer_session.get("id") or session_name),
+                    runtime=str(
+                        computer_session.get("runtime") or computer_request["runtime"]
+                    ),
+                    width=int(computer_request["display"]["width"]),
+                    height=int(computer_request["display"]["height"]),
+                    start_url=computer_request["start_url"],
+                    allowed_domains=computer_request["allowed_domains"],
+                    allowed_apps=computer_request["allowed_apps"],
+                    include_native=include_native,
+                    native_tool_type=computer_request.get("native_tool_type"),
+                )
+            )
+            metadata["computer"] = {
+                "enabled": True,
+                "runtime": computer_session.get("runtime"),
+                "session_id": computer_session.get("id"),
+            }
         if rag_prompt_text:
             generation_ctx.add_message(
                 "system",
@@ -3822,6 +4671,13 @@ async def chat(request: Request, chat_request: ChatRequest):
         try:
             generate_kwargs: Dict[str, Any] = {}
             reasoning = _reasoning_payload(chat_request.thinking)
+            if reasoning is None:
+                workflow_thinking = str(
+                    workflow_config["profile"].get("thinking_default") or "auto"
+                ).strip()
+                reasoning = _reasoning_payload(
+                    None if workflow_thinking == "auto" else workflow_thinking
+                )
             if reasoning is not None:
                 generate_kwargs["reasoning"] = reasoning
             if isinstance(provider_target, dict):
@@ -3866,30 +4722,17 @@ async def chat(request: Request, chat_request: ChatRequest):
             if isinstance(response.get("tools_used"), list)
             else []
         )
-        # Never surface "done" wording while tools are only proposed.
-        if tools_used_response:
-            text = _pending_tool_placeholder_text(tools_used_response)
-            response["text"] = text
+        text = response.get("text") or ""
+        if not tools_used_response and not text:
+            # Provide a friendlier fallback when no assistant text is returned.
             metadata = response.get("metadata")
-            metadata_update = dict(metadata) if isinstance(metadata, dict) else {}
-            metadata_update["tool_response_pending"] = True
-            response["metadata"] = metadata_update
-        else:
-            # Ensure we never return an empty string UI bubble.
-            text = response.get("text") or ""
-            if not text:
-                # Provide a friendlier fallback when no assistant text is returned.
-                metadata = response.get("metadata")
-                err = metadata.get("error") if isinstance(metadata, dict) else None
-                if not text:
-                    text = (
-                        f"I couldn't generate a reply ({err}). Please check model settings."
-                        if err
-                        else "I couldn't generate a reply. Please check model settings."
-                    )
-                response["text"] = text
-            else:
-                text = response.get("text") or ""
+            err = metadata.get("error") if isinstance(metadata, dict) else None
+            text = (
+                f"I couldn't generate a reply ({err}). Please check model settings."
+                if err
+                else "I couldn't generate a reply. Please check model settings."
+            )
+            response["text"] = text
 
         trace_source = analysis_trace or response.get("thought_trace") or []
         conversation_trace: list[dict[str, Any]] = []
@@ -3917,6 +4760,19 @@ async def chat(request: Request, chat_request: ChatRequest):
             )
 
         metadata_update = dict(response.get("metadata") or {})
+        metadata_update.setdefault(
+            "workflow",
+            {
+                "name": workflow_config["name"],
+                "modules": list(workflow_config["modules"]),
+            },
+        )
+        if computer_session:
+            metadata_update["computer"] = {
+                "enabled": True,
+                "runtime": computer_session.get("runtime"),
+                "session": computer_session,
+            }
         if isinstance(provider_target, dict):
             metadata_update.setdefault("provider", provider_target.get("provider"))
             metadata_update.setdefault("server_url", provider_target.get("base_url"))
@@ -4022,9 +4878,17 @@ async def chat(request: Request, chat_request: ChatRequest):
         # can render Accept/Deny/Edit actions before invocation.
         try:
             msg_id = message_id or None
+            tool_payloads = response.get("tools_used") or []
+            if computer_session:
+                tool_payloads = [
+                    _inject_session_into_tool_args(tool, computer_session.get("id"))
+                    if isinstance(tool, dict)
+                    else tool
+                    for tool in tool_payloads
+                ]
             response["tools_used"] = await _register_tool_proposals(
                 request,
-                tools=response.get("tools_used") or [],
+                tools=tool_payloads,
                 session_id=session_name,
                 message_id=msg_id,
                 model=chat_request.model,
@@ -4033,6 +4897,29 @@ async def chat(request: Request, chat_request: ChatRequest):
             )
         except Exception:
             pass
+        tools_used_response = (
+            response.get("tools_used")
+            if isinstance(response.get("tools_used"), list)
+            else []
+        )
+        if tools_used_response and _tools_require_resolution(tools_used_response):
+            text = _pending_tool_placeholder_text(tools_used_response)
+            response["text"] = text
+            metadata = response.get("metadata")
+            metadata_update = dict(metadata) if isinstance(metadata, dict) else {}
+            metadata_update["tool_response_pending"] = True
+            response["metadata"] = metadata_update
+        elif tools_used_response:
+            metadata = response.get("metadata")
+            metadata_update = dict(metadata) if isinstance(metadata, dict) else {}
+            metadata_update.pop("tool_response_pending", None)
+            response["metadata"] = metadata_update
+            text = response.get("text") or ""
+            if not text:
+                text = _resolved_tool_summary_text(tools_used_response)
+                response["text"] = text
+        else:
+            text = response.get("text") or text
         for task in response.get("tasks", []) or []:
             await request.app.state.pending_tasks.put(task)
             task_id = str(task.get("id") or task.get("task_id") or uuid4())
@@ -4134,6 +5021,7 @@ class ChatContinueRequest(BaseModel):
     tools: Optional[list[dict[str, Any]]] = None
     thinking: Optional[Union[bool, str]] = None
     mode: Optional[str] = None
+    workflow: Optional[str] = None
 
 
 def _extract_image_attachment_from_tool_payload(value: Any) -> Optional[Dict[str, Any]]:
@@ -4313,13 +5201,26 @@ async def chat_continue(request: Request, payload: ChatContinueRequest):
         mode_used = getattr(llm_service, "mode", "api")
 
     session_name = payload.session_id or "default"
+    current_workflow_name = _lookup_message_workflow(session_name, payload.message_id)
+    requested_workflow_name = resolve_workflow_name(
+        payload.workflow or current_workflow_name or _default_workflow_name()
+    )
+    if current_workflow_name and not continue_transition_allowed(
+        current_workflow_name,
+        requested_workflow_name,
+    ):
+        requested_workflow_name = current_workflow_name
+    workflow_config = _workflow_request_config(requested_workflow_name)
+    capture_policy = _capture_policy_settings()
     context = llm_service.get_context(session_name)
     if not context.messages:
         try:
             history = conversation_store.load_conversation(session_name)
             for entry in history:
                 role = entry.get("role")
-                text = entry.get("text") or entry.get("content")
+                text = _sanitize_context_message_text(
+                    entry.get("text") or entry.get("content")
+                )
                 if not role or not text:
                     continue
                 meta = entry.get("metadata") or {}
@@ -4340,32 +5241,40 @@ async def chat_continue(request: Request, payload: ChatContinueRequest):
         tools=list(context.tools),
         metadata=dict(context.metadata),
     )
+    generation_ctx.metadata["workflow"] = {
+        "name": workflow_config["name"],
+        "modules": list(workflow_config["modules"]),
+    }
+    generation_ctx.metadata["capture_policy"] = dict(capture_policy)
+    generation_ctx.add_message(
+        "system",
+        workflow_prompt(
+            workflow_config["name"],
+            modules=workflow_config["modules"],
+        ),
+        metadata={"workflow": workflow_config["name"], "ephemeral": True},
+    )
+    generation_ctx.add_message(
+        "system",
+        capture_policy_prompt(
+            retention_days=int(capture_policy["retention_days"]),
+            default_sensitivity=str(capture_policy["default_sensitivity"]),
+            raw_image_access=bool(capture_policy["allow_raw_image_access"]),
+            summary_fallback=bool(capture_policy["allow_summary_fallback"]),
+        ),
+        metadata={"capture_policy": dict(capture_policy), "ephemeral": True},
+    )
 
     tool_events = payload.tools or []
     tool_continue_signature = _tool_continue_signature(tool_events)
     recalled_image_attachments = _collect_tool_result_image_attachments(tool_events)
-    tool_lines: list[str] = []
+    normalized_tool_events: list[dict[str, Any]] = []
     for tool in tool_events:
         if not isinstance(tool, dict):
             continue
-        name = str(tool.get("name") or "").strip() or "tool"
-        status = str(tool.get("status") or "").strip()
-        status_key = status.lower()
-        request_id = str(tool.get("id") or tool.get("request_id") or "").strip()
-        timestamp = tool.get("timestamp")
-        timestamp_text = ""
-        if isinstance(timestamp, (int, float)):
-            try:
-                timestamp_text = (
-                    datetime.fromtimestamp(float(timestamp), tz=timezone.utc)
-                    .replace(microsecond=0)
-                    .isoformat()
-                    .replace("+00:00", "Z")
-                )
-            except Exception:
-                timestamp_text = ""
-        args = tool.get("args") if isinstance(tool.get("args"), dict) else {}
-        result = tool.get("result") if "result" in tool else None
+        normalized = dict(tool)
+        status_key = _tool_resolution_status(normalized.get("status"))
+        result = normalized.get("result") if "result" in normalized else None
         if result is None and status_key == "denied":
             result = _tool_outcome_payload("denied", "Denied by user.")
         elif result is None and status_key == "error":
@@ -4374,21 +5283,10 @@ async def chat_continue(request: Request, payload: ChatContinueRequest):
             result = _tool_outcome_payload(status_key, "Awaiting approval.")
         if result is None:
             continue
-        try:
-            args_text = json.dumps(args, ensure_ascii=False)
-        except Exception:
-            args_text = str(args)
-        try:
-            result_text = json.dumps(result, ensure_ascii=False)
-        except Exception:
-            result_text = str(result)
-        suffix = f" status={status}" if status else ""
-        request_id_suffix = f" rid={request_id}" if request_id else ""
-        timestamp_suffix = f" ts={timestamp_text}" if timestamp_text else ""
-        tool_lines.append(
-            f"- {name}{suffix}{request_id_suffix}{timestamp_suffix} "
-            f"args={args_text} result={result_text}"
-        )
+        normalized["status"] = status_key
+        normalized["result"] = result
+        normalized_tool_events.append(normalized)
+    tool_lines = _tool_events_prompt_lines(normalized_tool_events)
 
     if tool_lines:
         generation_ctx.add_message(
@@ -4396,7 +5294,11 @@ async def chat_continue(request: Request, payload: ChatContinueRequest):
             (
                 "Tool outcomes (chronological). Treat these as authoritative events. "
                 "Denied/proposed tools did not execute; invoked outcomes reflect file/system state "
-                "at their event timestamp.\n"
+                "at their event timestamp. If a tool errored, timed out, or was denied, say that "
+                "plainly and do not claim the action succeeded. Do not claim screenshots, browser "
+                "navigation, image embeds, or picture-in-picture unless the outcomes below explicitly "
+                "confirm them. Keep using the completed outcomes below instead of re-requesting the "
+                "same steps.\n"
             )
             + "\n".join(tool_lines),
             metadata={"ephemeral": True, "tool_results": True},
@@ -4432,6 +5334,13 @@ async def chat_continue(request: Request, payload: ChatContinueRequest):
     try:
         generate_kwargs: Dict[str, Any] = {}
         reasoning = _reasoning_payload(payload.thinking)
+        if reasoning is None:
+            workflow_thinking = str(
+                workflow_config["profile"].get("thinking_default") or "auto"
+            ).strip()
+            reasoning = _reasoning_payload(
+                None if workflow_thinking == "auto" else workflow_thinking
+            )
         if reasoning is not None:
             generate_kwargs["reasoning"] = reasoning
         if isinstance(provider_target, dict):
@@ -4501,6 +5410,17 @@ async def chat_continue(request: Request, payload: ChatContinueRequest):
         ):
             return False
         return _text_is_placeholders(resp.get("text") or "")
+
+    def _response_repeats_provided_tools(resp_tools: Any) -> bool:
+        if not isinstance(resp_tools, list) or not resp_tools or not provided_tool_sigs:
+            return False
+        response_sigs = {
+            _tool_signature(tool) for tool in resp_tools if isinstance(tool, dict)
+        }
+        response_sigs.discard(None)
+        if not response_sigs:
+            return False
+        return response_sigs.issubset(provided_tool_sigs)
 
     unresolved_loop_prefix = "I couldn't finish the continuation from tool results."
 
@@ -4748,22 +5668,61 @@ async def chat_continue(request: Request, payload: ChatContinueRequest):
     response_meta = (
         response.get("metadata") if isinstance(response.get("metadata"), dict) else {}
     )
-    if response_tools_used and not response_meta.get("unresolved_tool_loop"):
+    repeated_tool_requests = _response_repeats_provided_tools(response_tools_used)
+    has_unresolved_response_tools = _tools_require_resolution(response_tools_used)
+    if repeated_tool_requests:
+        repeated_names = sorted(
+            {
+                str(tool.get("name") or "").strip()
+                for tool in response_tools_used
+                if isinstance(tool, dict) and str(tool.get("name") or "").strip()
+            }
+        )
+        response_meta = dict(response_meta)
+        response_meta["repeated_tool_requests_ignored"] = True
+        if repeated_names:
+            response_meta["repeated_tool_names"] = repeated_names
+        response["metadata"] = response_meta
+        response["tools_used"] = []
+        response_tools_used = []
+        has_unresolved_response_tools = False
+    if has_unresolved_response_tools and not response_meta.get("unresolved_tool_loop"):
         text = _pending_tool_placeholder_text(response_tools_used)
         response["text"] = text
         response_meta = dict(response_meta)
         response_meta["tool_response_pending"] = True
         response["metadata"] = response_meta
     else:
+        if response_meta.get("tool_response_pending") is not None:
+            response_meta = dict(response_meta)
+            response_meta.pop("tool_response_pending", None)
+            response["metadata"] = response_meta
         text = response.get("text") or ""
         if not text:
-            if response_tools_used:
-                text = _pending_tool_placeholder_text(response_tools_used)
+            if repeated_tool_requests:
+                text = unresolved_loop_prefix
+                outcome_lines = _tool_outcome_lines(payload.tools or [])
+                if outcome_lines:
+                    text = f"{text}\n\n" + "\n".join(
+                        f"- {line}" for line in outcome_lines
+                    )
+                response_meta = dict(response.get("metadata") or {})
+                response_meta["unresolved_tool_loop"] = True
+                response["metadata"] = response_meta
+            elif response_tools_used:
+                text = _resolved_tool_summary_text(response_tools_used)
             else:
                 text = "I couldn't continue the response. Try regenerate."
             response["text"] = text
 
     metadata_update = dict(response.get("metadata") or {})
+    metadata_update.setdefault(
+        "workflow",
+        {
+            "name": workflow_config["name"],
+            "modules": list(workflow_config["modules"]),
+        },
+    )
     if isinstance(provider_target, dict):
         metadata_update.setdefault("provider", provider_target.get("provider"))
         metadata_update.setdefault("server_url", provider_target.get("base_url"))
@@ -5556,6 +6515,17 @@ class ToolDecision(BaseModel):
     chain_id: Optional[str] = None
 
 
+class ToolClientResolve(BaseModel):
+    request_id: str
+    status: Literal["invoked", "error", "denied"] = "invoked"
+    result: Optional[Dict[str, Any]] = None
+    args: Optional[Dict[str, Any]] = None
+    name: Optional[str] = None
+    session_id: Optional[str] = None
+    message_id: Optional[str] = None
+    chain_id: Optional[str] = None
+
+
 class ToolSchedule(BaseModel):
     request_id: str
     event_id: str
@@ -5587,12 +6557,13 @@ async def invoke_tool(request: Request, payload: ToolInvoke):
     try:
         _, args = normalize_and_sanitize_tool_args(payload.name, raw_args)
         signature = generate_signature(user, payload.name, args)
-        raw_result = request.app.state.memory_manager.invoke_tool(
-            payload.name,
+        raw_result = await _invoke_registered_tool_in_thread(
+            request.app,
+            name=payload.name,
             user=user,
             signature=signature,
-            _action_context=action_context,
-            **args,
+            action_context=action_context,
+            args=args,
         )
         result = _tool_outcome_payload("invoked", data=raw_result, ok=True)
         tool_invocations_total.labels(payload.name, "ok").inc()
@@ -5963,12 +6934,13 @@ async def decide_tool(request: Request, payload: ToolDecision):
         mode=rec.get("mode"),
     )
     try:
-        raw_result = request.app.state.memory_manager.invoke_tool(
-            rec["name"],
+        raw_result = await _invoke_registered_tool_in_thread(
+            request.app,
+            name=rec["name"],
             user=user,
             signature=signature,
-            _action_context=action_context,
-            **args,
+            action_context=action_context,
+            args=args,
         )
         result = _tool_outcome_payload("invoked", data=raw_result, ok=True)
         rec["status"] = "invoked"
@@ -6237,6 +7209,101 @@ async def decide_tool(request: Request, payload: ToolDecision):
         )
         rec["status"] = "error"
         return {"status": "error", "result": error_result, "error": error_text}
+
+
+@router.post("/tools/client-resolve")
+async def resolve_client_tool(request: Request, payload: ToolClientResolve):
+    registry: dict | None = getattr(request.app.state, "pending_tools", None)
+    if registry is None:
+        registry = {}
+        setattr(request.app.state, "pending_tools", registry)
+    rec = registry.get(payload.request_id)
+    if not rec:
+        recovered = _rehydrate_pending_tool(request.app, payload.request_id)
+        if recovered:
+            registry[payload.request_id] = recovered
+            rec = recovered
+    if not rec and payload.name:
+        rec = {
+            "id": payload.request_id,
+            "name": payload.name,
+            "args": payload.args or {},
+            "session_id": payload.session_id,
+            "message_id": payload.message_id,
+            "chain_id": payload.chain_id or payload.message_id or payload.session_id,
+            "status": "proposed",
+        }
+        registry[payload.request_id] = rec
+    if not rec:
+        raise HTTPException(status_code=404, detail="Request not found")
+
+    status = str(payload.status or "invoked").strip().lower()
+    result_payload = payload.result
+    if not isinstance(result_payload, dict):
+        if status == "denied":
+            result_payload = _tool_outcome_payload("denied", "Denied by user.")
+        elif status == "error":
+            result_payload = _tool_outcome_payload("error", "Tool error.")
+        else:
+            result_payload = _tool_outcome_payload("invoked", data=None, ok=True)
+    rec["status"] = status
+    try:
+        await publish_console_event(
+            request.app,
+            {
+                "type": "tool",
+                "id": payload.request_id,
+                "name": rec["name"],
+                "args": payload.args
+                if isinstance(payload.args, dict)
+                else rec.get("args", {}),
+                "result": result_payload,
+                "chain_id": rec.get("chain_id"),
+                "message_id": rec.get("message_id"),
+                "status": status,
+                "session_id": rec.get("session_id"),
+                "model": rec.get("model"),
+                "mode": rec.get("mode"),
+            },
+            default_agent=rec.get("chain_id") or rec.get("session_id"),
+        )
+    except Exception:
+        pass
+    try:
+        if rec.get("session_id") and rec.get("message_id"):
+            _append_tool_event_to_conversation(
+                rec["session_id"],
+                rec["message_id"],
+                rec["name"],
+                payload.args if isinstance(payload.args, dict) else rec.get("args", {}),
+                result_payload,
+                status=status,
+                model=rec.get("model"),
+                mode=rec.get("mode"),
+                request_id=payload.request_id,
+            )
+    except Exception:
+        pass
+    registry.pop(payload.request_id, None)
+    log_tool_event(
+        rec.get("session_id"),
+        rec["name"],
+        status,
+        args=payload.args if isinstance(payload.args, dict) else rec.get("args"),
+        result=result_payload,
+        message_id=rec.get("message_id"),
+        request_id=payload.request_id,
+    )
+    _emit_tool_hook(
+        rec["name"],
+        status,
+        args=payload.args if isinstance(payload.args, dict) else rec.get("args") or {},
+        result=result_payload,
+        session_id=rec.get("session_id"),
+        message_id=rec.get("message_id"),
+        request_id=payload.request_id,
+    )
+    return {"status": status, "result": result_payload}
 
 
 @router.post("/tools/schedule")
@@ -6678,9 +7745,13 @@ _TOOL_DISCOVERY_PROMPT_HINT = (
     "Do that before claiming a capability is unavailable. "
     "For reminders, tasks, events, or scheduled follow-ups, inspect/use create_task. "
     "For local workspace browsing or edits, inspect/use list_dir, read_file, and write_file. "
+    "For browser or desktop control, inspect/use computer.observe, computer.act, computer.navigate, "
+    "computer.windows.list, computer.windows.focus, computer.app.launch, and treat open_url as a legacy alias. "
+    "For shell commands, patches, or MCP access, inspect/use shell.exec, patch.apply, and mcp.call. "
     "For local files, use list_dir to discover paths first and keep read_file "
     "requests narrowly chunked. "
     "Check runtime and sandbox metadata before assuming Python, REPL, shell, network, or filesystem access. "
+    "Tool results may already encode error or denial details; do not keep asking for approval after a tool has already failed. "
     "Keep chatter between obvious tool steps brief."
 )
 
@@ -8475,9 +9546,7 @@ async def _refresh_sync_result_indexes(result: Dict[str, Any]) -> Dict[str, Any]
             refresh["attachments"] = {"error": str(exc)}
     if _sync_section_applied(section_results.get("calendar")):
         try:
-            refresh["calendar"] = await calendar_rag_rehydrate(
-                CalendarRagRehydrate()
-            )
+            refresh["calendar"] = await calendar_rag_rehydrate(CalendarRagRehydrate())
         except Exception as exc:
             refresh["calendar"] = {"error": str(exc)}
     if not refresh:
@@ -8490,9 +9559,7 @@ async def _refresh_sync_result_indexes(result: Dict[str, Any]) -> Dict[str, Any]
             if not text:
                 continue
             lower = text.lower()
-            if any(
-                snippet in lower for snippet in _SYNC_MANUAL_REFRESH_NOTE_SNIPPETS
-            ):
+            if any(snippet in lower for snippet in _SYNC_MANUAL_REFRESH_NOTE_SNIPPETS):
                 continue
             cleaned_notes.append(text)
     for section, refresh_result in refresh.items():
@@ -8991,10 +10058,8 @@ async def sync_plan(payload: SyncPlanRequest):
                 "workspace_mode": payload.workspace_mode,
                 "local_workspace_ids": payload.local_workspace_ids or [],
                 "remote_workspace_ids": payload.remote_workspace_ids or [],
-                "local_target_workspace_id": payload.local_target_workspace_id
-                or "",
-                "remote_target_workspace_id": payload.remote_target_workspace_id
-                or "",
+                "local_target_workspace_id": payload.local_target_workspace_id or "",
+                "remote_target_workspace_id": payload.remote_target_workspace_id or "",
             },
             exc=exc,
         )
@@ -9286,10 +10351,8 @@ async def sync_apply(request: Request, payload: SyncApplyRequest):
                 "workspace_mode": payload.workspace_mode,
                 "local_workspace_ids": payload.local_workspace_ids or [],
                 "remote_workspace_ids": payload.remote_workspace_ids or [],
-                "local_target_workspace_id": payload.local_target_workspace_id
-                or "",
-                "remote_target_workspace_id": payload.remote_target_workspace_id
-                or "",
+                "local_target_workspace_id": payload.local_target_workspace_id or "",
+                "remote_target_workspace_id": payload.remote_target_workspace_id or "",
             },
             exc=exc,
         )
@@ -9434,7 +10497,14 @@ class UserSettingsPayload(BaseModel):
     history: List[str] = []
     approval_level: str = "all"
     theme: str = "light"
+    visual_theme: str = "spring"
     action_history_retention_days: int = 7
+    capture_retention_days: int = 7
+    capture_default_sensitivity: str = "personal"
+    capture_allow_model_raw_image_access: bool = True
+    capture_allow_summary_fallback: bool = True
+    default_workflow: str = "default"
+    enabled_workflow_modules: List[str] = []
     push_enabled: bool = False
     calendar_notify_minutes: int = 5
     tool_resolution_notifications: bool = True
@@ -9475,9 +10545,26 @@ class HistoryItem(BaseModel):
 
 
 class HistoryPayload(BaseModel):
-    session_id: str = Field(alias="sessionId")
+    sessionId: str
     history: List[HistoryItem]
     model_config = ConfigDict(populate_by_name=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_session_alias(cls, value: Any):
+        if (
+            isinstance(value, dict)
+            and "sessionId" not in value
+            and "session_id" in value
+        ):
+            copied = dict(value)
+            copied["sessionId"] = copied.get("session_id")
+            return copied
+        return value
+
+    @property
+    def session_id(self) -> str:
+        return self.sessionId
 
 
 @router.get("/user-settings", response_model=UserSettingsPayload)
@@ -9517,7 +10604,7 @@ async def save_history(payload: HistoryPayload):
 @router.get("/history/{session_id}", response_model=HistoryPayload)
 async def get_history(session_id: str):
     history = conversation_store.load_conversation(session_id)
-    return HistoryPayload(session_id=session_id, history=history)
+    return HistoryPayload(sessionId=session_id, history=history)
 
 
 # ---------------------------------------------------------------------------
@@ -12739,6 +13826,7 @@ def _hf_cache_model_allowed(name: str, *, allow_extras: bool) -> bool:
         "zephyr",
     )
     allowed_exact = {
+        "gpt-5.4",
         "gpt-5.1",
         "gpt-4.1",
         "gpt-4o-mini",
@@ -13810,6 +14898,9 @@ async def openai_models(request: Request):
     if not api_key:
         raise HTTPException(status_code=400, detail="API key not configured")
     base = _responses_api_base(cfg.get("api_url"))
+    cached_models = _get_cached_openai_models(base, api_key)
+    if cached_models is not None:
+        return {"models": cached_models}
     headers = {"Authorization": f"Bearer {api_key}"}
     url = f"{base.rstrip('/')}/models"
     resp = http_session.get(url, headers=headers, timeout=10)
@@ -13828,6 +14919,7 @@ async def openai_models(request: Request):
             if isinstance(m, dict) and isinstance(m.get("id"), str) and m.get("id")
         }
     )
+    _store_cached_openai_models(base, api_key, model_ids)
     return {"models": model_ids}
 
 

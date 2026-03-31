@@ -3,7 +3,9 @@ import { useNavigate } from "react-router-dom";
 import { createPortal } from "react-dom"; // fix: portal used without import
 import "../styles/Chat.css";
 import "../styles/ToolActions.css";
+import "../styles/ToolPayload.css";
 import MediaViewer from "./MediaViewer";
+import BrowserSessionDialog from "./BrowserSessionDialog";
 import RagContextPanel, { normalizeRagMatches } from "./RagContextPanel";
 import axios from "axios";
 import { Room, RoomEvent } from "livekit-client";
@@ -18,6 +20,10 @@ import Button from "@mui/material/Button";
 import Tooltip from "@mui/material/Tooltip";
 import Divider from "@mui/material/Divider";
 import ToolEditorModal from "./ToolEditorModal";
+import ToolPayloadView, {
+  extractComputerPayload,
+  summarizeToolPayload,
+} from "./ToolPayloadView";
 import AttachFileIcon from "@mui/icons-material/AttachFile";
 import CloseIcon from "@mui/icons-material/Close";
 import SendIcon from "@mui/icons-material/Send";
@@ -32,10 +38,12 @@ import PhotoCameraIcon from "@mui/icons-material/PhotoCamera";
 import ScreenShareIcon from "@mui/icons-material/ScreenShare";
 import TuneIcon from "@mui/icons-material/Tune";
 import KeyboardArrowRightIcon from "@mui/icons-material/KeyboardArrowRight";
+import { normalizeToolDisplayMode } from "../utils/toolDisplayModes";
 import {
   buildToolContinuationSignature,
   hasMatchingToolContinuationSignature,
 } from "../utils/toolContinuations";
+import { mergeContinuationText } from "../utils/continuationText";
 
 const DEFAULT_COMPOSER_ROWS = 4;
 const MAX_COMPOSER_ROWS = 72;
@@ -45,12 +53,6 @@ const EMPTY_GLOBAL_STATE = Object.freeze({
 });
 const NOOP_SET_STATE = () => {};
 const TOOL_PLACEHOLDER_RE = /\[\[tool_call:(\d+)\]\]/g;
-const CONTINUATION_PLACEHOLDER_PATTERNS = [
-  /^Requested\s+tools?\b/i,
-  /^Tool results:/i,
-  /^Tool results are available\./i,
-  /^I couldn't finish the continuation from tool results\./i,
-];
 const VISION_WORKFLOW_OPTIONS = [
   {
     value: "auto",
@@ -509,11 +511,14 @@ const formatToolPayload = (value) => {
 
 const summarizeToolPayloadValue = (value, toolName) => {
   if (value === null || typeof value === "undefined") return "";
+  const toolLabel = typeof toolName === "string" ? toolName.toLowerCase() : "";
+  if (toolLabel.startsWith("computer.") || toolLabel === "open_url") {
+    return summarizeToolPayload(value, toolName);
+  }
   const parsed = parseToolJson(value);
   const { payload, message } = unwrapToolOutcome(parsed);
   if (message) return message;
   const normalized = parseToolJson(payload);
-  const toolLabel = typeof toolName === "string" ? toolName.toLowerCase() : "";
   if (toolLabel.includes("search") && normalized && typeof normalized === "object") {
     const query = normalized.query || normalized.search || normalized.q || "";
     const results = Array.isArray(normalized.results) ? normalized.results : null;
@@ -563,12 +568,59 @@ const mergeInlineTools = (tools, metadata) => {
 const resolveMessageTools = (msg) =>
   mergeInlineTools(msg?.tools, msg?.metadata);
 
-const mergeToolEntries = (existing, incoming, metadata) => {
+const normalizeToolResultPayload = (value) => {
+  if (typeof value !== "string") return value;
+  const trimmed = value.trim();
+  if (!trimmed) return value;
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return value;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return value;
+  }
+};
+
+const getBrowserSessionConversationContext = (msg, tool, order = 0) => {
+  if (!tool || typeof tool !== "object") return null;
+  const computer = extractComputerPayload(
+    normalizeToolResultPayload(tool.result),
+    tool.name,
+  );
+  const sessionId =
+    computer?.sessionId ||
+    (typeof tool.args?.session_id === "string" ? tool.args.session_id.trim() : "");
+  if (!sessionId) return null;
+  return {
+    ...computer,
+    sessionId,
+    messageId: msg?.id || msg?.message_id || null,
+    chainId: msg?.id || msg?.message_id || null,
+    sessionKey:
+      (typeof msg?.session_id === "string" && msg.session_id) ||
+      (typeof msg?.sessionId === "string" && msg.sessionId) ||
+      null,
+    tool,
+    message: msg,
+    order,
+  };
+};
+
+export const mergeToolEntries = (
+  existing,
+  incoming,
+  metadata,
+  options = {},
+) => {
+  const { includeInlineMetadata = true } = options || {};
   const base = (Array.isArray(existing) ? existing : [])
     .map(normalizeToolEntry)
     .filter(Boolean);
   const merged = [...base];
-  const additions = mergeInlineTools(incoming, metadata);
+  const additions = includeInlineMetadata
+    ? mergeInlineTools(incoming, metadata)
+    : (Array.isArray(incoming) ? incoming : [])
+        .map(normalizeToolEntry)
+        .filter(Boolean);
   additions.forEach((tool) => {
     const normalized = normalizeToolEntry(tool);
     if (!normalized) return;
@@ -611,6 +663,26 @@ const normalizeToolStatus = (status) => {
   return raw;
 };
 
+const getToolResultStatus = (result) => {
+  const parsed = parseToolJson(result);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "";
+  const status = normalizeToolStatus(parsed.status);
+  if (status) return status;
+  if (parsed.data && typeof parsed.data === "object" && !Array.isArray(parsed.data)) {
+    return normalizeToolStatus(parsed.data.status);
+  }
+  return "";
+};
+
+const getEffectiveToolStatus = (tool) => {
+  if (!tool || typeof tool !== "object") return "";
+  const status = normalizeToolStatus(tool.status);
+  if (status && status !== "proposed" && status !== "pending") {
+    return status;
+  }
+  return getToolResultStatus(tool.result) || status;
+};
+
 const getToolStatusDisplay = (status, statusRaw = "") => {
   switch (status) {
     case "invoked":
@@ -637,7 +709,7 @@ const getToolStatusDisplay = (status, statusRaw = "") => {
 
 const isToolReadyForContinue = (tool) => {
   if (!tool || typeof tool !== "object") return false;
-  const status = normalizeToolStatus(tool.status);
+  const status = getEffectiveToolStatus(tool);
   if (!status || status === "proposed" || status === "pending") return false;
   const hasResult = typeof tool.result !== "undefined" && tool.result !== null;
   if (hasResult) return true;
@@ -657,13 +729,6 @@ const buildToolContinuationBatch = (tools) => {
   if (!normalized.length) return null;
   if (!normalized.every(isToolReadyForContinue)) return null;
   return normalized;
-};
-
-const isContinuationPlaceholderText = (value) => {
-  if (typeof value !== "string") return false;
-  const trimmed = value.trim();
-  if (!trimmed) return false;
-  return CONTINUATION_PLACEHOLDER_PATTERNS.some((pattern) => pattern.test(trimmed));
 };
 
 const formatModelSourceLabel = (mode, model) => {
@@ -875,6 +940,7 @@ const Chat = ({
   const [collapsedTools, setCollapsedTools] = useState({});
   const [collapseAllTools, setCollapseAllTools] = useState(true);
   const thinkingMode = state.thinkingMode || "auto";
+  const workflowProfile = state.workflowProfile || "default";
   const preferredMicDeviceId = String(state.preferredMicDeviceId || "");
   const preferredCameraDeviceId = String(state.preferredCameraDeviceId || "");
   const micInputGain = clamp(Number(state.micInputGain) || 1, 0.25, 2);
@@ -882,6 +948,12 @@ const Chat = ({
   const liveCameraDefaultEnabled = state.liveCameraDefaultEnabled === true;
   const thinkingPayload =
     thinkingMode === "auto" ? {} : { thinking: thinkingMode };
+  const workflowPayload = {
+    workflow: workflowProfile,
+    modules: Array.isArray(state.enabledWorkflowModules)
+      ? state.enabledWorkflowModules
+      : [],
+  };
   const setThinkingMode = useCallback((mode) => {
     const normalized =
       mode === "high" || mode === "low" || mode === "auto" ? mode : "auto";
@@ -890,11 +962,29 @@ const Chat = ({
       return { ...prev, thinkingMode: normalized };
     });
   }, [setState]);
+  const setWorkflowProfile = useCallback((workflow) => {
+    const normalized = ["default", "architect_planner", "mini_execution"].includes(
+      workflow,
+    )
+      ? workflow
+      : "default";
+    setState((prev) => {
+      if ((prev.workflowProfile || "default") === normalized) return prev;
+      return { ...prev, workflowProfile: normalized };
+    });
+  }, [setState]);
   const mediaRecorderRef = useRef(null);
   const audioChunksRef = useRef([]);
   const activeRequestRef = useRef(null);
   const [toolEditorState, setToolEditorState] = useState(null); // { tool, onSubmit }
   const [messageEditorState, setMessageEditorState] = useState(null); // { mode: "user"|"assistant", assistantId, text }
+  const [browserSessionPopup, setBrowserSessionPopup] = useState(null);
+  const [browserPopupPendingAction, setBrowserPopupPendingAction] = useState("");
+  const [browserPopupError, setBrowserPopupError] = useState("");
+  const [browserNavigateDraft, setBrowserNavigateDraft] = useState("");
+  const [browserTypeDraft, setBrowserTypeDraft] = useState("");
+  const [browserKeyDraft, setBrowserKeyDraft] = useState("Enter");
+  const [browserSessionOverrides, setBrowserSessionOverrides] = useState({});
   const [hoverChainId, setHoverChainId] = useState(null);
   const [activeChainId, setActiveChainId] = useState(null);
   const [entryOpen, setEntryOpen] = useState(true);
@@ -907,14 +997,10 @@ const Chat = ({
   const inputOffsetRafRef = useRef(null);
   const inputOffsetTimerRef = useRef(null);
   const highlightChainId = hoverChainId || activeChainId;
-  const toolDisplayMode = useMemo(() => {
-    const raw = state.toolDisplayMode || "console";
-    const normalized = String(raw).trim().toLowerCase();
-    if (normalized === "inline" || normalized === "console") {
-      return normalized;
-    }
-    return "console";
-  }, [state.toolDisplayMode]);
+  const toolDisplayMode = useMemo(
+    () => normalizeToolDisplayMode(state.toolDisplayMode),
+    [state.toolDisplayMode],
+  );
   const toolLinkBehavior = useMemo(() => {
     const raw = state.toolLinkBehavior || "console";
     const normalized = String(raw).trim().toLowerCase();
@@ -923,7 +1009,30 @@ const Chat = ({
     }
     return "console";
   }, [state.toolLinkBehavior]);
-  const showInlineTools = toolDisplayMode === "inline";
+  const inlineToolsEnabled = toolDisplayMode !== "console";
+  const shouldShowInlineToolsForMessage = useCallback(
+    (msg, idx) => {
+      if (!inlineToolsEnabled) return false;
+      if (toolDisplayMode === "inline" || toolDisplayMode === "both") return true;
+      if (!msg?.id) return false;
+      if (activeMessageId && msg.id === activeMessageId) return true;
+      if (highlightChainId && msg.id === highlightChainId) return true;
+      return (
+        toolDisplayMode === "auto" &&
+        isStreaming &&
+        msg.role === "ai" &&
+        idx === state.conversation.length - 1
+      );
+    },
+    [
+      activeMessageId,
+      highlightChainId,
+      inlineToolsEnabled,
+      isStreaming,
+      state.conversation.length,
+      toolDisplayMode,
+    ],
+  );
   const activeModeModel = useMemo(
     () => resolveModeModel(state.backendMode, state),
     [state.backendMode, state.apiModel, state.localModel, state.transformerModel],
@@ -940,12 +1049,48 @@ const Chat = ({
     return ids;
   }, [thoughts]);
   const hasAnyTools = useMemo(() => {
-    if (!showInlineTools) return false;
+    if (!inlineToolsEnabled) return false;
     if (!Array.isArray(state.conversation) || state.conversation.length === 0) {
       return false;
     }
-    return state.conversation.some((msg) => resolveMessageTools(msg).length > 0);
-  }, [showInlineTools, state.conversation]);
+    return state.conversation.some(
+      (msg, idx) =>
+        shouldShowInlineToolsForMessage(msg, idx) &&
+        resolveMessageTools(msg).length > 0,
+    );
+  }, [inlineToolsEnabled, shouldShowInlineToolsForMessage, state.conversation]);
+  const browserSessionContexts = useMemo(() => {
+    const sessions = new Map();
+    let order = 0;
+    (Array.isArray(state.conversation) ? state.conversation : []).forEach((msg) => {
+      resolveMessageTools(msg).forEach((tool) => {
+        const context = getBrowserSessionConversationContext(msg, tool, order);
+        order += 1;
+        if (!context?.sessionId) return;
+        const override = browserSessionOverrides[context.sessionId];
+        const merged = override ? { ...context, ...override } : context;
+        const existing = sessions.get(context.sessionId);
+        if (!existing || merged.order >= existing.order) {
+          sessions.set(context.sessionId, merged);
+        }
+      });
+    });
+    Object.entries(browserSessionOverrides).forEach(([sessionId, context]) => {
+      if (!sessionId || !context) return;
+      const existing = sessions.get(sessionId);
+      if (!existing || (context.order ?? Number.MAX_SAFE_INTEGER) >= existing.order) {
+        sessions.set(sessionId, { ...existing, ...context, sessionId });
+      }
+    });
+    return sessions;
+  }, [browserSessionOverrides, state.conversation]);
+  const activeBrowserSession = useMemo(() => {
+    const sessionId =
+      browserSessionPopup && typeof browserSessionPopup.sessionId === "string"
+        ? browserSessionPopup.sessionId
+        : "";
+    return sessionId ? browserSessionContexts.get(sessionId) || null : null;
+  }, [browserSessionContexts, browserSessionPopup]);
   const baseTimeoutSec = useMemo(() => {
     const fromState = Number(state.requestTimeoutSec);
     if (Number.isFinite(fromState) && fromState > 0) {
@@ -3200,6 +3345,23 @@ const Chat = ({
     return () => document.removeEventListener("click", handleOutsideClick);
   }, [setActiveMessageId]);
 
+  useEffect(() => {
+    if (!activeBrowserSession?.sessionId) return;
+    setBrowserNavigateDraft(activeBrowserSession.currentUrl || "");
+  }, [activeBrowserSession?.currentUrl, activeBrowserSession?.sessionId]);
+
+  useEffect(() => {
+    if (!browserSessionPopup) return undefined;
+    const handleEscape = (event) => {
+      if (event.key !== "Escape") return;
+      setBrowserSessionPopup(null);
+      setBrowserPopupError("");
+      setBrowserPopupPendingAction("");
+    };
+    document.addEventListener("keydown", handleEscape);
+    return () => document.removeEventListener("keydown", handleEscape);
+  }, [browserSessionPopup]);
+
   // Ensure only one hover timer is ever active and clear on state changes
   useEffect(() => {
     if (entryHoverTimer.current) {
@@ -3539,6 +3701,9 @@ const Chat = ({
         origin: a.origin || null,
         relative_path: a.relative_path || a.relativePath || null,
         capture_source: a.capture_source || a.captureSource || null,
+        capture_id: a.capture_id || a.captureId || null,
+        transient: a.transient === true,
+        expires_at: a.expires_at || null,
         caption_status: a.caption_status || null,
         index_status: a.index_status || null,
         placeholder_caption: a.placeholder_caption ?? null,
@@ -3553,23 +3718,29 @@ const Chat = ({
           size,
           content_hash,
           origin,
-          relative_path,
-          capture_source,
-          caption_status,
-          index_status,
-          placeholder_caption,
-        }) => ({
+           relative_path,
+           capture_source,
+           capture_id,
+           transient,
+           expires_at,
+           caption_status,
+           index_status,
+           placeholder_caption,
+         }) => ({
         name,
         type,
         url,
         size,
         content_hash,
           origin,
-          relative_path,
-          capture_source,
-          caption_status,
-          index_status,
-          placeholder_caption,
+           relative_path,
+           capture_source,
+           capture_id,
+           transient,
+           expires_at,
+           caption_status,
+           index_status,
+           placeholder_caption,
         }),
       )
       .filter((att) => !!att.url);
@@ -3581,19 +3752,25 @@ const Chat = ({
           type,
           remoteUrl,
           size,
-          content_hash,
-          origin,
-          relative_path,
-          capture_source,
-        }) => ({
+           content_hash,
+           origin,
+           relative_path,
+           capture_source,
+           capture_id,
+           transient,
+           expires_at,
+         }) => ({
         name,
         type,
         url: remoteUrl,
         size,
         content_hash,
-          origin,
-          relative_path,
-          capture_source,
+           origin,
+           relative_path,
+           capture_source,
+           capture_id,
+           transient,
+           expires_at,
         }),
       );
     // Do not block chat when API provider check is offline; attempt anyway.
@@ -3707,6 +3884,7 @@ const Chat = ({
                 message_id: msgId,
                 attachments: apiAttachments,
                 vision_workflow: effectiveVisionWorkflow,
+                ...workflowPayload,
                 ...thinkingPayload,
               },
               { signal: controller?.signal },
@@ -3751,6 +3929,7 @@ const Chat = ({
           model,
           attachments: apiAttachments,
           vision_workflow: effectiveVisionWorkflow,
+          ...workflowPayload,
           ...thinkingPayload,
         };
         const r = await requestModelCompletion(payload, effectiveMessage, {
@@ -3811,7 +3990,12 @@ const Chat = ({
             if (normalized && !hasThought) thoughts.push(trimmed);
             entry.thoughts = thoughts;
           }
-          const mergedTools = mergeToolEntries(entry.tools, responseTools, responseMetadata);
+          const mergedTools = mergeToolEntries(
+            entry.tools,
+            responseTools,
+            responseMetadata,
+            { includeInlineMetadata: false },
+          );
           if (mergedTools.length) {
             entry.tools = mergedTools;
           }
@@ -3992,6 +4176,9 @@ const Chat = ({
         origin: att.origin || null,
         relative_path: att.relative_path || att.relativePath || null,
         capture_source: att.capture_source || att.captureSource || null,
+        capture_id: att.capture_id || att.captureId || null,
+        transient: att.transient === true,
+        expires_at: att.expires_at || null,
       }));
     const previousVisionWorkflow =
       state.conversation[idx - 1]?.metadata?.vision?.workflow || "auto";
@@ -4022,6 +4209,7 @@ const Chat = ({
               message_id: msg.id,
               attachments: previousAttachments,
               vision_workflow: previousVisionWorkflow,
+              ...workflowPayload,
               ...thinkingPayload,
             },
             { signal: controller?.signal },
@@ -4056,6 +4244,7 @@ const Chat = ({
           model,
           attachments: previousAttachments,
           vision_workflow: previousVisionWorkflow,
+          ...workflowPayload,
           ...thinkingPayload,
         };
         const r = await requestModelCompletion(payload, userText, {
@@ -4121,7 +4310,12 @@ const Chat = ({
             if (normalized && !hasThought) thoughts.push(trimmed);
             entry.thoughts = thoughts;
           }
-          const mergedTools = mergeToolEntries(entry.tools, responseTools, responseMetadata);
+          const mergedTools = mergeToolEntries(
+            entry.tools,
+            responseTools,
+            responseMetadata,
+            { includeInlineMetadata: false },
+          );
           if (mergedTools.length) {
             entry.tools = mergedTools;
           }
@@ -4261,6 +4455,10 @@ const Chat = ({
           typeof overrideTarget?.model === "string"
             ? overrideTarget.model.trim()
             : "";
+        const overrideWorkflow =
+          typeof overrideTarget?.workflow === "string"
+            ? overrideTarget.workflow.trim()
+            : "";
         const continueTarget = resolveModeModel(
           overrideMode || state.backendMode,
           state,
@@ -4306,11 +4504,16 @@ const Chat = ({
               })
           : [];
         const toolContinueSignature = buildToolContinuationSignature(toolPayload);
+        const semanticToolContinueSignature = buildToolContinuationSignature(
+          toolPayload,
+          { includeIds: false },
+        );
         const res = await axios.post("/api/chat/continue", {
           session_id: state.sessionId,
           message_id: msg.id,
           model: resolvedModel,
           mode: resolvedMode,
+          workflow: overrideWorkflow || workflowProfile,
           // Provide fallback results so denials can still unblock continuation.
           tools: toolPayload,
           ...thinkingPayload,
@@ -4327,16 +4530,11 @@ const Chat = ({
           const mIdx = updated.findIndex((m) => m && m.id === msg.id);
           if (mIdx !== -1) {
             const existingText = updated[mIdx]?.text || "";
-            const existingTrimmed = existingText.trim();
-            const placeholder = isContinuationPlaceholderText(existingTrimmed);
-            const joined =
-              placeholder && aiContinuation
-                ? aiContinuation
-                : existingText && existingTrimmed
-                ? aiContinuation
-                  ? `${existingText}\n\n${aiContinuation}`.trim()
-                  : existingText
-                : aiContinuation;
+            const joined = mergeContinuationText(
+              existingText,
+              aiContinuation,
+              updated[mIdx]?.metadata,
+            );
             const existingTools = Array.isArray(updated[mIdx]?.tools) ? [...updated[mIdx].tools] : [];
             const mergedTools = [...existingTools];
             returnedTools.forEach((tool) => {
@@ -4379,6 +4577,13 @@ const Chat = ({
                 ...(toolContinueSignature && !md?.tool_continue_signature
                   ? { tool_continue_signature: toolContinueSignature }
                   : {}),
+                ...(semanticToolContinueSignature &&
+                !md?.tool_continue_semantic_signature
+                  ? {
+                      tool_continue_semantic_signature:
+                        semanticToolContinueSignature,
+                    }
+                  : {}),
               },
             };
             if (typeof continuationThought === "string" && continuationThought.trim()) {
@@ -4399,18 +4604,9 @@ const Chat = ({
           const hist = Array.isArray(prev.history) ? [...prev.history] : [];
           if (hist.length && hist[hist.length - 1].role === "ai") {
             const last = hist[hist.length - 1].text || "";
-            const lastTrimmed = String(last || "").trim();
-            const placeholder = isContinuationPlaceholderText(lastTrimmed);
             hist[hist.length - 1] = {
               role: "ai",
-              text:
-                placeholder && aiContinuation
-                  ? aiContinuation
-                  : last && lastTrimmed
-                  ? aiContinuation
-                    ? `${last}\n\n${aiContinuation}`.trim()
-                    : last
-                  : aiContinuation,
+              text: mergeContinuationText(last, aiContinuation),
             };
           } else if (aiContinuation) {
             hist.push({ role: "ai", text: aiContinuation });
@@ -4460,7 +4656,14 @@ const Chat = ({
       const tools = Array.isArray(toolsOverride) ? toolsOverride : msgBase.tools;
       const batch = buildToolContinuationBatch(tools);
       if (!batch) return;
-      if (hasMatchingToolContinuationSignature(msgBase.metadata, batch)) return;
+      if (
+        hasMatchingToolContinuationSignature(msgBase.metadata, batch) ||
+        hasMatchingToolContinuationSignature(msgBase.metadata, batch, {
+          includeIds: false,
+        })
+      ) {
+        return;
+      }
       toolContinueLocksRef.current.add(msgBase.id);
       try {
         await continueGenerating(
@@ -4565,21 +4768,194 @@ const Chat = ({
       const toolId = el.getAttribute("data-tool-id") || null;
       const chainId = el.getAttribute("data-chain-id") || null;
       const wantsInline = toolLinkBehavior === "inline";
-      const canShowInline = wantsInline && showInlineTools && chainId;
+      const canShowInline = wantsInline && inlineToolsEnabled && chainId;
       if (canShowInline) {
+        setActiveMessageId && setActiveMessageId(chainId);
         setCollapsedTools((prev) => ({
           ...prev,
           [chainId]: false,
         }));
+        return;
       }
-      if ((!canShowInline || !showInlineTools) && typeof onOpenConsole === "function") {
+      if ((!canShowInline || !inlineToolsEnabled) && typeof onOpenConsole === "function") {
         onOpenConsole({
           toolId,
           chainId,
         });
       }
     },
-    [onOpenConsole, showInlineTools, toolLinkBehavior],
+    [inlineToolsEnabled, onOpenConsole, setActiveMessageId, toolLinkBehavior],
+  );
+
+  const openBrowserSessionInspector = useCallback((computer) => {
+    const sessionId =
+      computer && typeof computer.sessionId === "string" ? computer.sessionId.trim() : "";
+    if (!sessionId) return;
+    setBrowserSessionPopup({ sessionId });
+    setBrowserPopupError("");
+    setBrowserPopupPendingAction("");
+    setBrowserNavigateDraft(computer.currentUrl || "");
+    setBrowserTypeDraft("");
+    setBrowserKeyDraft("Enter");
+  }, []);
+
+  const invokeBrowserSessionTool = useCallback(
+    async (toolName, args = {}) => {
+      if (!activeBrowserSession?.sessionId) {
+        throw new Error("Browser session is unavailable.");
+      }
+      const payload = {
+        name: toolName,
+        args: {
+          session_id: activeBrowserSession.sessionId,
+          ...args,
+        },
+        session_id:
+          activeBrowserSession.sessionKey || state.sessionId || activeBrowserSession.sessionId,
+        message_id: activeBrowserSession.messageId || undefined,
+        chain_id: activeBrowserSession.chainId || undefined,
+      };
+      const resp = await axios.post("/api/tools/invoke", payload);
+      const result = resp?.data?.result;
+      const computer = extractComputerPayload(result, toolName);
+      if (computer?.sessionId) {
+        setBrowserSessionOverrides((prev) => ({
+          ...prev,
+          [computer.sessionId]: {
+            ...prev[computer.sessionId],
+            ...activeBrowserSession,
+            ...computer,
+            attachment: computer.attachment || activeBrowserSession?.attachment || null,
+            summary: computer.summary || activeBrowserSession?.summary || "",
+            order: Date.now(),
+          },
+        }));
+      }
+      return result;
+    },
+    [activeBrowserSession, state.sessionId],
+  );
+
+  const runBrowserSessionAction = useCallback(async (actionLabel, callback) => {
+    setBrowserPopupPendingAction(actionLabel);
+    setBrowserPopupError("");
+    try {
+      await callback();
+    } catch (err) {
+      console.error(`Browser popup action failed: ${actionLabel}`, err);
+      const detail =
+        err?.response?.data?.detail ||
+        err?.response?.data?.message ||
+        err?.message ||
+        "Browser action failed.";
+      setBrowserPopupError(String(detail));
+    } finally {
+      setBrowserPopupPendingAction("");
+    }
+  }, []);
+
+  const handleBrowserPopupObserve = useCallback(() => {
+    if (!activeBrowserSession?.sessionId || browserPopupPendingAction) return;
+    void runBrowserSessionAction("observe", async () => {
+      await invokeBrowserSessionTool("computer.observe");
+    });
+  }, [
+    activeBrowserSession,
+    browserPopupPendingAction,
+    invokeBrowserSessionTool,
+    runBrowserSessionAction,
+  ]);
+
+  const handleBrowserPopupNavigate = useCallback(
+    (event) => {
+      event?.preventDefault?.();
+      const targetUrl = browserNavigateDraft.trim();
+      if (!targetUrl || browserPopupPendingAction) return;
+      void runBrowserSessionAction("navigate", async () => {
+        await invokeBrowserSessionTool("computer.navigate", { url: targetUrl });
+      });
+    },
+    [
+      browserNavigateDraft,
+      browserPopupPendingAction,
+      invokeBrowserSessionTool,
+      runBrowserSessionAction,
+    ],
+  );
+
+  const handleBrowserPopupType = useCallback(
+    (event) => {
+      event?.preventDefault?.();
+      const text = browserTypeDraft;
+      if (!text || browserPopupPendingAction) return;
+      void runBrowserSessionAction("type", async () => {
+        await invokeBrowserSessionTool("computer.act", {
+          actions: [{ type: "type", text }],
+        });
+      });
+    },
+    [
+      browserPopupPendingAction,
+      browserTypeDraft,
+      invokeBrowserSessionTool,
+      runBrowserSessionAction,
+    ],
+  );
+
+  const handleBrowserPopupKeypress = useCallback(
+    (event) => {
+      event?.preventDefault?.();
+      const keys = browserKeyDraft.trim();
+      if (!keys || browserPopupPendingAction) return;
+      void runBrowserSessionAction("keypress", async () => {
+        await invokeBrowserSessionTool("computer.act", {
+          actions: [{ type: "keypress", keys }],
+        });
+      });
+    },
+    [
+      browserKeyDraft,
+      browserPopupPendingAction,
+      invokeBrowserSessionTool,
+      runBrowserSessionAction,
+    ],
+  );
+
+  const handleBrowserPreviewClick = useCallback(
+    (event) => {
+      if (!activeBrowserSession?.sessionId || browserPopupPendingAction) return;
+      const img = event.currentTarget;
+      const rect = img.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      const width = img.naturalWidth || activeBrowserSession.session?.width || 0;
+      const height = img.naturalHeight || activeBrowserSession.session?.height || 0;
+      if (!width || !height) return;
+      const x = Math.max(
+        0,
+        Math.min(
+          width,
+          Math.round(((event.clientX - rect.left) / rect.width) * width),
+        ),
+      );
+      const y = Math.max(
+        0,
+        Math.min(
+          height,
+          Math.round(((event.clientY - rect.top) / rect.height) * height),
+        ),
+      );
+      void runBrowserSessionAction("click", async () => {
+        await invokeBrowserSessionTool("computer.act", {
+          actions: [{ type: "click", x, y, button: "left" }],
+        });
+      });
+    },
+    [
+      activeBrowserSession,
+      browserPopupPendingAction,
+      invokeBrowserSessionTool,
+      runBrowserSessionAction,
+    ],
   );
 
   const handleInlineToolKeyDown = useCallback(
@@ -4766,6 +5142,7 @@ const Chat = ({
     const url = URL.createObjectURL(file);
     const origin = options.origin || "upload";
     const captureSource = options.captureSource || null;
+    const isTransientCapture = origin === "captured";
     setAttachments((prev) => [
       ...prev,
       {
@@ -4777,20 +5154,34 @@ const Chat = ({
         contentHash: null,
         origin,
         capture_source: captureSource,
+        transient: isTransientCapture,
       },
     ]);
     try {
       const formData = new FormData();
       formData.append("file", file);
-      formData.append("origin", origin);
-      if (captureSource) {
-        formData.append("capture_source", captureSource);
+      let res;
+      if (isTransientCapture) {
+        const captureKind =
+          captureSource && String(captureSource).toLowerCase().includes("screen")
+            ? "screen"
+            : "camera";
+        formData.append("source", captureKind);
+        res = await axios.post("/api/captures/upload", formData, {
+          headers: { "Content-Type": "multipart/form-data" },
+        });
+      } else {
+        formData.append("origin", origin);
+        if (captureSource) {
+          formData.append("capture_source", captureSource);
+        }
+        res = await axios.post("/api/attachments/upload", formData, {
+          headers: { "Content-Type": "multipart/form-data" },
+        });
       }
-      const res = await axios.post("/api/attachments/upload", formData, {
-        headers: { "Content-Type": "multipart/form-data" },
-      });
       const remoteUrl = res.data?.url;
       const contentHash = res.data?.content_hash || null;
+      const captureId = res.data?.capture_id || null;
       setAttachments((prev) =>
         prev.map((a) =>
           a.id === id
@@ -4802,24 +5193,33 @@ const Chat = ({
                 origin: res.data?.origin || origin,
                 relative_path: res.data?.relative_path || "",
                 capture_source: captureSource,
+                capture_id: captureId,
+                transient:
+                  typeof res.data?.transient === "boolean"
+                    ? res.data.transient
+                    : isTransientCapture,
+                promoted: res.data?.promoted === true,
+                expires_at: res.data?.expires_at_iso || res.data?.expires_at || null,
                 index_status: res.data?.index_status || a.index_status || null,
                 caption_status: res.data?.caption_status || a.caption_status || null,
               }
             : a,
         ),
       );
-      // best-effort: record attachment in memory for future recall
-      try {
-        await axios.post("/api/memory/update/", {
-          key: "attachment",
-          value: {
-            name: file.name,
-            type: file.type,
-            size: file.size.toString(),
-            url: remoteUrl,
-          },
-        });
-      } catch (_) { /* non-fatal */ }
+      if (!isTransientCapture) {
+        // best-effort: record durable attachments in memory for future recall
+        try {
+          await axios.post("/api/memory/update/", {
+            key: "attachment",
+            value: {
+              name: file.name,
+              type: file.type,
+              size: file.size.toString(),
+              url: remoteUrl,
+            },
+          });
+        } catch (_) { /* non-fatal */ }
+      }
     } catch (err) {
       console.error("Attachment upload failed", err);
       setError(getRequestErrorDetail(err, "Attachment upload failed"));
@@ -5125,6 +5525,7 @@ const Chat = ({
                 ["mic", "mic"],
                 ["volume", "volume"],
                 ["thinking", "thinking"],
+                ["workflow", "workflow"],
               ].map(([key, label]) => (
                 <button
                   key={key}
@@ -5296,6 +5697,32 @@ const Chat = ({
                       </button>
                     ))}
                   </div>
+                </>
+              )}
+              {chatSettingsSection === "workflow" && (
+                <>
+                  <label>workflow profile</label>
+                  <div className="chat-settings-choice-row">
+                    {[
+                      ["default", "default"],
+                      ["architect_planner", "architect"],
+                      ["mini_execution", "mini"],
+                    ].map(([workflow, label]) => (
+                      <button
+                        key={workflow}
+                        type="button"
+                        className={`chat-settings-choice${
+                          workflowProfile === workflow ? " is-active" : ""
+                        }`}
+                        onClick={() => setWorkflowProfile(workflow)}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                  <span className="chat-settings-note">
+                    Default balances quality. Architect plans more. Mini is for short execution bursts.
+                  </span>
                 </>
               )}
             </div>
@@ -5474,7 +5901,7 @@ const Chat = ({
                   }
                 />
               )}
-              {showInlineTools && resolvedTools.length > 0 && (() => {
+              {shouldShowInlineToolsForMessage(msg, idx) && resolvedTools.length > 0 && (() => {
                 const toolCollapseKey = msg.id || msg.message_id || fragmentKey;
                 const toolsCollapsed = Object.prototype.hasOwnProperty.call(
                   collapsedTools,
@@ -5501,7 +5928,9 @@ const Chat = ({
                       typeof tool.status === "string" && tool.status.trim()
                         ? tool.status.trim()
                         : "";
-                    const status = normalizeToolStatus(statusRaw || "proposed");
+                    const status =
+                      getEffectiveToolStatus(tool) ||
+                      normalizeToolStatus(statusRaw || "proposed");
                     const isPending = status === "proposed" || status === "pending";
                     const statusDisplay = getToolStatusDisplay(status, statusRaw);
                     const statusTone = statusDisplay.tone;
@@ -5916,9 +6345,30 @@ const Chat = ({
                             </pre>
                           )}
                           {hasResult && (
-                            <pre className="tool-result-inline" aria-label="Tool result">
-                              {formatToolPayload(tool.result)}
-                            </pre>
+                            (() => {
+                              const toolLabel =
+                                typeof tool.name === "string" ? tool.name.toLowerCase() : "";
+                              const renderStructuredResult =
+                                toolLabel.startsWith("computer.") || toolLabel === "open_url";
+                              if (!renderStructuredResult) {
+                                return (
+                                  <pre className="tool-result-inline" aria-label="Tool result">
+                                    {formatToolPayload(tool.result)}
+                                  </pre>
+                                );
+                              }
+                              return (
+                                <div className="tool-result-inline" aria-label="Tool result">
+                                  <ToolPayloadView
+                                    value={tool.result}
+                                    toolName={tool.name}
+                                    kind="result"
+                                    compact
+                                    onOpenComputerSession={openBrowserSessionInspector}
+                                  />
+                                </div>
+                              );
+                            })()
                           )}
                         </div>
                       )}
@@ -6627,6 +7077,35 @@ const Chat = ({
         </button>
       )), document.body)}
       {chatSettingsPopover}
+      {browserSessionPopup &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <BrowserSessionDialog
+            isOpen={Boolean(browserSessionPopup)}
+            session={activeBrowserSession}
+            fallbackSessionId={browserSessionPopup?.sessionId || ""}
+            pendingAction={browserPopupPendingAction}
+            error={browserPopupError}
+            navigateDraft={browserNavigateDraft}
+            setNavigateDraft={setBrowserNavigateDraft}
+            typeDraft={browserTypeDraft}
+            setTypeDraft={setBrowserTypeDraft}
+            keyDraft={browserKeyDraft}
+            setKeyDraft={setBrowserKeyDraft}
+            onClose={() => {
+              setBrowserSessionPopup(null);
+              setBrowserPopupError("");
+              setBrowserPopupPendingAction("");
+            }}
+            onObserve={handleBrowserPopupObserve}
+            onNavigate={handleBrowserPopupNavigate}
+            onType={handleBrowserPopupType}
+            onKeypress={handleBrowserPopupKeypress}
+            onScreenshotClick={handleBrowserPreviewClick}
+            idPrefix="chat-browser-session"
+          />,
+          document.body,
+        )}
       {scrollToBottomButton &&
         createPortal(scrollToBottomButton, document.body)}
     </>

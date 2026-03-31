@@ -179,4 +179,75 @@ describe("Full Auto tool loop", () => {
       expect(axiosMocks.post.mock.calls.filter(([url]) => url === "/api/chat/continue")).toHaveLength(2),
     );
   });
+
+  test("does not auto-continue the same semantic tool batch twice when request ids change", async () => {
+    axiosMocks.get.mockResolvedValue({ data: { agents: [] } });
+    axiosMocks.post.mockImplementation((url) => {
+      if (url === "/api/tools/decision") {
+        return Promise.resolve({
+          data: {
+            status: "invoked",
+            result: { status: "invoked", ok: true, message: null, data: { ok: true } },
+          },
+        });
+      }
+      if (url === "/api/chat/continue") {
+        return Promise.resolve({ data: { message: "done", metadata: {}, tools_used: [] } });
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    const { default: App } = await import("../App");
+    render(<App />);
+
+    await waitFor(() => expect(wsInstances.length).toBeGreaterThan(0));
+    const ws = wsInstances[0];
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const emitResolvedTool = async (id) => {
+      await act(async () => {
+        ws.emit({
+          type: "tool",
+          id,
+          name: "remember",
+          args: { key: "reddit_video_check", value: "same value" },
+          status: "proposed",
+          session_id: "sess-1",
+          message_id: "msg-1",
+          chain_id: "msg-1",
+        });
+        ws.emit({
+          type: "tool",
+          id,
+          name: "remember",
+          args: { key: "reddit_video_check", value: "same value" },
+          status: "invoked",
+          result: { status: "invoked", ok: true, message: null, data: "ok" },
+          session_id: "sess-1",
+          message_id: "msg-1",
+          chain_id: "msg-1",
+        });
+      });
+    };
+
+    await emitResolvedTool("tool-a");
+
+    await waitFor(() =>
+      expect(
+        axiosMocks.post.mock.calls.filter(([url]) => url === "/api/chat/continue"),
+      ).toHaveLength(1),
+    );
+
+    await emitResolvedTool("tool-b");
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+
+    expect(
+      axiosMocks.post.mock.calls.filter(([url]) => url === "/api/chat/continue"),
+    ).toHaveLength(1);
+  });
 });

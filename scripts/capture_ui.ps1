@@ -143,18 +143,36 @@ try {
   $tempProfile = Join-Path $tempProfileRoot ("profile-" + [Guid]::NewGuid().ToString("N"))
   New-Item -Path $tempProfile -ItemType Directory -Force | Out-Null
   try {
-    & $browser "--headless=new" "--disable-gpu" "--hide-scrollbars" "--no-first-run" "--no-default-browser-check" "--user-data-dir=$tempProfile" "--virtual-time-budget=$VirtualTimeMs" "--window-size=$windowSize" "--screenshot=$resolvedOutput" $targetUrl
+    $browserOutput = & $browser "--headless=new" "--disable-gpu" "--hide-scrollbars" "--no-first-run" "--no-default-browser-check" "--user-data-dir=$tempProfile" "--virtual-time-budget=$VirtualTimeMs" "--window-size=$windowSize" "--screenshot=$resolvedOutput" $targetUrl 2>&1
+    $browserExitCode = $LASTEXITCODE
   } finally {
     Remove-Item -Path $tempProfile -Recurse -Force -ErrorAction SilentlyContinue
   }
 
+  if ($browserExitCode -ne 0) {
+    $browserDetails = if ($browserOutput) {
+      ($browserOutput | Out-String).Trim()
+    } else {
+      "(no browser output)"
+    }
+    throw "Browser screenshot command failed with exit code $browserExitCode.`nBrowser: $browser`nTarget URL: $targetUrl`nOutput: $browserDetails"
+  }
+
   if (-not (Test-Path $resolvedOutput)) {
-    throw "Browser command completed but screenshot was not written: $resolvedOutput"
+    $browserDetails = if ($browserOutput) {
+      ($browserOutput | Out-String).Trim()
+    } else {
+      "(no browser output)"
+    }
+    throw "Browser command completed but screenshot was not written: $resolvedOutput`nBrowser: $browser`nTarget URL: $targetUrl`nOutput: $browserDetails"
   }
 
   Write-Host "Saved screenshot: $resolvedOutput"
   Write-Host "Target URL: $targetUrl"
   Write-Host "Browser: $browser"
+} catch {
+  [Console]::Error.WriteLine($_.Exception.Message)
+  exit 1
 } finally {
   Pop-Location
 }

@@ -26,9 +26,8 @@ This map summarises the major directories, the updated API surface, and how a ch
   - `src/components/KnowledgeTab.jsx`: Table/graph viewer
   - `src/components/ThreadsPanel.jsx`: Semantic threads UI
   - `src/styles/`: CSS modules
-- `docs/`: public architecture, setup, API reference, and feature overviews
-- `data/` (gitignored): runtime storage root for conversations, databases, uploads, downloads, and workspace files
-- `blobs/` (gitignored): legacy attachment/runtime storage that still exists for compatibility
+- `docs/`: Architecture, specs, UI mappings
+- `blobs/`, `object_store/` (gitignored): Sample storage roots for conversations/media
 
 ## API surface overview
 ### Chat & live input
@@ -90,7 +89,7 @@ This map summarises the major directories, the updated API surface, and how a ch
 - Settings allow relocating the storage root; backend updates watchers and background jobs accordingly.
 
 ## Cross references
-- `README.md` – setup, runtime modes, and release-facing notes
-- `docs/api_reference.md` – public endpoint reference
-- `docs/data_directory.md` – runtime storage layout
-- `docs/feature_overviews/README.md` – plain-language feature summaries
+- `README.md` - setup, runtime modes, and release-facing notes
+- `docs/api_reference.md` - public endpoint reference
+- `docs/data_directory.md` - runtime storage layout
+- `docs/feature_overviews/README.md` - plain-language feature summaries

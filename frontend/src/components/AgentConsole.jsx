@@ -6,8 +6,12 @@ import "../styles/Sidebar.css";
 import "../styles/ToolActions.css";
 import "../styles/ToolPayload.css";
 import ActionHistoryPanel from "./ActionHistoryPanel";
+import BrowserSessionDialog from "./BrowserSessionDialog";
 import ToolEditorModal from "./ToolEditorModal";
-import ToolPayloadView, { summarizeToolPayload } from "./ToolPayloadView";
+import ToolPayloadView, {
+  extractComputerPayload,
+  summarizeToolPayload,
+} from "./ToolPayloadView";
 import { formatLocalRuntimeLabel, isLocalRuntimeEntry } from "../utils/modelUtils";
 import {
   buildToolContinuationSignature,
@@ -17,6 +21,11 @@ import {
   handleUnifiedPress,
   supportsHoverInteractions,
 } from "../utils/pointerInteractions";
+import {
+  normalizeToolDisplayMode,
+  toolDisplayShowsConsole,
+} from "../utils/toolDisplayModes";
+import { mergeContinuationText } from "../utils/continuationText";
 
 const SIDEBAR_MIN_WIDTH = 220;
 const SIDEBAR_MAX_WIDTH = 520;
@@ -25,6 +34,56 @@ const SIDEBAR_KEYBOARD_STEP = 20;
 const SIDEBAR_KEYBOARD_STEP_FAST = 40;
 const EMPTY_GLOBAL_STATE = Object.freeze({});
 const NOOP_SET_STATE = () => {};
+const CLIENT_RESOLUTION_TOOLS = new Set(["camera.capture"]);
+const TOOL_TRUST_TIERS = {
+  "computer.observe": 1,
+  "camera.capture": 1,
+  "capture.list": 1,
+  "computer.session.start": 2,
+  "computer.session.stop": 2,
+  "computer.navigate": 2,
+  "computer.act": 2,
+  "computer.windows.list": 2,
+  "computer.windows.focus": 2,
+  "computer.app.launch": 2,
+  "capture.promote": 3,
+  "capture.delete": 3,
+  "shell.exec": 3,
+  "patch.apply": 3,
+  "mcp.call": 3,
+};
+
+const buildToolOutcomeResult = (status, message, data = null, ok = null) => {
+  const normalized = String(status || "").toLowerCase();
+  const resolvedOk =
+    typeof ok === "boolean" ? ok : normalized && !["error", "denied"].includes(normalized);
+  return {
+    status,
+    ok: Boolean(resolvedOk),
+    message: message ?? null,
+    data,
+  };
+};
+
+const fallbackResultForStatus = (toolStatus) => {
+  const normalized = String(toolStatus || "").toLowerCase();
+  if (normalized === "denied") {
+    return buildToolOutcomeResult("denied", "Denied by user.");
+  }
+  if (normalized === "error") {
+    return buildToolOutcomeResult("error", "Tool error.");
+  }
+  return undefined;
+};
+
+const shouldAutoApproveTool = (approvalLevel, toolName) => {
+  const normalizedApproval = String(approvalLevel || "all").toLowerCase();
+  if (normalizedApproval === "auto") return true;
+  if (normalizedApproval === "high") {
+    return Number(TOOL_TRUST_TIERS[toolName] || 4) <= 2;
+  }
+  return false;
+};
 
 const statusTone = (status) => {
   const key = (status || "idle").toLowerCase();
@@ -150,9 +209,61 @@ const formatModelSourceLabel = (mode, model) => {
 const normalizeToolStatus = (status) =>
   typeof status === "string" ? status.trim().toLowerCase() : "";
 
+const getToolResultStatus = (result) => {
+  if (result === null || typeof result === "undefined") return "";
+  let parsed = result;
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return "";
+    }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "";
+  return normalizeToolStatus(parsed.status);
+};
+
+const getEffectiveToolStatus = (tool) => {
+  if (!tool || typeof tool !== "object") return "";
+  const status = normalizeToolStatus(tool.status);
+  if (status && status !== "proposed" && status !== "pending") {
+    return status;
+  }
+  return getToolResultStatus(tool.result) || status;
+};
+
+const getBrowserSessionToolContext = (entry) => {
+  if (!entry || entry.type !== "tool") return null;
+  const computer = extractComputerPayload(entry.result, entry.name);
+  const sessionId =
+    computer?.sessionId ||
+    (typeof entry.args?.session_id === "string" ? entry.args.session_id.trim() : "");
+  if (!sessionId) return null;
+  const runtime =
+    computer?.runtime ||
+    (typeof entry.args?.runtime === "string" ? entry.args.runtime.trim() : "");
+  const currentUrl =
+    computer?.currentUrl ||
+    (typeof entry.args?.url === "string" ? entry.args.url.trim() : "");
+  return {
+    ...computer,
+    sessionId,
+    runtime,
+    currentUrl,
+    entry,
+    timestamp:
+      typeof entry.timestamp === "number" && Number.isFinite(entry.timestamp)
+        ? entry.timestamp
+        : 0,
+    chainId: entry.chain_id || entry.message_id || null,
+    messageId: entry.message_id || entry.chain_id || null,
+    toolName: entry.name || "",
+  };
+};
+
 const isToolReadyForContinue = (tool) => {
   if (!tool || typeof tool !== "object") return false;
-  const status = normalizeToolStatus(tool.status);
+  const status = getEffectiveToolStatus(tool);
   if (!status || status === "proposed" || status === "pending") return false;
   const hasResult = typeof tool.result !== "undefined" && tool.result !== null;
   if (hasResult) return true;
@@ -310,21 +421,19 @@ const AgentConsole = ({
       typeof state.userTimezone === "string" ? state.userTimezone.trim() : "";
     return preferred || Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
   }, [state.userTimezone]);
-  const toolDisplayMode = React.useMemo(() => {
-    const raw = state?.toolDisplayMode || "console";
-    const normalized = String(raw).trim().toLowerCase();
-    if (normalized === "inline" || normalized === "console") {
-      return normalized;
-    }
-    return "console";
-  }, [state?.toolDisplayMode]);
-  const showToolEntries = toolDisplayMode !== "inline";
+  const toolDisplayMode = React.useMemo(
+    () => normalizeToolDisplayMode(state?.toolDisplayMode),
+    [state?.toolDisplayMode],
+  );
+  const showToolEntries = toolDisplayShowsConsole(toolDisplayMode);
   const [taskQuery, setTaskQuery] = React.useState("");
   const [toolEditorState, setToolEditorState] = React.useState(null); // tool | task editor state
   const [collapsedChains, setCollapsedChains] = React.useState({});
   const [collapsedAgents, setCollapsedAgents] = React.useState({});
   const [expandedAgents, setExpandedAgents] = React.useState({});
   const [hiddenAgents, setHiddenAgents] = React.useState({});
+  const [actionHistoryCollapsed, setActionHistoryCollapsed] = React.useState(false);
+  const [actionHistoryHidden, setActionHistoryHidden] = React.useState(false);
   const [runtimeStatus, setRuntimeStatus] = React.useState(null);
   const [runtimeLoading, setRuntimeLoading] = React.useState(false);
   const [runtimeError, setRuntimeError] = React.useState("");
@@ -360,6 +469,13 @@ const AgentConsole = ({
   const [actionHistoryFeedback, setActionHistoryFeedback] = React.useState("");
   const [syncReviewPendingKey, setSyncReviewPendingKey] = React.useState("");
   const [syncReviewFeedback, setSyncReviewFeedback] = React.useState("");
+  const [syncInboxCollapsed, setSyncInboxCollapsed] = React.useState(false);
+  const [browserSessionPopup, setBrowserSessionPopup] = React.useState(null);
+  const [browserPopupPendingAction, setBrowserPopupPendingAction] = React.useState("");
+  const [browserPopupError, setBrowserPopupError] = React.useState("");
+  const [browserNavigateDraft, setBrowserNavigateDraft] = React.useState("");
+  const [browserTypeDraft, setBrowserTypeDraft] = React.useState("");
+  const [browserKeyDraft, setBrowserKeyDraft] = React.useState("Enter");
   const providerActionPending = Boolean(providerPendingAction);
   const sidebarRef = React.useRef(null);
   const focusTokenRef = React.useRef(null);
@@ -375,6 +491,7 @@ const AgentConsole = ({
   const overlapRafRef = React.useRef(null);
   const overlapTimerRef = React.useRef(null);
   const lastVerifyRef = React.useRef({ model: null, at: 0 });
+  const syncInboxInteractedRef = React.useRef(false);
   const selectedLocalProvider = React.useMemo(() => {
     const currentLocal =
       typeof state.localModel === "string" ? state.localModel.trim().toLowerCase() : "";
@@ -533,6 +650,7 @@ const AgentConsole = ({
   const showSyncInbox =
     pendingSyncReviews.length > 0 || recentSyncReviews.length > 0;
   const toolContinueLocksRef = React.useRef(new Set());
+  const autoToolResolveLocksRef = React.useRef(new Set());
 
   const formatBytes = React.useCallback((value) => {
     if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
@@ -800,6 +918,10 @@ const AgentConsole = ({
       overlapTimerRef.current = null;
       const scrollBody = scrollBodyRef.current;
       if (!scrollBody || typeof scrollBody.getBoundingClientRect !== "function") return;
+      const previousDistanceFromBottom = Math.max(
+        0,
+        scrollBody.scrollHeight - scrollBody.clientHeight - scrollBody.scrollTop,
+      );
 
       const composer =
         typeof document !== "undefined"
@@ -829,12 +951,18 @@ const AgentConsole = ({
       composerOverlapRef.current = overlapPx;
       scrollBody.style.setProperty("--composer-overlap", `${overlapPx}px`);
 
-      if (!lastScrollAtBottomRef.current) return;
-      if (typeof scrollBody.scrollTo === "function") {
-        scrollBody.scrollTo({ top: scrollBody.scrollHeight, behavior: "auto" });
-      } else {
-        scrollBody.scrollTop = scrollBody.scrollHeight;
+      if (lastScrollAtBottomRef.current) {
+        if (typeof scrollBody.scrollTo === "function") {
+          scrollBody.scrollTo({ top: scrollBody.scrollHeight, behavior: "auto" });
+        } else {
+          scrollBody.scrollTop = scrollBody.scrollHeight;
+        }
+        return;
       }
+      scrollBody.scrollTop = Math.max(
+        0,
+        scrollBody.scrollHeight - scrollBody.clientHeight - previousDistanceFromBottom,
+      );
     });
   }, []);
 
@@ -1075,10 +1203,11 @@ const AgentConsole = ({
         const mIdx = updatedConversation.findIndex((m) => m && m.id === assistantId);
         if (mIdx !== -1) {
           const existingText = updatedConversation[mIdx]?.text || "";
-          const joined =
-            existingText && existingText.trim()
-              ? `${existingText}\n\n${continuation}`.trim()
-              : continuation;
+          const joined = mergeContinuationText(
+            existingText,
+            continuation,
+            updatedConversation[mIdx]?.metadata,
+          );
           updatedConversation[mIdx] = {
             ...updatedConversation[mIdx],
             text: joined,
@@ -1095,7 +1224,7 @@ const AgentConsole = ({
           const last = hist[hist.length - 1].text || "";
           hist[hist.length - 1] = {
             role: "ai",
-            text: last && last.trim() ? `${last}\n\n${continuation}`.trim() : continuation,
+            text: mergeContinuationText(last, continuation),
           };
         } else {
           hist.push({ role: "ai", text: continuation });
@@ -1193,15 +1322,11 @@ const AgentConsole = ({
   React.useEffect(() => {
     const root = scrollBodyRef.current || sidebarRef.current;
     if (!root) return;
-    const distanceFromBottom = root.scrollHeight - root.clientHeight - root.scrollTop;
-    const nearBottom = distanceFromBottom < 120;
-    if (nearBottom || lastScrollAtBottomRef.current) {
-      if (typeof root.scrollTo === "function") {
-        root.scrollTo({ top: root.scrollHeight, behavior: "smooth" });
-      } else {
-        root.scrollTop = root.scrollHeight;
-      }
-      lastScrollAtBottomRef.current = true;
+    if (!lastScrollAtBottomRef.current) return;
+    if (typeof root.scrollTo === "function") {
+      root.scrollTo({ top: root.scrollHeight, behavior: "auto" });
+    } else {
+      root.scrollTop = root.scrollHeight;
     }
   }, [agents]);
 
@@ -1355,7 +1480,9 @@ const AgentConsole = ({
   ]);
 
   const refreshDisabled = !backendReady || (!isCalendar && loadingSnapshot);
-  const hiddenCount = Object.values(hiddenAgents).filter(Boolean).length;
+  const hiddenCount =
+    Object.values(hiddenAgents).filter(Boolean).length +
+    (showStandaloneActionHistory && actionHistoryHidden ? 1 : 0);
   const hasInlineToolActivity = React.useMemo(() => {
     if (showToolEntries) return false;
     return agents.some(
@@ -1364,6 +1491,60 @@ const AgentConsole = ({
         agent.events.some((entry) => entry && entry.type === "tool"),
     );
   }, [agents, showToolEntries]);
+  const browserSessionContexts = React.useMemo(() => {
+    const sessions = new Map();
+    agents.forEach((agent) => {
+      const events = Array.isArray(agent?.events) ? agent.events : [];
+      events.forEach((entry) => {
+        const context = getBrowserSessionToolContext(entry);
+        if (!context?.sessionId) return;
+        const existing = sessions.get(context.sessionId);
+        if (!existing || context.timestamp >= existing.timestamp) {
+          sessions.set(context.sessionId, context);
+        }
+      });
+    });
+    return sessions;
+  }, [agents]);
+  const activeBrowserSession = React.useMemo(() => {
+    const sessionId =
+      browserSessionPopup && typeof browserSessionPopup.sessionId === "string"
+        ? browserSessionPopup.sessionId
+        : "";
+    return sessionId ? browserSessionContexts.get(sessionId) || null : null;
+  }, [browserSessionContexts, browserSessionPopup]);
+  React.useEffect(() => {
+    if (!showSyncInbox) {
+      syncInboxInteractedRef.current = false;
+      setSyncInboxCollapsed(false);
+      return;
+    }
+    if (syncInboxInteractedRef.current) return;
+    setSyncInboxCollapsed(agents.length > 0 || hasInlineToolActivity);
+  }, [agents.length, hasInlineToolActivity, showSyncInbox]);
+  React.useEffect(() => {
+    if (showStandaloneActionHistory) return;
+    setActionHistoryCollapsed(false);
+    setActionHistoryHidden(false);
+  }, [showStandaloneActionHistory]);
+  React.useEffect(() => {
+    if (!activeBrowserSession?.sessionId) return;
+    setBrowserNavigateDraft(activeBrowserSession.currentUrl || "");
+  }, [activeBrowserSession?.currentUrl, activeBrowserSession?.sessionId]);
+  React.useEffect(() => {
+    if (!browserSessionPopup) return undefined;
+    const handleEscape = (event) => {
+      if (event.key === "Escape") {
+        setBrowserSessionPopup(null);
+        setBrowserPopupError("");
+        setBrowserPopupPendingAction("");
+      }
+    };
+    document.addEventListener("keydown", handleEscape);
+    return () => {
+      document.removeEventListener("keydown", handleEscape);
+    };
+  }, [browserSessionPopup]);
   const handleRefreshClick = () => {
     if (!backendReady) return;
     onRefreshAgents?.();
@@ -1389,6 +1570,7 @@ const AgentConsole = ({
   };
   const handleShowHidden = () => {
     setHiddenAgents({});
+    setActionHistoryHidden(false);
   };
 
   const ensureActionHistoryDetails = React.useCallback(
@@ -1510,6 +1692,11 @@ const AgentConsole = ({
     [backendReady, onRefreshAgents],
   );
 
+  const toggleSyncInboxCollapsed = React.useCallback(() => {
+    syncInboxInteractedRef.current = true;
+    setSyncInboxCollapsed((prev) => !prev);
+  }, []);
+
   const renderSyncInbox = React.useCallback(() => {
     if (!showSyncInbox) return null;
 
@@ -1588,7 +1775,11 @@ const AgentConsole = ({
     };
 
     return (
-      <section className="agent-sync-panel" aria-label="sync inbox">
+      <section
+        className="agent-sync-panel"
+        aria-label="sync inbox"
+        data-collapsed={syncInboxCollapsed ? "true" : "false"}
+      >
         <div className="agent-sync-panel-header">
           <div className="agent-sync-panel-title">
             <h3>sync inbox</h3>
@@ -1605,6 +1796,16 @@ const AgentConsole = ({
             <button
               type="button"
               className="agent-card-control-btn"
+              aria-expanded={!syncInboxCollapsed}
+              aria-label={syncInboxCollapsed ? "Expand sync inbox" : "Collapse sync inbox"}
+              onClick={toggleSyncInboxCollapsed}
+              title={syncInboxCollapsed ? "Expand sync inbox" : "Collapse sync inbox"}
+            >
+              {syncInboxCollapsed ? "+" : "-"}
+            </button>
+            <button
+              type="button"
+              className="agent-card-control-btn"
               onClick={() => navigate("/knowledge?tab=sync")}
             >
               Open sync
@@ -1616,12 +1817,12 @@ const AgentConsole = ({
             {syncReviewFeedback}
           </p>
         ) : null}
-        {pendingSyncReviews.length > 0 ? (
+        {!syncInboxCollapsed && pendingSyncReviews.length > 0 ? (
           <div className="agent-sync-review-list">
             {pendingSyncReviews.map((review) => renderReviewCard(review, "pending"))}
           </div>
         ) : null}
-        {recentSyncReviews.length > 0 ? (
+        {!syncInboxCollapsed && recentSyncReviews.length > 0 ? (
           <div className="agent-sync-review-history">
             <div className="agent-sync-history-label">recent decisions</div>
             <div className="agent-sync-review-list">
@@ -1637,8 +1838,10 @@ const AgentConsole = ({
     recentSyncReviews,
     showSyncInbox,
     submitSyncReviewDecision,
+    syncInboxCollapsed,
     syncReviewFeedback,
     syncReviewPendingKey,
+    toggleSyncInboxCollapsed,
   ]);
 
   const renderActionHistoryPopover = React.useCallback(
@@ -1779,8 +1982,492 @@ const AgentConsole = ({
     ],
   );
 
+  const resolveContinueTarget = React.useCallback(
+    (target) => {
+      const overrideMode =
+        typeof target?.mode === "string" ? target.mode.trim().toLowerCase() : "";
+      const overrideModel =
+        typeof target?.model === "string" ? target.model.trim() : "";
+      const overrideWorkflow =
+        typeof target?.workflow === "string" ? target.workflow.trim() : "";
+      const mode = overrideMode || (state.backendMode || "api").toLowerCase();
+      let model =
+        mode === "local"
+          ? state.localModel || state.transformerModel || state.apiModel
+          : mode === "server"
+            ? state.transformerModel || state.apiModel
+            : state.apiModel;
+      if (overrideModel) {
+        model = overrideModel;
+      }
+      return {
+        mode,
+        model,
+        workflow: overrideWorkflow || state.workflowProfile || "default",
+      };
+    },
+    [
+      state.apiModel,
+      state.backendMode,
+      state.localModel,
+      state.transformerModel,
+      state.workflowProfile,
+    ],
+  );
+
+  const maybeContinueBatch = React.useCallback(
+    async (
+      {
+        sessionId,
+        messageId,
+        toolUpdate = null,
+      },
+      continueTarget,
+      options = {},
+    ) => {
+      if (!sessionId || !messageId) return;
+      const force = options.force === true;
+      const messageEntry = conversationById.get(messageId);
+      const baseTools = Array.isArray(messageEntry?.tools) ? [...messageEntry.tools] : [];
+      const mergedTools = mergeToolUpdate(baseTools, toolUpdate);
+      if (toolUpdate) {
+        setState((prev) => {
+          const updated = Array.isArray(prev.conversation)
+            ? [...prev.conversation]
+            : [];
+          const mIdx = updated.findIndex((m) => m && m.id === messageId);
+          if (mIdx === -1) return prev;
+          const msgEntry = { ...(updated[mIdx] || {}) };
+          msgEntry.tools = mergedTools;
+          updated[mIdx] = msgEntry;
+          return { ...prev, conversation: updated };
+        });
+      }
+      const batch = buildToolContinuationBatch(mergedTools);
+      if (!batch) return;
+      const batchSignature = buildToolContinuationSignature(batch);
+      const semanticBatchSignature = buildToolContinuationSignature(batch, {
+        includeIds: false,
+      });
+      if (
+        !force &&
+        (hasMatchingToolContinuationSignature(messageEntry?.metadata, batch) ||
+          hasMatchingToolContinuationSignature(messageEntry?.metadata, batch, {
+            includeIds: false,
+          }))
+      ) {
+        return;
+      }
+      if (toolContinueLocksRef.current.has(messageId)) return;
+      toolContinueLocksRef.current.add(messageId);
+      try {
+        const thinkingValue = state.thinkingMode || "auto";
+        const thinkingPayload =
+          thinkingValue === "auto" ? {} : { thinking: thinkingValue };
+        const { mode, model, workflow } = resolveContinueTarget(continueTarget);
+        const res = await axios.post("/api/chat/continue", {
+          session_id: sessionId,
+          message_id: messageId,
+          model,
+          mode,
+          workflow,
+          ...thinkingPayload,
+          tools: batch,
+        });
+        const continuation = res.data?.message || "";
+        const md = res.data?.metadata || {};
+        if (continuation) {
+          applyContinuation(messageId, continuation, {
+            ...md,
+            ...(batchSignature && !md?.tool_continue_signature
+              ? { tool_continue_signature: batchSignature }
+              : {}),
+            ...(semanticBatchSignature &&
+            !md?.tool_continue_semantic_signature
+              ? {
+                  tool_continue_semantic_signature: semanticBatchSignature,
+                }
+              : {}),
+          });
+        }
+      } catch (err) {
+        console.error("Auto-continue failed", err);
+      } finally {
+        toolContinueLocksRef.current.delete(messageId);
+      }
+    },
+    [
+      applyContinuation,
+      conversationById,
+      resolveContinueTarget,
+      setState,
+      state.thinkingMode,
+    ],
+  );
+
+  const captureCameraToolResult = React.useCallback(async () => {
+    if (
+      typeof navigator === "undefined" ||
+      !navigator.mediaDevices ||
+      typeof navigator.mediaDevices.getUserMedia !== "function"
+    ) {
+      return buildToolOutcomeResult("error", "Camera capture is unavailable in this client.");
+    }
+    let stream = null;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: state.preferredCameraDeviceId
+          ? { deviceId: { ideal: state.preferredCameraDeviceId } }
+          : true,
+        audio: false,
+      });
+      const video = document.createElement("video");
+      video.playsInline = true;
+      video.muted = true;
+      video.srcObject = stream;
+      await video.play();
+      await new Promise((resolve) => {
+        if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+          resolve(true);
+          return;
+        }
+        video.onloadedmetadata = () => resolve(true);
+      });
+      const width = video.videoWidth || 1280;
+      const height = video.videoHeight || 720;
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        return buildToolOutcomeResult("error", "Could not access camera frame buffer.");
+      }
+      ctx.drawImage(video, 0, 0, width, height);
+      const blob = await new Promise((resolve) => {
+        canvas.toBlob(resolve, "image/png");
+      });
+      if (!(blob instanceof Blob)) {
+        return buildToolOutcomeResult("error", "Camera capture failed.");
+      }
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const file = new File([blob], `camera-tool-${stamp}.png`, {
+        type: "image/png",
+      });
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("source", "camera");
+      const res = await axios.post("/api/captures/upload", formData, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+      return buildToolOutcomeResult(
+        "invoked",
+        "Captured camera image.",
+        res.data || null,
+        true,
+      );
+    } catch (err) {
+      const detail =
+        err?.response?.data?.detail || err?.message || "Camera capture failed.";
+      return buildToolOutcomeResult("error", String(detail));
+    } finally {
+      if (stream) {
+        stream.getTracks().forEach((track) => track.stop());
+      }
+    }
+  }, [state.preferredCameraDeviceId]);
+
+  const resolveClientTool = React.useCallback(
+    async (entry) => {
+      const sessionId = entry.session_id || state.sessionId || null;
+      const messageId = entry.message_id || entry.chain_id || null;
+      let result = null;
+      let status = "error";
+      if (entry.name === "camera.capture") {
+        result = await captureCameraToolResult();
+        status = String(result?.status || "error").toLowerCase();
+      } else {
+        result = buildToolOutcomeResult(
+          "error",
+          `Client-side resolution is not implemented for ${entry.name || "this tool"}.`,
+        );
+      }
+      const resp = await axios.post("/api/tools/client-resolve", {
+        request_id: entry.id,
+        status:
+          status === "denied" || status === "error" ? status : "invoked",
+        result,
+        args: entry.args || {},
+        name: entry.name,
+        session_id: sessionId,
+        message_id: messageId,
+        chain_id: entry.chain_id || messageId || sessionId,
+      });
+      return {
+        status: String(resp?.data?.status || status || "error").toLowerCase(),
+        result:
+          typeof resp?.data?.result !== "undefined" ? resp.data.result : result,
+      };
+    },
+    [captureCameraToolResult, state.sessionId],
+  );
+
+  React.useEffect(() => {
+    if (!backendReady) return;
+    const approvalLevel = state.approvalLevel || "all";
+    const candidates = [];
+    agents.forEach((agent) => {
+      const events = Array.isArray(agent?.events) ? agent.events : [];
+      events.forEach((entry) => {
+        if (!entry || entry.type !== "tool") return;
+        const toolName = String(entry.name || "").trim();
+        if (!CLIENT_RESOLUTION_TOOLS.has(toolName)) return;
+        if (!shouldAutoApproveTool(approvalLevel, toolName)) return;
+        if (getEffectiveToolStatus(entry) !== "proposed") return;
+        const requestId = String(entry.id || entry.request_id || "").trim();
+        if (!requestId || autoToolResolveLocksRef.current.has(requestId)) return;
+        candidates.push({ requestId, entry });
+      });
+    });
+    candidates.forEach(({ requestId, entry }) => {
+      autoToolResolveLocksRef.current.add(requestId);
+      (async () => {
+        try {
+          const resp = await resolveClientTool(entry);
+          const status = String(resp?.status || "").toLowerCase();
+          const resolvedResult =
+            typeof resp?.result !== "undefined"
+              ? resp.result
+              : fallbackResultForStatus(status);
+          await maybeContinueBatch(
+            {
+              sessionId: entry.session_id || state.sessionId || null,
+              messageId: entry.message_id || entry.chain_id || null,
+              toolUpdate: {
+                id: entry.id || entry.request_id,
+                name: entry.name,
+                args: entry.args || {},
+                ...(typeof resolvedResult !== "undefined"
+                  ? { result: resolvedResult }
+                  : {}),
+                status: status || "invoked",
+              },
+            },
+            null,
+          );
+        } catch (err) {
+          console.error("Auto-resolving client tool failed", err);
+        } finally {
+          autoToolResolveLocksRef.current.delete(requestId);
+        }
+      })();
+    });
+  }, [
+    agents,
+    backendReady,
+    maybeContinueBatch,
+    resolveClientTool,
+    state.approvalLevel,
+    state.sessionId,
+  ]);
+
+  React.useEffect(() => {
+    const conversation = Array.isArray(state.conversation) ? state.conversation : [];
+    conversation.forEach((message) => {
+      if (!message || typeof message !== "object") return;
+      const metadata =
+        message.metadata && typeof message.metadata === "object" ? message.metadata : {};
+      if (!metadata.tool_response_pending) return;
+      const messageId = message.id || message.message_id || null;
+      if (!messageId) return;
+      const tools = Array.isArray(message.tools) ? message.tools : [];
+      if (!buildToolContinuationBatch(tools)) return;
+      void maybeContinueBatch(
+        {
+          sessionId: state.sessionId || null,
+          messageId,
+          toolUpdate: null,
+        },
+        metadata.continue_target || null,
+      );
+    });
+  }, [maybeContinueBatch, state.conversation, state.sessionId]);
+
+  const openBrowserSessionInspector = React.useCallback((computer) => {
+    const sessionId =
+      computer && typeof computer.sessionId === "string" ? computer.sessionId.trim() : "";
+    if (!sessionId) return;
+    setBrowserSessionPopup({ sessionId });
+    setBrowserPopupError("");
+    setBrowserPopupPendingAction("");
+    setBrowserNavigateDraft(computer.currentUrl || "");
+    setBrowserTypeDraft("");
+    setBrowserKeyDraft("Enter");
+  }, []);
+
+  const invokeBrowserSessionTool = React.useCallback(
+    async (toolName, args = {}) => {
+      if (!activeBrowserSession?.sessionId) {
+        throw new Error("Browser session is unavailable.");
+      }
+      const payload = {
+        name: toolName,
+        args: {
+          session_id: activeBrowserSession.sessionId,
+          ...args,
+        },
+        session_id:
+          activeBrowserSession.entry?.session_id || activeBrowserSession.sessionId,
+        message_id:
+          activeBrowserSession.entry?.message_id ||
+          activeBrowserSession.messageId ||
+          undefined,
+        chain_id:
+          activeBrowserSession.entry?.chain_id ||
+          activeBrowserSession.chainId ||
+          undefined,
+      };
+      const resp = await axios.post("/api/tools/invoke", payload);
+      onRefreshAgents?.();
+      return resp?.data?.result;
+    },
+    [activeBrowserSession, onRefreshAgents],
+  );
+
+  const runBrowserSessionAction = React.useCallback(
+    async (actionLabel, callback) => {
+      setBrowserPopupPendingAction(actionLabel);
+      setBrowserPopupError("");
+      try {
+        await callback();
+      } catch (err) {
+        console.error(`Browser popup action failed: ${actionLabel}`, err);
+        const detail =
+          err?.response?.data?.detail ||
+          err?.response?.data?.message ||
+          err?.message ||
+          "Browser action failed.";
+        setBrowserPopupError(String(detail));
+      } finally {
+        setBrowserPopupPendingAction("");
+      }
+    },
+    [],
+  );
+
+  const handleBrowserPopupObserve = React.useCallback(() => {
+    if (!activeBrowserSession?.sessionId || browserPopupPendingAction) return;
+    void runBrowserSessionAction("observe", async () => {
+      await invokeBrowserSessionTool("computer.observe");
+    });
+  }, [
+    activeBrowserSession,
+    browserPopupPendingAction,
+    invokeBrowserSessionTool,
+    runBrowserSessionAction,
+  ]);
+
+  const handleBrowserPopupNavigate = React.useCallback(
+    (event) => {
+      event?.preventDefault?.();
+      const targetUrl = browserNavigateDraft.trim();
+      if (!targetUrl || browserPopupPendingAction) return;
+      void runBrowserSessionAction("navigate", async () => {
+        await invokeBrowserSessionTool("computer.navigate", { url: targetUrl });
+      });
+    },
+    [
+      browserNavigateDraft,
+      browserPopupPendingAction,
+      invokeBrowserSessionTool,
+      runBrowserSessionAction,
+    ],
+  );
+
+  const handleBrowserPopupType = React.useCallback(
+    (event) => {
+      event?.preventDefault?.();
+      const text = browserTypeDraft;
+      if (!text || browserPopupPendingAction) return;
+      void runBrowserSessionAction("type", async () => {
+        await invokeBrowserSessionTool("computer.act", {
+          actions: [{ type: "type", text }],
+        });
+      });
+    },
+    [
+      browserPopupPendingAction,
+      browserTypeDraft,
+      invokeBrowserSessionTool,
+      runBrowserSessionAction,
+    ],
+  );
+
+  const handleBrowserPopupKeypress = React.useCallback(
+    (event) => {
+      event?.preventDefault?.();
+      const keys = browserKeyDraft.trim();
+      if (!keys || browserPopupPendingAction) return;
+      void runBrowserSessionAction("keypress", async () => {
+        await invokeBrowserSessionTool("computer.act", {
+          actions: [{ type: "keypress", keys }],
+        });
+      });
+    },
+    [
+      browserKeyDraft,
+      browserPopupPendingAction,
+      invokeBrowserSessionTool,
+      runBrowserSessionAction,
+    ],
+  );
+
+  const handleBrowserPreviewClick = React.useCallback(
+    (event) => {
+      if (!activeBrowserSession?.sessionId || browserPopupPendingAction) return;
+      const img = event.currentTarget;
+      const rect = img.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      const width =
+        img.naturalWidth ||
+        activeBrowserSession.session?.width ||
+        activeBrowserSession.entry?.result?.session?.width ||
+        0;
+      const height =
+        img.naturalHeight ||
+        activeBrowserSession.session?.height ||
+        activeBrowserSession.entry?.result?.session?.height ||
+        0;
+      if (!width || !height) return;
+      const x = Math.max(
+        0,
+        Math.min(
+          width,
+          Math.round(((event.clientX - rect.left) / rect.width) * width),
+        ),
+      );
+      const y = Math.max(
+        0,
+        Math.min(
+          height,
+          Math.round(((event.clientY - rect.top) / rect.height) * height),
+        ),
+      );
+      void runBrowserSessionAction("click", async () => {
+        await invokeBrowserSessionTool("computer.act", {
+          actions: [{ type: "click", x, y, button: "left" }],
+        });
+      });
+    },
+    [
+      activeBrowserSession,
+      browserPopupPendingAction,
+      invokeBrowserSessionTool,
+      runBrowserSessionAction,
+    ],
+  );
+
   const renderToolActions = (entry) => {
-      const normalizedStatus = entry.status ? entry.status.toLowerCase() : "";
+      const normalizedStatus = getEffectiveToolStatus(entry);
       const targetChain = entry.chain_id || entry.message_id;
       const sessionForEntry = entry.session_id || state.sessionId || null;
       const messageForEntry = entry.message_id || entry.chain_id || null;
@@ -1814,100 +2501,6 @@ const AgentConsole = ({
         return payload;
       };
 
-      const buildToolOutcomeResult = (status, message, data = null, ok = null) => {
-        const normalized = String(status || "").toLowerCase();
-        const resolvedOk =
-          typeof ok === "boolean" ? ok : normalized && !["error", "denied"].includes(normalized);
-        return {
-          status,
-          ok: Boolean(resolvedOk),
-          message: message ?? null,
-          data,
-        };
-      };
-      const fallbackResultForStatus = (toolStatus) => {
-        const normalized = String(toolStatus || "").toLowerCase();
-        if (normalized === "denied") {
-          return buildToolOutcomeResult("denied", "Denied by user.");
-        }
-        if (normalized === "error") {
-          return buildToolOutcomeResult("error", "Tool error.");
-        }
-        return undefined;
-      };
-      const resolveContinueTarget = (target) => {
-        const overrideMode =
-          typeof target?.mode === "string" ? target.mode.trim().toLowerCase() : "";
-        const overrideModel =
-          typeof target?.model === "string" ? target.model.trim() : "";
-        const mode = overrideMode || (state.backendMode || "api").toLowerCase();
-        let model =
-          mode === "local"
-            ? state.localModel || state.transformerModel || state.apiModel
-            : mode === "server"
-              ? state.transformerModel || state.apiModel
-              : state.apiModel;
-        if (overrideModel) {
-          model = overrideModel;
-        }
-        return { mode, model };
-      };
-      const maybeContinueBatch = async (toolUpdate, continueTarget, options = {}) => {
-        if (!sessionForEntry || !messageForEntry) return;
-        const force = options.force === true;
-        const messageEntry = conversationById.get(messageForEntry);
-        const baseTools = Array.isArray(messageEntry?.tools) ? [...messageEntry.tools] : [];
-        const mergedTools = mergeToolUpdate(baseTools, toolUpdate);
-        if (toolUpdate) {
-          setState((prev) => {
-            const updated = Array.isArray(prev.conversation)
-              ? [...prev.conversation]
-              : [];
-            const mIdx = updated.findIndex((m) => m && m.id === messageForEntry);
-            if (mIdx === -1) return prev;
-            const msgEntry = { ...(updated[mIdx] || {}) };
-            msgEntry.tools = mergedTools;
-            updated[mIdx] = msgEntry;
-            return { ...prev, conversation: updated };
-          });
-        }
-        const batch = buildToolContinuationBatch(mergedTools);
-        if (!batch) return;
-        const batchSignature = buildToolContinuationSignature(batch);
-        if (!force && hasMatchingToolContinuationSignature(messageEntry?.metadata, batch)) {
-          return;
-        }
-        if (toolContinueLocksRef.current.has(messageForEntry)) return;
-        toolContinueLocksRef.current.add(messageForEntry);
-        try {
-          const thinkingValue = state.thinkingMode || "auto";
-          const thinkingPayload =
-            thinkingValue === "auto" ? {} : { thinking: thinkingValue };
-          const { mode, model } = resolveContinueTarget(continueTarget);
-          const res = await axios.post("/api/chat/continue", {
-            session_id: sessionForEntry,
-            message_id: messageForEntry,
-            model,
-            mode,
-            ...thinkingPayload,
-            tools: batch,
-          });
-          const continuation = res.data?.message || "";
-          const md = res.data?.metadata || {};
-          if (continuation) {
-            applyContinuation(messageForEntry, continuation, {
-              ...md,
-              ...(batchSignature && !md?.tool_continue_signature
-                ? { tool_continue_signature: batchSignature }
-                : {}),
-            });
-          }
-        } catch (err) {
-          console.error("Auto-continue failed", err);
-        } finally {
-          toolContinueLocksRef.current.delete(messageForEntry);
-        }
-      };
       if (normalizedStatus && normalizedStatus !== "proposed") {
         return (
           <div className="agent-tool-actions">
@@ -1916,7 +2509,15 @@ const AgentConsole = ({
               className="tool-action-btn continue"
               onClick={async (event) => {
                 event.stopPropagation();
-                await maybeContinueBatch(null, null, { force: true });
+                await maybeContinueBatch(
+                  {
+                    sessionId: sessionForEntry,
+                    messageId: messageForEntry,
+                    toolUpdate: null,
+                  },
+                  null,
+                  { force: true },
+                );
               }}
             >
               Continue
@@ -1932,7 +2533,30 @@ const AgentConsole = ({
             onClick={async (event) => {
             event.stopPropagation();
             try {
-              if (entry.id) {
+              if (entry.id && CLIENT_RESOLUTION_TOOLS.has(String(entry.name || ""))) {
+                const resp = await resolveClientTool(entry);
+                const status = String(resp?.status || "").toLowerCase();
+                const resolvedResult =
+                  typeof resp?.result !== "undefined"
+                    ? resp.result
+                    : fallbackResultForStatus(status);
+                await maybeContinueBatch(
+                  {
+                    sessionId: sessionForEntry,
+                    messageId: messageForEntry,
+                    toolUpdate: {
+                      id: entry.id,
+                      name: entry.name,
+                      args: entry.args || {},
+                      ...(typeof resolvedResult !== "undefined"
+                        ? { result: resolvedResult }
+                        : {}),
+                      status: status || "invoked",
+                    },
+                  },
+                  null,
+                );
+              } else if (entry.id) {
                 const resp = await axios.post(
                   "/api/tools/decision",
                   buildDecisionPayload("accept"),
@@ -1943,15 +2567,22 @@ const AgentConsole = ({
                     typeof resp?.data?.result !== "undefined"
                       ? resp.data?.result
                       : fallbackResultForStatus(status);
-                  await maybeContinueBatch({
-                    id: entry.id,
-                    name: entry.name,
-                    args: entry.args || {},
-                    ...(typeof resolvedResult !== "undefined"
-                      ? { result: resolvedResult }
-                      : {}),
-                    status: status || "invoked",
-                  });
+                  await maybeContinueBatch(
+                    {
+                      sessionId: sessionForEntry,
+                      messageId: messageForEntry,
+                      toolUpdate: {
+                        id: entry.id,
+                        name: entry.name,
+                        args: entry.args || {},
+                        ...(typeof resolvedResult !== "undefined"
+                          ? { result: resolvedResult }
+                          : {}),
+                        status: status || "invoked",
+                      },
+                    },
+                    null,
+                  );
                 }
               } else {
                 try {
@@ -1962,15 +2593,22 @@ const AgentConsole = ({
                     session_id: entry.session_id || state.sessionId,
                     message_id: targetChain,
                   });
-                  await maybeContinueBatch({
-                    id: entry.id,
-                    name: entry.name,
-                    args: entry.args || {},
-                    ...(typeof resp?.data?.result !== "undefined"
-                      ? { result: resp.data?.result }
-                      : {}),
-                    status: "invoked",
-                  });
+                  await maybeContinueBatch(
+                    {
+                      sessionId: sessionForEntry,
+                      messageId: messageForEntry,
+                      toolUpdate: {
+                        id: entry.id,
+                        name: entry.name,
+                        args: entry.args || {},
+                        ...(typeof resp?.data?.result !== "undefined"
+                          ? { result: resp.data?.result }
+                          : {}),
+                        status: "invoked",
+                      },
+                    },
+                    null,
+                  );
                 } catch (err) {
                   console.error("Tool invoke failed", err);
                   const detail =
@@ -1981,13 +2619,20 @@ const AgentConsole = ({
                   const statusCode = err?.response?.status;
                   const safeDetail =
                     statusCode && statusCode >= 500 ? "Tool error." : detail;
-                  await maybeContinueBatch({
-                    id: entry.id,
-                    name: entry.name,
-                    args: entry.args || {},
-                    result: buildToolOutcomeResult("error", safeDetail),
-                    status: "error",
-                  });
+                  await maybeContinueBatch(
+                    {
+                      sessionId: sessionForEntry,
+                      messageId: messageForEntry,
+                      toolUpdate: {
+                        id: entry.id,
+                        name: entry.name,
+                        args: entry.args || {},
+                        result: buildToolOutcomeResult("error", safeDetail),
+                        status: "error",
+                      },
+                    },
+                    null,
+                  );
                 }
               }
             } catch (err) {
@@ -2015,15 +2660,22 @@ const AgentConsole = ({
                   typeof resp?.data?.result !== "undefined"
                     ? resp.data?.result
                     : fallbackResultForStatus(status);
-                await maybeContinueBatch({
-                  id: entry.id,
-                  name: entry.name,
-                  args: entry.args || {},
-                  ...(typeof resolvedResult !== "undefined"
-                    ? { result: resolvedResult }
-                    : {}),
-                  status: "denied",
-                });
+                await maybeContinueBatch(
+                  {
+                    sessionId: sessionForEntry,
+                    messageId: messageForEntry,
+                    toolUpdate: {
+                      id: entry.id,
+                      name: entry.name,
+                      args: entry.args || {},
+                      ...(typeof resolvedResult !== "undefined"
+                        ? { result: resolvedResult }
+                        : {}),
+                      status: "denied",
+                    },
+                  },
+                  null,
+                );
               }
             } catch (err) {
               console.error("Tool deny failed", err);
@@ -2071,13 +2723,17 @@ const AgentConsole = ({
                             : fallbackResultForStatus(status);
                         await maybeContinueBatch(
                           {
-                            id: entry.id,
-                            name: (name || entry.name || "").trim() || entry.name,
-                            args: args || {},
-                            ...(typeof resolvedResult !== "undefined"
-                              ? { result: resolvedResult }
-                              : {}),
-                            status: status || "invoked",
+                            sessionId: sessionForEntry,
+                            messageId: messageForEntry,
+                            toolUpdate: {
+                              id: entry.id,
+                              name: (name || entry.name || "").trim() || entry.name,
+                              args: args || {},
+                              ...(typeof resolvedResult !== "undefined"
+                                ? { result: resolvedResult }
+                                : {}),
+                              status: status || "invoked",
+                            },
                           },
                           continueTarget,
                         );
@@ -2092,13 +2748,17 @@ const AgentConsole = ({
                       });
                       await maybeContinueBatch(
                         {
-                          id: entry.id,
-                          name: (name || entry.name || "").trim() || entry.name,
-                          args: args || {},
-                          ...(typeof resp?.data?.result !== "undefined"
-                            ? { result: resp.data?.result }
-                            : {}),
-                          status: "invoked",
+                          sessionId: sessionForEntry,
+                          messageId: messageForEntry,
+                          toolUpdate: {
+                            id: entry.id,
+                            name: (name || entry.name || "").trim() || entry.name,
+                            args: args || {},
+                            ...(typeof resp?.data?.result !== "undefined"
+                              ? { result: resp.data?.result }
+                              : {}),
+                            status: "invoked",
+                          },
                         },
                         continueTarget,
                       );
@@ -2336,7 +2996,7 @@ const AgentConsole = ({
           <ul className="agent-activity-list">
             {activityList.map((entry) => {
               const ts = formatTimestamp(entry.timestamp);
-              const status = entry.status ? entry.status.toLowerCase() : null;
+              const status = getEffectiveToolStatus(entry) || normalizeToolStatus(entry.status) || null;
               const displayStatus = status && status !== "active" ? status : null;
               const isProposedTool = entry.type === "tool" && status === "proposed";
               const isResolvedTool = entry.type === "tool" && status && status !== "proposed";
@@ -2482,6 +3142,7 @@ const AgentConsole = ({
                             kind="result"
                             toolName={entry.name}
                             compact
+                            onOpenComputerSession={openBrowserSessionInspector}
                           />
                         )}
                       </>
@@ -2507,6 +3168,35 @@ const AgentConsole = ({
           </ul>
         )}
       </article>
+    );
+  };
+
+  const renderBrowserSessionPopup = () => {
+    return (
+      <BrowserSessionDialog
+        isOpen={Boolean(browserSessionPopup)}
+        session={activeBrowserSession}
+        fallbackSessionId={browserSessionPopup?.sessionId || ""}
+        pendingAction={browserPopupPendingAction}
+        error={browserPopupError}
+        navigateDraft={browserNavigateDraft}
+        setNavigateDraft={setBrowserNavigateDraft}
+        typeDraft={browserTypeDraft}
+        setTypeDraft={setBrowserTypeDraft}
+        keyDraft={browserKeyDraft}
+        setKeyDraft={setBrowserKeyDraft}
+        onClose={() => {
+          setBrowserSessionPopup(null);
+          setBrowserPopupError("");
+          setBrowserPopupPendingAction("");
+        }}
+        onObserve={handleBrowserPopupObserve}
+        onNavigate={handleBrowserPopupNavigate}
+        onType={handleBrowserPopupType}
+        onKeypress={handleBrowserPopupKeypress}
+        onScreenshotClick={handleBrowserPreviewClick}
+        idPrefix="agent-console-browser-session"
+      />
     );
   };
 
@@ -3676,8 +4366,8 @@ const AgentConsole = ({
             type="button"
             className="console-hidden-btn"
             onClick={handleShowHidden}
-            title="Show hidden agent cards"
-            aria-label="Show hidden agent cards"
+            title="Show hidden console cards"
+            aria-label="Show hidden console cards"
           >
             show hidden ({hiddenCount})
           </button>
@@ -3703,11 +4393,14 @@ const AgentConsole = ({
       <div className="agent-console-body" ref={scrollBodyRef}>
         {renderRuntimePanel()}
         {renderSyncInbox()}
-        {showStandaloneActionHistory ? (
+        {showStandaloneActionHistory && !actionHistoryHidden ? (
           <ActionHistoryPanel
             actions={actions}
             backendReady={backendReady}
             onRefresh={onRefreshAgents}
+            collapsed={actionHistoryCollapsed}
+            onToggleCollapsed={() => setActionHistoryCollapsed((prev) => !prev)}
+            onHide={() => setActionHistoryHidden(true)}
           />
         ) : null}
         {isCalendar && renderCalendar()}
@@ -3765,6 +4458,7 @@ const AgentConsole = ({
         onSchedule={toolEditorState.onSchedule}
       />
     )}
+    {renderBrowserSessionPopup()}
     </>
   );
 };

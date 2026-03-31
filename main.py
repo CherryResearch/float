@@ -13,6 +13,20 @@ import time
 import webbrowser
 
 
+def _build_backend_cmd(port: int) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "uvicorn",
+        "app.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(port),
+        "--reload",
+    ]
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=(
@@ -71,6 +85,28 @@ def main():
         action="store_true",
         help="Enable dev mode for this run (sets FLOAT_DEV_MODE=true)",
     )
+    parser.add_argument(
+        "--backend-auto-restart",
+        dest="backend_auto_restart",
+        action="store_true",
+        default=True,
+        help=(
+            "If the backend process exits, restart it and keep the frontend alive "
+            "(default: on)"
+        ),
+    )
+    parser.add_argument(
+        "--no-backend-auto-restart",
+        dest="backend_auto_restart",
+        action="store_false",
+        help="Do not restart the backend automatically if it exits",
+    )
+    parser.add_argument(
+        "--backend-restart-delay",
+        type=float,
+        default=1.0,
+        help="Seconds to wait before restarting the backend after it exits",
+    )
     launch_group = parser.add_mutually_exclusive_group()
     launch_group.add_argument(
         "--server",
@@ -108,6 +144,7 @@ def main():
     if args.sticky_ports and os.path.exists(state_path):
         try:
             import json as _json
+
             with open(state_path, "r", encoding="utf-8") as f:
                 state = _json.load(f) or {}
         except Exception:
@@ -123,11 +160,7 @@ def main():
 
     if not args.skip_backend and args.backend_port == 0:
         sticky_backend = state.get("backend_port")
-        if (
-            args.sticky_ports
-            and isinstance(sticky_backend, int)
-            and sticky_backend > 0
-        ):
+        if args.sticky_ports and isinstance(sticky_backend, int) and sticky_backend > 0:
             args.backend_port = sticky_backend
         else:
             args.backend_port = _choose_port()
@@ -144,26 +177,73 @@ def main():
             args.frontend_port = _choose_port()
         print(f"[INFO] Using frontend port {args.frontend_port}")
 
-    processes = []
+    processes: dict[str, subprocess.Popen] = {}
+    processes_lock = threading.Lock()
+    shutting_down = threading.Event()
+
+    def _register_process(name: str, proc: subprocess.Popen) -> None:
+        with processes_lock:
+            processes[name] = proc
+
+    def _start_monitor(name: str, proc: subprocess.Popen) -> None:
+        threading.Thread(target=monitor, args=(name, proc), daemon=True).start()
+
+    def _active_process_items() -> list[tuple[str, subprocess.Popen]]:
+        with processes_lock:
+            return list(processes.items())
+
+    def _launch_backend() -> subprocess.Popen:
+        print(f"[INFO] Starting backend on port {args.backend_port}...")
+        backend_proc = subprocess.Popen(
+            _build_backend_cmd(args.backend_port),
+            cwd=os.path.join(basedir, "backend"),
+        )
+        _register_process("backend", backend_proc)
+        _start_monitor("backend", backend_proc)
+        return backend_proc
+
+    def _terminate_service(name: str, proc: subprocess.Popen) -> None:
+        if proc.poll() is not None:
+            return
+        print(f"[INFO] Terminating {name} (PID {proc.pid})")
+        proc.terminate()
+
+    def _terminate_other_services(exclude: str | None = None) -> None:
+        for other_name, other_proc in _active_process_items():
+            if exclude and other_name == exclude:
+                continue
+            _terminate_service(other_name, other_proc)
+
+    def monitor(name: str, proc: subprocess.Popen) -> None:
+        code = proc.wait()
+        print(f"[INFO] {name} exited with code {code}")
+        if shutting_down.is_set():
+            return
+        with processes_lock:
+            current = processes.get(name)
+            if current is not proc:
+                return
+        if name == "backend" and args.backend_auto_restart:
+            delay = max(0.0, float(args.backend_restart_delay or 0.0))
+            print(
+                "[INFO] Backend exited; keeping the frontend up and restarting "
+                f"the backend in {delay:.1f}s..."
+            )
+            if delay:
+                time.sleep(delay)
+            if shutting_down.is_set():
+                return
+            try:
+                _launch_backend()
+                return
+            except Exception as exc:
+                print(f"[ERROR] Failed to restart backend: {exc}")
+        _terminate_other_services(exclude=name)
+        os._exit(code)
 
     # Start backend
     if not args.skip_backend:
-        print(f"[INFO] Starting backend on port {args.backend_port}...")
-        backend_cmd = [
-            sys.executable,
-            "-m",
-            "uvicorn",
-            "app.main:app",
-            "--host",
-            "0.0.0.0",
-            "--port",
-            str(args.backend_port),
-            "--reload",
-        ]
-        backend_proc = subprocess.Popen(
-            backend_cmd, cwd=os.path.join(basedir, "backend")
-        )
-        processes.append(("backend", backend_proc))
+        _launch_backend()
 
     # Start frontend
     if not args.skip_frontend:
@@ -207,7 +287,8 @@ def main():
                 )
                 args.skip_frontend = True
             else:
-                processes.append(("frontend", frontend_proc))
+                _register_process("frontend", frontend_proc)
+                _start_monitor("frontend", frontend_proc)
 
                 def _open_browser():
                     time.sleep(2)
@@ -227,6 +308,7 @@ def main():
     try:
         if args.sticky_ports and (not args.skip_backend or not args.skip_frontend):
             import json as _json
+
             if not args.skip_backend:
                 state["backend_port"] = args.backend_port
             if not args.skip_frontend:
@@ -235,32 +317,12 @@ def main():
                 _json.dump(state, f, indent=2)
     except Exception:
         pass
-    def monitor(name, proc):
-        code = proc.wait()
-        print(f"[INFO] {name} exited with code {code}")
-        # Terminate other services
-        for other_name, other_proc in processes:
-            if other_proc != proc and other_proc.poll() is None:
-                print(
-                    "[INFO] Terminating {} (PID {})".format(
-                        other_name,
-                        other_proc.pid,
-                    )
-                )
-                other_proc.terminate()
-        os._exit(code)
-
-    # Launch monitors
-    for name, proc in processes:
-        t = threading.Thread(target=monitor, args=(name, proc), daemon=True)
-        t.start()
 
     def shutdown(signum, frame):
         print("\n[INFO] Received signal, shutting down services...")
-        for name, proc in processes:
-            if proc.poll() is None:
-                print(f"[INFO] Terminating {name} (PID {proc.pid})")
-                proc.terminate()
+        shutting_down.set()
+        for name, proc in _active_process_items():
+            _terminate_service(name, proc)
         sys.exit(0)
 
     for sig in (signal.SIGINT, signal.SIGTERM):

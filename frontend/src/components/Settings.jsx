@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useContext, useMemo } from "react";
+import { Link } from "react-router-dom";
 
 import { Line, Rect } from "./Skeleton";
 
@@ -9,7 +10,9 @@ import "../styles/Settings.css";
 import "../styles/ProgressBar.css";
 
 import { GlobalContext } from "../main";
+import { normalizeVisualTheme, VISUAL_THEME_OPTIONS } from "../theme";
 import ModelJobsPanel from "./ModelJobsPanel";
+import { normalizeToolDisplayMode } from "../utils/toolDisplayModes";
 
 import { registerPush, unregisterPush } from "../utils/push";
 import { filterAvailableModelsForField } from "../utils/modelFiltering";
@@ -136,6 +139,10 @@ const SETTINGS_SECTIONS = [
     description: "Notifications, tool display, and the tool browser.",
     searchText: [
       "workspace",
+      "appearance",
+      "theme",
+      "spring",
+      "cappucino",
       "notifications",
       "push",
       "tool approval",
@@ -195,6 +202,73 @@ const ACTION_HISTORY_RETENTION_OPTIONS = [
   { value: 14, label: "2 weeks" },
   { value: 30, label: "1 month" },
 ];
+
+const CAPTURE_RETENTION_OPTIONS = [
+  { value: 1, label: "1 day" },
+  { value: 3, label: "3 days" },
+  { value: 7, label: "1 week" },
+  { value: 14, label: "2 weeks" },
+  { value: 30, label: "1 month" },
+];
+
+const CAPTURE_SENSITIVITY_OPTIONS = [
+  { value: "mundane", label: "Mundane" },
+  { value: "public", label: "Public" },
+  { value: "personal", label: "Personal" },
+  { value: "protected", label: "Protected" },
+  { value: "secret", label: "Secret" },
+];
+
+const DEFAULT_WORKFLOW_CATALOG = {
+  workflows: [
+    {
+      id: "default",
+      label: "Default",
+      description: "Balanced reasoning with normal tool access and moderate latency.",
+      preferred_continue: "mini_execution",
+    },
+    {
+      id: "architect_planner",
+      label: "Architect / Planner",
+      description: "Higher-reasoning planning workflow that prefers decomposition and explicit handoff.",
+      preferred_continue: "mini_execution",
+    },
+    {
+      id: "mini_execution",
+      label: "Mini Execution",
+      description: "Short, low-latency execution bursts for in-between tool steps and recursive continue loops.",
+      preferred_continue: "mini_execution",
+    },
+  ],
+  modules: [
+    {
+      id: "computer_use",
+      label: "Computer Use",
+      description: "Browser and desktop observation plus direct UI actions.",
+      status: "live",
+    },
+    {
+      id: "camera_capture",
+      label: "Camera Capture",
+      description: "Still-image capture from a connected camera via the client.",
+      status: "experimental",
+    },
+    {
+      id: "memory_promotion",
+      label: "Memory Promotion",
+      description: "Promote transient captures into durable attachments and later memory workflows.",
+      status: "live",
+    },
+    {
+      id: "host_shell",
+      label: "Host Shell",
+      description: "Approval-gated shell, patch, and host mutation tools.",
+      status: "live",
+    },
+  ],
+  addons: [],
+  addons_root: "data/modules/addons",
+};
 
 const Settings = () => {
 
@@ -842,6 +916,26 @@ const Settings = () => {
   const [actionHistorySaving, setActionHistorySaving] = useState(false);
   const [actionHistoryMessage, setActionHistoryMessage] = useState("");
   const [notificationPrefMessage, setNotificationPrefMessage] = useState("");
+  const [captureRetentionDays, setCaptureRetentionDays] = useState(
+    Math.max(1, Number(state.captureRetentionDays) || 7),
+  );
+  const [captureDefaultSensitivity, setCaptureDefaultSensitivity] = useState(
+    state.captureDefaultSensitivity || "personal",
+  );
+  const [captureAllowModelRawImageAccess, setCaptureAllowModelRawImageAccess] = useState(
+    state.captureAllowModelRawImageAccess !== false,
+  );
+  const [captureAllowSummaryFallback, setCaptureAllowSummaryFallback] = useState(
+    state.captureAllowSummaryFallback !== false,
+  );
+  const [defaultWorkflow, setDefaultWorkflow] = useState(state.workflowProfile || "default");
+  const [enabledWorkflowModules, setEnabledWorkflowModules] = useState(
+    Array.isArray(state.enabledWorkflowModules) ? state.enabledWorkflowModules : [],
+  );
+  const [workflowCatalog, setWorkflowCatalog] = useState(DEFAULT_WORKFLOW_CATALOG);
+  const [workflowCatalogLoading, setWorkflowCatalogLoading] = useState(false);
+  const [captureWorkflowSaving, setCaptureWorkflowSaving] = useState(false);
+  const [captureWorkflowMessage, setCaptureWorkflowMessage] = useState("");
 
   const [exportDefaults, setExportDefaults] = useState({
     format: "md",
@@ -2994,6 +3088,53 @@ const Settings = () => {
 
   ]);
 
+  useEffect(() => {
+    setCaptureRetentionDays(Math.max(1, Number(state.captureRetentionDays) || 7));
+    setCaptureDefaultSensitivity(state.captureDefaultSensitivity || "personal");
+    setCaptureAllowModelRawImageAccess(state.captureAllowModelRawImageAccess !== false);
+    setCaptureAllowSummaryFallback(state.captureAllowSummaryFallback !== false);
+    setDefaultWorkflow(state.workflowProfile || "default");
+    setEnabledWorkflowModules(
+      Array.isArray(state.enabledWorkflowModules) ? state.enabledWorkflowModules : [],
+    );
+  }, [
+    state.captureAllowModelRawImageAccess,
+    state.captureAllowSummaryFallback,
+    state.captureDefaultSensitivity,
+    state.captureRetentionDays,
+    state.enabledWorkflowModules,
+    state.workflowProfile,
+  ]);
+
+  const refreshWorkflowCatalog = async () => {
+    setWorkflowCatalogLoading(true);
+    try {
+      const res = await axios.get("/api/workflows/catalog");
+      const payload = res?.data || {};
+      setWorkflowCatalog({
+        workflows: Array.isArray(payload.workflows)
+          ? payload.workflows
+          : DEFAULT_WORKFLOW_CATALOG.workflows,
+        modules: Array.isArray(payload.modules)
+          ? payload.modules
+          : DEFAULT_WORKFLOW_CATALOG.modules,
+        addons: Array.isArray(payload.addons) ? payload.addons : [],
+        addons_root:
+          typeof payload.addons_root === "string" && payload.addons_root.trim()
+            ? payload.addons_root.trim()
+            : DEFAULT_WORKFLOW_CATALOG.addons_root,
+      });
+    } catch {
+      setWorkflowCatalog(DEFAULT_WORKFLOW_CATALOG);
+    } finally {
+      setWorkflowCatalogLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    refreshWorkflowCatalog();
+  }, []);
+
 
 
   useEffect(() => {
@@ -3024,6 +3165,27 @@ const Settings = () => {
         }
         if (typeof s.action_history_retention_days === "number") {
           setActionHistoryRetentionDays(s.action_history_retention_days);
+        }
+        if (typeof s.capture_retention_days === "number") {
+          setCaptureRetentionDays(Math.max(1, s.capture_retention_days));
+        }
+        if (
+          typeof s.capture_default_sensitivity === "string" &&
+          s.capture_default_sensitivity.trim()
+        ) {
+          setCaptureDefaultSensitivity(s.capture_default_sensitivity.trim());
+        }
+        if (typeof s.capture_allow_model_raw_image_access === "boolean") {
+          setCaptureAllowModelRawImageAccess(s.capture_allow_model_raw_image_access);
+        }
+        if (typeof s.capture_allow_summary_fallback === "boolean") {
+          setCaptureAllowSummaryFallback(s.capture_allow_summary_fallback);
+        }
+        if (typeof s.default_workflow === "string" && s.default_workflow.trim()) {
+          setDefaultWorkflow(s.default_workflow.trim());
+        }
+        if (Array.isArray(s.enabled_workflow_modules)) {
+          setEnabledWorkflowModules(s.enabled_workflow_modules);
         }
         const nextDefaults = {
           format: normalizeExportFormat(s.export_default_format),
@@ -4724,6 +4886,44 @@ const Settings = () => {
       setActionHistoryMessage("Failed to save work history retention.");
     } finally {
       setActionHistorySaving(false);
+    }
+  };
+
+  const handleCaptureWorkflowSave = async () => {
+    const nextModules = Array.from(
+      new Set(
+        (Array.isArray(enabledWorkflowModules) ? enabledWorkflowModules : [])
+          .map((item) => String(item || "").trim())
+          .filter(Boolean),
+      ),
+    );
+    const nextWorkflow = String(defaultWorkflow || "default").trim() || "default";
+    const nextRetentionDays = Math.max(1, Number(captureRetentionDays) || 7);
+    setCaptureWorkflowSaving(true);
+    setCaptureWorkflowMessage("");
+    try {
+      await axios.post("/api/user-settings", {
+        capture_retention_days: nextRetentionDays,
+        capture_default_sensitivity: captureDefaultSensitivity || "personal",
+        capture_allow_model_raw_image_access: captureAllowModelRawImageAccess !== false,
+        capture_allow_summary_fallback: captureAllowSummaryFallback !== false,
+        default_workflow: nextWorkflow,
+        enabled_workflow_modules: nextModules,
+      });
+      setState((prev) => ({
+        ...prev,
+        captureRetentionDays: nextRetentionDays,
+        captureDefaultSensitivity: captureDefaultSensitivity || "personal",
+        captureAllowModelRawImageAccess: captureAllowModelRawImageAccess !== false,
+        captureAllowSummaryFallback: captureAllowSummaryFallback !== false,
+        workflowProfile: nextWorkflow,
+        enabledWorkflowModules: nextModules,
+      }));
+      setCaptureWorkflowMessage("Capture and workflow defaults saved.");
+    } catch {
+      setCaptureWorkflowMessage("Failed to save capture and workflow defaults.");
+    } finally {
+      setCaptureWorkflowSaving(false);
     }
   };
 
@@ -6941,6 +7141,37 @@ const Settings = () => {
           </div>
 
           <div className="settings-section">
+            <h3>Appearance</h3>
+            <label
+              className="field-label"
+              htmlFor="visual-theme"
+              title="Choose the app's color palette family while keeping the existing dark/light toggle."
+            >
+              Visual theme
+            </label>
+            <select
+              id="visual-theme"
+              value={normalizeVisualTheme(state.visualTheme)}
+              onChange={(event) =>
+                setState((prev) => ({
+                  ...prev,
+                  visualTheme: normalizeVisualTheme(event.target.value),
+                }))
+              }
+            >
+              {VISUAL_THEME_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            <p className="status-note" style={{ marginTop: 6 }}>
+              Dark and light mode still toggle from the top bar; this picker changes the color family
+              underneath them.
+            </p>
+          </div>
+
+          <div className="settings-section">
             <h3>Tool display</h3>
             <label
               className="field-label"
@@ -6951,7 +7182,7 @@ const Settings = () => {
             </label>
             <select
               id="tool-display-mode"
-              value={state.toolDisplayMode === "inline" ? "inline" : "console"}
+              value={normalizeToolDisplayMode(state.toolDisplayMode)}
               onChange={(e) =>
                 setState((prev) => ({
                   ...prev,
@@ -6961,6 +7192,8 @@ const Settings = () => {
             >
               <option value="console">Agent console</option>
               <option value="inline">Inline in chat</option>
+              <option value="both">Both</option>
+              <option value="auto">Auto</option>
             </select>
             <label
               className="field-label"
@@ -6984,15 +7217,30 @@ const Settings = () => {
             </select>
             <p className="status-note" style={{ marginTop: 6 }}>
               Agent console keeps tool details out of the transcript. Inline in chat shows tool
-              cards under the related message and removes duplicate tool rows from the agent
-              console.
+              cards under the related message. Both keeps inline cards visible while the agent
+              console still shows the full tool timeline. Auto keeps tool details inline for the
+              selected or highlighted message, and while the current response is streaming.
             </p>
             <p className="status-note" style={{ marginTop: 6 }}>
-              {state.toolDisplayMode === "inline"
-                ? state.toolLinkBehavior === "inline"
-                  ? "Current behavior: clicking a tool link expands the matching inline tool card in chat."
-                  : "Current behavior: clicking a tool link focuses the matching item in the agent console while tool cards stay inline in chat."
-                : "Current behavior: clicking a tool link opens the agent console because tool details are set to appear there."}
+              {(() => {
+                const toolDisplayMode = normalizeToolDisplayMode(state.toolDisplayMode);
+                if (toolDisplayMode === "inline") {
+                  return state.toolLinkBehavior === "inline"
+                    ? "Current behavior: clicking a tool link expands the matching inline tool card in chat."
+                    : "Current behavior: clicking a tool link focuses the matching item in the agent console while tool cards stay inline in chat.";
+                }
+                if (toolDisplayMode === "both") {
+                  return state.toolLinkBehavior === "inline"
+                    ? "Current behavior: clicking a tool link expands the matching inline tool card in chat, and the agent console still keeps the same tool activity available."
+                    : "Current behavior: clicking a tool link focuses the matching item in the agent console while inline tool cards also stay visible in chat.";
+                }
+                if (toolDisplayMode === "auto") {
+                  return state.toolLinkBehavior === "inline"
+                    ? "Current behavior: clicking a tool link prefers the inline tool card on the active message, while the agent console continues to handle non-active tool activity."
+                    : "Current behavior: clicking a tool link focuses the matching item in the agent console, while auto mode still shows inline cards for the active or streaming message.";
+                }
+                return "Current behavior: clicking a tool link opens the agent console because tool details are set to appear there.";
+              })()}
             </p>
           </div>
 
@@ -7030,8 +7278,202 @@ const Settings = () => {
               >
                 {actionHistorySaving ? "Saving..." : "Save work history"}
               </button>
+              <Link
+                to="/work-history"
+                className="icon-btn"
+                style={{
+                  marginTop: 0,
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  textDecoration: "none",
+                  color: "var(--color-black)",
+                }}
+              >
+                Open work history
+              </Link>
             </div>
             {actionHistoryMessage && <p className="status-note">{actionHistoryMessage}</p>}
+          </div>
+
+          <div className="settings-section">
+            <div className="settings-header">
+              <h3>Capture &amp; workflows</h3>
+              <button
+                type="button"
+                className="icon-btn"
+                onClick={refreshWorkflowCatalog}
+                disabled={workflowCatalogLoading}
+                style={{ marginTop: 0 }}
+              >
+                {workflowCatalogLoading ? "Refreshing..." : "Refresh profiles"}
+              </button>
+            </div>
+            <label
+              className="field-label"
+              htmlFor="capture-retention"
+              title="How long transient computer, screen, and camera captures stay available before pruning."
+            >
+              How long transient captures are kept
+            </label>
+            <select
+              id="capture-retention"
+              value={String(captureRetentionDays)}
+              onChange={(event) => setCaptureRetentionDays(Number(event.target.value) || 7)}
+            >
+              {CAPTURE_RETENTION_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            <label
+              className="field-label"
+              htmlFor="capture-sensitivity"
+              title="Default sensitivity label attached when a capture is created."
+            >
+              Default capture sensitivity
+            </label>
+            <select
+              id="capture-sensitivity"
+              value={captureDefaultSensitivity}
+              onChange={(event) => setCaptureDefaultSensitivity(event.target.value)}
+            >
+              {CAPTURE_SENSITIVITY_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            <div className="inline-flex" style={{ gap: 12, marginTop: 10, flexWrap: "wrap" }}>
+              <label
+                className="checkbox-row"
+                style={{ display: "inline-flex", gap: 8, alignItems: "center" }}
+              >
+                <input
+                  type="checkbox"
+                  checked={captureAllowModelRawImageAccess}
+                  onChange={(event) =>
+                    setCaptureAllowModelRawImageAccess(event.target.checked)
+                  }
+                />
+                <span>Allow raw image access for supported models</span>
+              </label>
+              <label
+                className="checkbox-row"
+                style={{ display: "inline-flex", gap: 8, alignItems: "center" }}
+              >
+                <input
+                  type="checkbox"
+                  checked={captureAllowSummaryFallback}
+                  onChange={(event) => setCaptureAllowSummaryFallback(event.target.checked)}
+                />
+                <span>Allow summary fallback when raw images are restricted</span>
+              </label>
+            </div>
+            <p className="status-note" style={{ marginTop: 6 }}>
+              Computer observations, camera captures, and screen stills stay transient for this
+              window unless promoted. Promoted captures remain accessible as durable attachments for
+              later memory workflows.
+            </p>
+            <label
+              className="field-label"
+              htmlFor="default-workflow"
+              title="Default workflow profile for new messages and auto-continues."
+            >
+              Default workflow profile
+            </label>
+            <select
+              id="default-workflow"
+              value={defaultWorkflow}
+              onChange={(event) => setDefaultWorkflow(event.target.value)}
+            >
+              {(workflowCatalog.workflows.length
+                ? workflowCatalog.workflows
+                : DEFAULT_WORKFLOW_CATALOG.workflows
+              ).map((workflow) => (
+                <option key={workflow.id} value={workflow.id}>
+                  {workflow.label}
+                </option>
+              ))}
+            </select>
+            <p className="status-note" style={{ marginTop: 6 }}>
+              {(() => {
+                const workflows = workflowCatalog.workflows.length
+                  ? workflowCatalog.workflows
+                  : DEFAULT_WORKFLOW_CATALOG.workflows;
+                const selected =
+                  workflows.find((workflow) => workflow.id === defaultWorkflow) || workflows[0];
+                if (!selected) return "Workflow profiles control reasoning depth, recursion, and tool posture.";
+                const preferredContinue = selected.preferred_continue || "the active workflow";
+                return `${selected.description} Continue defaults prefer ${preferredContinue}.`;
+              })()}
+            </p>
+            <div style={{ marginTop: 12 }}>
+              <div className="field-label" style={{ marginBottom: 8 }}>
+                Enabled modules
+              </div>
+              <div style={{ display: "grid", gap: 8 }}>
+                {(workflowCatalog.modules.length
+                  ? workflowCatalog.modules
+                  : DEFAULT_WORKFLOW_CATALOG.modules
+                ).map((module) => (
+                  <label
+                    key={module.id}
+                    className="checkbox-row"
+                    style={{
+                      display: "grid",
+                      gap: 4,
+                      padding: "10px 12px",
+                      border: "1px solid var(--glass-border)",
+                      borderRadius: 12,
+                    }}
+                  >
+                    <span style={{ display: "inline-flex", gap: 8, alignItems: "center" }}>
+                      <input
+                        type="checkbox"
+                        checked={enabledWorkflowModules.includes(module.id)}
+                        onChange={(event) => {
+                          setEnabledWorkflowModules((prev) => {
+                            const current = Array.isArray(prev) ? prev : [];
+                            if (event.target.checked) {
+                              return Array.from(new Set([...current, module.id]));
+                            }
+                            return current.filter((item) => item !== module.id);
+                          });
+                        }}
+                      />
+                      <strong>{module.label}</strong>
+                      <span className="status-note">({module.status || "live"})</span>
+                    </span>
+                    <span className="status-note" style={{ margin: 0 }}>
+                      {module.description}
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </div>
+            <p className="status-note" style={{ marginTop: 10 }}>
+              Custom add-ons live in{" "}
+              <code>{workflowCatalog.addons_root || DEFAULT_WORKFLOW_CATALOG.addons_root}</code>.
+              {Array.isArray(workflowCatalog.addons) && workflowCatalog.addons.length > 0
+                ? ` ${workflowCatalog.addons.length} add-on${
+                    workflowCatalog.addons.length === 1 ? "" : "s"
+                  } currently registered.`
+                : " Drop sanctioned workflow/module packs there to surface them here later."}
+            </p>
+            <div className="inline-flex" style={{ gap: 10, marginTop: 10, flexWrap: "wrap" }}>
+              <button
+                type="button"
+                className="icon-btn"
+                onClick={handleCaptureWorkflowSave}
+                disabled={captureWorkflowSaving}
+                style={{ marginTop: 0 }}
+              >
+                {captureWorkflowSaving ? "Saving..." : "Save capture defaults"}
+              </button>
+            </div>
+            {captureWorkflowMessage && <p className="status-note">{captureWorkflowMessage}</p>}
           </div>
 
           <div className="settings-section">
@@ -7051,6 +7493,43 @@ const Settings = () => {
               Read-only browser for built-ins today, with source status for MCP and future custom
               tool management.
             </p>
+            <div className="tool-browser-source-card" style={{ marginBottom: 12 }}>
+              <div className="status-header">
+                <strong>Computer use</strong>
+                {renderToolStatusBadge(
+                  filteredToolCatalog.some((entry) => String(entry?.id || "").startsWith("computer."))
+                    ? "live"
+                    : "experimental",
+                )}
+              </div>
+              <p>
+                Browser computer-use is exposed through the shared tool catalog. Windows desktop
+                control is available as an experimental runtime and may require extra host
+                dependencies.
+              </p>
+              <div className="tool-browser-source-meta">
+                <span>
+                  Browser tools:{" "}
+                  {
+                    filteredToolCatalog.filter((entry) =>
+                      ["computer.observe", "computer.act", "computer.navigate", "open_url"].includes(
+                        String(entry?.id || ""),
+                      ),
+                    ).length
+                  }
+                </span>
+                <span>
+                  Windows tools:{" "}
+                  {
+                    filteredToolCatalog.filter((entry) =>
+                      String(entry?.id || "").startsWith("computer.windows.") ||
+                      String(entry?.id || "") === "computer.app.launch",
+                    ).length
+                  }
+                </span>
+                <span>Shell + patch share the same approval flow.</span>
+              </div>
+            </div>
             <div className="tool-browser-source-grid">
               {toolSourceCards.map((card) => (
                 <article key={card.id} className="tool-browser-source-card">

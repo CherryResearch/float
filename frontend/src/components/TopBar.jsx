@@ -73,6 +73,7 @@ const TopBar = () => {
       : NOOP_SET_STATE;
   const location = useLocation();
   const currentTab = location.pathname.startsWith("/settings")
+    || location.pathname.startsWith("/work-history")
     ? "/settings"
     : location.pathname.startsWith("/knowledge")
       ? "/knowledge"
