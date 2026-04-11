@@ -8,7 +8,6 @@ import shutil
 import sys
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = REPO_ROOT / "data" / "workspace" / "release-public-alpha"
 
@@ -66,10 +65,17 @@ EXCLUDED_PREFIXES = (
     ".dev_state.json",
     ".env",
     ".env.example",
+    "backend/.env",
+    "backend/.env.example",
+    "backend/conversations/",
+    "backend/logs/",
+    "backend/models/",
     "backend/venv/",
     "blobs/",
     "conversations/",
     "data/",
+    "frontend/.env",
+    "frontend/.env.example",
     "devices.json",
     "docs/function descriptions/",
     "docs/internal/",
@@ -215,11 +221,15 @@ def scan_text_files(files: list[Path], root: Path) -> list[str]:
             for snippet in FORBIDDEN_TEXT_SNIPPETS:
                 if snippet in text:
                     errors.append(f"{relative}: references excluded path `{snippet}`")
-        if relative in {
-            "pyproject.toml",
-            "frontend/package.json",
-            "backend/app/config.py",
-        } and "0.0.0" in text:
+        if (
+            relative
+            in {
+                "pyproject.toml",
+                "frontend/package.json",
+                "backend/app/config.py",
+            }
+            and "0.0.0" in text
+        ):
             errors.append(f"{relative}: still contains placeholder version `0.0.0`")
     return errors
 
@@ -235,7 +245,12 @@ def validate_source(files: list[Path], missing: list[str]) -> list[str]:
 def validate_snapshot(output_dir: Path) -> list[str]:
     snapshot_files = [path for path in output_dir.rglob("*") if path.is_file()]
     errors = scan_text_files(snapshot_files, output_dir)
-    for required in ("LICENSE", "CLA.md", "CONTRIBUTOR_ASSIGNMENT_AGREEMENT.md", "README.md"):
+    for required in (
+        "LICENSE",
+        "CLA.md",
+        "CONTRIBUTOR_ASSIGNMENT_AGREEMENT.md",
+        "README.md",
+    ):
         if not (output_dir / required).exists():
             errors.append(f"snapshot missing required file `{required}`")
     return errors
@@ -261,8 +276,7 @@ def main() -> int:
             print(f"- {error}", file=sys.stderr)
         return 1
     print(
-        f"Release snapshot copied to {args.output.resolve()} "
-        f"({len(files)} files)."
+        f"Release snapshot copied to {args.output.resolve()} " f"({len(files)} files)."
     )
     return 0
 

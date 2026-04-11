@@ -570,3 +570,27 @@ def test_capture_routes_round_trip(monkeypatch, tmp_path):
     delete_resp = client.delete(f"/api/captures/{capture_id}")
     assert delete_resp.status_code == 200
     assert delete_resp.json()["status"] == "deleted"
+
+
+def test_capture_upload_truncates_oversized_camera_filenames(monkeypatch, tmp_path):
+    monkeypatch.setenv("FLOAT_CONV_DIR", str(tmp_path))
+    conv_store = importlib.import_module("app.utils.conversation_store")
+    importlib.reload(conv_store)
+
+    capture_module = importlib.import_module("app.services.capture_service")
+    app = importlib.import_module("app.main").app
+    app.state.capture_service = capture_module.CaptureService(data_dir=tmp_path)
+    client = TestClient(app)
+
+    long_name = f"{'camera-' * 40}capture.png"
+    upload_resp = client.post(
+        "/api/captures/upload",
+        files={"file": (long_name, PNG_BYTES, "image/png")},
+        data={"source": "camera"},
+    )
+
+    assert upload_resp.status_code == 200
+    capture = upload_resp.json()
+    assert capture["filename"].endswith(".png")
+    assert len(capture["filename"]) <= 120
+    assert capture["filename"] != long_name

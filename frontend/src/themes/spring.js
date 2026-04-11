@@ -1,29 +1,29 @@
 // Keep in sync with CSS variables defined in styles/theme.css.
 // Slots are the future-facing theme contract; palette keeps legacy semantic tokens alive.
 export const slots = {
-  c1Light: "#f3f0ff",
-  c1Med: "#4f46e5",
-  c1Dark: "#3730a3",
-  c2Light: "#86efac",
-  c2Med: "#16a34a",
-  c2Dark: "#166534",
+  c1Light: "#e4d9f3",
+  c1Med: "#630ac3",
+  c1Dark: "#340865",
+  c2Light: "#86eaa0",
+  c2Med: "#21b228",
+  c2Dark: "#166d2a",
   veryLight: "#ffffff",
-  veryDark: "#0b1220",
+  veryDark: "#090d17",
 };
 
 export const palette = {
   white: slots.veryLight,
-  softWhite: "#f6f8fb",
-  mintGreen: "#22c55e",
-  pearGreen: "#16a34a",
+  softWhite: "#f2eef7",
+  mintGreen: slots.c2Light,
+  pearGreen: slots.c2Med,
   black: slots.veryDark,
   purple: slots.c1Med,
   deepPurple: slots.c1Dark,
-  indigo: "#390892", // used in dark mode styling elsewhere
+  indigo: "#390892",
   lavender: slots.c1Light,
-  lavenderDark: "#e2e8f0",
-  petrolBlue: "#051427",
-  violetGlow: "#9f8df0",
+  lavenderDark: "#b29ed9",
+  petrolBlue: "#0b1120",
+  violetGlow: "#c3aceb",
 };
 
 const lightLayers = [
@@ -34,14 +34,12 @@ const lightLayers = [
 ];
 
 const darkLayers = [
-  `radial-gradient(1500px 780px at -8% 32%, color-mix(in oklab, ${slots.c1Dark} 52%, rgba(0, 0, 0, 0.45)), transparent 72%)`,
-  `radial-gradient(1500px 760px at 110% 22%, color-mix(in oklab, ${slots.c1Light} 34%, rgba(62, 15, 22, 0.56)), transparent 74%)`,
-  `radial-gradient(1200px 840px at 40% 118%, color-mix(in oklab, ${slots.c2Med} 42%, rgba(0, 0, 0, 0.4)), transparent 75%)`,
-  `radial-gradient(900px 580px at -6% 118%, color-mix(in oklab, ${slots.c2Dark} 44%, rgba(0, 0, 0, 0.5)), transparent 85%)`,
-  `radial-gradient(820px 520px at 6% -3%, rgba(255, 255, 255, 0.08), transparent 80%)`,
-  `radial-gradient(620px 420px at 96% 98%, rgba(255, 232, 239, 0.12), transparent 86%)`,
-  `linear-gradient(128deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0) 48%, rgba(255, 255, 255, 0.05) 96%)`,
-  `linear-gradient(210deg, rgba(2, 4, 10, 0.98), rgba(6, 7, 22, 0.92))`,
+  `radial-gradient(1560px 840px at -10% 18%, color-mix(in oklab, ${slots.c1Light} 14%, rgba(9, 13, 23, 0.96)), transparent 72%)`,
+  `radial-gradient(1480px 780px at 108% 16%, color-mix(in oklab, ${slots.c1Med} 42%, rgba(14, 10, 34, 0.64)), transparent 76%)`,
+  `radial-gradient(1180px 760px at 46% 118%, color-mix(in oklab, ${palette.indigo} 22%, rgba(6, 9, 18, 0.92)), transparent 82%)`,
+  `radial-gradient(760px 420px at 100% 100%, color-mix(in oklab, ${slots.c2Med} 14%, rgba(7, 10, 18, 0.9)), transparent 86%)`,
+  `linear-gradient(126deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0) 38%, rgba(255, 255, 255, 0.03) 88%)`,
+  `linear-gradient(210deg, rgba(7, 10, 18, 0.99), rgba(10, 7, 20, 0.96))`,
 ];
 
 export const gradients = {

@@ -48,7 +48,7 @@ export const formatConversationDate = (id) => {
   )}`;
 };
 
-const threadPalette = ["#8F9BFF", "#FFB347", "#7DD3FC", "#F472B6", "#34D399"];
+const threadPalette = ["#9B8CFF", "#B29ED9", "#6B7AD6", "#86EAA0", "#21B228"];
 
 const getThreadColor = (conversationId) => {
   if (!conversationId) return threadPalette[0];
@@ -88,12 +88,12 @@ const ROOT_FOLDER_KEY = "__root__";
 const THREAD_GROUP_ROOT_KEY = "__thread_root__";
 const DEFAULT_FOLDER_COLORS = [
   "#9B8CFF",
-  "#7DD3FC",
-  "#F472B6",
-  "#34D399",
-  "#FBBF24",
-  "#FCA5A5",
-  "#A78BFA",
+  "#B29ED9",
+  "#C7B6FF",
+  "#6B7AD6",
+  "#86EAA0",
+  "#21B228",
+  "#7B5CD6",
 ];
 const SIDEBAR_MIN_WIDTH = 220;
 const SIDEBAR_MAX_WIDTH = 520;

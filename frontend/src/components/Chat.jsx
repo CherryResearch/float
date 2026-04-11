@@ -21,6 +21,7 @@ import Tooltip from "@mui/material/Tooltip";
 import Divider from "@mui/material/Divider";
 import ToolEditorModal from "./ToolEditorModal";
 import ToolPayloadView, {
+  extractCapturePayload,
   extractComputerPayload,
   summarizeToolPayload,
 } from "./ToolPayloadView";
@@ -43,7 +44,12 @@ import {
   buildToolContinuationSignature,
   hasMatchingToolContinuationSignature,
 } from "../utils/toolContinuations";
-import { mergeContinuationText } from "../utils/continuationText";
+import {
+  isContinuationPlaceholderText,
+  mergeContinuationText,
+  stripInlineToolPlaceholders,
+} from "../utils/continuationText";
+import { resolveRequestModelForMode } from "../utils/modelUtils";
 
 const DEFAULT_COMPOSER_ROWS = 4;
 const MAX_COMPOSER_ROWS = 72;
@@ -89,6 +95,13 @@ const SAFE_REALTIME_TOOL_NAMES = [
   "tool_info",
   "search_web",
 ];
+const COMMAND_COMPLETION_LIMIT = 8;
+const COMMAND_REFERENCE_RE = /(^|[\s\n])(\.\/\/|\.\/|\/\/)(\[[^\]\n]+\]|[^\s]+)/g;
+const TOOL_DIRECTIVE_RE = /^(\s*)%([a-z0-9._-]+)(?:\s+([\s\S]*))?$/i;
+const hasInlineToolPlaceholder = (value) =>
+  /\[\[tool_call:\d+\]\]/.test(String(value || ""));
+const hasRenderableAssistantContent = (value) =>
+  Boolean(stripInlineToolPlaceholders(value).trim());
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 const LIVE_TOOL_PANEL_OFFSETS = {
   camera: 0,
@@ -97,6 +110,22 @@ const LIVE_TOOL_PANEL_OFFSETS = {
   thinking: 132,
 };
 const LIVE_SESSION_CANCELLED_CODE = "LIVE_SESSION_CANCELLED";
+const RESPONSE_FAILURE_METADATA_KEYS = [
+  "error",
+  "attempts",
+  "status_code",
+  "category",
+  "endpoint",
+  "hint",
+  "request_id",
+  "provider_message",
+  "provider_error",
+  "provider_error_text",
+  "idle_seconds",
+  "empty_response",
+  "empty_response_reason",
+  "warning",
+];
 
 const createLiveSessionCancelledError = () => {
   const error = new Error("Live streaming start was cancelled.");
@@ -194,6 +223,323 @@ const getRequestErrorDetail = (error, fallback = "Request failed") => {
   }
   const message = typeof error?.message === "string" ? error.message.trim() : "";
   return message || fallback;
+};
+
+const getSelectedTargetModelForMode = (state, mode) => {
+  return resolveRequestModelForMode({
+    backendMode: mode,
+    apiModel: state?.apiModel,
+    transformerModel: state?.transformerModel,
+    localModel: state?.localModel,
+  });
+};
+
+export const resolveRegenerateRequestTarget = (state, msg) => {
+  const meta = msg && typeof msg === "object" && msg.metadata && typeof msg.metadata === "object"
+    ? msg.metadata
+    : {};
+  const currentMode =
+    typeof state?.backendMode === "string" && state.backendMode.trim()
+      ? state.backendMode.trim().toLowerCase()
+      : "api";
+  const originalMode =
+    typeof meta.mode === "string" && meta.mode.trim()
+      ? meta.mode.trim().toLowerCase()
+      : currentMode;
+  const fallbackModel = getSelectedTargetModelForMode(state, originalMode);
+  const originalModelCandidates =
+    originalMode === "local"
+      ? [meta.model_requested, meta.model, meta.model_resolved, meta.model_received]
+      : [meta.model_requested, meta.model_resolved, meta.model_received, meta.model];
+  const originalModel =
+    originalModelCandidates.find(
+      (value) => typeof value === "string" && value.trim(),
+    ) || fallbackModel;
+  return {
+    mode: originalMode,
+    model: typeof originalModel === "string" ? originalModel.trim() : "",
+  };
+};
+
+const normalizeConversationHistoryRole = (role) => {
+  const normalized = typeof role === "string" ? role.trim().toLowerCase() : "";
+  if (normalized === "assistant") return "ai";
+  if (normalized === "user" || normalized === "ai") return normalized;
+  return "";
+};
+
+export const mergeAssistantMessageMetadata = (existingMetadata, nextMetadata) => {
+  const existing =
+    existingMetadata && typeof existingMetadata === "object" ? { ...existingMetadata } : {};
+  const next =
+    nextMetadata && typeof nextMetadata === "object" ? { ...nextMetadata } : {};
+  const nextStatus =
+    typeof next.status === "string" ? next.status.trim().toLowerCase() : "";
+  const successful =
+    (nextStatus === "complete" || nextStatus === "completed") &&
+    !next.error &&
+    !next.empty_response;
+  if (successful) {
+    RESPONSE_FAILURE_METADATA_KEYS.forEach((key) => {
+      delete existing[key];
+    });
+  }
+  return { ...existing, ...next };
+};
+
+const unwrapCommandValue = (value) => {
+  const raw = String(value || "");
+  if (raw.startsWith("[") && raw.endsWith("]")) {
+    return raw.slice(1, -1);
+  }
+  return raw;
+};
+
+const wrapCommandValue = (value) => {
+  const raw = String(value || "");
+  if (!raw) return raw;
+  return /\s/.test(raw) ? `[${raw}]` : raw;
+};
+
+const buildCommandInsertText = (kind, value) => {
+  const normalizedValue = String(value || "").trim();
+  if (kind === "tool") {
+    return `%${normalizedValue} `;
+  }
+  const prefix = kind === "file" ? "./" : "//";
+  return `${prefix}${wrapCommandValue(normalizedValue)} `;
+};
+
+const buildFallbackToolArgs = (toolName, body) => {
+  const name = String(toolName || "").trim().toLowerCase();
+  const trimmed = String(body || "").trim();
+  if (!trimmed) return {};
+  if (name === "remember") {
+    const separator = trimmed.indexOf(":");
+    if (separator > 0) {
+      const key = trimmed.slice(0, separator).trim();
+      const value = trimmed.slice(separator + 1).trim();
+      return {
+        ...(key ? { key } : {}),
+        ...(value ? { value } : {}),
+      };
+    }
+    return { value: trimmed };
+  }
+  if (name === "search_web") return { query: trimmed };
+  if (name === "recall") return { key: trimmed };
+  if (name === "tool_help" || name === "tool_info") {
+    return trimmed ? { tool_name: trimmed } : {};
+  }
+  return {};
+};
+
+const parseLeadingToolDirective = (text) => {
+  const match = String(text || "").match(TOOL_DIRECTIVE_RE);
+  if (!match) return null;
+  const leadingWhitespace = match[1] || "";
+  const toolName = String(match[2] || "").trim();
+  if (!toolName) return null;
+  const body = typeof match[3] === "string" ? match[3] : "";
+  return {
+    toolName,
+    body,
+    start: leadingWhitespace.length,
+    prefixEnd: leadingWhitespace.length + 1 + toolName.length,
+  };
+};
+
+const extractCommandReferences = (text) => {
+  const value = String(text || "");
+  const matches = [];
+  let match;
+  COMMAND_REFERENCE_RE.lastIndex = 0;
+  while ((match = COMMAND_REFERENCE_RE.exec(value)) !== null) {
+    const leading = match[1] || "";
+    const prefix = match[2] || "";
+    const rawValue = match[3] || "";
+    const tokenStart = match.index + leading.length;
+    const tokenEnd = tokenStart + prefix.length + rawValue.length;
+    const normalizedValue = unwrapCommandValue(rawValue);
+    matches.push({
+      prefix,
+      rawValue,
+      value: normalizedValue,
+      start: tokenStart,
+      end: tokenEnd,
+      kind:
+        prefix === "./" ? "file" : prefix === "//" ? "memory" : "blended",
+    });
+  }
+  return matches;
+};
+
+export const prepareComposerSubmission = (rawMessage, attachmentCount = 0) => {
+  const displayMessage = typeof rawMessage === "string" ? rawMessage.trim() : "";
+  const normalizedAttachmentCount =
+    typeof attachmentCount === "number" && Number.isFinite(attachmentCount)
+      ? attachmentCount
+      : Array.isArray(attachmentCount)
+        ? attachmentCount.length
+        : 0;
+  return {
+    displayMessage,
+    shouldSend: Boolean(displayMessage) || normalizedAttachmentCount > 0,
+  };
+};
+
+const buildCommandAwareRequest = (displayMessage) => {
+  const text = typeof displayMessage === "string" ? displayMessage : "";
+  const toolDirective = parseLeadingToolDirective(text);
+  const references = extractCommandReferences(text).filter(
+    (item) => item.kind === "file" || item.kind === "memory",
+  );
+  const referenceLines = references.map((item) =>
+    item.kind === "file"
+      ? `- file reference: ${item.value}`
+      : `- memory reference: ${item.value}`,
+  );
+  let requestMessage = text;
+  if (toolDirective) {
+    const commandBody = toolDirective.body.trim();
+    const bodyText =
+      commandBody ||
+      `The user explicitly requested the ${toolDirective.toolName} tool for this turn.`;
+    requestMessage = `${bodyText}\n\nTool preference: prefer the \`${toolDirective.toolName}\` tool for this turn if it fits the request. Do not pretend the tool ran if it did not, and do not force it if another path is clearly better.`;
+  }
+  if (referenceLines.length) {
+    requestMessage = `${requestMessage}\n\nContext references:\n${referenceLines.join("\n")}`;
+  }
+  return {
+    displayMessage: text,
+    requestMessage,
+    toolDirective,
+    references,
+  };
+};
+
+const responseUsesToolName = (tools, toolName) => {
+  const target = String(toolName || "").trim().toLowerCase();
+  if (!target) return false;
+  return (Array.isArray(tools) ? tools : []).some((tool) => {
+    const normalized = normalizeToolEntry(tool);
+    return normalized && String(normalized.name || "").trim().toLowerCase() === target;
+  });
+};
+
+const buildCommandFallbackTool = (toolDirective, messageId) => {
+  if (!toolDirective?.toolName) return null;
+  const normalizedName = String(toolDirective.toolName || "").trim();
+  if (!normalizedName) return null;
+  return {
+    name: normalizedName,
+    args: buildFallbackToolArgs(normalizedName, toolDirective.body || ""),
+    status: "proposed",
+    synthetic: true,
+    synthetic_id: `command-fallback:${messageId || "message"}:${normalizedName}`,
+    manual_fill_required: true,
+    source: "command_fallback",
+    prompt: String(toolDirective.body || "").trim(),
+  };
+};
+
+const clampCursor = (value, max) => {
+  const numeric = Number.isFinite(value) ? value : 0;
+  return Math.max(0, Math.min(max, numeric));
+};
+
+const findTokenEnd = (text, start) => {
+  const value = String(text || "");
+  if (start < 0 || start >= value.length) return start;
+  let index = start;
+  while (index < value.length) {
+    const char = value[index];
+    if (/\s/.test(char)) return index;
+    if (char === "[") {
+      const closing = value.indexOf("]", index + 1);
+      if (closing === -1) return value.length;
+      index = closing + 1;
+      continue;
+    }
+    index += 1;
+  }
+  return index;
+};
+
+const getCommandCompletionContext = (text, cursor) => {
+  const value = String(text || "");
+  const caret = clampCursor(cursor, value.length);
+  let start = caret;
+  while (start > 0 && !/\s/.test(value[start - 1])) {
+    start -= 1;
+  }
+  const token = value.slice(start, caret);
+  const prefix =
+    token.startsWith(".//")
+      ? ".//"
+      : token.startsWith("./")
+        ? "./"
+        : token.startsWith("//")
+          ? "//"
+          : token.startsWith("%")
+            ? "%"
+            : "";
+  if (!prefix) return null;
+  const query = unwrapCommandValue(token.slice(prefix.length));
+  return {
+    prefix,
+    kind:
+      prefix === "%"
+        ? "tool"
+        : prefix === "./"
+          ? "file"
+          : prefix === "//"
+            ? "memory"
+            : "blended",
+    query,
+    tokenStart: start,
+    tokenEnd: findTokenEnd(value, start),
+  };
+};
+
+const findLinkedTokenAtCursor = (text, cursor) => {
+  const value = String(text || "");
+  const caret = clampCursor(cursor, value.length);
+  const toolDirective = parseLeadingToolDirective(value);
+  if (toolDirective && caret === value.length && toolDirective.body.trim()) {
+    return {
+      kind: "tool",
+      start: toolDirective.start,
+      end: value.length,
+      prefix: "%",
+      rawValue: value.slice(toolDirective.start + 1, value.length),
+    };
+  }
+  const matches = extractCommandReferences(value);
+  return (
+    matches.find((item) => item.end === caret) || null
+  );
+};
+
+const unlinkCommandText = (text, cursor) => {
+  const value = String(text || "");
+  const match = findLinkedTokenAtCursor(value, cursor);
+  if (!match) return null;
+  if (match.kind === "tool") {
+    const percentIndex = value.indexOf("%", match.start);
+    if (percentIndex === -1) return null;
+    const nextText = `${value.slice(0, percentIndex)}${value.slice(percentIndex + 1)}`;
+    return {
+      text: nextText,
+      cursor: Math.max(0, cursor - 1),
+    };
+  }
+  const rawValue = unwrapCommandValue(match.rawValue);
+  const nextText = `${value.slice(0, match.start)}${rawValue}${value.slice(match.end)}`;
+  return {
+    text: nextText,
+    cursor: match.start + rawValue.length,
+  };
 };
 
 const LIVE_STREAM_INPUT_TRANSCRIPT_DELTA_TYPES = new Set([
@@ -742,16 +1088,15 @@ const formatModelSourceLabel = (mode, model) => {
 
 const resolveModeModel = (mode, state) => {
   const currentMode = (mode || state.backendMode || "").toLowerCase();
-  if (currentMode === "local") {
-    return { mode: currentMode, model: state.localModel || state.transformerModel || "" };
-  }
-  if (currentMode === "server") {
-    return { mode: currentMode, model: state.transformerModel || state.apiModel || "" };
-  }
-  if (currentMode === "api") {
-    return { mode: currentMode, model: state.apiModel || "" };
-  }
-  return { mode: currentMode || state.backendMode, model: state.apiModel || state.transformerModel || state.localModel || "" };
+  return {
+    mode: currentMode || state.backendMode,
+    model: resolveRequestModelForMode({
+      backendMode: currentMode || state.backendMode,
+      apiModel: state.apiModel,
+      transformerModel: state.transformerModel,
+      localModel: state.localModel,
+    }),
+  };
 };
 
 const getMessageStatusBadge = (msg) => {
@@ -852,6 +1197,11 @@ const Chat = ({
       : NOOP_SET_STATE;
   const navigate = useNavigate();
   const [message, setMessage] = useState("");
+  const [composerCursor, setComposerCursor] = useState(0);
+  const [commandSuggestions, setCommandSuggestions] = useState([]);
+  const [commandSuggestionsLoading, setCommandSuggestionsLoading] = useState(false);
+  const [activeCommandSuggestionIndex, setActiveCommandSuggestionIndex] = useState(0);
+  const [commandMenuStyle, setCommandMenuStyle] = useState(null);
   const [loading, setLoading] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState(null);
@@ -893,6 +1243,11 @@ const Chat = ({
   const chatSettingsTriggerRef = useRef(null);
   const chatSettingsPopoverRef = useRef(null);
   const attachmentMenuRef = useRef(null);
+  const toolCatalogRef = useRef(null);
+  const knowledgeDocsRef = useRef(null);
+  const commandLookupRequestRef = useRef(0);
+  const inputMainRef = useRef(null);
+  const activeCommandOptionRef = useRef(null);
   const realtimeResponseLifecycleRef = useRef({
     active: false,
     requested: false,
@@ -954,6 +1309,15 @@ const Chat = ({
       ? state.enabledWorkflowModules
       : [],
   };
+  const composerCommandContext = useMemo(
+    () => getCommandCompletionContext(message, composerCursor),
+    [message, composerCursor],
+  );
+  const activeCommandSuggestion =
+    activeCommandSuggestionIndex >= 0 &&
+    activeCommandSuggestionIndex < commandSuggestions.length
+      ? commandSuggestions[activeCommandSuggestionIndex]
+      : null;
   const setThinkingMode = useCallback((mode) => {
     const normalized =
       mode === "high" || mode === "low" || mode === "auto" ? mode : "auto";
@@ -973,6 +1337,236 @@ const Chat = ({
       return { ...prev, workflowProfile: normalized };
     });
   }, [setState]);
+  const placeComposerSelection = useCallback((nextText, nextCursor) => {
+    const safeText = typeof nextText === "string" ? nextText : "";
+    const safeCursor = clampCursor(nextCursor, safeText.length);
+    setMessage(safeText);
+    setComposerCursor(safeCursor);
+    if (typeof window !== "undefined") {
+      window.requestAnimationFrame(() => {
+        const target = composerInputRef.current;
+        if (
+          target &&
+          typeof target.setSelectionRange === "function" &&
+          document.activeElement === target
+        ) {
+          target.setSelectionRange(safeCursor, safeCursor);
+        }
+      });
+    }
+  }, []);
+  const syncComposerCursorFromTarget = useCallback((target) => {
+    if (!target || typeof target.selectionStart !== "number") return;
+    setComposerCursor(clampCursor(target.selectionStart, String(target.value || "").length));
+  }, []);
+  const handleComposerChange = useCallback(
+    (event) => {
+      const nextValue = typeof event?.target?.value === "string" ? event.target.value : "";
+      setMessage(nextValue);
+      syncComposerCursorFromTarget(event?.target);
+    },
+    [syncComposerCursorFromTarget],
+  );
+  const handleComposerSelectionChange = useCallback(
+    (event) => {
+      syncComposerCursorFromTarget(event?.target);
+    },
+    [syncComposerCursorFromTarget],
+  );
+  const loadToolCatalog = useCallback(async () => {
+    if (Array.isArray(toolCatalogRef.current)) return toolCatalogRef.current;
+    const res = await axios.get("/api/tools/catalog");
+    const tools = Array.isArray(res.data?.tools) ? res.data.tools : [];
+    toolCatalogRef.current = tools;
+    return tools;
+  }, []);
+  const loadKnowledgeDocs = useCallback(async () => {
+    if (Array.isArray(knowledgeDocsRef.current)) return knowledgeDocsRef.current;
+    const res = await axios.get("/api/knowledge/list");
+    const ids = Array.isArray(res.data?.ids) ? res.data.ids : [];
+    const metadatas = Array.isArray(res.data?.metadatas) ? res.data.metadatas : [];
+    const docs = ids.map((id, index) => {
+      const meta = metadatas[index] && typeof metadatas[index] === "object" ? metadatas[index] : {};
+      const source = String(meta.relative_path || meta.source || meta.filename || id || "").trim();
+      const title = String(meta.title || meta.filename || source || id || "").trim();
+      return {
+        id,
+        title,
+        source,
+      };
+    });
+    knowledgeDocsRef.current = docs;
+    return docs;
+  }, []);
+  useEffect(() => {
+    let cancelled = false;
+    const requestId = commandLookupRequestRef.current + 1;
+    commandLookupRequestRef.current = requestId;
+    const loadSuggestions = async () => {
+      if (!composerCommandContext) {
+        setCommandSuggestions([]);
+        setCommandSuggestionsLoading(false);
+        setActiveCommandSuggestionIndex(0);
+        return;
+      }
+      setCommandSuggestionsLoading(true);
+      try {
+        const query = String(composerCommandContext.query || "").trim().toLowerCase();
+        let suggestions = [];
+        if (composerCommandContext.kind === "tool") {
+          const tools = await loadToolCatalog();
+          suggestions = tools
+            .map((tool) => ({
+              kind: "tool",
+              label: String(tool?.name || "").trim(),
+              description: String(tool?.summary || tool?.description || "").trim(),
+              insertText: buildCommandInsertText("tool", tool?.name || ""),
+            }))
+            .filter((tool) => tool.label)
+            .filter((tool) => !query || tool.label.toLowerCase().includes(query))
+            .sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: "base" }));
+        } else {
+          const buildFileSuggestions = async () => {
+            const docs = await loadKnowledgeDocs();
+            return docs
+              .filter((doc) => doc && doc.source)
+              .filter((doc) => {
+                if (!query) return true;
+                const haystack = [doc.source, doc.title, doc.id]
+                  .filter(Boolean)
+                  .join(" ")
+                  .toLowerCase();
+                return haystack.includes(query);
+              })
+              .map((doc) => ({
+                kind: "file",
+                label: doc.source,
+                description: doc.title && doc.title !== doc.source ? doc.title : "knowledge file",
+                insertText: buildCommandInsertText("file", doc.source),
+              }));
+          };
+          const buildMemorySuggestions = async () => {
+            if (query) {
+              const res = await axios.post("/api/memory/search", {
+                query,
+                limit: COMMAND_COMPLETION_LIMIT * 2,
+              });
+              const results = Array.isArray(res.data?.results) ? res.data.results : [];
+              return results.map((item) => ({
+                kind: "memory",
+                label: String(item?.key || "").trim(),
+                description: String(item?.snippet || "").trim(),
+                insertText: buildCommandInsertText("memory", item?.key || ""),
+              }));
+            }
+            const res = await axios.get("/api/memory", {
+              params: { detailed: true },
+            });
+            const items = Array.isArray(res.data?.items) ? res.data.items : [];
+            return items.map((item) => ({
+              kind: "memory",
+              label: String(item?.key || "").trim(),
+              description: String(item?.hint || item?.value || "").trim(),
+              insertText: buildCommandInsertText("memory", item?.key || ""),
+            }));
+          };
+          if (composerCommandContext.kind === "file") {
+            suggestions = await buildFileSuggestions();
+          } else if (composerCommandContext.kind === "memory") {
+            suggestions = await buildMemorySuggestions();
+          } else {
+            const [files, memories] = await Promise.all([
+              buildFileSuggestions(),
+              buildMemorySuggestions(),
+            ]);
+            suggestions = [...files, ...memories];
+          }
+          suggestions = suggestions
+            .filter((item) => item.label)
+            .sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: "base" }));
+        }
+        if (cancelled || requestId !== commandLookupRequestRef.current) return;
+        setCommandSuggestions(suggestions.slice(0, COMMAND_COMPLETION_LIMIT));
+        setActiveCommandSuggestionIndex(0);
+      } catch (err) {
+        if (cancelled || requestId !== commandLookupRequestRef.current) return;
+        setCommandSuggestions([]);
+      } finally {
+        if (!cancelled && requestId === commandLookupRequestRef.current) {
+          setCommandSuggestionsLoading(false);
+        }
+      }
+    };
+    void loadSuggestions();
+    return () => {
+      cancelled = true;
+    };
+  }, [composerCommandContext, loadKnowledgeDocs, loadToolCatalog]);
+
+  const updateCommandMenuPosition = useCallback(() => {
+    if (
+      !composerCommandContext ||
+      (!commandSuggestionsLoading && commandSuggestions.length === 0) ||
+      typeof window === "undefined"
+    ) {
+      setCommandMenuStyle(null);
+      return;
+    }
+    const anchor = inputMainRef.current;
+    if (!anchor || typeof anchor.getBoundingClientRect !== "function") {
+      setCommandMenuStyle(null);
+      return;
+    }
+    const rect = anchor.getBoundingClientRect();
+    const inputBox = anchor.closest?.(".input-box");
+    const inputBoxStyles =
+      inputBox && typeof window.getComputedStyle === "function"
+        ? window.getComputedStyle(inputBox)
+        : null;
+    const railWidth =
+      parseFloat(inputBoxStyles?.getPropertyValue("--input-action-rail-width") || "0") || 0;
+    const width = Math.max(220, Math.round(rect.width - railWidth - 12));
+    setCommandMenuStyle({
+      left: `${Math.round(rect.left)}px`,
+      top: `${Math.round(rect.top - 10)}px`,
+      width: `${width}px`,
+    });
+  }, [
+    commandSuggestions.length,
+    commandSuggestionsLoading,
+    composerCommandContext,
+  ]);
+
+  useEffect(() => {
+    updateCommandMenuPosition();
+  }, [updateCommandMenuPosition]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return undefined;
+    }
+    const frame = window.requestAnimationFrame(() => {
+      const activeNode = activeCommandOptionRef.current;
+      if (!activeNode || typeof activeNode.scrollIntoView !== "function") {
+        return;
+      }
+      activeNode.scrollIntoView({ block: "nearest", inline: "nearest" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeCommandSuggestionIndex, commandSuggestions.length]);
+
+  useEffect(() => {
+    if (!composerCommandContext) return undefined;
+    const handlePositionUpdate = () => {
+      updateCommandMenuPosition();
+    };
+    window.addEventListener("resize", handlePositionUpdate);
+    window.addEventListener("scroll", handlePositionUpdate, true);
+    return () => {
+      window.removeEventListener("resize", handlePositionUpdate);
+      window.removeEventListener("scroll", handlePositionUpdate, true);
+    };
+  }, [composerCommandContext, updateCommandMenuPosition]);
   const mediaRecorderRef = useRef(null);
   const audioChunksRef = useRef([]);
   const activeRequestRef = useRef(null);
@@ -1123,8 +1717,34 @@ const Chat = ({
       if (!msg || typeof msg !== "object") return "";
       const meta = msg.metadata && typeof msg.metadata === "object" ? msg.metadata : {};
       const mode = typeof meta.mode === "string" ? meta.mode : "";
-      const model = typeof meta.model === "string" ? meta.model : "";
-      return formatModelSourceLabel(mode, model);
+      const modelCandidates = [
+        meta.model_received,
+        meta.model_resolved,
+        meta.effective_model_id,
+        meta.effective_model,
+        meta.model,
+      ];
+      const resolvedModel =
+        modelCandidates.find(
+          (value) => typeof value === "string" && value.trim(),
+        ) || "";
+      const model =
+        typeof resolvedModel === "string" ? resolvedModel.trim() : "";
+      const provider =
+        typeof meta.provider === "string" ? meta.provider.trim() : "";
+      if (mode && model) {
+        const normalizedMode = mode.toLowerCase();
+        const normalizedModel = model.toLowerCase();
+        const normalizedProvider = provider.toLowerCase();
+        if (
+          normalizedMode === "local" &&
+          normalizedProvider &&
+          normalizedProvider !== normalizedModel
+        ) {
+          return `${mode}/${provider}:${model}`;
+        }
+      }
+      return formatModelSourceLabel(mode, model || provider);
     },
     [],
   );
@@ -1151,19 +1771,28 @@ const Chat = ({
   }, []);
 
   const buildHistoryFromConversation = useCallback((conversation) => {
-    if (!Array.isArray(conversation)) return [];
-    return conversation
-      .filter(
-        (entry) =>
-          entry &&
-          (entry.role === "user" || entry.role === "ai" || entry.role === "assistant") &&
-          typeof entry.text === "string" &&
-          entry.text.trim(),
-      )
-      .map((entry) => ({
-        role: entry.role === "assistant" ? "ai" : entry.role,
-        text: entry.text,
-      }));
+    return (Array.isArray(conversation) ? conversation : []).reduce((history, entry) => {
+      if (!entry || typeof entry !== "object") return history;
+      const role = normalizeConversationHistoryRole(entry.role);
+      if (!role) return history;
+      const text = typeof entry.text === "string" ? entry.text : String(entry.text || "");
+      const trimmed = text.trim();
+      if (!trimmed) return history;
+      const metadata =
+        entry.metadata && typeof entry.metadata === "object" ? entry.metadata : {};
+      const explicitToolPlaceholder =
+        role === "ai" &&
+        isContinuationPlaceholderText(trimmed) &&
+        (metadata.tool_response_pending || Array.isArray(entry.tools));
+      const pendingInlinePlaceholder =
+        role === "ai" &&
+        metadata.tool_response_pending &&
+        hasInlineToolPlaceholder(trimmed) &&
+        !hasRenderableAssistantContent(trimmed);
+      if (explicitToolPlaceholder || pendingInlinePlaceholder) return history;
+      history.push({ role, text });
+      return history;
+    }, []);
   }, []);
 
   const syncHistoryFromConversation = useCallback(
@@ -1528,10 +2157,15 @@ const Chat = ({
 
   const buildCameraConstraints = useCallback(() => {
     const video = {
-      facingMode: "environment",
+      width: { ideal: 1920 },
+      height: { ideal: 1080 },
+      aspectRatio: { ideal: 16 / 9 },
+      resizeMode: "none",
     };
     if (preferredCameraDeviceId) {
       video.deviceId = { exact: preferredCameraDeviceId };
+    } else {
+      video.facingMode = "environment";
     }
     return video;
   }, [preferredCameraDeviceId]);
@@ -1622,7 +2256,7 @@ const Chat = ({
       top: `${Math.round(top)}px`,
       left: `${Math.round(left)}px`,
       maxWidth: `min(calc(100vw - ${margin * 2}px), 388px)`,
-      zIndex: 1400,
+      zIndex: 3600,
     });
   }, []);
 
@@ -2946,7 +3580,11 @@ const Chat = ({
 
   const requestModelCompletion = useCallback(
     async (payload, text, options = {}) => {
-      const { trackAbort = true, endpoint = "/api/llm/generate" } = options;
+      const {
+        trackAbort = true,
+        endpoint = "/api/llm/generate",
+        allowRetry = true,
+      } = options;
       const attemptRequest = async (attemptIndex) => {
         const timeoutMs = computeAdaptiveTimeoutMs(text, attemptIndex);
         const canAbort = typeof AbortController !== "undefined";
@@ -3025,7 +3663,7 @@ const Chat = ({
       try {
         return await attemptRequest(0);
       } catch (err) {
-        if (!shouldRetry(err)) {
+        if (!allowRetry || !shouldRetry(err)) {
           throw err;
         }
         await new Promise((resolve) => setTimeout(resolve, 400));
@@ -3624,30 +4262,11 @@ const Chat = ({
       refreshAvailableInputDevices().catch(() => {});
     } catch (err) {
       console.error("camera open failed", err);
-      setCameraError("Camera access failed.");
+      setCameraError(getRequestErrorDetail(err, "Camera access failed."));
     } finally {
       setCameraBusy(false);
     }
   }, [buildCameraConstraints, cameraOpen, refreshAvailableInputDevices, stopCameraCapture]);
-
-  const buildDefaultPrompt = useCallback(
-    (workflow, imageCount, attachmentTotal) => {
-      if (attachmentTotal <= 0) return "";
-      if (imageCount > 0) {
-        if (workflow === "ocr") return "Read any visible text in the attached image.";
-        if (workflow === "compare") return "Compare the attached images.";
-        if (workflow === "caption") return "Describe the attached image.";
-        if (workflow === "image_qa") return "Answer using the attached image.";
-        return imageCount > 1
-          ? "Analyze the attached images."
-          : "Analyze the attached image.";
-      }
-      return attachmentTotal > 1
-        ? "Use the attached files in your response."
-        : "Use the attached file in your response.";
-    },
-    [],
-  );
 
   const imageAttachmentCount = useMemo(
     () => attachments.filter((attachment) => attachmentLooksImage(attachment)).length,
@@ -3667,16 +4286,20 @@ const Chat = ({
 
   const sendMessage = async (msg = message) => {
     setAttachmentMenuOpen(false);
-    const trimmedMessage = typeof msg === "string" ? msg.trim() : "";
+    const rawDisplayMessage = typeof msg === "string" ? msg : "";
+    const composerSubmission = prepareComposerSubmission(
+      rawDisplayMessage,
+      attachments.length,
+    );
     const effectiveVisionWorkflow = hasImageAttachments ? visionWorkflow : "auto";
     if (effectiveVisionWorkflow === "compare" && imageAttachmentCount < 2) {
       setError("Compare mode needs at least two image attachments.");
       return;
     }
-    const effectiveMessage =
-      trimmedMessage ||
-      buildDefaultPrompt(effectiveVisionWorkflow, imageAttachmentCount, attachments.length);
-    if (!effectiveMessage) return;
+    const { displayMessage, shouldSend } = composerSubmission;
+    if (!shouldSend) return;
+    const commandRequest = buildCommandAwareRequest(displayMessage);
+    const effectiveMessage = commandRequest.requestMessage;
     if (attachments.some((a) => a.uploading)) {
       setError("Attachments are still uploading. Please wait.");
       return;
@@ -3783,16 +4406,16 @@ const Chat = ({
     setIsStreaming(true);
     const msgId = crypto.randomUUID();
     setActiveMessageId && setActiveMessageId(msgId);
-    console.log("Sending message:", effectiveMessage);
+    console.log("Sending message:", displayMessage);
 
     try {
       // Ensure device token for any sync-enabled features
       if (state.backendMode === "api") {
         await ensureDeviceAndToken();
       }
-      memoryStore["last_message"] = { content: effectiveMessage, importance: 5 };
+      memoryStore["last_message"] = { content: displayMessage, importance: 5 };
     setState((prev) => {
-      const newHistory = [...prev.history, { role: "user", text: effectiveMessage }];
+      const newHistory = [...prev.history, { role: "user", text: displayMessage }];
         const attachmentsForState = conversationAttachments.map((att) => ({ ...att }));
         const timestampIso = new Date().toISOString();
         const newState = {
@@ -3802,7 +4425,7 @@ const Chat = ({
             {
               id: `${msgId}:user`,
               role: "user",
-              text: effectiveMessage,
+              text: displayMessage,
               timestamp: timestampIso,
               attachments: attachmentsForState,
               metadata:
@@ -3841,6 +4464,7 @@ const Chat = ({
         return newState;
       });
       setMessage("");
+      setComposerCursor(0);
       setComposerRows(DEFAULT_COMPOSER_ROWS);
       scheduleScrollToBottom("smooth");
       let aiResponse = "";
@@ -3858,6 +4482,7 @@ const Chat = ({
           let res = await apiWrapper.chat(
             {
               message: effectiveMessage,
+              mode: "api",
               session_id: state.sessionId,
               model: state.apiModel,
               message_id: msgId,
@@ -3879,6 +4504,7 @@ const Chat = ({
             res = await apiWrapper.chat(
               {
                 message: effectiveMessage,
+                mode: "api",
                 session_id: state.sessionId,
                 model: state.apiModel,
                 message_id: msgId,
@@ -3920,7 +4546,12 @@ const Chat = ({
         }
       } else if (state.backendMode === "local" || state.backendMode === "server") {
         const mode = state.backendMode;
-        const model = mode === "local" ? (state.localModel || state.transformerModel) : (state.transformerModel || state.apiModel);
+        const model = resolveRequestModelForMode({
+          backendMode: mode,
+          apiModel: state.apiModel,
+          transformerModel: state.transformerModel,
+          localModel: state.localModel,
+        });
         const payload = {
           message: effectiveMessage,
           mode,
@@ -3935,6 +4566,9 @@ const Chat = ({
         const r = await requestModelCompletion(payload, effectiveMessage, {
           trackAbort: true,
           endpoint: "/api/chat",
+          // Persisted chat requests already reserve a canonical message_id server-side.
+          // Retrying the same turn here duplicates backend work and can scramble ordering.
+          allowRetry: false,
         });
         aiResponse = r.data?.message || "";
         responseThought = r.data?.thought || "";
@@ -3961,6 +4595,17 @@ const Chat = ({
           setBanner(null);
         }
       }
+      if (
+        commandRequest.toolDirective &&
+        !responseUsesToolName(responseTools, commandRequest.toolDirective.toolName)
+      ) {
+        const fallbackTool = buildCommandFallbackTool(commandRequest.toolDirective, msgId);
+        if (fallbackTool) {
+          responseTools = mergeToolEntries(responseTools, [fallbackTool], null, {
+            includeInlineMetadata: false,
+          });
+        }
+      }
       const metadataDisplayName =
         responseMetadata &&
         (responseMetadata.session_display_name ||
@@ -3977,7 +4622,14 @@ const Chat = ({
         if (idx !== -1) {
           const entry = { ...updatedConversation[idx], text: aiResponse };
           if (responseMetadata && Object.keys(responseMetadata).length) {
-            entry.metadata = { ...(entry.metadata || {}), ...responseMetadata };
+            entry.metadata = mergeAssistantMessageMetadata(
+              entry.metadata,
+              responseMetadata,
+            );
+          } else if (aiResponse && aiResponse.trim()) {
+            entry.metadata = mergeAssistantMessageMetadata(entry.metadata, {
+              status: "complete",
+            });
           }
           if (typeof responseThought === "string" && responseThought.trim()) {
             const trimmed = responseThought.trim();
@@ -4188,13 +4840,14 @@ const Chat = ({
     setLoading(true);
     setIsStreaming(true);
     setActiveMessageId && setActiveMessageId(msg.id);
+    const regenerateTarget = resolveRegenerateRequestTarget(state, msg);
     let responseMetadata = null;
     let ragMatchesFromResponse = [];
     let responseThought = "";
     let responseTools = [];
     try {
       let aiResponse = "";
-      if (state.backendMode === "api") {
+      if (regenerateTarget.mode === "api") {
         const controller =
           typeof AbortController !== "undefined" ? new AbortController() : null;
         if (controller) {
@@ -4204,8 +4857,9 @@ const Chat = ({
           const res = await apiWrapper.chat(
             {
               message: userText,
+              mode: "api",
               session_id: state.sessionId,
-              model: state.apiModel,
+              model: regenerateTarget.model || state.apiModel,
               message_id: msg.id,
               attachments: previousAttachments,
               vision_workflow: previousVisionWorkflow,
@@ -4233,9 +4887,13 @@ const Chat = ({
             clearActiveRequest();
           }
         }
-      } else if (state.backendMode === "local" || state.backendMode === "server") {
-        const mode = state.backendMode;
-        const model = mode === "local" ? (state.localModel || state.transformerModel) : (state.transformerModel || state.apiModel);
+      } else if (
+        regenerateTarget.mode === "local" ||
+        regenerateTarget.mode === "server"
+      ) {
+        const mode = regenerateTarget.mode;
+        const model =
+          regenerateTarget.model || getSelectedTargetModelForMode(state, mode);
         const payload = {
           message: userText,
           mode,
@@ -4250,6 +4908,7 @@ const Chat = ({
         const r = await requestModelCompletion(payload, userText, {
           trackAbort: true,
           endpoint: "/api/chat",
+          allowRetry: false,
         });
         aiResponse = r.data?.message || "";
         responseThought = r.data?.thought || "";
@@ -4297,7 +4956,14 @@ const Chat = ({
             timestamp: new Date().toISOString(),
           };
           if (responseMetadata && Object.keys(responseMetadata).length) {
-            entry.metadata = { ...(entry.metadata || {}), ...responseMetadata };
+            entry.metadata = mergeAssistantMessageMetadata(
+              entry.metadata,
+              responseMetadata,
+            );
+          } else if (aiResponse && aiResponse.trim()) {
+            entry.metadata = mergeAssistantMessageMetadata(entry.metadata, {
+              status: "complete",
+            });
           }
           if (typeof responseThought === "string" && responseThought.trim()) {
             const trimmed = responseThought.trim();
@@ -4425,7 +5091,16 @@ const Chat = ({
       if (!msg || typeof msg !== "object") return false;
       const meta = msg.metadata && typeof msg.metadata === "object" ? msg.metadata : {};
       if (meta.unresolved_tool_loop) return true;
-      return hasInvokedToolResults(msg);
+      if (!hasInvokedToolResults(msg)) return false;
+      const status = typeof meta.status === "string" ? meta.status.trim().toLowerCase() : "";
+      const text = typeof msg.text === "string" ? msg.text : String(msg.text || "");
+      const hasRenderableContent = hasRenderableAssistantContent(text);
+      const isPlaceholder = isContinuationPlaceholderText(text);
+      if (meta.tool_continued && hasRenderableContent && !isPlaceholder) return false;
+      if (meta.tool_response_pending) return true;
+      if (isPlaceholder) return true;
+      if (!hasRenderableContent) return true;
+      return status === "pending" || status === "proposed" || status === "streaming";
     },
     [hasInvokedToolResults],
   );
@@ -4573,6 +5248,12 @@ const Chat = ({
               metadata: {
                 ...(updated[mIdx]?.metadata || {}),
                 ...(md || {}),
+                ...(Object.prototype.hasOwnProperty.call(
+                  md && typeof md === "object" ? md : {},
+                  "tool_response_pending",
+                )
+                  ? { tool_response_pending: md.tool_response_pending }
+                  : { tool_response_pending: false }),
                 tool_continued: true,
                 ...(toolContinueSignature && !md?.tool_continue_signature
                   ? { tool_continue_signature: toolContinueSignature }
@@ -4654,6 +5335,8 @@ const Chat = ({
       if (!msgBase || !msgBase.id) return;
       if (toolContinueLocksRef.current.has(msgBase.id)) return;
       const tools = Array.isArray(toolsOverride) ? toolsOverride : msgBase.tools;
+      const messageForContinuation = { ...msgBase, tools };
+      if (!canContinueMessage(messageForContinuation)) return;
       const batch = buildToolContinuationBatch(tools);
       if (!batch) return;
       if (
@@ -4674,7 +5357,7 @@ const Chat = ({
         toolContinueLocksRef.current.delete(msgBase.id);
       }
     },
-    [continueGenerating],
+    [canContinueMessage, continueGenerating],
   );
 
   const openEditUserMessage = useCallback(
@@ -5100,7 +5783,58 @@ const Chat = ({
     return text;
   };
 
+  const acceptCommandSuggestion = useCallback(
+    (suggestion) => {
+      if (!suggestion || !composerCommandContext) return;
+      const before = message.slice(0, composerCommandContext.tokenStart);
+      const after = message.slice(composerCommandContext.tokenEnd);
+      const insertText = String(suggestion.insertText || "");
+      placeComposerSelection(
+        `${before}${insertText}${after}`,
+        before.length + insertText.length,
+      );
+    },
+    [composerCommandContext, message, placeComposerSelection],
+  );
+
   const handleKeyDown = (e) => {
+    const selectionStart =
+      typeof e?.target?.selectionStart === "number" ? e.target.selectionStart : composerCursor;
+    const selectionEnd =
+      typeof e?.target?.selectionEnd === "number" ? e.target.selectionEnd : selectionStart;
+    if (e.key === "Backspace" && selectionStart === selectionEnd && selectionStart > 0) {
+      const unlinked = unlinkCommandText(message, selectionStart);
+      if (unlinked) {
+        e.preventDefault();
+        placeComposerSelection(unlinked.text, unlinked.cursor);
+        return;
+      }
+    }
+    if (e.key === "ArrowDown" && commandSuggestions.length) {
+      e.preventDefault();
+      setActiveCommandSuggestionIndex((prev) =>
+        prev >= commandSuggestions.length - 1 ? 0 : prev + 1,
+      );
+      return;
+    }
+    if (e.key === "ArrowUp" && commandSuggestions.length) {
+      e.preventDefault();
+      setActiveCommandSuggestionIndex((prev) =>
+        prev <= 0 ? commandSuggestions.length - 1 : prev - 1,
+      );
+      return;
+    }
+    if (e.key === "Escape" && commandSuggestions.length) {
+      e.preventDefault();
+      setCommandSuggestions([]);
+      setActiveCommandSuggestionIndex(0);
+      return;
+    }
+    if (e.key === "Tab" && commandSuggestions.length && activeCommandSuggestion) {
+      e.preventDefault();
+      acceptCommandSuggestion(activeCommandSuggestion);
+      return;
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       sendMessage();
@@ -5486,6 +6220,9 @@ const Chat = ({
   const liveStreamingStatusLabel = getLiveStreamingStatusLabel(
     liveStreamingPhase,
   );
+  const inputAlerts = [error, cameraError, liveVisualError].filter(
+    (value) => typeof value === "string" && value.trim(),
+  );
   const liveStreamingActive =
     recording || liveSessionPending || liveStreamingPhase === "connecting";
   const liveTranscriptVisible =
@@ -5730,6 +6467,54 @@ const Chat = ({
           document.body,
         )
       : null;
+  const commandSuggestionsPopover =
+    composerCommandContext &&
+    (commandSuggestionsLoading || commandSuggestions.length > 0) &&
+    commandMenuStyle &&
+    typeof document !== "undefined"
+      ? createPortal(
+          <div
+            className="composer-command-menu composer-command-menu-floating"
+            role="listbox"
+            aria-label="Command suggestions"
+            style={commandMenuStyle}
+          >
+            {commandSuggestionsLoading && commandSuggestions.length === 0 ? (
+              <div className="composer-command-empty">loading suggestions...</div>
+            ) : (
+              commandSuggestions.map((suggestion, index) => (
+                <button
+                  key={`${suggestion.kind}-${suggestion.label}-${index}`}
+                  type="button"
+                  ref={index === activeCommandSuggestionIndex ? activeCommandOptionRef : null}
+                  role="option"
+                  aria-selected={index === activeCommandSuggestionIndex}
+                  className={`composer-command-option${
+                    index === activeCommandSuggestionIndex ? " is-active" : ""
+                  }`}
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    acceptCommandSuggestion(suggestion);
+                  }}
+                >
+                  <span className={`composer-command-kind kind-${suggestion.kind}`}>
+                    {suggestion.kind}
+                  </span>
+                  <span className="composer-command-copy">
+                    <span className="composer-command-label">{suggestion.label}</span>
+                    {suggestion.description ? (
+                      <span className="composer-command-description">
+                        {suggestion.description}
+                      </span>
+                    ) : null}
+                  </span>
+                </button>
+              ))
+            )}
+          </div>,
+          document.body,
+        )
+      : null;
 
   return (
     <>
@@ -5964,6 +6749,11 @@ const Chat = ({
                       : hasArgs
                         ? summarizeToolValue(tool.args, toolName)
                         : "";
+                    const acceptDisabled = tool?.manual_fill_required === true && !requestId;
+                    const localDenyAllowed = tool?.synthetic === true && !requestId;
+                    const syntheticToolKey =
+                      typeof tool?.synthetic_id === "string" ? tool.synthetic_id : "";
+                    const baselineToolSignature = toolSignature(tool);
                     const invokeDirect = async (overrideArgs, overrideName) => {
                       if (!toolName || !chainTarget) return;
                       const payload = {
@@ -6132,6 +6922,37 @@ const Chat = ({
                             continueTarget,
                           );
                         }
+                      } else if (decision === "deny" && localDenyAllowed) {
+                        setState((prev) => {
+                          const updated = Array.isArray(prev.conversation)
+                            ? [...prev.conversation]
+                            : [];
+                          const mIdx = updated.findIndex((m) => m && m.id === chainTarget);
+                          if (mIdx === -1) return prev;
+                          const msgEntry = { ...(updated[mIdx] || {}) };
+                          const existingTools = Array.isArray(msgEntry.tools)
+                            ? [...msgEntry.tools]
+                            : [];
+                          const tIdx = existingTools.findIndex((entryTool) => {
+                            if (!entryTool || typeof entryTool !== "object") return false;
+                            if (
+                              syntheticToolKey &&
+                              entryTool.synthetic_id === syntheticToolKey
+                            ) {
+                              return true;
+                            }
+                            return toolSignature(entryTool) === baselineToolSignature;
+                          });
+                          if (tIdx === -1) return prev;
+                          existingTools[tIdx] = {
+                            ...existingTools[tIdx],
+                            status: "denied",
+                            result: buildToolOutcomeResult("denied", "Dismissed by user."),
+                          };
+                          msgEntry.tools = existingTools;
+                          updated[mIdx] = msgEntry;
+                          return { ...prev, conversation: updated };
+                        });
                       }
                     } catch (err) {
                       console.error("Tool decision failed", err);
@@ -6181,7 +7002,6 @@ const Chat = ({
                         }${
                           isActiveMessage ? " active" : ""
                         }`}
-                        open={isActiveMessage && !toolsCollapsed}
                       >
                       <summary className="tool-summary compact">
                         <div className="tool-summary-main">
@@ -6206,9 +7026,11 @@ const Chat = ({
                             <button
                               type="button"
                               className="tool-action-btn accept"
+                              disabled={acceptDisabled}
                               onClick={async (event) => {
                                 event.preventDefault();
                                 event.stopPropagation();
+                                if (acceptDisabled) return;
                                 await submitDecision("accept");
                               }}
                             >
@@ -6217,11 +7039,11 @@ const Chat = ({
                             <button
                               type="button"
                               className="tool-action-btn deny"
-                              disabled={!requestId}
+                              disabled={!requestId && !localDenyAllowed}
                               onClick={async (event) => {
                                 event.preventDefault();
                                 event.stopPropagation();
-                                if (!requestId) return;
+                                if (!requestId && !localDenyAllowed) return;
                                 await submitDecision("deny");
                               }}
                             >
@@ -6349,7 +7171,12 @@ const Chat = ({
                               const toolLabel =
                                 typeof tool.name === "string" ? tool.name.toLowerCase() : "";
                               const renderStructuredResult =
-                                toolLabel.startsWith("computer.") || toolLabel === "open_url";
+                                toolLabel.startsWith("computer.") ||
+                                toolLabel === "open_url" ||
+                                !!extractCapturePayload(
+                                  normalizeToolResultPayload(tool.result),
+                                  tool.name,
+                                );
                               if (!renderStructuredResult) {
                                 return (
                                   <pre className="tool-result-inline" aria-label="Tool result">
@@ -6633,6 +7460,7 @@ const Chat = ({
       </div>
     )}
     {!entryOpen && error && <p className="error">{error}</p>}
+    {commandSuggestionsPopover}
     {typeof document !== 'undefined' && createPortal(
       (entryOpen ? (
         <div
@@ -6672,9 +7500,17 @@ const Chat = ({
             }}
             onKeyDown={handleComposerResizeKeyDown}
           />
-          {error && (
-            <div className="input-error" role="alert">
-              {error}
+          {inputAlerts.length > 0 && (
+            <div className="input-alert-stack" aria-live="polite">
+              {inputAlerts.map((message, index) => (
+                <div
+                  key={`input-alert-${index}-${message}`}
+                  className="input-error"
+                  role="alert"
+                >
+                  {message}
+                </div>
+              ))}
             </div>
           )}
           {banner && (
@@ -6687,16 +7523,6 @@ const Chat = ({
                 ))}
               </span>
               <button className="chip" style={{ float: 'right' }} onClick={() => setBanner(null)}>dismiss</button>
-            </div>
-          )}
-          {cameraError && (
-            <div className="input-error" role="alert">
-              {cameraError}
-            </div>
-          )}
-          {liveVisualError && (
-            <div className="input-error" role="alert">
-              {liveVisualError}
             </div>
           )}
           {liveTranscriptVisible && (
@@ -6853,10 +7679,10 @@ const Chat = ({
             </div>
           )}
           <div className="input-row">
-            <div className="input-main">
+            <div className="input-main" ref={inputMainRef}>
               <TextField
                 value={message}
-                onChange={(e) => setMessage(e.target.value)}
+                onChange={handleComposerChange}
                 onKeyDown={handleKeyDown}
                 onPaste={handleComposerPaste}
                 disabled={loading && !isStreaming}
@@ -6864,6 +7690,12 @@ const Chat = ({
                 size="medium"
                 multiline
                 inputRef={composerInputRef}
+                inputProps={{
+                  className: "composer-rich-input",
+                  onSelect: handleComposerSelectionChange,
+                  onClick: handleComposerSelectionChange,
+                  onKeyUp: handleComposerSelectionChange,
+                }}
                 minRows={effectiveComposerRows}
                 maxRows={effectiveComposerRows}
                 fullWidth

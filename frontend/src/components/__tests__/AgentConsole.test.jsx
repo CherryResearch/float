@@ -70,19 +70,18 @@ describe("AgentConsole", () => {
     vi.spyOn(axios, "get").mockImplementation((url) => {
       if (url === "/api/llm/local-status") {
         return Promise.resolve({
-          data: { runtime: { mode: "local", memory: { gpu: [], system: {} } } },
-        });
-      }
-      if (url === "/api/llm/provider/status") {
-        return Promise.resolve({
           data: {
             runtime: {
-              provider: "lmstudio",
-              installed: true,
-              server_running: false,
-              model_loaded: false,
-              loaded_model: null,
-              capabilities: { start_stop: true, context_length: true },
+              mode: "local",
+              memory: { gpu: [], system: {} },
+              load_state: "ready",
+              load_finished_at: Math.floor(Date.now() / 1000) - 4,
+              preflight: {
+                python_executable: "D:/notebooks/float_dev/backend/.venv/Scripts/python.exe",
+                missing_packages: [],
+                missing_runtime_components: [],
+                hint: null,
+              },
             },
           },
         });
@@ -91,7 +90,16 @@ describe("AgentConsole", () => {
         return Promise.resolve({
           data: {
             models: ["gpt-oss-20b"],
-            runtime: { loaded_model: null },
+            runtime: {
+              provider: "lmstudio",
+              installed: true,
+              server_running: false,
+              model_loaded: false,
+              loaded_model: null,
+              effective_model_id: "gpt-oss-20b",
+              capabilities: { start_stop: true, context_length: true },
+              checked_at: Math.floor(Date.now() / 1000) - 3,
+            },
           },
         });
       }
@@ -264,6 +272,80 @@ describe("AgentConsole", () => {
     expect(
       screen.getByRole("button", { name: /collapse sync inbox/i }),
     ).toHaveTextContent("-");
+  });
+
+  it("lets the user hide and restore the sync inbox", async () => {
+    const now = Date.now() / 1000;
+
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled
+        onStreamToggle={() => {}}
+        syncReviews={{
+          pending: [],
+          recent: [
+            {
+              id: "review-2",
+              status: "approved",
+              source_label: "Desk",
+              updated_at: now - 60,
+              requested_section_labels: ["Knowledge"],
+            },
+          ],
+        }}
+        onSelectMessage={() => {}}
+        backendReady
+        onRefreshAgents={() => {}}
+      />,
+    );
+
+    expect(await screen.findByRole("heading", { name: /sync inbox/i })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /hide sync inbox/i }));
+
+    expect(screen.queryByRole("heading", { name: /sync inbox/i })).not.toBeInTheDocument();
+    expect(screen.queryByText(/recent decisions/i)).not.toBeInTheDocument();
+    const showHiddenButton = screen.getByRole("button", {
+      name: /show hidden console cards/i,
+    });
+    expect(showHiddenButton).toHaveTextContent("show hidden (1)");
+
+    fireEvent.click(showHiddenButton);
+
+    expect(await screen.findByRole("heading", { name: /sync inbox/i })).toBeInTheDocument();
+    expect(screen.getByText(/recent decisions/i)).toBeInTheDocument();
+  });
+
+  it("uses symbol toggles for runtime details", async () => {
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled
+        onStreamToggle={() => {}}
+        agents={[]}
+        onSelectMessage={() => {}}
+        backendReady
+        onRefreshAgents={() => {}}
+      />,
+      {
+        stateOverrides: {
+          backendMode: "local",
+          localModel: "gpt-oss-20b",
+          transformerModel: "gpt-oss-20b",
+        },
+      },
+    );
+
+    const collapseButton = await screen.findByRole("button", {
+      name: /collapse runtime details/i,
+    });
+    expect(collapseButton).toHaveTextContent("-");
+
+    fireEvent.click(collapseButton);
+
+    expect(screen.getByRole("button", { name: /expand runtime details/i })).toHaveTextContent("+");
   });
 
   it("does not auto-scroll the console when the user has moved away from the bottom", async () => {
@@ -572,9 +654,10 @@ describe("AgentConsole", () => {
     );
 
     expect(screen.getByText(/draft reply/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /minimize draft reply/i })).toHaveTextContent("-");
 
     fireEvent.click(screen.getByRole("button", { name: /minimize draft reply/i }));
-    expect(screen.getByRole("button", { name: /expand draft reply/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /expand draft reply/i })).toHaveTextContent("+");
 
     fireEvent.click(screen.getByRole("button", { name: /hide draft reply/i }));
     expect(screen.queryByText(/draft reply/i)).not.toBeInTheDocument();
@@ -661,6 +744,105 @@ describe("AgentConsole", () => {
           message_id: "msg-1",
         }),
       );
+    });
+  });
+
+  it("keeps synthetic fallback tools denyable while manual accept stays disabled", async () => {
+    const now = Date.now() / 1000;
+    const setState = vi.fn();
+    const syntheticTool = {
+      name: "remember",
+      args: { value: "project note" },
+      status: "proposed",
+      synthetic: true,
+      synthetic_id: "command-fallback:msg-synth-1:remember",
+      manual_fill_required: true,
+    };
+
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled
+        onStreamToggle={() => {}}
+        agents={[
+          {
+            id: "agent-synth",
+            label: "command-fallback",
+            status: "pending",
+            updatedAt: now,
+            events: [
+              {
+                type: "tool",
+                name: "remember",
+                args: { value: "project note" },
+                status: "proposed",
+                timestamp: now,
+                chain_id: "msg-synth-1",
+                message_id: "msg-synth-1",
+                session_id: "sess-123",
+                synthetic: true,
+                synthetic_id: "command-fallback:msg-synth-1:remember",
+                manual_fill_required: true,
+              },
+            ],
+          },
+        ]}
+        onSelectMessage={() => {}}
+        backendReady
+        onRefreshAgents={() => {}}
+      />,
+      {
+        stateOverrides: {
+          conversation: [
+            {
+              id: "msg-synth-1",
+              role: "ai",
+              text: "Need confirmation.",
+              tools: [syntheticTool],
+            },
+          ],
+        },
+        setState,
+      },
+    );
+
+    const acceptButton = await screen.findByText("Accept", { selector: "button" });
+    const denyButton = screen.getByText("Deny", { selector: "button" });
+
+    expect(acceptButton).toBeDisabled();
+    expect(denyButton).toBeEnabled();
+
+    fireEvent.click(denyButton);
+
+    await waitFor(() => {
+      expect(setState).toHaveBeenCalled();
+    });
+    expect(
+      axios.post.mock.calls.some(([url]) => url === "/api/tools/decision"),
+    ).toBe(false);
+
+    const updater = setState.mock.calls.at(-1)?.[0];
+    expect(typeof updater).toBe("function");
+
+    const nextState = updater({
+      ...baseGlobalState,
+      conversation: [
+        {
+          id: "msg-synth-1",
+          role: "ai",
+          text: "Need confirmation.",
+          tools: [syntheticTool],
+        },
+      ],
+    });
+
+    expect(nextState.conversation[0].tools[0]).toMatchObject({
+      status: "denied",
+      result: {
+        status: "denied",
+        message: "Dismissed by user.",
+      },
     });
   });
 
@@ -1270,39 +1452,146 @@ describe("AgentConsole", () => {
     });
   });
 
-  it("updates provider status label after refresh", async () => {
-    let providerStatusCalls = 0;
+  it("renders remote external endpoints with inventory visible but without local process controls", async () => {
     axios.get.mockImplementation((url) => {
       if (url === "/api/llm/local-status") {
         return Promise.resolve({
           data: { runtime: { mode: "local", model: "lmstudio", memory: { gpu: [], system: {} } } },
         });
       }
-      if (url === "/api/llm/provider/status") {
-        providerStatusCalls += 1;
+      if (url === "/api/llm/provider/models") {
         return Promise.resolve({
           data: {
+            models: ["gemma-4-e4b-it", "gpt-oss-20b", "text-embedding-nomic-embed-text-v1.5"],
+            runtime: {
+              provider: "lmstudio",
+              mode: "remote-unmanaged",
+              installed: true,
+              server_running: true,
+              model_loaded: false,
+              loaded_model: null,
+              effective_model_id: "gemma-4-e4b-it",
+              base_url: "http://127.0.0.1:1234/v1",
+              capabilities: {
+                start_stop: false,
+                load_unload: true,
+                context_length: true,
+                logs_stream: false,
+              },
+              checked_at: Math.floor(Date.now() / 1000) - 2,
+            },
+          },
+        });
+      }
+      if (url === "/api/llm/provider/status") {
+        return Promise.resolve({
+          data: {
+            runtime: {
+              provider: "lmstudio",
+              mode: "remote-unmanaged",
+              installed: true,
+              server_running: true,
+              model_loaded: false,
+              loaded_model: null,
+              effective_model_id: "gemma-4-e4b-it",
+              base_url: "http://127.0.0.1:1234/v1",
+              capabilities: {
+                start_stop: false,
+                load_unload: true,
+                context_length: true,
+                logs_stream: false,
+              },
+              checked_at: Math.floor(Date.now() / 1000) - 2,
+            },
+          },
+        });
+      }
+      if (typeof url === "string" && url.startsWith("/api/models/verify/")) {
+        return Promise.resolve({ data: { exists: false, verified: false } });
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled={false}
+        onStreamToggle={() => {}}
+        agents={[]}
+        onSelectMessage={() => {}}
+        backendReady
+        onRefreshAgents={() => {}}
+      />,
+      {
+        stateOverrides: {
+          backendMode: "local",
+          localModel: "lmstudio",
+          transformerModel: "lmstudio",
+        },
+      },
+    );
+
+    expect(await screen.findByText("endpoint reachable")).toBeInTheDocument();
+    expect(screen.getByText("remote endpoint")).toBeInTheDocument();
+    expect(screen.getByText(/2 models/i)).toBeInTheDocument();
+    const providerSelect = screen.getByTitle(/provider target model/i);
+    expect(providerSelect).toHaveDisplayValue("gemma-4-e4b-it");
+    expect(screen.getByText(/4B params/i)).toBeInTheDocument();
+    fireEvent.change(providerSelect, {
+      target: { value: "gpt-oss-20b" },
+    });
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith("/api/settings", {
+        local_provider_preferred_model: "gpt-oss-20b",
+      });
+    });
+    expect(screen.getByText(/20B params/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /set target/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^start$/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^stop$/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^load$/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^unload$/i })).toBeInTheDocument();
+    expect(screen.getByLabelText("context")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /show logs/i })).not.toBeInTheDocument();
+  });
+
+  it("updates provider status label and selected model after refresh", async () => {
+    let providerSnapshotCalls = 0;
+    axios.get.mockImplementation((url) => {
+      if (url === "/api/llm/local-status") {
+        return Promise.resolve({
+          data: { runtime: { mode: "local", model: "lmstudio", memory: { gpu: [], system: {} } } },
+        });
+      }
+      if (url === "/api/llm/provider/models") {
+        providerSnapshotCalls += 1;
+        return Promise.resolve({
+          data: {
+            models: ["gemma-4-a", "gemma-4-b"],
             runtime:
-              providerStatusCalls < 2
+              providerSnapshotCalls < 2
                 ? {
                     provider: "lmstudio",
                     installed: false,
                     server_running: false,
                     model_loaded: false,
+                    loaded_model: "gemma-4-a",
+                    effective_model_id: "gemma-4-a",
                     capabilities: { start_stop: true, context_length: true },
                   }
                 : {
                     provider: "lmstudio",
                     installed: true,
                     server_running: true,
-                    model_loaded: false,
+                    model_loaded: true,
+                    loaded_model: "gemma-4-b",
+                    effective_model_id: "gemma-4-b",
                     capabilities: { start_stop: true, context_length: true },
+                    checked_at: Math.floor(Date.now() / 1000) - 2,
                   },
           },
         });
-      }
-      if (url === "/api/llm/provider/models") {
-        return Promise.resolve({ data: { models: [], runtime: {} } });
       }
       if (url === "/api/llm/provider/logs") {
         return Promise.resolve({ data: { logs: { entries: [], cursor: 0, next_cursor: 0 } } });
@@ -1334,8 +1623,242 @@ describe("AgentConsole", () => {
     );
 
     expect(await screen.findByText("not installed")).toBeInTheDocument();
+    expect(await screen.findByDisplayValue("gemma-4-a")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /refresh provider runtime status/i }));
-    expect(await screen.findByText("server running")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(providerSnapshotCalls).toBeGreaterThanOrEqual(2);
+    });
+    expect(await screen.findByDisplayValue("gemma-4-b")).toBeInTheDocument();
+  });
+
+  it("polls provider runtime less often and only loads provider logs on demand", async () => {
+    const intervalDelays = [];
+    const providerLogCalls = [];
+    let providerModelCalls = 0;
+    vi.spyOn(window, "setInterval").mockImplementation((callback, delay) => {
+      intervalDelays.push(delay);
+      return 1;
+    });
+    vi.spyOn(window, "clearInterval").mockImplementation(() => {});
+    axios.get.mockImplementation((url) => {
+      if (url === "/api/llm/local-status") {
+        return Promise.resolve({
+          data: { runtime: { mode: "local", model: "lmstudio", memory: { gpu: [], system: {} } } },
+        });
+      }
+      if (url === "/api/llm/provider/models") {
+        providerModelCalls += 1;
+        return Promise.resolve({
+          data: {
+            models: ["gemma4:e4b"],
+            runtime: {
+              provider: "lmstudio",
+              installed: true,
+              server_running: true,
+              model_loaded: true,
+              loaded_model: "gemma4:e4b",
+              effective_model_id: "gemma4:e4b",
+              capabilities: { start_stop: true, context_length: true },
+              checked_at: Math.floor(Date.now() / 1000) - 5,
+            },
+          },
+        });
+      }
+      if (url === "/api/llm/provider/status") {
+        return Promise.resolve({
+          data: {
+            runtime: {
+              provider: "lmstudio",
+              installed: true,
+              server_running: true,
+              model_loaded: true,
+              loaded_model: "gemma4:e4b",
+              effective_model_id: "gemma4:e4b",
+              capabilities: { start_stop: true, context_length: true },
+              checked_at: Math.floor(Date.now() / 1000) - 5,
+            },
+          },
+        });
+      }
+      if (url === "/api/llm/provider/logs") {
+        providerLogCalls.push(url);
+        return Promise.resolve({
+          data: { logs: { entries: ["provider log line"], cursor: 0, next_cursor: 1 } },
+        });
+      }
+      if (typeof url === "string" && url.startsWith("/api/models/verify/")) {
+        return Promise.resolve({ data: { exists: false, verified: false } });
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled={false}
+        onStreamToggle={() => {}}
+        agents={[]}
+        onSelectMessage={() => {}}
+        backendReady
+        onRefreshAgents={() => {}}
+      />,
+      {
+        stateOverrides: {
+          backendMode: "local",
+          localModel: "lmstudio",
+          transformerModel: "lmstudio",
+        },
+      },
+    );
+
+    expect(await screen.findByText("model loaded")).toBeInTheDocument();
+    expect(intervalDelays).toContain(60000);
+    expect(providerLogCalls).toHaveLength(0);
+    expect(providerModelCalls).toBe(1);
+    expect(screen.queryByText(/Inventory checked/i)).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Provider inventory freshness")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /show logs/i }));
+
+    await waitFor(() => {
+      expect(providerLogCalls).toHaveLength(1);
+    });
+    expect(providerModelCalls).toBe(1);
+  });
+
+  it("renders long ollama model ids in the provider runtime controls", async () => {
+    axios.get.mockImplementation((url) => {
+      if (url === "/api/llm/local-status") {
+        return Promise.resolve({
+          data: { runtime: { mode: "local", model: "ollama", memory: { gpu: [], system: {} } } },
+        });
+      }
+      if (url === "/api/llm/provider/models") {
+        return Promise.resolve({
+          data: {
+            models: ["gemma-4-E2B-it-Q4_K_M"],
+            runtime: {
+              provider: "ollama",
+              installed: true,
+              server_running: true,
+              model_loaded: true,
+              effective_model_id: "gemma-4-E2B-it-Q4_K_M",
+              loaded_model: "gemma-4-E2B-it-Q4_K_M",
+              base_url: "http://127.0.0.1:11434/v1",
+              context_length: 32768,
+              capabilities: { start_stop: true, load_unload: true, context_length: true },
+              checked_at: Math.floor(Date.now() / 1000) - 2,
+            },
+          },
+        });
+      }
+      if (url === "/api/llm/provider/logs") {
+        return Promise.resolve({ data: { logs: { entries: [], cursor: 0, next_cursor: 0 } } });
+      }
+      if (typeof url === "string" && url.startsWith("/api/models/verify/")) {
+        return Promise.resolve({ data: { exists: false, verified: false } });
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled={false}
+        onStreamToggle={() => {}}
+        agents={[]}
+        onSelectMessage={() => {}}
+        backendReady
+        onRefreshAgents={() => {}}
+      />,
+      {
+        stateOverrides: {
+          backendMode: "local",
+          localModel: "ollama",
+          transformerModel: "ollama",
+        },
+      },
+    );
+
+    expect(await screen.findByText("model loaded")).toBeInTheDocument();
+    expect(screen.getByText("http://127.0.0.1:11434/v1")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("gemma-4-E2B-it-Q4_K_M")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^load$/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^unload$/i })).toBeInTheDocument();
+    expect(screen.getByLabelText("context")).toBeInTheDocument();
+  });
+
+  it("shows direct-local timing and actionable preflight guidance", async () => {
+    axios.get.mockImplementation((url) => {
+      if (url === "/api/llm/local-status") {
+        return Promise.resolve({
+          data: {
+            runtime: {
+              mode: "local",
+              model: "gemma-4-E2B-it",
+              effective_model_id: "gemma-4-E2B-it",
+              load_state: "loading",
+              load_started_at: Math.floor(Date.now() / 1000) - 9,
+              local_loader: "image_text_to_text",
+              supports_images: true,
+              memory: { gpu: [], system: {} },
+              preflight: {
+                python_executable: "D:/notebooks/float_dev/backend/.venv/Scripts/python.exe",
+                missing_packages: ["torch", "transformers"],
+                missing_runtime_components: [
+                  "AutoModelForMultimodalLM or AutoModelForImageTextToText",
+                ],
+                hint:
+                  "Direct local loading uses the backend Python at 'D:/notebooks/float_dev/backend/.venv/Scripts/python.exe', but this environment is missing torch, transformers.",
+              },
+            },
+          },
+        });
+      }
+      if (typeof url === "string" && url.startsWith("/api/models/verify/")) {
+        return Promise.resolve({
+          data: { exists: true, verified: true, installed_bytes: 1024 },
+        });
+      }
+      if (url === "/api/llm/provider/models") {
+        return Promise.resolve({ data: { models: [], runtime: {} } });
+      }
+      if (url === "/api/llm/provider/logs") {
+        return Promise.resolve({ data: { logs: { entries: [], cursor: 0, next_cursor: 0 } } });
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled={false}
+        onStreamToggle={() => {}}
+        agents={[]}
+        onSelectMessage={() => {}}
+        backendReady
+        onRefreshAgents={() => {}}
+      />,
+      {
+        stateOverrides: {
+          backendMode: "local",
+          localModel: "gemma-4-E2B-it",
+          transformerModel: "gemma-4-E2B-it",
+        },
+      },
+    );
+
+    expect(await screen.findByText(/loading started/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/Backend Python: D:\/notebooks\/float_dev\/backend\/\.venv\/Scripts\/python\.exe/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Missing direct-local packages: torch, transformers\./i),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Missing transformers loader classes:/i)).toBeInTheDocument();
   });
 
   it("treats pointer presses and clicks as one collapse action", async () => {
@@ -1448,9 +1971,10 @@ describe("AgentConsole", () => {
 
     expect(await screen.findByRole("heading", { name: /write history/i })).toBeInTheDocument();
     expect(screen.getByText(/draft reply/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /minimize write history/i })).toHaveTextContent("-");
 
     fireEvent.click(screen.getByRole("button", { name: /minimize write history/i }));
-    expect(screen.getByRole("button", { name: /expand write history/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /expand write history/i })).toHaveTextContent("+");
     expect(screen.queryByText(/draft reply/i)).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /hide write history/i }));

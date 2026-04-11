@@ -23,6 +23,12 @@ def _coerce_int(value: Any, fallback: int) -> int:
 class LMStudioAdapter(LocalProviderAdapter):
     provider_name = "lmstudio"
 
+    def _provider(self, cfg: Dict[str, Any]) -> str:
+        value = str(cfg.get("local_provider") or "").strip().lower()
+        if value in {"lmstudio", "ollama", "custom-openai-compatible"}:
+            return value
+        return "lmstudio"
+
     def _port(self, cfg: Dict[str, Any]) -> int:
         return _coerce_int(cfg.get("local_provider_port"), 1234)
 
@@ -31,10 +37,22 @@ class LMStudioAdapter(LocalProviderAdapter):
         return host or "127.0.0.1"
 
     def _mode(self, cfg: Dict[str, Any]) -> str:
+        if self._provider(cfg) == "custom-openai-compatible":
+            return "remote-unmanaged"
         mode = str(cfg.get("local_provider_mode") or "").strip().lower()
-        return mode if mode in {"local-managed", "remote-unmanaged"} else "local-managed"
+        return (
+            mode if mode in {"local-managed", "remote-unmanaged"} else "local-managed"
+        )
+
+    def _headers(self, cfg: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        token = str(cfg.get("local_provider_api_token") or "").strip()
+        if not token:
+            return None
+        return {"Authorization": f"Bearer {token}"}
 
     def _lms_binary(self, cfg: Dict[str, Any]) -> Optional[str]:
+        if self._provider(cfg) == "custom-openai-compatible":
+            return None
         explicit = str(cfg.get("lmstudio_path") or "").strip()
         if explicit:
             p = Path(explicit)
@@ -49,6 +67,8 @@ class LMStudioAdapter(LocalProviderAdapter):
         return found
 
     def detect_installation(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        if self._provider(cfg) == "custom-openai-compatible":
+            return {"ok": False, "installed": False, "binary": ""}
         binary = self._lms_binary(cfg)
         return {
             "ok": bool(binary),
@@ -63,9 +83,15 @@ class LMStudioAdapter(LocalProviderAdapter):
         base = f"http://{self._host(cfg)}:{self._port(cfg)}"
         return normalize_base_url(base, with_v1=with_v1)
 
-    def _http_get_json(self, url: str, timeout: float = 2.5) -> Optional[Dict[str, Any]]:
+    def _http_get_json(
+        self,
+        url: str,
+        *,
+        timeout: float = 2.5,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Optional[Dict[str, Any]]:
         try:
-            response = requests.get(url, timeout=timeout)
+            response = requests.get(url, timeout=timeout, headers=headers)
             response.raise_for_status()
             payload = response.json()
             if isinstance(payload, dict):
@@ -79,9 +105,12 @@ class LMStudioAdapter(LocalProviderAdapter):
         url: str,
         payload: Dict[str, Any],
         timeout: float = 30.0,
+        headers: Optional[Dict[str, str]] = None,
     ) -> Optional[Dict[str, Any]]:
         try:
-            response = requests.post(url, json=payload, timeout=timeout)
+            response = requests.post(
+                url, json=payload, timeout=timeout, headers=headers
+            )
             response.raise_for_status()
             data = response.json()
             if isinstance(data, dict):
@@ -90,53 +119,83 @@ class LMStudioAdapter(LocalProviderAdapter):
         except Exception:
             return None
 
-    def list_models(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
-        base_v1 = self.resolve_base_url(cfg, with_v1=True)
-        candidates = [f"{base_v1}/models"]
+    def _extract_inventory_items(
+        self, payload: Dict[str, Any]
+    ) -> tuple[List[str], List[Dict[str, Any]]]:
+        models: List[str] = []
+        items: List[Dict[str, Any]] = []
+
+        def _append_entry(raw_entry: Any) -> None:
+            if isinstance(raw_entry, str) and raw_entry.strip():
+                model_id = raw_entry.strip()
+                models.append(model_id)
+                items.append({"id": model_id})
+                return
+            if not isinstance(raw_entry, dict):
+                return
+            value = raw_entry.get("id") or raw_entry.get("model")
+            if not isinstance(value, str) or not value.strip():
+                return
+            model_id = value.strip()
+            models.append(model_id)
+            items.append({**raw_entry, "id": model_id})
+
+        data = payload.get("data")
+        if isinstance(data, list):
+            for item in data:
+                _append_entry(item)
+        raw_models = payload.get("models")
+        if isinstance(raw_models, list):
+            for item in raw_models:
+                _append_entry(item)
+        return models, items
+
+    def _inventory_snapshot(
+        self,
+        cfg: Dict[str, Any],
+        *,
+        timeout: float = 2.5,
+    ) -> Dict[str, Any]:
+        headers = self._headers(cfg)
         api_base = self.resolve_base_url(cfg, with_v1=False)
-        candidates.extend(
-            [
-                f"{api_base}/api/v0/models",
-                f"{api_base}/api/v1/models",
-            ]
-        )
+        base_v1 = self.resolve_base_url(cfg, with_v1=True)
+        candidates = [
+            f"{api_base}/api/v0/models",
+            f"{api_base}/api/v1/models",
+            f"{base_v1}/models",
+        ]
         reachable = False
         for endpoint in candidates:
-            payload = self._http_get_json(endpoint)
+            payload = self._http_get_json(endpoint, timeout=timeout, headers=headers)
             if not isinstance(payload, dict):
                 continue
             reachable = True
-            models: List[str] = []
-            data = payload.get("data")
-            if isinstance(data, list):
-                for item in data:
-                    if isinstance(item, dict):
-                        value = item.get("id") or item.get("model")
-                        if isinstance(value, str) and value.strip():
-                            models.append(value.strip())
-            raw_models = payload.get("models")
-            if isinstance(raw_models, list):
-                for item in raw_models:
-                    if isinstance(item, str) and item.strip():
-                        models.append(item.strip())
-                    elif isinstance(item, dict):
-                        value = item.get("id") or item.get("model")
-                        if isinstance(value, str) and value.strip():
-                            models.append(value.strip())
+            models, items = self._extract_inventory_items(payload)
             if models:
                 return {
                     "ok": True,
                     "models": sorted(set(models)),
+                    "items": items,
                     "endpoint": endpoint,
                 }
-        return {"ok": reachable, "models": []}
+        return {"ok": reachable, "models": [], "items": []}
 
-    def poll_status(self, cfg: Dict[str, Any], *, quick: bool = False) -> Dict[str, Any]:
+    def list_models(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        inventory = self._inventory_snapshot(cfg)
+        return {
+            "ok": bool(inventory.get("ok")),
+            "models": list(inventory.get("models") or []),
+            "endpoint": inventory.get("endpoint"),
+        }
+
+    def poll_status(
+        self, cfg: Dict[str, Any], *, quick: bool = False
+    ) -> Dict[str, Any]:
         base = self.resolve_base_url(cfg, with_v1=False)
+        headers = self._headers(cfg)
         status_payload = None
         if quick:
             status_endpoints = (
-                f"{base}/health",
                 f"{base}/api/v1/status",
                 f"{base}/api/v0/status",
             )
@@ -146,22 +205,17 @@ class LMStudioAdapter(LocalProviderAdapter):
                 f"{base}/api/v0/status",
                 f"{base}/api/v0/system/status",
                 f"{base}/api/v1/status",
-                f"{base}/health",
             )
             status_timeout = 2.5
         for endpoint in status_endpoints:
-            payload = self._http_get_json(endpoint, timeout=status_timeout)
+            payload = self._http_get_json(
+                endpoint,
+                timeout=status_timeout,
+                headers=headers,
+            )
             if payload is not None:
                 status_payload = payload
                 break
-
-        if quick:
-            models_result: Dict[str, Any] = {"ok": False, "models": []}
-        else:
-            models_result = self.list_models(cfg)
-        models = models_result.get("models") if isinstance(models_result, dict) else []
-        if not isinstance(models, list):
-            models = []
 
         loaded_model = None
         context_length = None
@@ -188,15 +242,93 @@ class LMStudioAdapter(LocalProviderAdapter):
                 if isinstance(value, str) and value.isdigit():
                     context_length = int(value)
                     break
-        if loaded_model is None and models:
-            if len(models) == 1:
-                loaded_model = str(models[0]).strip()
+
+        inventory_result = (
+            self._inventory_snapshot(cfg, timeout=0.35 if quick else 2.5)
+            if (not quick or loaded_model is None or context_length is None)
+            else {"ok": False, "models": [], "items": []}
+        )
+        models = (
+            inventory_result.get("models") if isinstance(inventory_result, dict) else []
+        )
+        if not isinstance(models, list):
+            models = []
+        inventory_items = (
+            inventory_result.get("items") if isinstance(inventory_result, dict) else []
+        )
+        if not isinstance(inventory_items, list):
+            inventory_items = []
+        if loaded_model is None:
+            for item in inventory_items:
+                if not isinstance(item, dict):
+                    continue
+                state = (
+                    str(item.get("state") or item.get("status") or "").strip().lower()
+                )
+                if state not in {"loaded", "active"}:
+                    continue
+                value = item.get("id") or item.get("model")
+                if isinstance(value, str) and value.strip():
+                    loaded_model = value.strip()
+                    break
+        if context_length is None and loaded_model:
+            for item in inventory_items:
+                if not isinstance(item, dict):
+                    continue
+                value = item.get("id") or item.get("model")
+                if str(value or "").strip() != loaded_model:
+                    continue
+                for key in (
+                    "loaded_context_length",
+                    "context_length",
+                    "max_context_length",
+                    "n_ctx",
+                ):
+                    raw = item.get(key)
+                    if isinstance(raw, (int, float)):
+                        context_length = int(raw)
+                        break
+                    if isinstance(raw, str) and raw.isdigit():
+                        context_length = int(raw)
+                        break
+                if context_length is not None:
+                    break
+
+        models_result = {
+            "ok": bool(inventory_result.get("ok")),
+            "models": models,
+            "endpoint": inventory_result.get("endpoint"),
+        }
 
         base_v1 = self.resolve_base_url(cfg, with_v1=True)
-        server_running = bool(status_payload is not None or models_result.get("ok"))
+        status_reachable = status_payload is not None
+        inventory_reachable = bool(models_result.get("ok"))
+        status_indicates_running = bool(
+            isinstance(status_payload, dict)
+            and (
+                not str(status_payload.get("error") or "").strip()
+                or any(
+                    key in status_payload
+                    for key in (
+                        "loaded_model",
+                        "active_model",
+                        "current_model",
+                        "model",
+                        "status",
+                        "uptime",
+                        "version",
+                    )
+                )
+            )
+        )
         return {
             "ok": True,
-            "server_running": server_running,
+            "server_running": bool(
+                inventory_reachable or loaded_model or status_indicates_running
+            ),
+            "status_reachable": status_reachable,
+            "inventory_reachable": inventory_reachable,
+            "inventory_model_count": len(models),
             "model_loaded": bool(loaded_model),
             "loaded_model": loaded_model,
             "context_length": context_length,
@@ -227,7 +359,9 @@ class LMStudioAdapter(LocalProviderAdapter):
             }
         return {"ok": True, "stdout": result.stdout or "", "cmd": args}
 
-    def _wait_until_running(self, cfg: Dict[str, Any], timeout_seconds: int = 30) -> bool:
+    def _wait_until_running(
+        self, cfg: Dict[str, Any], timeout_seconds: int = 30
+    ) -> bool:
         deadline = time.time() + max(1, timeout_seconds)
         while time.time() < deadline:
             status = self.poll_status(cfg)
@@ -238,7 +372,13 @@ class LMStudioAdapter(LocalProviderAdapter):
 
     def start_server(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
         if self._mode(cfg) == "remote-unmanaged":
-            return {"ok": False, "error": "Remote unmanaged mode does not support start."}
+            return {
+                "ok": False,
+                "error": "Remote unmanaged mode does not support start.",
+            }
+        current = self.poll_status(cfg, quick=True)
+        if current.get("server_running"):
+            return {"ok": True, "note": "LM Studio server already running."}
         install = self.detect_installation(cfg)
         if not install.get("installed"):
             return {"ok": False, "error": "LM Studio CLI (lms) was not found."}
@@ -252,12 +392,24 @@ class LMStudioAdapter(LocalProviderAdapter):
         if not result.get("ok"):
             return result
         if not self._wait_until_running(cfg):
-            return {"ok": False, "error": "LM Studio server did not become ready in time."}
+            base = self.resolve_base_url(cfg, with_v1=False)
+            return {
+                "ok": False,
+                "error": (
+                    f"LM Studio CLI responded, but the API at '{base}' did not become "
+                    "reachable in time. Open LM Studio and start its local server "
+                    "manually, or switch Float to External HTTP only and point it at a "
+                    "running LM Studio endpoint."
+                ),
+            }
         return {"ok": True}
 
     def stop_server(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
         if self._mode(cfg) == "remote-unmanaged":
-            return {"ok": False, "error": "Remote unmanaged mode does not support stop."}
+            return {
+                "ok": False,
+                "error": "Remote unmanaged mode does not support stop.",
+            }
         install = self.detect_installation(cfg)
         if not install.get("installed"):
             return {"ok": False, "error": "LM Studio CLI (lms) was not found."}
@@ -284,7 +436,12 @@ class LMStudioAdapter(LocalProviderAdapter):
                 f"{base}/api/v0/models/load",
                 f"{base}/api/v1/model/load",
             ):
-                response = self._http_post_json(endpoint, payload, timeout=8.0)
+                response = self._http_post_json(
+                    endpoint,
+                    payload,
+                    timeout=8.0,
+                    headers=self._headers(cfg),
+                )
                 if isinstance(response, dict):
                     return {"ok": True, "endpoint": endpoint, "response": response}
             return {
@@ -314,7 +471,12 @@ class LMStudioAdapter(LocalProviderAdapter):
                 f"{base}/api/v0/models/unload",
                 f"{base}/api/v1/model/unload",
             ):
-                response = self._http_post_json(endpoint, payload, timeout=8.0)
+                response = self._http_post_json(
+                    endpoint,
+                    payload,
+                    timeout=8.0,
+                    headers=self._headers(cfg),
+                )
                 if isinstance(response, dict):
                     return {"ok": True, "endpoint": endpoint, "response": response}
             return {
@@ -390,11 +552,12 @@ class LMStudioAdapter(LocalProviderAdapter):
                     pass
 
     def capabilities(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        provider = self._provider(cfg)
         mode = self._mode(cfg)
         managed = mode == "local-managed"
         return {
             "start_stop": managed,
-            "load_unload": True,
+            "load_unload": provider != "custom-openai-compatible",
             "context_length": True,
-            "logs_stream": managed,
+            "logs_stream": managed and provider != "custom-openai-compatible",
         }

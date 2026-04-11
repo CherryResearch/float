@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 from uuid import uuid4
 
-from app import config as app_config
-from app.services.capture_service import get_capture_service
 from app.computer.playwright_runtime import PlaywrightComputerRuntime
+from app.computer.runtime_base import ComputerRuntime
 from app.computer.session_store import ComputerSessionStore
 from app.computer.types import (
     DEFAULT_DISPLAY_HEIGHT,
@@ -14,7 +14,52 @@ from app.computer.types import (
     ComputerAction,
     ComputerObservation,
 )
-from app.computer.windows_runtime import WindowsComputerRuntime
+from app.services.capture_service import get_capture_service
+
+
+class _UnavailableRuntime(ComputerRuntime):
+    def __init__(self, *, screenshot_root: Path, runtime_name: str, detail: str):
+        super().__init__(screenshot_root=screenshot_root)
+        self._runtime_name = runtime_name
+        self._detail = detail
+
+    @property
+    def name(self) -> str:
+        return self._runtime_name
+
+    def available(self) -> bool:
+        return False
+
+    def start_session(self, **kwargs):
+        raise RuntimeError(self._detail)
+
+    def stop_session(self, session):
+        return {"status": "stopped", "session_id": session.id}
+
+    def observe(self, session):
+        raise RuntimeError(self._detail)
+
+    def navigate(self, session, url: str):
+        raise RuntimeError(self._detail)
+
+    def act(self, session, actions):
+        raise RuntimeError(self._detail)
+
+
+def _build_windows_runtime(*, screenshot_root: Path) -> ComputerRuntime:
+    try:
+        runtime_module = importlib.import_module("app.computer.windows_runtime")
+        runtime_cls = getattr(runtime_module, "WindowsComputerRuntime")
+        return runtime_cls(screenshot_root=screenshot_root)
+    except Exception as exc:
+        return _UnavailableRuntime(
+            screenshot_root=screenshot_root,
+            runtime_name="windows",
+            detail=(
+                "Windows desktop control is unavailable. "
+                f"Optional dependency import failed: {exc}"
+            ),
+        )
 
 
 class ComputerService:
@@ -26,7 +71,7 @@ class ComputerService:
         self.store = ComputerSessionStore(screenshot_root=screenshot_root)
         self.runtimes = {
             "browser": PlaywrightComputerRuntime(screenshot_root=screenshot_root),
-            "windows": WindowsComputerRuntime(screenshot_root=screenshot_root),
+            "windows": _build_windows_runtime(screenshot_root=screenshot_root),
         }
         self.capture_service = capture_service
 
@@ -127,6 +172,34 @@ class ComputerService:
         self.store.delete(session.id)
         return {"session": session.to_dict(), "result": result}
 
+    def shutdown(self) -> Dict[str, Any]:
+        stopped_sessions: List[str] = []
+        runtime_results: Dict[str, Any] = {}
+        errors: List[Dict[str, str]] = []
+
+        for session in list(self.store.all().values()):
+            try:
+                runtime = self._runtime(session.runtime)
+                runtime.stop_session(session)
+                stopped_sessions.append(session.id)
+            except Exception as exc:
+                errors.append({"session_id": session.id, "error": str(exc)})
+            finally:
+                self.store.delete(session.id)
+
+        for name, runtime in self.runtimes.items():
+            try:
+                runtime_results[name] = runtime.shutdown()
+            except Exception as exc:
+                errors.append({"runtime": name, "error": str(exc)})
+
+        return {
+            "status": "stopped",
+            "stopped_sessions": stopped_sessions,
+            "runtime_results": runtime_results,
+            "errors": errors,
+        }
+
     def _attachment_path_to_url(self, path_value: str) -> str:
         return f"/api/computer/screenshots/{Path(path_value).name}"
 
@@ -161,13 +234,13 @@ class ComputerService:
                     last_screenshot_path,
                     source="computer",
                     content_type=str(
-                        attachment.get("type") if isinstance(attachment, dict) else "image/png"
+                        attachment.get("type")
+                        if isinstance(attachment, dict)
+                        else "image/png"
                     )
                     or "image/png",
                     filename=(
-                        attachment.get("name")
-                        if isinstance(attachment, dict)
-                        else None
+                        attachment.get("name") if isinstance(attachment, dict) else None
                     ),
                     capture_source=(
                         attachment.get("capture_source")
@@ -178,10 +251,12 @@ class ComputerService:
                         updated.metadata.get("chat_session") or ""
                     ).strip()
                     or None,
-                    message_id=str(updated.metadata.get("message_id") or "").strip() or None,
+                    message_id=str(updated.metadata.get("message_id") or "").strip()
+                    or None,
                     computer_session_id=session_id,
                     current_url=str(result.get("current_url") or "").strip() or None,
-                    active_window=str(result.get("active_window") or "").strip() or None,
+                    active_window=str(result.get("active_window") or "").strip()
+                    or None,
                 )
             except Exception:
                 capture_payload = None

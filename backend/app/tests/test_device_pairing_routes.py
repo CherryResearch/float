@@ -117,9 +117,7 @@ def test_sync_overview_reports_visibility_and_urls(client):
 def test_sync_overview_prefers_resolvable_hostname_for_lan_url(client, monkeypatch):
     from app.utils import device_visibility
 
-    monkeypatch.setattr(
-        device_visibility, "_detect_lan_ips", lambda: ["192.168.0.44"]
-    )
+    monkeypatch.setattr(device_visibility, "_detect_lan_ips", lambda: ["192.168.0.44"])
     monkeypatch.setattr(device_visibility.socket, "gethostname", lambda: "Pear")
     monkeypatch.setattr(
         device_visibility,
@@ -133,7 +131,9 @@ def test_sync_overview_prefers_resolvable_hostname_for_lan_url(client, monkeypat
     overview = client.get("/sync/overview", headers={"host": "localhost:5000"})
     assert overview.status_code == 200
     payload = overview.json()
-    assert payload["device_access"]["advertised_urls"]["lan"] == "http://pear.local:5000"
+    assert (
+        payload["device_access"]["advertised_urls"]["lan"] == "http://pear.local:5000"
+    )
 
 
 def test_sync_pair_stores_saved_peer(client, monkeypatch):
@@ -552,7 +552,7 @@ def test_sync_apply_pull_import_adds_synced_workspace_profile(client, monkeypatc
     )
     assert imported["name"] == "Pear"
     assert imported["namespace"] == "Pear"
-    assert imported["root_path"] == "data/files/workspace/Pear"
+    assert imported["root_path"] == "data/sync/Pear/workspace"
 
 
 def test_sync_apply_push_filters_selected_items(client, monkeypatch):
@@ -650,9 +650,10 @@ def test_sync_apply_push_filters_selected_items(client, monkeypatch):
 
     assert res.status_code == 200
     assert captured["item_selections"] == {"conversations": ["conv-2"]}
-    assert [record["sync_id"] for record in captured["snapshot"]["sections"]["conversations"]] == [
-        "conv-2"
-    ]
+    assert [
+        record["sync_id"]
+        for record in captured["snapshot"]["sections"]["conversations"]
+    ] == ["conv-2"]
 
 
 def test_sync_apply_pull_refreshes_search_mirrors(client, monkeypatch):

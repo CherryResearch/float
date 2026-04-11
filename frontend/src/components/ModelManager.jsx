@@ -2,6 +2,7 @@ import React, { useState, useEffect, useContext, useRef } from 'react';
 import axios from 'axios';
 import { GlobalContext } from '../main';
 import { List, ListItem, ListItemText, Button, Typography, Paper, Grid, CircularProgress, Chip } from '@mui/material';
+import { resolveLocalCatalogModelId } from "../utils/modelUtils";
 
 const ModelManager = () => {
   const { state } = useContext(GlobalContext);
@@ -31,7 +32,7 @@ const ModelManager = () => {
 
   const fetchSupportedModels = async () => {
     try {
-      const response = await axios.get('/api/models/supported');
+      const response = await axios.get('/api/models/downloadable');
       setSupportedModels(response.data.models);
       return response.data.models;
     } catch (error) {
@@ -42,7 +43,9 @@ const ModelManager = () => {
 
   const fetchModelInfo = async (modelName) => {
     try {
-      const response = await axios.get(`/api/models/info/${modelName}`);
+      const response = await axios.get(
+        `/api/models/info/${encodeURIComponent(resolveLocalCatalogModelId(modelName))}`,
+      );
       setModelInfo(prev => ({ ...prev, [modelName]: response.data }));
     } catch (error) {
       console.error(`Error fetching info for model ${modelName}:`, error);
@@ -51,7 +54,9 @@ const ModelManager = () => {
 
   const verifyModel = async (modelName) => {
     try {
-      const response = await axios.get(`/api/models/verify/${modelName}`);
+      const response = await axios.get(
+        `/api/models/verify/${encodeURIComponent(resolveLocalCatalogModelId(modelName))}`,
+      );
       setModelStatus(prev => ({ ...prev, [modelName]: response.data }));
     } catch (error) {
       console.error(`Error verifying model ${modelName}:`, error);
@@ -103,7 +108,9 @@ const ModelManager = () => {
 
   const handleDelete = async (modelName) => {
     try {
-      await axios.delete(`/api/models/${modelName}`);
+      await axios.delete(
+        `/api/models/${encodeURIComponent(resolveLocalCatalogModelId(modelName))}`,
+      );
       await fetchAvailableModels();
       await verifyModel(modelName);
     } catch (error) {

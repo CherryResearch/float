@@ -27,6 +27,7 @@ import {
   hasMatchingToolContinuationSignature,
 } from "../utils/toolContinuations";
 import { mergeContinuationText } from "../utils/continuationText";
+import { resolveRequestModelForMode } from "../utils/modelUtils";
 import {
   handleUnifiedPress,
   supportsHoverInteractions,
@@ -1183,12 +1184,12 @@ const AppContent = () => {
               const thinkingPayload =
                 thinkingValue === "auto" ? {} : { thinking: thinkingValue };
               const mode = (backendModeRef.current || "api").toLowerCase();
-              const model =
-                mode === "local"
-                  ? localModelRef.current || transformerModelRef.current || apiModelRef.current
-                  : mode === "server"
-                    ? transformerModelRef.current || apiModelRef.current
-                    : apiModelRef.current;
+              const model = resolveRequestModelForMode({
+                backendMode: mode,
+                apiModel: apiModelRef.current,
+                transformerModel: transformerModelRef.current,
+                localModel: localModelRef.current,
+              });
 
               axios
                 .post("/api/chat/continue", {
@@ -1437,6 +1438,7 @@ const AppContent = () => {
   }, []);
 
   const isCalendarView = location.pathname.startsWith("/knowledge");
+  const isSettingsView = location.pathname === "/settings";
 
   const filteredCalendarEvents = useMemo(() => {
     if (!isCalendarView) return [];
@@ -1565,7 +1567,7 @@ const AppContent = () => {
           {">"}
         </button>
       )}
-      <div className="main-chat">
+      <div className={`main-chat${isSettingsView ? " main-chat--settings" : ""}`}>
         <div className="center-rail">
           <ErrorBoundary fallback={<div><Link to="/">Back to chat</Link></div>}>
             <Routes>

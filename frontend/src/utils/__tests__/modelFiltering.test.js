@@ -2,12 +2,19 @@ import { describe, expect, it } from "vitest";
 
 import {
   filterAvailableModelsForField,
+  isGemmaFamilyModelName,
   isLikelyEmbeddingModelName,
 } from "../modelFiltering";
 
 describe("modelFiltering", () => {
   it("detects embedding model names", () => {
     expect(isLikelyEmbeddingModelName("all-MiniLM-L6-v2")).toBe(true);
+    expect(isLikelyEmbeddingModelName("google/embeddinggemma-300M")).toBe(true);
+  });
+
+  it("recognizes Gemma family model names", () => {
+    expect(isGemmaFamilyModelName("gemma-4-E2B-it")).toBe(true);
+    expect(isGemmaFamilyModelName("gpt-oss-20b")).toBe(false);
   });
 
   it("filters model lists per settings field by default", () => {
@@ -49,4 +56,3 @@ describe("modelFiltering", () => {
     ).toEqual(models);
   });
 });
-

@@ -20,6 +20,9 @@ from app.utils import knowledge_store as knowledge_store_module
 from app.utils import memory_store, user_settings
 from app.utils.attachment_media import build_attachment_media_descriptor
 from app.utils.blob_store import BLOBS_DIR, find_asset_path
+from app.utils.blob_store import iter_attachment_hashes as iter_stored_attachment_hashes
+from app.utils.blob_store import managed_relative_path, resolve_managed_path
+from app.utils.sync_paths import sync_attachment_relative_path
 from app.utils.workspace_registry import resolve_workspace_selection
 
 logger = logging.getLogger(__name__)
@@ -184,29 +187,9 @@ def _resolve_attachment_updated_at(
 
 
 def _iter_attachment_hashes() -> List[str]:
-    hashes: set[str] = set()
-    try:
-        for entry in BLOBS_DIR.iterdir():
-            if not entry.is_file():
-                continue
-            name = entry.name
-            if name.lower() == "readme.md":
-                continue
-            if name.endswith(".json"):
-                hashes.add(entry.stem)
-                continue
-            hashes.add(name)
-    except FileNotFoundError:
-        pass
-    files_dir = blob_store._resolve_data_files_root()
-    for dirname in set(_ATTACHMENT_ORIGIN_DIRS.values()) | {"downloaded", "workspace"}:
-        root = files_dir / dirname
-        if not root.exists() or not root.is_dir():
-            continue
-        for child in root.iterdir():
-            if child.is_dir():
-                hashes.add(child.name)
-    return sorted(hash_value for hash_value in hashes if hash_value)
+    return sorted(
+        hash_value for hash_value in iter_stored_attachment_hashes() if hash_value
+    )
 
 
 def _safe_attachment_filename(value: Any, fallback: str) -> str:
@@ -255,6 +238,9 @@ def _attachment_path_namespace(value: Any) -> Optional[str]:
     relative_path = _coerce_relative_files_path(value)
     if not relative_path:
         return None
+    parts = relative_path.split("/")
+    if len(parts) >= 4 and parts[0] == "sync" and parts[2] == "workspace":
+        return ""
     namespace, _, _rest = relative_path.partition("/")
     if namespace in ROOT_ATTACHMENT_PATH_SEGMENTS:
         return ""
@@ -282,16 +268,11 @@ def _resolve_attachment_target(
     filename: Optional[str] = None,
 ) -> Optional[Path]:
     metadata = _load_attachment_meta(content_hash)
-    files_dir = blob_store._resolve_data_files_root()
     rel_candidate = _coerce_relative_files_path(
         str(metadata.get("relative_path") or metadata.get("source_path") or "").strip()
     )
     if rel_candidate:
-        target = (files_dir / rel_candidate).resolve()
-        try:
-            target.relative_to(files_dir)
-        except Exception:
-            target = None
+        target = resolve_managed_path(rel_candidate)
         if target and target.exists() and target.is_file():
             return target
     abs_candidate = str(
@@ -300,9 +281,11 @@ def _resolve_attachment_target(
     if abs_candidate:
         target = Path(abs_candidate).expanduser()
         if not target.is_absolute():
-            target = (files_dir / target).resolve()
+            target = resolve_managed_path(abs_candidate)
+        else:
+            target = target.resolve()
         try:
-            target.relative_to(files_dir)
+            target.relative_to(blob_store._resolve_data_files_root().parent)
         except Exception:
             target = None
         if target and target.exists() and target.is_file():
@@ -834,18 +817,14 @@ class InstanceSyncService:
             )
             return _namespace_from_prefixed_token(
                 metadata.get("id") or record.get("sync_id")
-            ) or _coerce_relative_files_path(
-                metadata.get("source_sync_namespace")
-            )
+            ) or _coerce_relative_files_path(metadata.get("source_sync_namespace"))
         if section == "memories":
             payload = (
                 record.get("payload") if isinstance(record.get("payload"), dict) else {}
             )
             return _namespace_from_prefixed_token(
                 record.get("key") or record.get("sync_id")
-            ) or _coerce_relative_files_path(
-                payload.get("source_sync_namespace")
-            )
+            ) or _coerce_relative_files_path(payload.get("source_sync_namespace"))
         if section == "knowledge":
             metadata = (
                 record.get("metadata")
@@ -854,9 +833,7 @@ class InstanceSyncService:
             )
             return _namespace_from_prefixed_token(
                 record.get("knowledge_id") or record.get("sync_id")
-            ) or _coerce_relative_files_path(
-                metadata.get("source_sync_namespace")
-            )
+            ) or _coerce_relative_files_path(metadata.get("source_sync_namespace"))
         if section == "graph":
             if "node_id" in record:
                 attributes = (
@@ -893,9 +870,7 @@ class InstanceSyncService:
             )
             return _namespace_from_prefixed_token(
                 record.get("event_id") or record.get("sync_id")
-            ) or _coerce_relative_files_path(
-                payload.get("source_sync_namespace")
-            )
+            ) or _coerce_relative_files_path(payload.get("source_sync_namespace"))
         return ""
 
     def _filter_manifest_by_workspaces(
@@ -1296,9 +1271,12 @@ class InstanceSyncService:
                             original_relative_path,
                         )
                         metadata["source_path"] = metadata["relative_path"]
-                    metadata["source_sync_relative_path"] = (
-                        metadata.get("source_sync_relative_path")
-                        or f"workspace/sync/{namespace}/{record.get('content_hash')}/{filename}"
+                    metadata["source_sync_relative_path"] = metadata.get(
+                        "source_sync_relative_path"
+                    ) or sync_attachment_relative_path(
+                        namespace,
+                        record.get("content_hash"),
+                        filename,
                     )
                     if not str(metadata.get("relative_path") or "").strip():
                         metadata["relative_path"] = metadata[
@@ -1499,9 +1477,12 @@ class InstanceSyncService:
                         metadata.setdefault(
                             "source_sync_original_relative_path", original_relative_path
                         )
-                    custody_path = (
-                        metadata.get("source_sync_relative_path")
-                        or f"workspace/sync/{safe_namespace}/{record.get('content_hash')}/{filename}"
+                    custody_path = metadata.get(
+                        "source_sync_relative_path"
+                    ) or sync_attachment_relative_path(
+                        safe_namespace,
+                        record.get("content_hash"),
+                        filename,
                     )
                     metadata["source_sync_relative_path"] = custody_path
                     if rewrite_attachment_paths:
@@ -1831,9 +1812,7 @@ class InstanceSyncService:
         remote_ts = _safe_float((remote_item or {}).get("updated_at"))
         return {
             "resource_id": sync_id,
-            "selection_id": self._manifest_selection_id(
-                primary_item, fallback=sync_id
-            ),
+            "selection_id": self._manifest_selection_id(primary_item, fallback=sync_id),
             "resource_type": self._manifest_resource_type(section, label_item),
             "label": self._manifest_item_label(
                 section,
@@ -2598,9 +2577,7 @@ class InstanceSyncService:
             conn.commit()
         notes: List[str] = []
         if applied:
-            notes.append(
-                "Knowledge rows were synced into the canonical SQLite store."
-            )
+            notes.append("Knowledge rows were synced into the canonical SQLite store.")
         return {"applied": applied, "skipped": skipped, "notes": notes}
 
     def _graph_manifest(self) -> List[Dict[str, Any]]:
@@ -2941,30 +2918,27 @@ class InstanceSyncService:
         metadata: Dict[str, Any],
         data: bytes,
     ) -> None:
-        files_dir = blob_store._resolve_data_files_root()
         rel_candidate = _coerce_relative_files_path(
             str(
                 metadata.get("relative_path") or metadata.get("source_path") or ""
             ).strip()
         )
         if rel_candidate:
-            target = (files_dir / rel_candidate).resolve()
-            try:
-                target.relative_to(files_dir)
-            except Exception as exc:
-                raise ValueError(
-                    "Attachment relative_path escaped data/files root"
-                ) from exc
+            target = resolve_managed_path(rel_candidate)
+            if target is None:
+                raise ValueError("Attachment relative_path escaped data/files root")
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
             normalized_meta = dict(metadata)
             normalized_meta["filename"] = target.name
-            normalized_meta["relative_path"] = target.relative_to(files_dir).as_posix()
+            normalized_meta["relative_path"] = managed_relative_path(target)
+            normalized_meta["path"] = str(target.resolve())
             _write_attachment_meta(content_hash, normalized_meta)
             return
         origin = str(metadata.get("origin") or "upload").strip().lower()
         dirname = _ATTACHMENT_ORIGIN_DIRS.get(origin)
         if dirname:
+            files_dir = blob_store._resolve_data_files_root()
             target = (files_dir / dirname / content_hash / filename).resolve()
             try:
                 target.relative_to(files_dir)
@@ -2975,7 +2949,8 @@ class InstanceSyncService:
             normalized_meta = dict(metadata)
             normalized_meta["filename"] = filename
             normalized_meta["origin"] = origin
-            normalized_meta["relative_path"] = target.relative_to(files_dir).as_posix()
+            normalized_meta["relative_path"] = managed_relative_path(target)
+            normalized_meta["path"] = str(target.resolve())
             _write_attachment_meta(content_hash, normalized_meta)
             return
         target = BLOBS_DIR / content_hash
@@ -3035,9 +3010,7 @@ class InstanceSyncService:
             applied += 1
         notes: List[str] = []
         if applied:
-            notes.append(
-                "Attachment files and captions were synced."
-            )
+            notes.append("Attachment files and captions were synced.")
         return {"applied": applied, "skipped": skipped, "notes": notes}
 
     def _calendar_manifest(self) -> List[Dict[str, Any]]:
@@ -3116,9 +3089,7 @@ class InstanceSyncService:
             applied += 1
         notes: List[str] = []
         if applied:
-            notes.append(
-                "Calendar files were synced."
-            )
+            notes.append("Calendar files were synced.")
         return {"applied": applied, "skipped": skipped, "notes": notes}
 
     def _settings_manifest(self) -> List[Dict[str, Any]]:

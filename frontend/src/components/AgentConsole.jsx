@@ -12,7 +12,18 @@ import ToolPayloadView, {
   extractComputerPayload,
   summarizeToolPayload,
 } from "./ToolPayloadView";
-import { formatLocalRuntimeLabel, isLocalRuntimeEntry } from "../utils/modelUtils";
+import {
+  formatLocalRuntimeLabel,
+  isLocalRuntimeEntry,
+  normalizeModelId,
+  resolveLocalCatalogModelId,
+  resolveRequestModelForMode,
+  resolveRuntimeModelLabel,
+} from "../utils/modelUtils";
+import {
+  filterChatCapableProviderModels,
+  isChatCapableProviderModelName,
+} from "../utils/providerRuntime";
 import {
   buildToolContinuationSignature,
   hasMatchingToolContinuationSignature,
@@ -32,6 +43,8 @@ const SIDEBAR_MAX_WIDTH = 520;
 const SIDEBAR_VIEWPORT_GUTTER = 160;
 const SIDEBAR_KEYBOARD_STEP = 20;
 const SIDEBAR_KEYBOARD_STEP_FAST = 40;
+const LOCAL_RUNTIME_POLL_MS = 8000;
+const PROVIDER_RUNTIME_POLL_MS = 60000;
 const EMPTY_GLOBAL_STATE = Object.freeze({});
 const NOOP_SET_STATE = () => {};
 const CLIENT_RESOLUTION_TOOLS = new Set(["camera.capture"]);
@@ -126,6 +139,46 @@ const formatReviewTimestamp = (timestamp) => {
     hour: "2-digit",
     minute: "2-digit",
   });
+};
+
+const normalizeRuntimeTimestamp = (value) => {
+  if (value == null || value === "") return null;
+  const raw = Number(value);
+  if (Number.isFinite(raw)) {
+    return raw > 0 && raw < 1e12 ? raw * 1000 : raw;
+  }
+  const parsed = new Date(value);
+  const ms = parsed.getTime();
+  return Number.isNaN(ms) ? null : ms;
+};
+
+const formatRuntimeClockTime = (value) => {
+  const normalized = normalizeRuntimeTimestamp(value);
+  if (!normalized) return null;
+  const date = new Date(normalized);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+};
+
+const formatRuntimeRelativeTime = (value, now = Date.now()) => {
+  const normalized = normalizeRuntimeTimestamp(value);
+  if (!normalized) return null;
+  const diff = now - normalized;
+  if (!Number.isFinite(diff)) return null;
+  if (diff < 0) return "in future";
+  const seconds = Math.floor(diff / 1000);
+  if (seconds <= 1) return "just now";
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
 };
 
 const normalizePreviewText = (value) => {
@@ -293,9 +346,7 @@ const mergeToolUpdate = (tools, update) => {
     const sig = JSON.stringify({ name: update.name, args: update.args || {} });
     idx = list.findIndex((t) => {
       if (!t || typeof t !== "object") return false;
-      return (
-        JSON.stringify({ name: t?.name, args: t?.args || {} }) === sig
-      );
+      return JSON.stringify({ name: t?.name, args: t?.args || {} }) === sig;
     });
   }
   if (idx >= 0) {
@@ -437,6 +488,7 @@ const AgentConsole = ({
   const [runtimeStatus, setRuntimeStatus] = React.useState(null);
   const [runtimeLoading, setRuntimeLoading] = React.useState(false);
   const [runtimeError, setRuntimeError] = React.useState("");
+  const [runtimePanelCollapsed, setRuntimePanelCollapsed] = React.useState(false);
   const [providerStatus, setProviderStatus] = React.useState(null);
   const [providerModels, setProviderModels] = React.useState([]);
   const [providerLogs, setProviderLogs] = React.useState([]);
@@ -446,6 +498,7 @@ const AgentConsole = ({
   const [providerContextDraft, setProviderContextDraft] = React.useState("");
   const [providerPendingAction, setProviderPendingAction] = React.useState("");
   const [providerActionError, setProviderActionError] = React.useState("");
+  const [runtimeNow, setRuntimeNow] = React.useState(() => Date.now());
   const [contextDraft, setContextDraft] = React.useState("");
   const [contextDirty, setContextDirty] = React.useState(false);
   const [contextSaving, setContextSaving] = React.useState(false);
@@ -470,6 +523,7 @@ const AgentConsole = ({
   const [syncReviewPendingKey, setSyncReviewPendingKey] = React.useState("");
   const [syncReviewFeedback, setSyncReviewFeedback] = React.useState("");
   const [syncInboxCollapsed, setSyncInboxCollapsed] = React.useState(false);
+  const [syncInboxHidden, setSyncInboxHidden] = React.useState(false);
   const [browserSessionPopup, setBrowserSessionPopup] = React.useState(null);
   const [browserPopupPendingAction, setBrowserPopupPendingAction] = React.useState("");
   const [browserPopupError, setBrowserPopupError] = React.useState("");
@@ -490,8 +544,16 @@ const AgentConsole = ({
   const composerOverlapRef = React.useRef(0);
   const overlapRafRef = React.useRef(null);
   const overlapTimerRef = React.useRef(null);
+  const providerAutoSelectedModelRef = React.useRef("");
+  const providerLogsCursorRef = React.useRef(0);
+  const providerLogsOpenRef = React.useRef(false);
+  const providerActionPendingRef = React.useRef(false);
   const lastVerifyRef = React.useRef({ model: null, at: 0 });
   const syncInboxInteractedRef = React.useRef(false);
+  const selectedDirectLocalModel = React.useMemo(
+    () => resolveRuntimeModelLabel({ state, runtime: runtimeStatus }),
+    [runtimeStatus, state.localModel, state.transformerModel],
+  );
   const selectedLocalProvider = React.useMemo(() => {
     const currentLocal =
       typeof state.localModel === "string" ? state.localModel.trim().toLowerCase() : "";
@@ -506,6 +568,33 @@ const AgentConsole = ({
   const usingProviderRuntime =
     state.backendMode === "local" && Boolean(selectedLocalProvider);
   const isLocalMode = (state.backendMode || "").toLowerCase() === "local";
+  const applyProviderSnapshot = React.useCallback((payload) => {
+    const runtime = payload?.runtime || null;
+    const models = filterChatCapableProviderModels(payload?.models);
+    setProviderStatus(runtime);
+    setProviderModels(models);
+    const effectiveModel =
+      typeof runtime?.effective_model_id === "string"
+        ? runtime.effective_model_id.trim()
+        : "";
+    const loadedModel =
+      typeof runtime?.loaded_model === "string" ? runtime.loaded_model.trim() : "";
+    const preferredSnapshotModel =
+      effectiveModel ||
+      models[0] ||
+      (isChatCapableProviderModelName(loadedModel) ? loadedModel : "");
+    const previousAutoSelectedModel = providerAutoSelectedModelRef.current;
+    providerAutoSelectedModelRef.current = preferredSnapshotModel;
+    setProviderSelectedModel((prev) => {
+      const current = typeof prev === "string" ? prev.trim() : "";
+      if (!current) return preferredSnapshotModel;
+      if (current === previousAutoSelectedModel) return preferredSnapshotModel;
+      return prev;
+    });
+    if (runtime?.context_length) {
+      setProviderContextDraft(String(runtime.context_length));
+    }
+  }, []);
   const clampSidebarWidth = React.useCallback((value, minWidth, maxWidth) => {
     if (!Number.isFinite(value)) return minWidth;
     return Math.min(maxWidth, Math.max(minWidth, value));
@@ -665,6 +754,26 @@ const AgentConsole = ({
     if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
     if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
     return `${Math.round(value)}`;
+  }, []);
+  const formatModelScaleLabel = React.useCallback((modelName) => {
+    const raw = String(modelName || "").trim();
+    if (!raw) return "";
+    const directMatch = raw.match(/(?:^|[-_/])(?:e)?(\d+(?:\.\d+)?)([bm])(?:[-_/]|$)/i);
+    const compactMatch = directMatch ? null : raw.match(/(\d+(?:\.\d+)?)([bm])\b/i);
+    const match = directMatch || compactMatch;
+    if (!match) return "";
+    const value = Number(match[1]);
+    if (!Number.isFinite(value) || value <= 0) return "";
+    const suffix = String(match[2] || "").toUpperCase();
+    const whole = Number.isInteger(value) ? String(value) : value.toFixed(1);
+    return `${whole}${suffix} params`;
+  }, []);
+  const formatModelQuantLabel = React.useCallback((modelName) => {
+    const raw = String(modelName || "").trim().toLowerCase();
+    if (!raw) return "";
+    const match = raw.match(/(?:^|[-_/])q(\d+(?:_[a-z0-9]+)?)(?:[-_/]|$)/i);
+    if (!match) return "";
+    return `Q${String(match[1]).toUpperCase()}`;
   }, []);
   const parseContextLength = React.useCallback((value) => {
     if (typeof value === "number" && Number.isFinite(value)) {
@@ -1001,55 +1110,37 @@ const AgentConsole = ({
     }
   }, [backendReady, isLocalMode]);
 
-  const fetchProviderStatus = React.useCallback(async () => {
+  const fetchProviderSnapshot = React.useCallback(async ({ refresh = false } = {}) => {
+    if (!backendReady || !selectedLocalProvider) return;
+    try {
+      const res = await axios.get("/api/llm/provider/models", {
+        params: refresh
+          ? { provider: selectedLocalProvider, refresh: true }
+          : { provider: selectedLocalProvider },
+      });
+      applyProviderSnapshot(res?.data || {});
+    } catch (err) {
+      setProviderStatus((prev) => prev);
+      setProviderModels((prev) => prev);
+    }
+  }, [applyProviderSnapshot, backendReady, selectedLocalProvider]);
+
+  const fetchProviderRuntimeStatus = React.useCallback(async () => {
     if (!backendReady || !selectedLocalProvider) return;
     try {
       const res = await axios.get("/api/llm/provider/status", {
         params: { provider: selectedLocalProvider, quick: true },
-        timeout: 2500,
       });
-      const runtime = res?.data?.runtime || null;
-      setProviderStatus(runtime);
-      const loadedModel = runtime?.loaded_model;
-      if (typeof loadedModel === "string" && loadedModel.trim()) {
-        setProviderSelectedModel((prev) =>
-          prev && prev.trim() ? prev : loadedModel.trim(),
-        );
-      }
-      if (runtime?.context_length) {
-        setProviderContextDraft(String(runtime.context_length));
-      }
+      setProviderStatus(res?.data?.runtime || null);
     } catch (err) {
       setProviderStatus((prev) => prev);
-    }
-  }, [backendReady, selectedLocalProvider]);
-
-  const fetchProviderModels = React.useCallback(async () => {
-    if (!backendReady || !selectedLocalProvider) return;
-    try {
-      const res = await axios.get("/api/llm/provider/models", {
-        params: { provider: selectedLocalProvider },
-      });
-      const models = Array.isArray(res?.data?.models) ? res.data.models : [];
-      setProviderModels(models);
-      setProviderSelectedModel((prev) => {
-        if (prev && prev.trim()) return prev;
-        const loaded =
-          typeof res?.data?.runtime?.loaded_model === "string"
-            ? res.data.runtime.loaded_model.trim()
-            : "";
-        if (loaded) return loaded;
-        return models.length ? String(models[0]) : "";
-      });
-    } catch (err) {
-      setProviderModels((prev) => prev);
     }
   }, [backendReady, selectedLocalProvider]);
 
   const fetchProviderLogs = React.useCallback(
     async ({ reset = false } = {}) => {
       if (!backendReady || !selectedLocalProvider) return;
-      const cursor = reset ? 0 : providerLogsCursor;
+      const cursor = reset ? 0 : providerLogsCursorRef.current;
       try {
         const res = await axios.get("/api/llm/provider/logs", {
           params: {
@@ -1061,19 +1152,22 @@ const AgentConsole = ({
         const logsPayload = res?.data?.logs || {};
         const entries = Array.isArray(logsPayload.entries) ? logsPayload.entries : [];
         const nextCursor = Number(logsPayload.next_cursor || cursor);
-        setProviderLogsCursor(Number.isFinite(nextCursor) ? nextCursor : cursor);
+        const resolvedCursor = Number.isFinite(nextCursor) ? nextCursor : cursor;
+        providerLogsCursorRef.current = resolvedCursor;
+        setProviderLogsCursor(resolvedCursor);
         setProviderLogs((prev) => {
           const merged = reset ? entries : [...prev, ...entries];
           return merged.slice(-500);
         });
       } catch (err) {
         if (reset) {
+          providerLogsCursorRef.current = 0;
           setProviderLogs([]);
           setProviderLogsCursor(0);
         }
       }
     },
-    [backendReady, providerLogsCursor, selectedLocalProvider],
+    [backendReady, selectedLocalProvider],
   );
 
   const runProviderAction = React.useCallback(
@@ -1084,9 +1178,10 @@ const AgentConsole = ({
       try {
         await axios.post(endpoint, { provider: selectedLocalProvider, ...body });
         await fetchRuntimeStatus();
-        await fetchProviderStatus();
-        await fetchProviderModels();
-        await fetchProviderLogs();
+        await fetchProviderSnapshot({ refresh: true });
+        if (providerLogsOpen) {
+          await fetchProviderLogs({ reset: true });
+        }
       } catch (err) {
         const detail =
           err?.response?.data?.detail || "Provider action failed. Check runtime logs.";
@@ -1098,9 +1193,9 @@ const AgentConsole = ({
     [
       backendReady,
       fetchProviderLogs,
-      fetchProviderModels,
-      fetchProviderStatus,
+      fetchProviderSnapshot,
       fetchRuntimeStatus,
+      providerLogsOpen,
       selectedLocalProvider,
     ],
   );
@@ -1130,6 +1225,43 @@ const AgentConsole = ({
     }, "unload");
   }, [providerSelectedModel, runProviderAction]);
 
+  const handleProviderSetTarget = React.useCallback(async (modelOverride = null) => {
+    if (!backendReady) return;
+    const nextModel = String(modelOverride ?? providerSelectedModel ?? "").trim();
+    if (!nextModel) return;
+    setProviderPendingAction("set-target");
+    setProviderActionError("");
+    try {
+      await axios.post("/api/settings", {
+        local_provider_preferred_model: nextModel,
+      });
+      await fetchRuntimeStatus();
+      await fetchProviderSnapshot({ refresh: true });
+    } catch (err) {
+      const detail =
+        err?.response?.data?.detail || "Unable to save the provider target model.";
+      setProviderActionError(String(detail));
+    } finally {
+      setProviderPendingAction("");
+    }
+  }, [
+    backendReady,
+    fetchProviderSnapshot,
+    fetchRuntimeStatus,
+    providerSelectedModel,
+  ]);
+
+  const handleProviderModelSelection = React.useCallback(
+    (nextModel, { persist = false } = {}) => {
+      const normalized = String(nextModel || "").trim();
+      setProviderSelectedModel(normalized);
+      if (persist && normalized) {
+        void handleProviderSetTarget(normalized);
+      }
+    },
+    [handleProviderSetTarget],
+  );
+
   const fetchModelVerify = React.useCallback(
     async (modelName, { force = false } = {}) => {
       if (!backendReady || !modelName) return;
@@ -1144,8 +1276,9 @@ const AgentConsole = ({
       lastVerifyRef.current = { model: modelName, at: now };
       setModelVerifyError("");
       try {
+        const catalogModel = resolveLocalCatalogModelId(modelName);
         const res = await axios.get(
-          `/api/models/verify/${encodeURIComponent(modelName)}`,
+          `/api/models/verify/${encodeURIComponent(catalogModel)}`,
         );
         setModelVerify(res?.data || null);
       } catch (err) {
@@ -1401,23 +1534,31 @@ const AgentConsole = ({
   }, [updateComposerOverlap, collapsed]);
 
   React.useEffect(() => {
+    providerActionPendingRef.current = providerActionPending;
+  }, [providerActionPending]);
+
+  React.useEffect(() => {
+    providerLogsOpenRef.current = providerLogsOpen;
+  }, [providerLogsOpen]);
+
+  React.useEffect(() => {
     if (!backendReady || collapsed) return;
     let runtimeId = null;
     if (isLocalMode) {
       fetchRuntimeStatus();
-      if (usingProviderRuntime && !providerActionPending) {
-        fetchProviderStatus();
-        fetchProviderModels();
-        fetchProviderLogs({ reset: true });
+      if (usingProviderRuntime && !providerActionPendingRef.current) {
+        fetchProviderSnapshot();
       }
       runtimeId = setInterval(() => {
-        fetchRuntimeStatus();
-        if (usingProviderRuntime && !providerActionPending) {
-          fetchProviderStatus();
-          fetchProviderModels();
-          fetchProviderLogs();
+        if (usingProviderRuntime && !providerActionPendingRef.current) {
+          fetchProviderRuntimeStatus();
+          if (providerLogsOpenRef.current) {
+            fetchProviderLogs();
+          }
+        } else {
+          fetchRuntimeStatus();
         }
-      }, 8000);
+      }, usingProviderRuntime ? PROVIDER_RUNTIME_POLL_MS : LOCAL_RUNTIME_POLL_MS);
     } else {
       setRuntimeStatus(null);
       setRuntimeError("");
@@ -1438,43 +1579,53 @@ const AgentConsole = ({
     backendReady,
     collapsed,
     fetchProviderLogs,
-    fetchProviderModels,
-    fetchProviderStatus,
+    fetchProviderSnapshot,
+    fetchProviderRuntimeStatus,
     fetchResourceSnapshot,
     fetchRuntimeStatus,
     isLocalMode,
-    providerActionPending,
     usingProviderRuntime,
   ]);
 
   React.useEffect(() => {
-    const modelName =
-      runtimeStatus?.model || state.transformerModel || state.localModel;
+    if (!backendReady || collapsed || !providerLogsOpen || !usingProviderRuntime) return;
+    fetchProviderLogs({ reset: true });
+  }, [
+    backendReady,
+    collapsed,
+    fetchProviderLogs,
+    providerLogsOpen,
+    usingProviderRuntime,
+  ]);
+
+  React.useEffect(() => {
+    const timerId = setInterval(() => {
+      setRuntimeNow(Date.now());
+    }, 1000);
+    return () => clearInterval(timerId);
+  }, []);
+
+  React.useEffect(() => {
+    const modelName = selectedDirectLocalModel;
     if (!modelName) return;
     if (isLocalRuntimeEntry(modelName)) return;
     fetchModelVerify(modelName);
   }, [
     fetchModelVerify,
-    runtimeStatus?.model,
-    state.transformerModel,
-    state.localModel,
+    selectedDirectLocalModel,
   ]);
 
   React.useEffect(() => {
+    providerLogsCursorRef.current = 0;
     setProviderActionError("");
     setProviderLogs([]);
     setProviderLogsCursor(0);
     setProviderStatus(null);
     setProviderModels([]);
     setProviderSelectedModel("");
+    providerAutoSelectedModelRef.current = "";
     if (!usingProviderRuntime) return;
-    fetchProviderStatus();
-    fetchProviderModels();
-    fetchProviderLogs({ reset: true });
   }, [
-    fetchProviderLogs,
-    fetchProviderModels,
-    fetchProviderStatus,
     selectedLocalProvider,
     usingProviderRuntime,
   ]);
@@ -1482,7 +1633,8 @@ const AgentConsole = ({
   const refreshDisabled = !backendReady || (!isCalendar && loadingSnapshot);
   const hiddenCount =
     Object.values(hiddenAgents).filter(Boolean).length +
-    (showStandaloneActionHistory && actionHistoryHidden ? 1 : 0);
+    (showStandaloneActionHistory && actionHistoryHidden ? 1 : 0) +
+    (showSyncInbox && syncInboxHidden ? 1 : 0);
   const hasInlineToolActivity = React.useMemo(() => {
     if (showToolEntries) return false;
     return agents.some(
@@ -1517,6 +1669,7 @@ const AgentConsole = ({
     if (!showSyncInbox) {
       syncInboxInteractedRef.current = false;
       setSyncInboxCollapsed(false);
+      setSyncInboxHidden(false);
       return;
     }
     if (syncInboxInteractedRef.current) return;
@@ -1554,12 +1707,12 @@ const AgentConsole = ({
       setRuntimeStatus(null);
     }
     if (isLocalMode && usingProviderRuntime) {
-      fetchProviderStatus();
-      fetchProviderModels();
-      fetchProviderLogs({ reset: true });
+      fetchProviderSnapshot();
+      if (providerLogsOpen) {
+        fetchProviderLogs({ reset: true });
+      }
     } else {
-      const modelName =
-        runtimeStatus?.model || state.transformerModel || state.localModel;
+      const modelName = selectedDirectLocalModel;
       if (modelName && !isLocalRuntimeEntry(modelName)) {
         fetchModelVerify(modelName, { force: true });
       }
@@ -1571,6 +1724,7 @@ const AgentConsole = ({
   const handleShowHidden = () => {
     setHiddenAgents({});
     setActionHistoryHidden(false);
+    setSyncInboxHidden(false);
   };
 
   const ensureActionHistoryDetails = React.useCallback(
@@ -1697,9 +1851,13 @@ const AgentConsole = ({
     setSyncInboxCollapsed((prev) => !prev);
   }, []);
 
-  const renderSyncInbox = React.useCallback(() => {
-    if (!showSyncInbox) return null;
+  const toggleSyncInboxHidden = React.useCallback(() => {
+    syncInboxInteractedRef.current = true;
+    setSyncInboxHidden((prev) => !prev);
+  }, []);
 
+  const renderSyncInbox = React.useCallback(() => {
+    if (!showSyncInbox || syncInboxHidden) return null;
     const renderReviewCard = (review, mode = "pending") => {
       if (!review || typeof review !== "object") return null;
       const reviewId = String(review.id || "").trim();
@@ -1788,11 +1946,20 @@ const AgentConsole = ({
                 ? `${pendingSyncReviews.length} pending`
                 : "no pending approvals"}
               {recentSyncReviews.length > 0
-                ? ` · ${recentSyncReviews.length} recent`
+                ? ` Â· ${recentSyncReviews.length} recent`
                 : ""}
             </span>
           </div>
           <div className="agent-sync-panel-actions">
+            <button
+              type="button"
+              className="agent-card-control-btn"
+              aria-label="Hide sync inbox"
+              onClick={toggleSyncInboxHidden}
+              title="Hide sync inbox"
+            >
+              Hide
+            </button>
             <button
               type="button"
               className="agent-card-control-btn"
@@ -1839,9 +2006,11 @@ const AgentConsole = ({
     showSyncInbox,
     submitSyncReviewDecision,
     syncInboxCollapsed,
+    syncInboxHidden,
     syncReviewFeedback,
     syncReviewPendingKey,
     toggleSyncInboxCollapsed,
+    toggleSyncInboxHidden,
   ]);
 
   const renderActionHistoryPopover = React.useCallback(
@@ -1853,7 +2022,7 @@ const AgentConsole = ({
             <div>
               <strong>work history</strong>
               <div className="agent-history-popout-meta">
-                {group.responseLabel} · {group.actions.length} tracked
+                {group.responseLabel} Â· {group.actions.length} tracked
                 {group.actions.length === 1 ? " change" : " changes"}
               </div>
             </div>
@@ -1924,7 +2093,7 @@ const AgentConsole = ({
                       Revert
                     </button>
                   </div>
-                  {detail?.loading ? <p className="status-note">Loading diff…</p> : null}
+                  {detail?.loading ? <p className="status-note">Loading diffâ€¦</p> : null}
                   {detail?.error ? <p className="status-note">{detail.error}</p> : null}
                   {detailItems.length ? (
                     <div className="agent-history-diff-list">
@@ -1991,12 +2160,12 @@ const AgentConsole = ({
       const overrideWorkflow =
         typeof target?.workflow === "string" ? target.workflow.trim() : "";
       const mode = overrideMode || (state.backendMode || "api").toLowerCase();
-      let model =
-        mode === "local"
-          ? state.localModel || state.transformerModel || state.apiModel
-          : mode === "server"
-            ? state.transformerModel || state.apiModel
-            : state.apiModel;
+      let model = resolveRequestModelForMode({
+        backendMode: mode,
+        apiModel: state.apiModel,
+        transformerModel: state.transformerModel,
+        localModel: state.localModel,
+      });
       if (overrideModel) {
         model = overrideModel;
       }
@@ -2115,10 +2284,22 @@ const AgentConsole = ({
     }
     let stream = null;
     try {
+      const videoConstraints = state.preferredCameraDeviceId
+        ? {
+            deviceId: { ideal: state.preferredCameraDeviceId },
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+            aspectRatio: { ideal: 16 / 9 },
+            resizeMode: "none",
+          }
+        : {
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+            aspectRatio: { ideal: 16 / 9 },
+            resizeMode: "none",
+          };
       stream = await navigator.mediaDevices.getUserMedia({
-        video: state.preferredCameraDeviceId
-          ? { deviceId: { ideal: state.preferredCameraDeviceId } }
-          : true,
+        video: videoConstraints,
         audio: false,
       });
       const video = document.createElement("video");
@@ -2500,6 +2681,17 @@ const AgentConsole = ({
         }
         return payload;
       };
+      const acceptDisabled = entry?.manual_fill_required === true && !entry?.id;
+      const localDenyAllowed = entry?.synthetic === true && !entry?.id;
+      const syntheticToolKey =
+        typeof entry?.synthetic_id === "string" ? entry.synthetic_id : "";
+      const entrySignature = JSON.stringify({
+        name: entry?.name || "",
+        args:
+          entry?.args && typeof entry.args === "object" && !Array.isArray(entry.args)
+            ? entry.args
+            : {},
+      });
 
       if (normalizedStatus && normalizedStatus !== "proposed") {
         return (
@@ -2530,8 +2722,10 @@ const AgentConsole = ({
           <button
             type="button"
             className="tool-action-btn accept"
+            disabled={acceptDisabled}
             onClick={async (event) => {
             event.stopPropagation();
+            if (acceptDisabled) return;
             try {
               if (entry.id && CLIENT_RESOLUTION_TOOLS.has(String(entry.name || ""))) {
                 const resp = await resolveClientTool(entry);
@@ -2645,37 +2839,75 @@ const AgentConsole = ({
         <button
           type="button"
           className="tool-action-btn deny"
-          disabled={!entry.id}
+          disabled={!entry.id && !localDenyAllowed}
           onClick={async (event) => {
             event.stopPropagation();
-            if (!entry.id) return;
+            if (!entry.id && !localDenyAllowed) return;
             try {
-              const resp = await axios.post(
-                "/api/tools/decision",
-                buildDecisionPayload("deny"),
-              );
-              const status = String(resp?.data?.status || "").toLowerCase();
-              if (status === "denied") {
-                const resolvedResult =
-                  typeof resp?.data?.result !== "undefined"
-                    ? resp.data?.result
-                    : fallbackResultForStatus(status);
-                await maybeContinueBatch(
-                  {
-                    sessionId: sessionForEntry,
-                    messageId: messageForEntry,
-                    toolUpdate: {
-                      id: entry.id,
-                      name: entry.name,
-                      args: entry.args || {},
-                      ...(typeof resolvedResult !== "undefined"
-                        ? { result: resolvedResult }
-                        : {}),
-                      status: "denied",
-                    },
-                  },
-                  null,
+              if (entry.id) {
+                const resp = await axios.post(
+                  "/api/tools/decision",
+                  buildDecisionPayload("deny"),
                 );
+                const status = String(resp?.data?.status || "").toLowerCase();
+                if (status === "denied") {
+                  const resolvedResult =
+                    typeof resp?.data?.result !== "undefined"
+                      ? resp.data?.result
+                      : fallbackResultForStatus(status);
+                  await maybeContinueBatch(
+                    {
+                      sessionId: sessionForEntry,
+                      messageId: messageForEntry,
+                      toolUpdate: {
+                        id: entry.id,
+                        name: entry.name,
+                        args: entry.args || {},
+                        ...(typeof resolvedResult !== "undefined"
+                          ? { result: resolvedResult }
+                          : {}),
+                        status: "denied",
+                      },
+                    },
+                    null,
+                  );
+                }
+              } else if (localDenyAllowed) {
+                setState((prev) => {
+                  const updated = Array.isArray(prev.conversation)
+                    ? [...prev.conversation]
+                    : [];
+                  const mIdx = updated.findIndex((item) => item && item.id === messageForEntry);
+                  if (mIdx === -1) return prev;
+                  const msgEntry = { ...(updated[mIdx] || {}) };
+                  const tools = Array.isArray(msgEntry.tools) ? [...msgEntry.tools] : [];
+                  const tIdx = tools.findIndex((toolEntry) => {
+                    if (!toolEntry || typeof toolEntry !== "object") return false;
+                    if (syntheticToolKey && toolEntry.synthetic_id === syntheticToolKey) {
+                      return true;
+                    }
+                    return (
+                      JSON.stringify({
+                        name: toolEntry?.name || "",
+                        args:
+                          toolEntry?.args &&
+                          typeof toolEntry.args === "object" &&
+                          !Array.isArray(toolEntry.args)
+                            ? toolEntry.args
+                            : {},
+                      }) === entrySignature
+                    );
+                  });
+                  if (tIdx === -1) return prev;
+                  tools[tIdx] = {
+                    ...tools[tIdx],
+                    status: "denied",
+                    result: { status: "denied", message: "Dismissed by user." },
+                  };
+                  msgEntry.tools = tools;
+                  updated[mIdx] = msgEntry;
+                  return { ...prev, conversation: updated };
+                });
               }
             } catch (err) {
               console.error("Tool deny failed", err);
@@ -3624,45 +3856,161 @@ const AgentConsole = ({
       const installed = !!providerRuntime.installed;
       const serverRunning = !!providerRuntime.server_running;
       const modelLoaded = !!providerRuntime.model_loaded;
+      const effectiveProviderModel =
+        typeof providerRuntime.effective_model_id === "string"
+          ? providerRuntime.effective_model_id.trim()
+          : typeof providerRuntime.effective_model === "string"
+            ? providerRuntime.effective_model.trim()
+            : "";
       const loadedModel =
         typeof providerRuntime.loaded_model === "string"
           ? providerRuntime.loaded_model.trim()
           : "";
+      const embeddingOnlyLoadedModel = Boolean(loadedModel) && !isChatCapableProviderModelName(loadedModel);
       const providerModelOptions = Array.from(
         new Set(
-          [...providerModels, loadedModel, providerSelectedModel]
+          [
+            ...providerModels,
+            isChatCapableProviderModelName(effectiveProviderModel) ? effectiveProviderModel : "",
+            isChatCapableProviderModelName(loadedModel) ? loadedModel : "",
+            providerSelectedModel,
+          ]
             .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
-            .filter(Boolean),
+            .filter((entry) => isChatCapableProviderModelName(entry)),
         ),
       );
+      const selectedProviderModel = isChatCapableProviderModelName(providerSelectedModel)
+        ? providerSelectedModel.trim()
+        : "";
       const effectiveSelectedModel =
-        (providerSelectedModel || loadedModel || providerModelOptions[0] || "").trim();
+        (
+          selectedProviderModel ||
+          effectiveProviderModel ||
+          providerModelOptions[0] ||
+          ""
+        ).trim();
       const contextSupported = capabilities.context_length !== false;
+      const externalEndpointMode = capabilities.start_stop === false;
+      const loadControlsAvailable = capabilities.load_unload !== false;
+      const providerLogsSupported = capabilities.logs_stream !== false;
+      const startStopAvailable = capabilities.start_stop !== false;
+      const providerEndpointReachable =
+        serverRunning || (externalEndpointMode && providerModelOptions.length > 0);
+      const providerRuntimeLastError =
+        typeof providerRuntime.last_error === "string"
+          ? providerRuntime.last_error.trim()
+          : "";
       const providerStatusLabel = modelLoaded
         ? "model loaded"
-        : serverRunning
-          ? "server running"
-          : installed
-            ? "installed"
-            : "not installed";
+        : embeddingOnlyLoadedModel
+          ? "embedding loaded"
+          : externalEndpointMode
+            ? providerEndpointReachable
+              ? "endpoint reachable"
+              : "endpoint offline"
+            : serverRunning
+              ? "server running"
+              : installed
+                ? "installed"
+                : "not installed";
       const providerLabel = formatLocalRuntimeLabel(selectedLocalProvider);
       const baseUrl =
         typeof providerRuntime.base_url === "string" ? providerRuntime.base_url : "";
+      const providerDetails =
+        providerRuntime?.details && typeof providerRuntime.details === "object"
+          ? providerRuntime.details
+          : {};
       const contextLength =
         typeof providerRuntime.context_length === "number"
           ? providerRuntime.context_length
           : null;
+      const providerCheckedAgo = formatRuntimeRelativeTime(
+        providerRuntime?.checked_at,
+        runtimeNow,
+      );
+      const providerCheckedClock = formatRuntimeClockTime(providerRuntime?.checked_at);
+      const providerCheckTooltip = providerCheckedAgo
+        ? `Inventory checked ${providerCheckedAgo}${
+            providerCheckedClock ? ` (${providerCheckedClock})` : ""
+          }. Automatic provider refresh runs about once per minute.`
+        : "Inventory has not been checked yet.";
       const runtimeLastError =
         providerActionError ||
-        providerRuntime.last_error ||
+        (
+          externalEndpointMode &&
+          /remote load endpoint is unavailable/i.test(providerRuntimeLastError)
+            ? ""
+            : providerRuntimeLastError
+        ) ||
         runtimeError ||
         "";
+      const providerFreshnessTone = runtimeLastError
+        ? "error"
+        : modelLoaded
+          ? "ok"
+          : externalEndpointMode
+            ? providerEndpointReachable
+              ? "ok"
+              : "idle"
+            : embeddingOnlyLoadedModel || serverRunning || installed
+              ? "warn"
+            : "idle";
       const logsCount = Array.isArray(providerLogs) ? providerLogs.length : 0;
       const loadBusy = providerPendingAction === "load";
       const unloadBusy = providerPendingAction === "unload";
       const startBusy = providerPendingAction === "start";
       const stopBusy = providerPendingAction === "stop";
-      const controlsLocked = loadBusy || unloadBusy;
+      const setTargetBusy = providerPendingAction === "set-target";
+      const controlsLocked = loadBusy || unloadBusy || setTargetBusy;
+      const showProviderInventory =
+        providerModelOptions.length > 0 || Boolean(effectiveSelectedModel);
+      const providerInventoryCount = providerModelOptions.length;
+      const providerInventoryLabel =
+        providerInventoryCount === 1
+          ? "1 model"
+          : providerInventoryCount > 1
+            ? `${providerInventoryCount} models`
+            : "";
+      const detailSizeBytesCandidates = [
+        providerDetails?.model_size_bytes,
+        providerDetails?.size_bytes,
+        providerDetails?.vram_estimate_bytes,
+        providerDetails?.memory_bytes,
+      ];
+      const detailSizeBytes = detailSizeBytesCandidates.find(
+        (value) => typeof value === "number" && Number.isFinite(value) && value > 0,
+      );
+      const selectedModelMetaParts = [];
+      const modelSizeLabel =
+        typeof detailSizeBytes === "number"
+          ? formatBytes(detailSizeBytes)
+          : formatModelScaleLabel(effectiveSelectedModel);
+      if (modelSizeLabel) {
+        selectedModelMetaParts.push(modelSizeLabel);
+      }
+      const detailQuantLabel =
+        typeof providerDetails?.quantization === "string" && providerDetails.quantization.trim()
+          ? providerDetails.quantization.trim()
+          : typeof providerDetails?.quant === "string" && providerDetails.quant.trim()
+            ? providerDetails.quant.trim()
+            : "";
+      const modelQuantLabel = detailQuantLabel || formatModelQuantLabel(effectiveSelectedModel);
+      if (modelQuantLabel && selectedModelMetaParts.length < 2) {
+        selectedModelMetaParts.push(modelQuantLabel);
+      }
+      if (
+        contextLength &&
+        effectiveSelectedModel &&
+        (effectiveSelectedModel === effectiveProviderModel || effectiveSelectedModel === loadedModel) &&
+        selectedModelMetaParts.length < 2
+      ) {
+        selectedModelMetaParts.push(`ctx ${formatTokenCount(contextLength)}`);
+      }
+      const selectedModelMetaLabel = selectedModelMetaParts.join(" / ");
+      const showProviderActionRow =
+        startStopAvailable || showProviderInventory || loadControlsAvailable;
+      const showProviderSecondaryRow =
+        (contextSupported && loadControlsAvailable) || providerLogsSupported;
 
       return (
         <section className="agent-runtime-panel">
@@ -3677,9 +4025,10 @@ const AgentConsole = ({
                 className="runtime-action-btn"
                 onClick={() => {
                   fetchRuntimeStatus();
-                  fetchProviderStatus();
-                  fetchProviderModels();
-                  fetchProviderLogs({ reset: true });
+                  fetchProviderSnapshot({ refresh: true });
+                  if (providerLogsOpen) {
+                    fetchProviderLogs({ reset: true });
+                  }
                 }}
                 disabled={providerActionPending && providerPendingAction === "refresh"}
                 aria-label="Refresh provider runtime status"
@@ -3687,6 +4036,11 @@ const AgentConsole = ({
               >
                 refresh
               </button>
+              <span
+                className={`runtime-freshness-indicator ${providerFreshnessTone}`}
+                title={providerCheckTooltip}
+                aria-label="Provider inventory freshness"
+              />
               <div className="runtime-panel-status" title={`runtime status: ${providerStatusLabel}`}>
                 {providerStatusLabel}
               </div>
@@ -3696,112 +4050,164 @@ const AgentConsole = ({
             <span className="runtime-model-name" title={providerLabel || selectedLocalProvider}>
               {providerLabel || selectedLocalProvider}
             </span>
+            {externalEndpointMode ? (
+              <span className="runtime-pill" title="Float is inspecting an external provider endpoint.">
+                remote endpoint
+              </span>
+            ) : null}
             {baseUrl ? <span className="runtime-pill">{baseUrl}</span> : null}
+            {loadedModel ? (
+              <span className="runtime-pill" title="loaded provider model">
+                loaded {loadedModel}
+              </span>
+            ) : null}
+            {providerInventoryLabel ? (
+              <span className="runtime-pill" title="provider inventory">
+                {providerInventoryLabel}
+              </span>
+            ) : null}
             {contextLength ? (
               <span className="runtime-pill" title="loaded context length">
                 ctx {formatTokenCount(contextLength)}
               </span>
             ) : null}
           </div>
-          <div className="runtime-provider-actions">
-            <button
-              type="button"
-              className="runtime-action-btn"
-              onClick={handleProviderStart}
-              disabled={startBusy || capabilities.start_stop === false}
-              title={
-                capabilities.start_stop === false
-                  ? "Start is unavailable in remote-unmanaged mode."
-                  : "Start provider server"
-              }
-            >
-              {startBusy ? "starting..." : "start"}
-            </button>
-            <button
-              type="button"
-              className="runtime-action-btn"
-              onClick={handleProviderStop}
-              disabled={stopBusy || capabilities.start_stop === false}
-              title={
-                capabilities.start_stop === false
-                  ? "Stop is unavailable in remote-unmanaged mode."
-                  : "Stop provider server"
-              }
-            >
-              {stopBusy ? "stopping..." : "stop"}
-            </button>
-            <select
-              className="model-select runtime-provider-model-select"
-              value={effectiveSelectedModel}
-              onChange={(event) => setProviderSelectedModel(event.target.value)}
-              disabled={controlsLocked}
-              title="Provider model"
-            >
-              {providerModelOptions.length === 0 ? (
-                <option value="">no provider models</option>
-              ) : (
-                providerModelOptions.map((model) => (
-                  <option key={model} value={model}>
-                    {model}
-                  </option>
-                ))
-              )}
-            </select>
-            <button
-              type="button"
-              className="runtime-action-btn"
-              onClick={handleProviderLoad}
-              disabled={loadBusy || !effectiveSelectedModel}
-              title="Load selected provider model"
-            >
-              {loadBusy ? "loading..." : "load"}
-            </button>
-            <button
-              type="button"
-              className="runtime-action-btn"
-              onClick={handleProviderUnload}
-              disabled={unloadBusy || (!effectiveSelectedModel && !loadedModel)}
-              title="Unload provider model"
-            >
-              {unloadBusy ? "unloading..." : "unload"}
-            </button>
-          </div>
-          <div className="runtime-provider-actions">
-            <label className="runtime-context-label" htmlFor="runtime-provider-context">
-              context
-            </label>
-            <input
-              id="runtime-provider-context"
-              className="runtime-provider-context-input"
-              type="number"
-              min="0"
-              step="1"
-              value={providerContextDraft}
-              onChange={(event) => setProviderContextDraft(event.target.value)}
-              disabled={controlsLocked || !contextSupported}
-              placeholder={contextSupported ? "optional" : "unsupported"}
-              title={
-                contextSupported
-                  ? "Optional context length for load requests"
-                  : "Context length control is unavailable for this provider."
-              }
-            />
-            <button
-              type="button"
-              className="runtime-action-btn"
-              onClick={() => setProviderLogsOpen((prev) => !prev)}
-              disabled={false}
-              title="Show or hide provider runtime logs"
-            >
-              {providerLogsOpen ? "hide logs" : "show logs"} ({logsCount})
-            </button>
-          </div>
+          {providerRuntime?.model_mismatch ? (
+            <div className="runtime-panel-warning" role="status">
+              Loaded model {loadedModel || "unknown"} differs from preferred model{" "}
+              {providerRuntime.preferred_model || "unknown"}.
+            </div>
+          ) : null}
+          {embeddingOnlyLoadedModel ? (
+            <div className="runtime-panel-warning" role="status">
+              Loaded model {loadedModel} looks like an embedding model. Chat requests need a
+              language model loaded here.
+            </div>
+          ) : null}
+          {showProviderActionRow ? (
+            <>
+              <div className="runtime-provider-actions">
+                {startStopAvailable ? (
+                  <>
+                    <button
+                      type="button"
+                      className="runtime-action-btn"
+                      onClick={handleProviderStart}
+                      disabled={startBusy}
+                      title="Start provider server"
+                    >
+                      {startBusy ? "starting..." : "start"}
+                    </button>
+                    <button
+                      type="button"
+                      className="runtime-action-btn"
+                      onClick={handleProviderStop}
+                      disabled={stopBusy}
+                      title="Stop provider server"
+                    >
+                      {stopBusy ? "stopping..." : "stop"}
+                    </button>
+                  </>
+                ) : null}
+                {showProviderInventory ? (
+                  <div
+                    className={`runtime-provider-select-wrap${
+                      selectedModelMetaLabel ? " has-meta" : ""
+                    }`}
+                  >
+                    <select
+                      className="model-select runtime-provider-model-select"
+                      value={effectiveSelectedModel}
+                      onChange={(event) =>
+                        handleProviderModelSelection(event.target.value, {
+                          persist: externalEndpointMode,
+                        })
+                      }
+                      disabled={controlsLocked || providerModelOptions.length === 0}
+                      title={externalEndpointMode ? "Provider target model" : "Provider model"}
+                    >
+                      {providerModelOptions.length === 0 ? (
+                        <option value="">no provider models</option>
+                      ) : (
+                        providerModelOptions.map((model) => (
+                          <option key={model} value={model}>
+                            {model}
+                          </option>
+                        ))
+                      )}
+                    </select>
+                    {selectedModelMetaLabel ? (
+                      <span className="runtime-provider-model-meta" title="Model metadata hint">
+                        {selectedModelMetaLabel}
+                      </span>
+                    ) : null}
+                  </div>
+                ) : null}
+                {loadControlsAvailable ? (
+                  <>
+                    <button
+                      type="button"
+                      className="runtime-action-btn"
+                      onClick={handleProviderLoad}
+                      disabled={loadBusy || !effectiveSelectedModel}
+                      title="Load selected provider model"
+                    >
+                      {loadBusy ? "loading..." : "load"}
+                    </button>
+                    <button
+                      type="button"
+                      className="runtime-action-btn"
+                      onClick={handleProviderUnload}
+                      disabled={unloadBusy || (!effectiveSelectedModel && !loadedModel)}
+                      title="Unload provider model"
+                    >
+                      {unloadBusy ? "unloading..." : "unload"}
+                    </button>
+                  </>
+                ) : null}
+              </div>
+              {showProviderSecondaryRow ? (
+                <div className="runtime-provider-actions">
+                  {contextSupported && loadControlsAvailable ? (
+                    <>
+                      <label className="runtime-context-label" htmlFor="runtime-provider-context">
+                        context
+                      </label>
+                      <input
+                        id="runtime-provider-context"
+                        className="runtime-provider-context-input"
+                        type="number"
+                        min="0"
+                        step="1"
+                        value={providerContextDraft}
+                        onChange={(event) => setProviderContextDraft(event.target.value)}
+                        disabled={controlsLocked}
+                        placeholder="optional"
+                        title="Optional context length for load requests"
+                      />
+                    </>
+                  ) : null}
+                  {providerLogsSupported ? (
+                    <button
+                      type="button"
+                      className="runtime-action-btn"
+                      onClick={() => setProviderLogsOpen((prev) => !prev)}
+                      disabled={false}
+                      title="Show or hide provider runtime logs"
+                    >
+                      {providerLogsOpen ? "hide logs" : "show logs"} ({logsCount})
+                    </button>
+                  ) : null}
+                </div>
+              ) : null}
+            </>
+          ) : null}
           {runtimeLastError ? (
             <div className="runtime-panel-error" role="status">
               {runtimeLastError}
             </div>
           ) : null}
-          {providerLogsOpen ? (
+          {providerLogsOpen && providerLogsSupported ? (
             <div className="runtime-provider-logs-wrap">
               <pre className="runtime-provider-logs">
                 {(providerLogs || [])
@@ -3825,11 +4231,37 @@ const AgentConsole = ({
         </section>
       );
     }
-    const modelName =
-      runtime?.model || state.transformerModel || state.localModel || "";
+    const modelName = selectedDirectLocalModel;
+    const activeModelId =
+      (typeof runtime?.effective_model_id === "string" && runtime.effective_model_id.trim()) ||
+      (typeof runtime?.model === "string" && runtime.model.trim()) ||
+      "";
+    const activeModelDiffers =
+      Boolean(activeModelId) &&
+      Boolean(modelName) &&
+      normalizeModelId(activeModelId) !== normalizeModelId(modelName);
     const loadState = runtime?.load_state || "idle";
     const isLoaded = runtime?.loaded || loadState === "ready";
     const loadError = runtime?.load_error || runtimeError;
+    const runtimePreflight =
+      runtime?.preflight && typeof runtime.preflight === "object"
+        ? runtime.preflight
+        : null;
+    const runtimeTiming = (() => {
+      const startedAgo = formatRuntimeRelativeTime(runtime?.load_started_at, runtimeNow);
+      const finishedAgo = formatRuntimeRelativeTime(runtime?.load_finished_at, runtimeNow);
+      const finishedClock = formatRuntimeClockTime(runtime?.load_finished_at);
+      if (loadState === "loading" && startedAgo) {
+        return `Loading started ${startedAgo}.`;
+      }
+      if (loadState === "ready" && finishedAgo) {
+        return `Loaded ${finishedAgo}${finishedClock ? ` (${finishedClock})` : ""}.`;
+      }
+      if (loadState === "error" && finishedAgo) {
+        return `Load failed ${finishedAgo}${finishedClock ? ` (${finishedClock})` : ""}.`;
+      }
+      return null;
+    })();
     const hasModel = Boolean(modelName);
     const downloadState = modelVerify?.exists ? "done" : "pending";
     const verifyState = modelVerify?.verified
@@ -4000,7 +4432,7 @@ const AgentConsole = ({
         const label = gpu?.name
           ? `${gpu.name}`
           : `GPU ${gpu?.index ?? idx}`;
-        const meta = parts.join(" · ");
+        const meta = parts.join(" Â· ");
         return (
           <div key={gpu?.id || idx} className="runtime-meter-block">
             {renderMeter(label, used, total, meta, meta)}
@@ -4013,6 +4445,8 @@ const AgentConsole = ({
       ? "offline"
       : runtimeLoading
         ? "updating..."
+        : loadState === "loading"
+          ? "loading..."
         : runtimeError
           ? "offline"
           : "live";
@@ -4044,7 +4478,7 @@ const AgentConsole = ({
     if (tokenSource) {
       tokenMetaParts.push(tokenSource);
     }
-    const tokenMeta = tokenMetaParts.join(" · ");
+    const tokenMeta = tokenMetaParts.join(" Â· ");
     const tokenValue =
       typeof tokenTotal === "number"
         ? tokenLimit
@@ -4076,11 +4510,27 @@ const AgentConsole = ({
                 </button>
               </span>
             )}
+            <button
+              type="button"
+              className="runtime-action-btn runtime-action-symbol"
+              onClick={() => setRuntimePanelCollapsed((prev) => !prev)}
+              aria-expanded={!runtimePanelCollapsed}
+              aria-label={runtimePanelCollapsed ? "Expand runtime details" : "Collapse runtime details"}
+              title={runtimePanelCollapsed ? "Expand runtime details" : "Collapse runtime details"}
+            >
+              {runtimePanelCollapsed ? "+" : "-"}
+            </button>
             <div className="runtime-panel-status" title={`runtime status: ${statusText}`}>
               {statusText}
             </div>
           </div>
         </header>
+        {runtimePanelCollapsed ? (
+          <div className="runtime-panel-note" role="status">
+            Runtime details hidden. Selected model: {hasModel ? modelName : "none"}.
+          </div>
+        ) : (
+          <>
         <div className="runtime-model-row">
           <span
             className="runtime-model-name"
@@ -4088,6 +4538,11 @@ const AgentConsole = ({
           >
             {hasModel ? modelName : "local model"}
           </span>
+          {activeModelDiffers ? (
+            <span className="runtime-pill" title={`loaded model: ${activeModelId}`}>
+              loaded {activeModelId}
+            </span>
+          ) : null}
           {tokenLimit && (
             <span className="runtime-pill" title="max context length">
               ctx {formatTokenCount(tokenLimit)}
@@ -4223,6 +4678,32 @@ const AgentConsole = ({
             </li>
           ))}
         </ol>
+        {runtimeTiming ? (
+          <div className="runtime-panel-note" role="status">
+            {runtimeTiming}
+          </div>
+        ) : null}
+        {runtimePreflight?.python_executable ? (
+          <div className="runtime-panel-note" role="status">
+            Backend Python: {runtimePreflight.python_executable}
+          </div>
+        ) : null}
+        {runtimePreflight?.missing_packages?.length ? (
+          <div className="runtime-panel-error" role="status">
+            Missing direct-local packages: {runtimePreflight.missing_packages.join(", ")}.
+          </div>
+        ) : null}
+        {runtimePreflight?.missing_runtime_components?.length ? (
+          <div className="runtime-panel-error" role="status">
+            Missing transformers loader classes:{" "}
+            {runtimePreflight.missing_runtime_components.join(", ")}.
+          </div>
+        ) : null}
+        {!loadError && runtimePreflight?.hint ? (
+          <div className="runtime-panel-note" role="status">
+            {runtimePreflight.hint}
+          </div>
+        ) : null}
         {loadError && (
           <div className="runtime-panel-error" role="status">
             {loadError}
@@ -4277,6 +4758,8 @@ const AgentConsole = ({
             </div>
           </div>
         </div>
+          </>
+        )}
       </section>
     );
   };
@@ -4464,4 +4947,3 @@ const AgentConsole = ({
 };
 
 export default AgentConsole;
-

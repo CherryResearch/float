@@ -97,6 +97,27 @@ def test_nested_conversation_paths(monkeypatch, tmp_path):
     assert detailed[0]["display_name"] == "alpha"
 
 
+def test_list_conversations_skips_object_artifacts(monkeypatch, tmp_path):
+    store = setup_store(tmp_path, monkeypatch)
+    store.save_conversation("demo/sess-1", [{"role": "user", "content": "x"}])
+    (tmp_path / "demo").mkdir(exist_ok=True)
+    (tmp_path / "demo" / "demo_manifest.json").write_text(
+        '{"created_at_utc":"2026-04-10T00:00:00Z"}',
+        encoding="utf-8",
+    )
+    names = store.list_conversations()
+    assert names == ["demo/sess-1"]
+
+
+def test_load_conversation_returns_empty_for_object_payload(monkeypatch, tmp_path):
+    store = setup_store(tmp_path, monkeypatch)
+    (tmp_path / "demo_manifest.json").write_text(
+        '{"created_at_utc":"2026-04-10T00:00:00Z"}',
+        encoding="utf-8",
+    )
+    assert store.load_conversation("demo_manifest") == []
+
+
 def test_move_preserves_display_name(monkeypatch, tmp_path):
     store = setup_store(tmp_path, monkeypatch)
     store.save_conversation("sess-1", [{"role": "user", "content": "1"}])

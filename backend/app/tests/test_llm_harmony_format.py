@@ -129,3 +129,10 @@ def test_generate_forwards_text_response_format_in_server_mode(monkeypatch):
     res = svc.generate("hi", response_format="text")
     assert res["text"] == "ok"
     assert captured["payload"]["response_format"] == {"type": "text"}
+
+
+def test_normalize_chat_role_maps_persisted_aliases():
+    import app.base_services as base_services
+
+    assert base_services._normalize_chat_role("ai") == "assistant"
+    assert base_services._normalize_chat_role("human") == "user"

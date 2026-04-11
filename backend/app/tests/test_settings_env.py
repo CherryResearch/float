@@ -26,6 +26,14 @@ def client(add_backend_to_sys_path):
     return TestClient(app)
 
 
+def test_app_bootstrap_seeds_stable_mode_into_config(client):
+    from app import routes
+
+    assert client.app.state.config["mode"] == "api"
+    assert routes.llm_service.mode == "api"
+    assert routes.llm_service.config is client.app.state.config
+
+
 def test_update_settings_creates_dotenv(tmp_path, client):
     env_path = tmp_path / ".env"
     assert not env_path.exists()
@@ -56,6 +64,22 @@ def test_models_folder_setting(client, tmp_path):
     assert resp2.json()["settings"]["models_folder"] == str(new_dir)
 
 
+def test_mode_setting_updates_config_and_rejects_invalid_values(client):
+    resp = client.post("/settings", json={"mode": "local"})
+    assert resp.status_code == 200
+    assert resp.json()["mode"] == "local"
+    assert client.app.state.config["mode"] == "local"
+
+    resp2 = client.get("/settings")
+    assert resp2.status_code == 200
+    assert resp2.json()["mode"] == "local"
+
+    invalid = client.post("/settings", json={"mode": "definitely-not-a-mode"})
+    assert invalid.status_code == 400
+    assert invalid.json()["detail"] == "Invalid mode"
+    assert client.app.state.config["mode"] == "local"
+
+
 def test_local_provider_settings(client, tmp_path):
     env_path = tmp_path / ".env"
     resp = client.post(
@@ -77,6 +101,22 @@ def test_local_provider_settings(client, tmp_path):
     assert "LOCAL_PROVIDER" in content and "ollama" in content
     assert "LOCAL_PROVIDER_MODE" in content and "remote-unmanaged" in content
     assert "LOCAL_PROVIDER_API_TOKEN" in content and "provider-secret" in content
+
+
+def test_mode_setting_persists_to_env_and_settings(client, tmp_path):
+    env_path = tmp_path / ".env"
+    resp = client.post("/settings", json={"mode": "local"})
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload.get("mode") == "local"
+    settings = payload.get("settings") or {}
+    assert settings.get("mode") == "local"
+    content = env_path.read_text()
+    assert "MODE" in content and "local" in content
+
+    resp2 = client.get("/settings")
+    assert resp2.status_code == 200
+    assert resp2.json()["mode"] == "local"
 
 
 def test_rag_similarity_setting_allows_zero(client, tmp_path):
@@ -178,3 +218,20 @@ def test_default_system_prompt_mentions_artifact_summaries_and_runtime_checks():
     assert "sandboxed runtime" in prompt
     assert "help/tool_info output" in prompt
     assert "before saying it does not exist" in prompt
+
+
+def test_default_system_prompt_is_loaded_from_plaintext_asset():
+    from app import config as app_config
+
+    prompt_path = (
+        Path(app_config.__file__).resolve().parent / "prompts" / "system_prompt.txt"
+    )
+    assert prompt_path.exists()
+
+    raw_prompt = prompt_path.read_text(encoding="utf-8")
+    normalized_prompt = " ".join(
+        line.strip() for line in raw_prompt.splitlines() if line.strip()
+    )
+
+    cfg = app_config.load_config()
+    assert cfg["system_prompt"] == normalized_prompt

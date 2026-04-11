@@ -6,6 +6,11 @@ const normalizeModelName = (value) => {
 const includesAny = (haystack, needles) =>
   needles.some((needle) => haystack.includes(needle));
 
+export const isGemmaFamilyModelName = (name) => {
+  const value = normalizeModelName(name).toLowerCase();
+  return value.startsWith("gemma-");
+};
+
 export const isLikelyEmbeddingModelName = (name) => {
   const value = normalizeModelName(name).toLowerCase();
   if (!value) return false;
@@ -94,4 +99,3 @@ export const filterAvailableModelsForField = (
   }
   return out;
 };
-

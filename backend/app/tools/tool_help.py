@@ -6,11 +6,15 @@ embedding full guidance in every model prompt.
 
 from __future__ import annotations
 
+from difflib import get_close_matches
+from pathlib import Path
 from typing import Any, Dict, List
 
+from app import config as app_config
 from app.tool_catalog import get_tool_catalog_entry
 from app.tool_specs import BUILTIN_TOOL_SPECS
 from app.utils import verify_signature
+from app.workflow_profiles import workflow_catalog_payload
 
 _TOOL_NOTES: Dict[str, Dict[str, Any]] = {
     "help": {
@@ -18,10 +22,13 @@ _TOOL_NOTES: Dict[str, Dict[str, Any]] = {
             "Use this as the primary built-in documentation tool: omit `tool_name` to list tools, or pass one tool name for a focused guide.",
             "Defaults stay intentionally lean so the model can verify capabilities without dumping full schemas into context.",
             "If browser or desktop control is needed, inspect `computer.session.start` first, then follow with `computer.navigate`, `computer.observe`, or `computer.act`.",
+            "Pass `tool_name='modules'` to inspect live workflows, enabled modules, and packaged add-ons, or `tool_name='skills'` to inspect packaged skill files.",
         ],
         "examples": [
             {"tool_name": ""},
             {"tool_name": "computer.session.start"},
+            {"tool_name": "modules"},
+            {"tool_name": "skills"},
         ],
     },
     "tool_info": {
@@ -29,9 +36,11 @@ _TOOL_NOTES: Dict[str, Dict[str, Any]] = {
             "Use this when the model needs one authoritative capability record for a built-in tool.",
             "The response mirrors the built-in catalog used by the UI.",
             "Inspect runtime and sandbox fields before assuming a tool has network, filesystem, or Python-style execution access.",
+            "It also accepts the special entries `modules` and `skills` for non-tool runtime catalogs.",
         ],
         "examples": [
             {"tool_name": "search_web", "include_schema": True},
+            {"tool_name": "modules", "include_schema": False},
         ],
     },
     "list_actions": {
@@ -80,8 +89,9 @@ _TOOL_NOTES: Dict[str, Dict[str, Any]] = {
             "Use this to discover which tools actually exist in the current environment before planning a multi-tool workflow.",
             "Prefer `help` for new calls; `tool_help` remains as a compatibility alias.",
             "Prefer calling this over hand-listing tool handles from memory when the user asks what float can do.",
+            "Pass `tool_name='modules'` for workflow/module/add-on state or `tool_name='skills'` for packaged skill-file discovery.",
             "If the user is asking about Float itself, its setup, or project layout, inspect the repo's root `README.md`; because that file is outside the managed `data/` sandbox, prefer `shell.exec` over `read_file` for that path.",
-            "If the user asks for reminders, tasks, events, or scheduling, inspect `create_task` before claiming no scheduler exists.",
+            "If the user asks for reminders, tasks, events, or scheduling, inspect `create_task` and `list_tasks` before claiming no scheduler exists.",
             "Check runtime and sandbox metadata before assuming shell, REPL, Python, network, or filesystem access.",
             "For browser or desktop automation, inspect the `computer.*` tools before describing what the runtime can click, type, or launch.",
             "For structured or semi-structured artifacts such as CSV, JSON, logs, or sampled document sets, prefer typed summaries and stable handles when the available tools support that flow.",
@@ -382,6 +392,17 @@ _TOOL_NOTES: Dict[str, Dict[str, Any]] = {
             },
         ],
     },
+    "list_tasks": {
+        "notes": [
+            "Use this to read upcoming or already-saved Float calendar tasks back from local storage.",
+            "By default it focuses on upcoming items; set `include_past=true` when the user explicitly wants historical entries too.",
+            "Use it alongside `create_task` when the model needs to verify what is already scheduled before adding a duplicate reminder.",
+        ],
+        "examples": [
+            {"limit": 10},
+            {"include_past": True, "status": "scheduled", "limit": 20},
+        ],
+    },
     "read_file": {
         "notes": [
             "Use `list_dir` first when the exact path is uncertain.",
@@ -417,6 +438,68 @@ _TOOL_NOTES: Dict[str, Dict[str, Any]] = {
         ],
     },
 }
+
+
+def _available_tool_names() -> List[str]:
+    return [
+        str(name)
+        for name in BUILTIN_TOOL_SPECS.keys()
+        if isinstance(name, str) and name.strip()
+    ]
+
+
+def _balanced_tool_name_selection(
+    names: List[str], limit: int
+) -> tuple[List[str], List[str]]:
+    if limit <= 0:
+        return [], list(names)
+    if len(names) <= limit:
+        return list(names), []
+
+    head_count = (limit + 1) // 2
+    tail_count = limit - head_count
+    selected: List[str] = []
+    seen: set[str] = set()
+    for name in names[:head_count] + names[-tail_count:]:
+        if name in seen:
+            continue
+        seen.add(name)
+        selected.append(name)
+    omitted = [name for name in names if name not in seen]
+    return selected, omitted
+
+
+def _tool_name_suggestions(
+    requested_name: str, available: List[str], *, limit: int = 3
+) -> List[str]:
+    needle = str(requested_name or "").strip().lower()
+    if not needle:
+        return []
+
+    lowered = {name.lower(): name for name in available}
+    suggestions: List[str] = []
+    seen: set[str] = set()
+
+    def _add(candidate: str) -> None:
+        resolved = lowered.get(candidate.lower(), candidate)
+        if not resolved or resolved in seen:
+            return
+        seen.add(resolved)
+        suggestions.append(resolved)
+
+    for candidate in get_close_matches(
+        needle, list(lowered.keys()), n=limit, cutoff=0.55
+    ):
+        _add(candidate)
+    for name in available:
+        lowered_name = name.lower()
+        if needle in lowered_name or any(
+            part.startswith(needle) for part in lowered_name.split(".")
+        ):
+            _add(name)
+        if len(suggestions) >= limit:
+            break
+    return suggestions[:limit]
 
 
 def _prop_type(prop: Dict[str, Any]) -> str:
@@ -523,6 +606,135 @@ def _build_tool_entry(
     return base
 
 
+def _skills_root() -> Path:
+    return (app_config.REPO_ROOT / "modules" / "skills").resolve()
+
+
+def _read_skill_summary(path: Path) -> str:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return ""
+    for raw_line in lines:
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            continue
+        return line
+    return ""
+
+
+def _skills_catalog_payload() -> Dict[str, Any]:
+    root = _skills_root()
+    entries: List[Dict[str, Any]] = []
+    if root.exists():
+        for path in sorted(root.glob("*.md")):
+            if path.name.lower() == "readme.md":
+                continue
+            entries.append(
+                {
+                    "id": path.stem,
+                    "label": path.stem.replace("_", " "),
+                    "path": str(path),
+                    "summary": _read_skill_summary(path),
+                }
+            )
+    return {
+        "skills_root": str(root),
+        "skills": entries,
+        "count": len(entries),
+    }
+
+
+def _build_special_entry(
+    name: str,
+    *,
+    detail: str,
+    include_schema: bool,
+) -> Dict[str, Any] | None:
+    normalized = str(name or "").strip().lower()
+    if normalized == "modules":
+        catalog = workflow_catalog_payload()
+        entry: Dict[str, Any] = {
+            "name": "modules",
+            "status": "live",
+            "category": "runtime",
+            "summary": "Runtime workflow catalog including built-in workflows, modules, and packaged add-ons.",
+            "description": "Inspect this when you need the current workflow/module surface rather than guessing from memory.",
+        }
+        if detail == "brief":
+            entry["workflows"] = [
+                item.get("id")
+                for item in catalog.get("workflows", [])
+                if isinstance(item, dict)
+            ]
+            entry["modules"] = [
+                item.get("id")
+                for item in catalog.get("modules", [])
+                if isinstance(item, dict)
+            ]
+            entry["addons"] = [
+                item.get("id")
+                for item in catalog.get("addons", [])
+                if isinstance(item, dict)
+            ]
+            return entry
+        entry["notes"] = [
+            "Modules are live workflow capabilities such as computer use, camera capture, memory promotion, and host shell access.",
+            "Workflows choose behavior style and default enabled modules for a run.",
+            "Add-ons are packaged manifests discoverable from the repo and optional local data overrides.",
+        ]
+        entry["workflows"] = catalog.get("workflows", [])
+        entry["modules"] = catalog.get("modules", [])
+        entry["addons"] = catalog.get("addons", [])
+        entry["addons_root"] = catalog.get("addons_root")
+        entry["addons_roots"] = catalog.get("addons_roots", [])
+        if include_schema:
+            entry["schema"] = {
+                "type": "object",
+                "properties": {
+                    "workflows": {"type": "array"},
+                    "modules": {"type": "array"},
+                    "addons": {"type": "array"},
+                },
+            }
+        return entry
+    if normalized == "skills":
+        catalog = _skills_catalog_payload()
+        entry = {
+            "name": "skills",
+            "status": "partial",
+            "category": "runtime",
+            "summary": "Packaged skill markdown files available in this repo.",
+            "description": "These are repo-shipped guidance files, not first-class executable tools.",
+        }
+        if detail == "brief":
+            entry["skills"] = [
+                item.get("id")
+                for item in catalog.get("skills", [])
+                if isinstance(item, dict)
+            ]
+            entry["skills_root"] = catalog.get("skills_root")
+            return entry
+        entry["notes"] = [
+            "Skills are markdown guidance files stored under the repo's modules/skills directory.",
+            "They are discoverable here, but they are not yet dynamically injected as a full runtime capability layer.",
+        ]
+        entry["skills_root"] = catalog.get("skills_root")
+        entry["skills"] = catalog.get("skills", [])
+        if include_schema:
+            entry["schema"] = {
+                "type": "object",
+                "properties": {
+                    "skills_root": {"type": "string"},
+                    "skills": {"type": "array"},
+                },
+            }
+        return entry
+    return None
+
+
 def _run_tool_help(
     *,
     tool_key: str,
@@ -548,14 +760,29 @@ def _run_tool_help(
     }
     verify_signature(signature, user, tool_key, payload)
 
-    available = sorted(BUILTIN_TOOL_SPECS.keys())
+    available = _available_tool_names()
     if requested_name:
-        if requested_name not in BUILTIN_TOOL_SPECS:
+        special_entry = _build_special_entry(
+            requested_name,
+            detail=normalized_detail,
+            include_schema=include_schema_flag,
+        )
+        if special_entry is not None:
             return {
+                "query": payload,
+                "count": 1,
+                "tools": [special_entry],
+            }
+        if requested_name not in BUILTIN_TOOL_SPECS:
+            response = {
                 "error": "unknown_tool",
                 "tool_name": requested_name,
                 "available": available,
             }
+            suggestions = _tool_name_suggestions(requested_name, available)
+            if suggestions:
+                response["did_you_mean"] = suggestions
+            return response
         entries = [
             _build_tool_entry(
                 requested_name,
@@ -569,20 +796,30 @@ def _run_tool_help(
             "tools": entries,
         }
 
-    selected_names = available[:limited_max_tools]
-    entries = [
-        _build_tool_entry(
-            name,
-            detail=normalized_detail,
-            include_schema=include_schema_flag,
-        )
-        for name in selected_names
-    ]
+    selected_names, omitted_names = _balanced_tool_name_selection(
+        available, limited_max_tools
+    )
+    tools_payload: List[Any]
+    if normalized_detail == "brief":
+        tools_payload = list(selected_names)
+    else:
+        tools_payload = [
+            _build_tool_entry(
+                name,
+                detail=normalized_detail,
+                include_schema=include_schema_flag,
+            )
+            for name in selected_names
+        ]
     response: Dict[str, Any] = {
         "query": payload,
-        "count": len(entries),
-        "tools": entries,
+        "count": len(selected_names),
+        "total_count": len(available),
+        "tools": tools_payload,
     }
+    if omitted_names:
+        response["remaining_count"] = len(omitted_names)
+        response["more_tools"] = omitted_names[:limited_max_tools]
     if normalized_detail == "rich":
         response["note"] = "Pass tool_name to get a single full tool guide."
     return response
@@ -646,17 +883,29 @@ def tool_info(
         "include_schema": include_schema_flag,
     }
     verify_signature(signature, user, "tool_info", payload)
+    available = _available_tool_names()
     if not requested_name:
         return {
             "error": "missing_tool",
-            "available": sorted(BUILTIN_TOOL_SPECS.keys()),
+            "available": available,
         }
+    special_entry = _build_special_entry(
+        requested_name,
+        detail="rich",
+        include_schema=include_schema_flag,
+    )
+    if special_entry is not None:
+        return special_entry
     if requested_name not in BUILTIN_TOOL_SPECS:
-        return {
+        response = {
             "error": "unknown_tool",
             "tool_name": requested_name,
-            "available": sorted(BUILTIN_TOOL_SPECS.keys()),
+            "available": available,
         }
+        suggestions = _tool_name_suggestions(requested_name, available)
+        if suggestions:
+            response["did_you_mean"] = suggestions
+        return response
     entry = get_tool_catalog_entry(requested_name)
     if not include_schema_flag:
         entry.pop("input_schema", None)

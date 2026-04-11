@@ -1115,6 +1115,25 @@ class RAGService:
             "error": self._embedding_encoder_error,
         }
 
+    def load_embedding_runtime(self) -> Dict[str, Any]:
+        lowered = (self.embedding_model or "").strip().lower()
+        if lowered in {"", "simple", "hash"} or lowered.startswith("api:"):
+            return self.embedding_runtime_status()
+        with self._embedding_encoder_lock:
+            if self._embedding_encoder is not None:
+                return self.embedding_runtime_status()
+            self._embedding_encoder_error = None
+            self._embedding_encoder_init_attempted = False
+        self._ensure_embedding_encoder()
+        return self.embedding_runtime_status()
+
+    def unload_embedding_runtime(self) -> Dict[str, Any]:
+        with self._embedding_encoder_lock:
+            self._embedding_encoder = None
+            self._embedding_encoder_error = None
+            self._embedding_encoder_init_attempted = False
+        return self.embedding_runtime_status()
+
     def _embed_text(self, text: str) -> list[float]:
         if self._embedding_encoder is None:
             self._ensure_embedding_encoder()

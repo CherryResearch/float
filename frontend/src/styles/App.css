@@ -34,15 +34,16 @@ body {
 
 body.dark-mode {
   background:
-    radial-gradient(1250px 720px at -4% 18%, color-mix(in oklab, var(--theme-c1-dark) 52%, var(--theme-warm-black)), transparent 74%),
-    radial-gradient(1120px 660px at 106% 18%, color-mix(in oklab, var(--theme-c2-med) 28%, var(--theme-warm-black)), transparent 78%),
-    radial-gradient(980px 620px at 50% 118%, color-mix(in oklab, var(--theme-c2-dark) 18%, var(--theme-warm-black)), transparent 82%),
+    radial-gradient(1320px 760px at -4% 16%, color-mix(in oklab, var(--color-lavender) 16%, var(--theme-warm-black)), transparent 74%),
+    radial-gradient(1180px 700px at 108% 16%, color-mix(in oklab, var(--color-purple) 26%, var(--theme-warm-black)), transparent 78%),
+    radial-gradient(980px 620px at 50% 118%, color-mix(in oklab, var(--color-indigo) 18%, var(--theme-warm-black)), transparent 82%),
+    radial-gradient(720px 400px at 100% 100%, color-mix(in oklab, var(--color-accent) 10%, var(--theme-warm-black)), transparent 86%),
     linear-gradient(156deg, rgba(255, 255, 255, 0.026), rgba(255, 255, 255, 0) 48%, rgba(255, 255, 255, 0.016) 100%),
     var(--gradient-background);
   background-repeat: no-repeat;
   background-size: cover;
   background-attachment: fixed;
-  background-color: color-mix(in oklab, var(--theme-warm-black) 92%, var(--theme-c1-dark) 8%);
+  background-color: color-mix(in oklab, var(--theme-warm-black) 94%, var(--color-petrol) 6%);
 }
 
 h1 {
@@ -169,19 +170,19 @@ body:not(.dark-mode)
 body.dark-mode .topbar-inner {
   background:
     var(--glass-sheen-strong),
-    linear-gradient(148deg, color-mix(in oklab, var(--theme-c2-med) 18%, transparent), transparent 60%),
+    linear-gradient(148deg, color-mix(in oklab, var(--color-purple) 16%, transparent), transparent 60%),
     radial-gradient(
       720px 420px at 16% 0%,
-      color-mix(in oklab, var(--theme-c1-dark) 20%, transparent),
+      color-mix(in oklab, var(--color-lavender) 18%, transparent),
       transparent 76%
     ),
     radial-gradient(
       700px 420px at 86% 132%,
-      color-mix(in oklab, var(--theme-c2-light) 16%, transparent),
+      color-mix(in oklab, var(--color-accent) 10%, transparent),
       transparent 80%
     ),
     color-mix(in oklab, var(--glass-tint-strong) 96%, transparent);
-  border-color: color-mix(in oklab, var(--theme-c2-med) 30%, var(--glass-border) 70%);
+  border-color: color-mix(in oklab, var(--color-lavender) 26%, var(--glass-border) 74%);
 }
 
 /* Main chat column should expand to fill viewport */
@@ -195,6 +196,14 @@ body.dark-mode .topbar-inner {
   overflow-y: scroll;
   /* Keep layout width stable when vertical scrollbar toggles; center remains aligned */
   scrollbar-gutter: stable both-edges;
+}
+
+.main-chat--settings {
+  overflow: hidden;
+}
+
+.main-chat--settings .center-rail {
+  min-height: 0;
 }
 
 /* Button shown when a sidebar is collapsed */
@@ -233,6 +242,41 @@ body.dark-mode .show-sidebar-btn {
   color: color-mix(in oklab, var(--theme-c1-dark) 72%, var(--theme-c2-med) 28%);
   border-color: color-mix(in oklab, var(--theme-c2-med) 40%, var(--glass-border) 60%);
   box-shadow: 0 10px 24px color-mix(in oklab, var(--theme-c1-shadow) 26%, transparent);
+}
+
+:root[data-visual-theme="spring"] body.dark-mode {
+  background:
+    radial-gradient(
+      1420px 780px at -6% 16%,
+      color-mix(in oklab, var(--color-lavender) 18%, var(--theme-warm-black)),
+      transparent 74%
+    ),
+    radial-gradient(
+      1220px 720px at 108% 14%,
+      color-mix(in oklab, var(--color-purple) 30%, var(--theme-warm-black)),
+      transparent 76%
+    ),
+    radial-gradient(
+      1020px 640px at 48% 118%,
+      color-mix(in oklab, var(--color-indigo) 20%, var(--theme-warm-black)),
+      transparent 82%
+    ),
+    radial-gradient(
+      720px 400px at 100% 100%,
+      color-mix(in oklab, var(--color-accent) 12%, var(--theme-warm-black)),
+      transparent 86%
+    ),
+    linear-gradient(
+      156deg,
+      rgba(255, 255, 255, 0.03),
+      rgba(255, 255, 255, 0) 48%,
+      rgba(255, 255, 255, 0.014) 100%
+    ),
+    var(--gradient-background);
+  background-repeat: no-repeat;
+  background-size: cover;
+  background-attachment: fixed;
+  background-color: color-mix(in oklab, var(--theme-warm-black) 95%, var(--color-petrol) 5%);
 }
 
 .show-sidebar-btn.left {

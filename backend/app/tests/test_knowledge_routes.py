@@ -180,6 +180,30 @@ def test_knowledge_file_serves_local_file_under_data_files(client, tmp_path):
     assert "text/plain" in str(file_resp.headers.get("content-type", "")).lower()
 
 
+def test_knowledge_update_rewrites_local_workspace_text_file(client, tmp_path):
+    data_root = tmp_path / "data_root"
+    local_doc = data_root / "files" / "workspace" / "editable.txt"
+    local_doc.parent.mkdir(parents=True, exist_ok=True)
+    local_doc.write_text("before", encoding="utf-8")
+
+    add_resp = client.post("/knowledge/add", json={"path": str(local_doc)})
+    assert add_resp.status_code == 200
+    doc_id = add_resp.json()["id"]
+
+    update_resp = client.put(
+        f"/knowledge/{doc_id}",
+        json={"text": "after"},
+    )
+    assert update_resp.status_code == 200
+    assert update_resp.json() == {"status": "updated"}
+    assert local_doc.read_text(encoding="utf-8") == "after"
+
+    fetch_resp = client.get(f"/knowledge/{doc_id}")
+    assert fetch_resp.status_code == 200
+    payload = (fetch_resp.json().get("metadatas") or [{}])[0]
+    assert payload.get("source_last_saved_at")
+
+
 def test_knowledge_file_rejects_non_local_source(client):
     add_resp = client.post(
         "/knowledge/text",

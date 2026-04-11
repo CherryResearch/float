@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import subprocess
 import sys
 import time
@@ -9,23 +10,58 @@ from typing import Dict, List, Optional
 from .runtime_base import ComputerRuntime
 from .types import ComputerAction, ComputerSessionState
 
-try:  # pragma: no cover - optional dependency
-    from PIL import ImageGrab
+ImageGrab = None  # type: ignore[assignment]
+PIL_IMPORT_ERROR = None
+_PIL_IMPORT_ATTEMPTED = False
 
-    PIL_IMPORT_ERROR = None
-except Exception as exc:  # pragma: no cover - optional dependency
-    ImageGrab = None  # type: ignore[assignment]
-    PIL_IMPORT_ERROR = exc
+Desktop = None  # type: ignore[assignment]
+keyboard = None  # type: ignore[assignment]
+mouse = None  # type: ignore[assignment]
+PYWINAUTO_IMPORT_ERROR = None
+_PYWINAUTO_IMPORT_ATTEMPTED = False
 
-try:  # pragma: no cover - optional dependency
-    from pywinauto import Desktop, keyboard, mouse
 
-    PYWINAUTO_IMPORT_ERROR = None
-except Exception as exc:  # pragma: no cover - optional dependency
-    Desktop = None  # type: ignore[assignment]
-    keyboard = None  # type: ignore[assignment]
-    mouse = None  # type: ignore[assignment]
-    PYWINAUTO_IMPORT_ERROR = exc
+def _module_available(module_name: str) -> bool:
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except Exception:
+        return False
+
+
+def _ensure_imagegrab():
+    global ImageGrab, PIL_IMPORT_ERROR, _PIL_IMPORT_ATTEMPTED
+    if not _PIL_IMPORT_ATTEMPTED:
+        try:  # pragma: no cover - optional dependency
+            from PIL import ImageGrab as imported_imagegrab
+
+            ImageGrab = imported_imagegrab  # type: ignore[assignment]
+            PIL_IMPORT_ERROR = None
+        except Exception as exc:  # pragma: no cover - optional dependency
+            ImageGrab = None  # type: ignore[assignment]
+            PIL_IMPORT_ERROR = exc
+        _PIL_IMPORT_ATTEMPTED = True
+    return ImageGrab
+
+
+def _ensure_pywinauto():
+    global Desktop, keyboard, mouse, PYWINAUTO_IMPORT_ERROR, _PYWINAUTO_IMPORT_ATTEMPTED
+    if not _PYWINAUTO_IMPORT_ATTEMPTED:
+        try:  # pragma: no cover - optional dependency
+            from pywinauto import Desktop as imported_desktop
+            from pywinauto import keyboard as imported_keyboard
+            from pywinauto import mouse as imported_mouse
+
+            Desktop = imported_desktop  # type: ignore[assignment]
+            keyboard = imported_keyboard  # type: ignore[assignment]
+            mouse = imported_mouse  # type: ignore[assignment]
+            PYWINAUTO_IMPORT_ERROR = None
+        except Exception as exc:  # pragma: no cover - optional dependency
+            Desktop = None  # type: ignore[assignment]
+            keyboard = None  # type: ignore[assignment]
+            mouse = None  # type: ignore[assignment]
+            PYWINAUTO_IMPORT_ERROR = exc
+        _PYWINAUTO_IMPORT_ATTEMPTED = True
+    return Desktop, keyboard, mouse
 
 
 class WindowsComputerRuntime(ComputerRuntime):
@@ -36,25 +72,25 @@ class WindowsComputerRuntime(ComputerRuntime):
     def available(self) -> bool:
         return (
             sys.platform.startswith("win")
-            and ImageGrab is not None
-            and Desktop is not None
-            and mouse is not None
-            and keyboard is not None
+            and _module_available("PIL.ImageGrab")
+            and _module_available("pywinauto")
         )
 
     def _save_screenshot(self, session_id: str) -> Path:
-        if ImageGrab is None:
+        imagegrab = _ensure_imagegrab()
+        if imagegrab is None:
             raise RuntimeError("Pillow ImageGrab support is unavailable")
         target = self.screenshot_root / f"{session_id}-{int(time.time() * 1000)}.png"
         target.parent.mkdir(parents=True, exist_ok=True)
-        ImageGrab.grab().save(target)
+        imagegrab.grab().save(target)
         return target
 
     def _active_window_title(self) -> Optional[str]:
-        if Desktop is None:
+        desktop, _, _ = _ensure_pywinauto()
+        if desktop is None:
             return None
         try:
-            return Desktop(backend="uia").get_active().window_text()
+            return desktop(backend="uia").get_active().window_text()
         except Exception:
             return None
 
@@ -113,31 +149,36 @@ class WindowsComputerRuntime(ComputerRuntime):
     def act(
         self, session: ComputerSessionState, actions: List[ComputerAction]
     ) -> Dict[str, object]:
-        if mouse is None or keyboard is None:
+        _, keyboard_module, mouse_module = _ensure_pywinauto()
+        if mouse_module is None or keyboard_module is None:
             raise RuntimeError("pywinauto mouse/keyboard controls are unavailable")
         applied: List[Dict[str, object]] = []
         for action in actions:
             kind = str(action.type or "").strip().lower()
             if kind == "click":
-                mouse.click(coords=(int(action.x or 0), int(action.y or 0)))
+                mouse_module.click(coords=(int(action.x or 0), int(action.y or 0)))
             elif kind == "double_click":
-                mouse.double_click(coords=(int(action.x or 0), int(action.y or 0)))
+                mouse_module.double_click(
+                    coords=(int(action.x or 0), int(action.y or 0))
+                )
             elif kind == "scroll":
-                mouse.scroll(
+                mouse_module.scroll(
                     coords=(int(action.x or 0), int(action.y or 0)),
                     wheel_dist=int(action.delta_y or 0),
                 )
             elif kind == "type":
                 if action.text:
-                    keyboard.send_keys(str(action.text), with_spaces=True, pause=0.01)
+                    keyboard_module.send_keys(
+                        str(action.text), with_spaces=True, pause=0.01
+                    )
             elif kind in {"keypress", "key"}:
                 keys = action.keys
                 if isinstance(keys, list):
                     for item in keys:
                         if item:
-                            keyboard.send_keys(str(item))
+                            keyboard_module.send_keys(str(item))
                 elif keys:
-                    keyboard.send_keys(str(keys))
+                    keyboard_module.send_keys(str(keys))
             elif kind == "wait":
                 time.sleep(max(0.0, int(action.ms or 0) / 1000.0))
             else:
@@ -149,10 +190,11 @@ class WindowsComputerRuntime(ComputerRuntime):
         return observed
 
     def list_windows(self, session: ComputerSessionState) -> Dict[str, object]:
-        if Desktop is None:
+        desktop, _, _ = _ensure_pywinauto()
+        if desktop is None:
             raise RuntimeError("pywinauto desktop enumeration is unavailable")
         windows: List[Dict[str, str]] = []
-        for window in Desktop(backend="uia").windows():
+        for window in desktop(backend="uia").windows():
             try:
                 title = window.window_text()
             except Exception:
@@ -165,10 +207,11 @@ class WindowsComputerRuntime(ComputerRuntime):
     def focus_window(
         self, session: ComputerSessionState, window_title: str
     ) -> Dict[str, str]:
-        if Desktop is None:
+        desktop, _, _ = _ensure_pywinauto()
+        if desktop is None:
             raise RuntimeError("pywinauto desktop enumeration is unavailable")
         needle = str(window_title or "").strip().lower()
-        for window in Desktop(backend="uia").windows():
+        for window in desktop(backend="uia").windows():
             try:
                 title = window.window_text()
             except Exception:
@@ -186,5 +229,7 @@ class WindowsComputerRuntime(ComputerRuntime):
         args: Optional[List[str]] = None,
     ) -> Dict[str, object]:
         command = [str(app)] + [str(item) for item in (args or []) if item is not None]
-        proc = subprocess.Popen(command)  # noqa: S603,S607 - explicit user-approved tool
+        proc = subprocess.Popen(
+            command
+        )  # noqa: S603,S607 - explicit user-approved tool
         return {"pid": proc.pid, "command": command}

@@ -186,6 +186,83 @@ def test_convert_tools_for_openai_preserves_native_computer_tool():
     assert converted == tools
 
 
+def test_convert_tools_for_openai_uses_responses_function_shape():
+    tools = [
+        {
+            "name": "weather",
+            "description": "Look up a forecast.",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        }
+    ]
+
+    converted = _convert_tools_for_openai(tools, responses_api=True)
+
+    assert converted == [
+        {
+            "type": "function",
+            "name": "weather",
+            "description": "Look up a forecast.",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        }
+    ]
+
+
+def test_generate_via_api_uses_responses_tool_shape_for_gpt5(monkeypatch):
+    captured = {}
+    service = LLMService(
+        config={
+            "api_key": "test",
+            "api_url": "http://test/v1/chat/completions",
+            "api_model": "gpt-5",
+        }
+    )
+    context = ModelContext(
+        tools=[
+            {
+                "name": "weather",
+                "description": "Look up a forecast.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            }
+        ]
+    )
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured["url"] = url
+        captured["payload"] = json
+        return DummyResponse({"output_text": "done"})
+
+    monkeypatch.setattr("app.base_services.http_session.post", fake_post)
+
+    result = service._generate_via_api("hi", context)
+
+    assert result["text"] == "done"
+    assert captured["url"] == "http://test/v1/responses"
+    assert captured["payload"]["tools"] == [
+        {
+            "type": "function",
+            "name": "weather",
+            "description": "Look up a forecast.",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        }
+    ]
+
+
 def test_extract_native_responses_tool_calls_parses_computer_call():
     payload = {
         "output": [

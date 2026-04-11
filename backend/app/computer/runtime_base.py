@@ -67,3 +67,6 @@ class ComputerRuntime(ABC):
         args: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         raise RuntimeError(f"{self.name} runtime does not support app launch")
+
+    def shutdown(self) -> Dict[str, Any]:
+        return {"status": "idle", "runtime": self.name}

@@ -1,4 +1,11 @@
-import React, { useState, useEffect, useContext, useMemo } from "react";
+import React, {
+  useState,
+  useEffect,
+  useContext,
+  useMemo,
+  useRef,
+  useCallback,
+} from "react";
 import { Link } from "react-router-dom";
 
 import { Line, Rect } from "./Skeleton";
@@ -10,7 +17,13 @@ import "../styles/Settings.css";
 import "../styles/ProgressBar.css";
 
 import { GlobalContext } from "../main";
-import { normalizeVisualTheme, VISUAL_THEME_OPTIONS } from "../theme";
+import {
+  DEFAULT_VISUAL_THEME,
+  getVisualTheme,
+  getVisualThemeOptions,
+  normalizeVisualTheme,
+  THEME_SLOT_KEYS,
+} from "../theme";
 import ModelJobsPanel from "./ModelJobsPanel";
 import { normalizeToolDisplayMode } from "../utils/toolDisplayModes";
 
@@ -20,12 +33,22 @@ import {
   buildModelGroups,
   DEFAULT_API_MODELS,
   formatLocalRuntimeLabel,
+  isDirectLocalGemmaModel,
+  isGemmaFamilyModel,
+  isKnownDownloadableModel,
   isLocalRuntimeEntry,
+  isKnownDirectDownloadModel,
+  isProviderFirstGemmaModel,
   LOCAL_RUNTIME_ENTRIES,
   normalizeModelId,
+  resolveLocalCatalogModelId,
   SUGGESTED_LOCAL_MODELS,
   isGptOssModel,
 } from "../utils/modelUtils";
+import {
+  filterChatCapableProviderModels,
+  isChatCapableProviderModelName,
+} from "../utils/providerRuntime";
 
 const FLOAT_SETTING_FIELDS = new Set([
   "gpu_memory_fraction",
@@ -46,7 +69,13 @@ const INT_SETTING_FIELDS = new Set([
   "local_provider_default_context_length",
 ]);
 
-const MANAGED_LOCAL_PROVIDERS = new Set(["lmstudio", "ollama"]);
+const MANAGED_LOCAL_PROVIDERS = new Set([
+  "lmstudio",
+  "ollama",
+  "custom-openai-compatible",
+]);
+
+const PROVIDER_RUNTIME_STATUS_POLL_MS = 60000;
 
 const SETTINGS_SECTIONS = [
   {
@@ -136,13 +165,16 @@ const SETTINGS_SECTIONS = [
   {
     id: "workspace",
     label: "Workspace",
-    description: "Notifications, tool display, and the tool browser.",
+    description: "Notifications, appearance, work history, and tool browsing.",
     searchText: [
       "workspace",
       "appearance",
       "theme",
       "spring",
+      "ash",
       "cappucino",
+      "sunset citrus",
+      "midnight plum",
       "notifications",
       "push",
       "tool approval",
@@ -157,6 +189,34 @@ const SETTINGS_SECTIONS = [
       "mcp tool source",
       "agent console",
       "catalog",
+      "work history",
+      "write history",
+      "notifications",
+      "theme",
+      "appearance",
+    ].join(" "),
+  },
+  {
+    id: "workflows",
+    label: "Workflows",
+    description: "Prompt stacks, model posture, and module / permission defaults.",
+    searchText: [
+      "workflow",
+      "workflows",
+      "default workflow",
+      "workflow profile",
+      "workflow module",
+      "capture retention",
+      "capture sensitivity",
+      "prompt stack",
+      "restrictions",
+      "permissions",
+      "followup hooks",
+      "continue defaults",
+      "conditional workflow",
+      "camera capture",
+      "computer use",
+      "host shell",
     ].join(" "),
   },
   {
@@ -225,19 +285,33 @@ const DEFAULT_WORKFLOW_CATALOG = {
       id: "default",
       label: "Default",
       description: "Balanced reasoning with normal tool access and moderate latency.",
+      thinking_default: "auto",
       preferred_continue: "mini_execution",
+      allow_continue_to: ["default", "mini_execution"],
+      enabled_modules: ["computer_use", "camera_capture", "memory_promotion"],
     },
     {
       id: "architect_planner",
       label: "Architect / Planner",
       description: "Higher-reasoning planning workflow that prefers decomposition and explicit handoff.",
+      thinking_default: "high",
       preferred_continue: "mini_execution",
+      allow_continue_to: ["architect_planner", "default", "mini_execution"],
+      enabled_modules: [
+        "computer_use",
+        "camera_capture",
+        "memory_promotion",
+        "host_shell",
+      ],
     },
     {
       id: "mini_execution",
       label: "Mini Execution",
       description: "Short, low-latency execution bursts for in-between tool steps and recursive continue loops.",
+      thinking_default: "low",
       preferred_continue: "mini_execution",
+      allow_continue_to: ["mini_execution"],
+      enabled_modules: ["computer_use", "camera_capture"],
     },
   ],
   modules: [
@@ -270,7 +344,33 @@ const DEFAULT_WORKFLOW_CATALOG = {
   addons_root: "data/modules/addons",
 };
 
+const THEME_SLOT_LABELS = {
+  c1Light: "C1 light",
+  c1Med: "C1 medium",
+  c1Dark: "C1 dark",
+  c2Light: "C2 light",
+  c2Med: "C2 medium",
+  c2Dark: "C2 dark",
+  veryLight: "Very light",
+  veryDark: "Very dark",
+};
+
+const buildThemeDraftFromTheme = (themeSource, label = "Custom Theme") => {
+  const theme =
+    themeSource && typeof themeSource === "object"
+      ? themeSource
+      : getVisualTheme(themeSource);
+  const slots = THEME_SLOT_KEYS.reduce((acc, key) => {
+    acc[key] = theme?.slots?.[key] || "#000000";
+    return acc;
+  }, {});
+  return { label, slots };
+};
+
 const Settings = () => {
+
+  const settingsContainerRef = useRef(null);
+  const settingsToolbarRef = useRef(null);
 
   const [loading, setLoading] = useState(true);
 
@@ -325,6 +425,20 @@ const Settings = () => {
   const [failuresLoading, setFailuresLoading] = useState(false);
 
   const [failuresError, setFailuresError] = useState("");
+
+  const [themeEditorMode, setThemeEditorMode] = useState("none");
+  const [themeDraftId, setThemeDraftId] = useState(null);
+  const [themeDraftLabel, setThemeDraftLabel] = useState("Custom Theme");
+  const [themeDraftSlots, setThemeDraftSlots] = useState(() =>
+    buildThemeDraftFromTheme(DEFAULT_VISUAL_THEME).slots,
+  );
+  const [themeSaveBusy, setThemeSaveBusy] = useState(false);
+  const [themeDeleteBusy, setThemeDeleteBusy] = useState(false);
+  const [themeMessage, setThemeMessage] = useState("");
+  const [activeSettingsSection, setActiveSettingsSection] = useState(
+    SETTINGS_SECTIONS[0]?.id || "connections",
+  );
+  const [pendingSettingsScroll, setPendingSettingsScroll] = useState(null);
 
 
 
@@ -404,7 +518,10 @@ const Settings = () => {
 
     try {
 
-      const date = new Date(value);
+      const raw = Number(value);
+      const normalized =
+        Number.isFinite(raw) && raw > 0 && raw < 1e12 ? raw * 1000 : value;
+      const date = new Date(normalized);
 
       if (Number.isNaN(date.getTime())) return null;
 
@@ -422,7 +539,10 @@ const Settings = () => {
 
     if (value == null || value === "") return null;
 
-    const date = new Date(value);
+    const raw = Number(value);
+    const normalized =
+      Number.isFinite(raw) && raw > 0 && raw < 1e12 ? raw * 1000 : value;
+    const date = new Date(normalized);
 
     if (Number.isNaN(date.getTime())) return null;
 
@@ -440,11 +560,17 @@ const Settings = () => {
 
 
 
-  const formatRelativeTime = (value) => {
+  const formatRelativeTime = (value, now = Date.now()) => {
 
     if (value == null || value === "") return null;
 
-    const diff = Date.now() - value;
+    const raw = Number(value);
+    const normalized = Number.isFinite(raw)
+      ? raw > 0 && raw < 1e12
+        ? raw * 1000
+        : raw
+      : new Date(value).getTime();
+    const diff = now - normalized;
 
     if (!Number.isFinite(diff)) return null;
 
@@ -539,7 +665,133 @@ const Settings = () => {
     );
   };
 
+  const customThemes = Array.isArray(state.customThemes) ? state.customThemes : [];
+  const visualThemeOptions = useMemo(
+    () => getVisualThemeOptions(customThemes),
+    [customThemes],
+  );
+  const selectedThemeId = normalizeVisualTheme(state.visualTheme);
+  const selectedCustomTheme = useMemo(
+    () =>
+      customThemes.find(
+        (theme) => normalizeVisualTheme(theme?.id || "") === selectedThemeId,
+      ) || null,
+    [customThemes, selectedThemeId],
+  );
+  const isEditingCustomTheme = themeEditorMode === "edit" && !!themeDraftId;
+  const showThemeEditor = themeEditorMode === "new" || themeEditorMode === "edit";
 
+  const syncCustomThemes = (themes) => {
+    setState((prev) => ({
+      ...prev,
+      customThemes: Array.isArray(themes) ? themes : [],
+    }));
+  };
+
+  const openNewThemeEditor = () => {
+    const draft = buildThemeDraftFromTheme(
+      selectedThemeId || DEFAULT_VISUAL_THEME,
+      "Custom Theme",
+    );
+    setThemeEditorMode("new");
+    setThemeDraftId(null);
+    setThemeDraftLabel(draft.label);
+    setThemeDraftSlots(draft.slots);
+    setThemeMessage("");
+  };
+
+  const loadThemeDraft = (theme) => {
+    const draft = buildThemeDraftFromTheme(theme, theme?.label || "Custom Theme");
+    setThemeEditorMode("edit");
+    setThemeDraftId(theme?.id || null);
+    setThemeDraftLabel(theme?.label || draft.label);
+    setThemeDraftSlots(draft.slots);
+  };
+
+  const closeThemeEditor = () => {
+    setThemeEditorMode("none");
+    setThemeDraftId(null);
+    setThemeDraftLabel("Custom Theme");
+    setThemeDraftSlots(buildThemeDraftFromTheme(selectedThemeId || DEFAULT_VISUAL_THEME).slots);
+  };
+
+  const saveThemeDraft = async () => {
+    setThemeSaveBusy(true);
+    setThemeMessage("");
+    try {
+      const response = await axios.post("/api/themes", {
+        id: isEditingCustomTheme ? themeDraftId : null,
+        label: themeDraftLabel,
+        slots: themeDraftSlots,
+      });
+      const savedTheme = response?.data?.theme;
+      const nextThemes = [...customThemes.filter((theme) => theme.id !== savedTheme.id), savedTheme]
+        .sort((a, b) => String(a.label || a.id).localeCompare(String(b.label || b.id)));
+      syncCustomThemes(nextThemes);
+      setState((prev) => ({
+        ...prev,
+        visualTheme: normalizeVisualTheme(savedTheme.id),
+      }));
+      loadThemeDraft(savedTheme);
+      setThemeMessage("Theme saved.");
+    } catch (error) {
+      setThemeMessage(
+        error?.response?.data?.detail || "Failed to save theme.",
+      );
+    } finally {
+      setThemeSaveBusy(false);
+    }
+  };
+
+  const deleteThemeDraft = async () => {
+    if (!themeDraftId) return;
+    setThemeDeleteBusy(true);
+    setThemeMessage("");
+    try {
+      await axios.delete(`/api/themes/${themeDraftId}`);
+      const nextThemes = customThemes.filter((theme) => theme.id !== themeDraftId);
+      syncCustomThemes(nextThemes);
+      setState((prev) => ({
+        ...prev,
+        visualTheme:
+          normalizeVisualTheme(prev.visualTheme) === normalizeVisualTheme(themeDraftId)
+            ? DEFAULT_VISUAL_THEME
+            : prev.visualTheme,
+      }));
+      closeThemeEditor();
+      setThemeMessage("Theme deleted.");
+    } catch (error) {
+      setThemeMessage(
+        error?.response?.data?.detail || "Failed to delete theme.",
+      );
+    } finally {
+      setThemeDeleteBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    axios
+      .get("/api/themes")
+      .then((response) => {
+        const themes = Array.isArray(response?.data?.themes) ? response.data.themes : [];
+        syncCustomThemes(themes);
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (selectedCustomTheme && themeEditorMode !== "new") {
+      const selectedId = normalizeVisualTheme(selectedCustomTheme?.id || "");
+      const draftId = normalizeVisualTheme(themeDraftId || "");
+      if (!showThemeEditor || selectedId !== draftId) {
+        loadThemeDraft(selectedCustomTheme);
+      }
+      return;
+    }
+    if (!selectedCustomTheme && themeEditorMode === "edit") {
+      closeThemeEditor();
+    }
+  }, [selectedCustomTheme, themeEditorMode, themeDraftId, showThemeEditor]);
 
   const applyCelerySnapshot = (snapshot) => {
 
@@ -866,7 +1118,7 @@ const Settings = () => {
     // RAG / Weaviate
     rag_embedding_model: "local:all-MiniLM-L6-v2",
     rag_clip_model: "ViT-B-32",
-    rag_chat_min_similarity: 0.3,
+    rag_chat_min_similarity: 0.45,
     sae_threads_signal_mode: "hybrid",
     sae_threads_signal_blend: 0.7,
     sae_model_combo: "openai/gpt-oss-20b :: future SAE pack",
@@ -934,6 +1186,7 @@ const Settings = () => {
   );
   const [workflowCatalog, setWorkflowCatalog] = useState(DEFAULT_WORKFLOW_CATALOG);
   const [workflowCatalogLoading, setWorkflowCatalogLoading] = useState(false);
+  const [workflowInspectorOpen, setWorkflowInspectorOpen] = useState(false);
   const [captureWorkflowSaving, setCaptureWorkflowSaving] = useState(false);
   const [captureWorkflowMessage, setCaptureWorkflowMessage] = useState("");
 
@@ -974,6 +1227,16 @@ const Settings = () => {
   const [providerModelOptions, setProviderModelOptions] = useState([]);
   const [providerActionBusy, setProviderActionBusy] = useState("");
   const [providerActionMessage, setProviderActionMessage] = useState("");
+  const [localRuntime, setLocalRuntime] = useState(null);
+  const [localRuntimeLoading, setLocalRuntimeLoading] = useState(false);
+  const [localRuntimeError, setLocalRuntimeError] = useState("");
+  const [localRuntimeActionBusy, setLocalRuntimeActionBusy] = useState("");
+  const [localRuntimeMessage, setLocalRuntimeMessage] = useState("");
+  const [languageRuntimeCollapsed, setLanguageRuntimeCollapsed] = useState(false);
+  const [embeddingRuntimeCollapsed, setEmbeddingRuntimeCollapsed] = useState(false);
+  const [embeddingRuntimeBusy, setEmbeddingRuntimeBusy] = useState("");
+  const [embeddingRuntimeMessage, setEmbeddingRuntimeMessage] = useState("");
+  const [runtimeNow, setRuntimeNow] = useState(() => Date.now());
   const [includeCacheUnfiltered, setIncludeCacheUnfiltered] = useState(false);
   const [registeredLocalModels, setRegisteredLocalModels] = useState([]);
   const [registerModelAlias, setRegisterModelAlias] = useState("");
@@ -1101,6 +1364,12 @@ const Settings = () => {
     toolStatusSummary.live,
     toolStatusSummary.stub,
   ]);
+  useEffect(() => {
+    const timerId = window.setInterval(() => {
+      setRuntimeNow(Date.now());
+    }, 1000);
+    return () => window.clearInterval(timerId);
+  }, []);
   const settingsSearchTerms = useMemo(
     () =>
       String(settingsSearch || "")
@@ -1120,8 +1389,143 @@ const Settings = () => {
     () => new Set(visibleSettingsSections.map((section) => section.id)),
     [visibleSettingsSections],
   );
+  const visibleSettingsSectionList = useMemo(
+    () => visibleSettingsSections.map((section) => section.id),
+    [visibleSettingsSections],
+  );
   const showSettingsSection = (sectionId) =>
     !settingsSearchTerms.length || visibleSettingsSectionIds.has(sectionId);
+
+  useEffect(() => {
+    if (!visibleSettingsSectionList.length) return;
+    if (!visibleSettingsSectionList.includes(activeSettingsSection)) {
+      setActiveSettingsSection(visibleSettingsSectionList[0]);
+    }
+  }, [activeSettingsSection, visibleSettingsSectionList]);
+
+  const getSettingsToolbarOffset = useCallback(() => {
+    const toolbarHeight = settingsToolbarRef.current?.offsetHeight || 0;
+    return toolbarHeight + 18;
+  }, []);
+
+  const scrollToSettingsSection = useCallback(
+    (sectionId, { behavior = "smooth" } = {}) => {
+      const container = settingsContainerRef.current;
+      const target = document.getElementById(`settings-${sectionId}`);
+      if (!container || !target) return false;
+      setActiveSettingsSection(sectionId);
+      const nextTop = Math.max(0, target.offsetTop - getSettingsToolbarOffset());
+      if (typeof container.scrollTo === "function") {
+        container.scrollTo({
+          top: nextTop,
+          behavior,
+        });
+      } else {
+        container.scrollTop = nextTop;
+      }
+      return true;
+    },
+    [getSettingsToolbarOffset],
+  );
+
+  useEffect(() => {
+    const container = settingsContainerRef.current;
+    if (!container || !visibleSettingsSectionList.length || loading) return undefined;
+
+    const resolveActiveSection = () => {
+      const scrollAnchor = container.scrollTop + getSettingsToolbarOffset();
+      let nextActive = visibleSettingsSectionList[0];
+      visibleSettingsSectionList.forEach((sectionId) => {
+        const section = document.getElementById(`settings-${sectionId}`);
+        if (!section) return;
+        if (section.offsetTop <= scrollAnchor) {
+          nextActive = sectionId;
+        }
+      });
+      setActiveSettingsSection((prev) => (prev === nextActive ? prev : nextActive));
+    };
+
+    let frameId = null;
+    const queueResolve = () => {
+      if (frameId !== null || typeof window === "undefined") return;
+      frameId = window.requestAnimationFrame(() => {
+        frameId = null;
+        resolveActiveSection();
+      });
+    };
+
+    queueResolve();
+    container.addEventListener("scroll", queueResolve, { passive: true });
+    window.addEventListener("resize", queueResolve);
+    return () => {
+      if (frameId !== null && typeof window !== "undefined") {
+        window.cancelAnimationFrame(frameId);
+      }
+      container.removeEventListener("scroll", queueResolve);
+      window.removeEventListener("resize", queueResolve);
+    };
+  }, [getSettingsToolbarOffset, loading, visibleSettingsSectionList]);
+
+  useEffect(() => {
+    if (!pendingSettingsScroll || loading || typeof window === "undefined") {
+      return undefined;
+    }
+    if (
+      settingsSearchTerms.length > 0 &&
+      !visibleSettingsSectionIds.has(pendingSettingsScroll)
+    ) {
+      return undefined;
+    }
+    const frameId = window.requestAnimationFrame(() => {
+      if (scrollToSettingsSection(pendingSettingsScroll)) {
+        setPendingSettingsScroll((current) =>
+          current === pendingSettingsScroll ? null : current,
+        );
+      }
+    });
+    return () => window.cancelAnimationFrame(frameId);
+  }, [
+    loading,
+    pendingSettingsScroll,
+    scrollToSettingsSection,
+    settingsSearchTerms.length,
+    visibleSettingsSectionIds,
+  ]);
+
+  const handleSettingsNavClick = useCallback(
+    (sectionId) => {
+      if (settingsSearchTerms.length > 0 && !visibleSettingsSectionIds.has(sectionId)) {
+        setPendingSettingsScroll(sectionId);
+        setSettingsSearch("");
+        return;
+      }
+      setPendingSettingsScroll(null);
+      scrollToSettingsSection(sectionId);
+    },
+    [scrollToSettingsSection, settingsSearchTerms.length, visibleSettingsSectionIds],
+  );
+  const workflowProfiles = useMemo(
+    () =>
+      workflowCatalog.workflows.length
+        ? workflowCatalog.workflows
+        : DEFAULT_WORKFLOW_CATALOG.workflows,
+    [workflowCatalog.workflows],
+  );
+  const workflowModules = useMemo(
+    () =>
+      workflowCatalog.modules.length
+        ? workflowCatalog.modules
+        : DEFAULT_WORKFLOW_CATALOG.modules,
+    [workflowCatalog.modules],
+  );
+  const workflowProfileMap = useMemo(
+    () => new Map(workflowProfiles.map((workflow) => [workflow.id, workflow])),
+    [workflowProfiles],
+  );
+  const workflowModuleMap = useMemo(
+    () => new Map(workflowModules.map((module) => [module.id, module])),
+    [workflowModules],
+  );
 
   const suggestedLangModels = Array.from(
     new Set([
@@ -1129,15 +1533,112 @@ const Settings = () => {
       ...(Array.isArray(LOCAL_RUNTIME_ENTRIES) ? LOCAL_RUNTIME_ENTRIES : []),
     ]),
   );
+  const suggestedApiLangModels = apiModelGroups.all;
 
-  const suggestedSttModels = ["whisper-large-v3-turbo", "whisper-small"];
+  const suggestedSttModels = ["whisper-1", "whisper-large-v3-turbo", "whisper-small"];
 
   const suggestedTtsModels = ["tts-1", "tts-1-hd", "kokoro", "kitten"];
+
+  const languageToolingFamilies = new Set([
+    "gpt-oss",
+    "gemma",
+    "llama",
+    "qwen",
+    "mistral",
+    "mixtral",
+  ]);
+
+  const inferModelFamily = (value, info = null) => {
+    const normalized = String(value || "").trim().toLowerCase();
+    const metadataFamily = String(info?.metadata?.family || "")
+      .trim()
+      .toLowerCase();
+    if (metadataFamily) return metadataFamily;
+    if (!normalized) return "";
+    if (normalized.startsWith("gpt-oss")) return "gpt-oss";
+    if (normalized.startsWith("gemma-")) return "gemma";
+    if (normalized.startsWith("llama")) return "llama";
+    if (normalized.startsWith("qwen")) return "qwen";
+    if (normalized.startsWith("mistral")) return "mistral";
+    if (normalized.startsWith("mixtral")) return "mixtral";
+    if (normalized.includes("paligemma")) return "paligemma";
+    if (normalized.includes("pixtral")) return "pixtral";
+    if (normalized.includes("clip")) return "clip";
+    if (normalized.includes("whisper")) return "whisper";
+    if (normalized.includes("kokoro")) return "kokoro";
+    if (normalized.includes("kitten")) return "kitten";
+    return "";
+  };
+
+  const getModelLaneMeta = (field, value, info = null) => {
+    const raw = String(value || "").trim();
+    const normalizedField = String(field || "").trim().toLowerCase();
+    const normalizedValue = raw.toLowerCase();
+    if (!raw) return null;
+    if (normalizedField === "transformer_model") {
+      if (isLocalRuntimeEntry(raw)) {
+        return { key: "provider", label: "Server / LAN" };
+      }
+      if (
+        isDirectLocalGemmaModel(raw) ||
+        info?.lane === "local" ||
+        info?.local_download_supported ||
+        isKnownDirectDownloadModel(raw)
+      ) {
+        return { key: "local", label: "Local" };
+      }
+      if (
+        isProviderFirstGemmaModel(raw) ||
+        info?.lane === "server_lan" ||
+        (info?.provider_supported && !info?.local_download_supported)
+      ) {
+        return { key: "provider", label: "Server / LAN" };
+      }
+      return { key: "local", label: "Local" };
+    }
+    if (normalizedField === "stt_model") {
+      if (
+        normalizedValue === "whisper-1" ||
+        normalizedValue.startsWith("gpt-4o") ||
+        normalizedValue.includes("transcribe")
+      ) {
+        return { key: "api", label: "API" };
+      }
+      return { key: "local", label: "Local" };
+    }
+    if (normalizedField === "tts_model") {
+      if (normalizedValue.startsWith("tts-")) {
+        return { key: "api", label: "API" };
+      }
+      return { key: "local", label: "Local" };
+    }
+    if (normalizedField === "vision_model") {
+      return { key: "local", label: "Local" };
+    }
+    if (normalizedField === "rag_embedding_model") {
+      return normalizedValue.startsWith("api:")
+        ? { key: "api", label: "API" }
+        : { key: "local", label: "Local" };
+    }
+    if (normalizedField === "rag_clip_model") {
+      return { key: "local", label: "Local" };
+    }
+    if (normalizedField === "realtime_model" || normalizedField === "realtime_voice") {
+      return { key: "api", label: "Cloud live" };
+    }
+    return null;
+  };
 
   const describeModelProvider = (field, value) => {
     const normalizedField = String(field || "").trim().toLowerCase();
     const normalizedValue = String(value || "").trim().toLowerCase();
     if (!normalizedValue) return "";
+    if (normalizedField === "transformer_model" && isDirectLocalGemmaModel(value)) {
+      return "direct local";
+    }
+    if (normalizedField === "transformer_model" && isProviderFirstGemmaModel(value)) {
+      return "provider/server lane";
+    }
     if (normalizedField === "tts_model") {
       if (normalizedValue.startsWith("tts-")) return "OpenAI API";
       if (normalizedValue.includes("kitten") || normalizedValue.includes("kokoro")) {
@@ -1145,6 +1646,191 @@ const Settings = () => {
       }
     }
     return "";
+  };
+
+  const getLaneDisplayLabel = (laneKey) => {
+    if (laneKey === "api") return "API";
+    if (laneKey === "provider") return "Server / LAN";
+    return "Local";
+  };
+
+  const renderLaneSelector = (field, currentLaneKey, laneKeys, onSelect) => {
+    const uniqueLaneKeys = Array.from(new Set((laneKeys || []).filter(Boolean)));
+    if (!currentLaneKey || uniqueLaneKeys.length <= 1) return null;
+    return (
+      <div className="model-lane-switch" role="tablist" aria-label={`${field} model lanes`}>
+        {uniqueLaneKeys.map((laneKey) => (
+          <button
+            key={`${field}-${laneKey}`}
+            type="button"
+            className={`model-lane-switch-btn model-lane-switch-btn--${laneKey}${
+              currentLaneKey === laneKey ? " is-active" : ""
+            }`}
+            onClick={() => onSelect(laneKey)}
+            aria-pressed={currentLaneKey === laneKey}
+            title={`Show ${getLaneDisplayLabel(laneKey)} models`}
+          >
+            {getLaneDisplayLabel(laneKey)}
+          </button>
+        ))}
+      </div>
+    );
+  };
+
+  const getModelCapabilities = (field, value, info = null) => {
+    const raw = String(value || "").trim();
+    const normalizedField = String(field || "").trim().toLowerCase();
+    const normalizedValue = raw.toLowerCase();
+    if (!raw) return [];
+
+    const capabilities = [];
+    const pushCapability = (id, label) => {
+      if (!capabilities.some((entry) => entry.id === id)) {
+        capabilities.push({ id, label });
+      }
+    };
+    const family = inferModelFamily(raw, info);
+    const supportsImages =
+      !!info?.supports_images ||
+      normalizedValue.includes("paligemma") ||
+      normalizedValue.includes("pixtral");
+
+    if (normalizedField === "transformer_model") {
+      pushCapability("text", "Text generation");
+      if (supportsImages) {
+        pushCapability("vision", "Image understanding");
+      }
+      if (
+        languageToolingFamilies.has(family) ||
+        isGemmaFamilyModel(raw) ||
+        isGptOssModel(raw)
+      ) {
+        pushCapability("agentic", "Tool-aware chat");
+      }
+      return capabilities;
+    }
+
+    if (normalizedField === "stt_model") {
+      pushCapability("speech", "Speech transcription");
+      return capabilities;
+    }
+
+    if (normalizedField === "tts_model") {
+      pushCapability("speech", "Speech synthesis");
+      return capabilities;
+    }
+
+    if (normalizedField === "vision_model") {
+      pushCapability("vision", "Image understanding");
+      if (!normalizedValue.includes("clip")) {
+        pushCapability("text", "Text output");
+      }
+      return capabilities;
+    }
+
+    if (normalizedField === "rag_embedding_model") {
+      pushCapability("text", "Text embeddings");
+      return capabilities;
+    }
+
+    if (normalizedField === "rag_clip_model") {
+      pushCapability("vision", "Image embeddings");
+      return capabilities;
+    }
+
+    if (normalizedField === "realtime_model") {
+      pushCapability("live", "Live streaming");
+      pushCapability("speech", "Live speech session");
+      pushCapability("text", "Realtime responses");
+      return capabilities;
+    }
+
+    if (normalizedField === "realtime_voice") {
+      pushCapability("live", "Live streaming");
+      pushCapability("speech", "Realtime voice output");
+      return capabilities;
+    }
+
+    return capabilities;
+  };
+
+  const CapabilityGlyph = ({ id }) => {
+    const svgProps = {
+      viewBox: "0 0 20 20",
+      fill: "none",
+      stroke: "currentColor",
+      strokeWidth: "1.7",
+      strokeLinecap: "round",
+      strokeLinejoin: "round",
+      "aria-hidden": "true",
+    };
+    if (id === "speech") {
+      return (
+        <svg {...svgProps}>
+          <path d="M10 3.5a2.5 2.5 0 0 1 2.5 2.5v4a2.5 2.5 0 1 1-5 0V6A2.5 2.5 0 0 1 10 3.5Z" />
+          <path d="M5.5 9.5v.5a4.5 4.5 0 0 0 9 0v-.5" />
+          <path d="M10 14.5v2.5" />
+          <path d="M7.5 17h5" />
+        </svg>
+      );
+    }
+    if (id === "vision") {
+      return (
+        <svg {...svgProps}>
+          <rect x="3.5" y="4.5" width="13" height="11" rx="2" />
+          <circle cx="8" cy="8.25" r="1.1" />
+          <path d="m5.5 13.5 3.2-3.4 2.1 2.2 1.8-1.7 2.4 2.9" />
+        </svg>
+      );
+    }
+    if (id === "live") {
+      return (
+        <svg {...svgProps}>
+          <path d="M4.5 10h2.25l1.6-3 2.2 6 1.55-3h3.4" />
+          <path d="M4 5.5a8 8 0 0 1 0 9" />
+          <path d="M16 5.5a8 8 0 0 1 0 9" />
+        </svg>
+      );
+    }
+    if (id === "agentic") {
+      return (
+        <svg {...svgProps}>
+          <circle cx="10" cy="10" r="2.2" />
+          <circle cx="10" cy="4.2" r="1.2" />
+          <circle cx="14.8" cy="12.8" r="1.2" />
+          <circle cx="5.2" cy="12.8" r="1.2" />
+          <path d="M10 5.4v2.4" />
+          <path d="m13.8 12.1-1.9-1.1" />
+          <path d="m6.2 12.1 1.9-1.1" />
+        </svg>
+      );
+    }
+    return (
+      <svg {...svgProps}>
+        <path d="M5 5h10" />
+        <path d="M5 10h10" />
+        <path d="M5 15h7" />
+      </svg>
+    );
+  };
+
+  const renderCapabilityStrip = (field, value, info = null) => {
+    const capabilities = getModelCapabilities(field, value, info);
+    if (capabilities.length === 0) return null;
+    return (
+      <div className="model-capability-strip" aria-label="Model capabilities">
+        {capabilities.map((capability) => (
+          <span
+            key={`${field}-${capability.id}`}
+            className="model-capability-chip"
+            title={capability.label}
+            aria-label={capability.label}
+          >
+            <CapabilityGlyph id={capability.id} />
+          </span>
+        ))}
+      </div>
+    );
   };
 
   const openAiVoiceOptions = ["alloy", "nova", "shimmer", "echo", "fable", "onyx"];
@@ -1178,11 +1864,50 @@ const Settings = () => {
     ...kokoroVoiceOptions,
   ];
 
+  const voicePresetLooksLikeSpeechModel = (() => {
+    const value = String(settings.voice_model || "").trim().toLowerCase();
+    if (!value) return false;
+    return [
+      "voxtral",
+      "whisper",
+      "wav2vec",
+      "transcribe",
+      "gemma-",
+      "gpt-realtime",
+      "llama",
+      "mistral",
+      "qwen",
+    ].some((needle) => value.includes(needle));
+  })();
+
+  const realtimeVoiceIsKnown =
+    !settings.realtime_voice ||
+    realtimeVoiceOptions.includes(settings.realtime_voice);
+
   const ragEmbeddingPresets = [
     { label: "Hash fallback (local)", value: "simple" },
     { label: "Sentence Transformers · all-MiniLM-L6-v2", value: "local:all-MiniLM-L6-v2" },
+    { label: "EmbeddingGemma 300M (local review)", value: "local:google/embeddinggemma-300M" },
+    { label: "OpenAI text-embedding-3-small (API stub)", value: "api:text-embedding-3-small" },
     { label: "OpenAI text-embedding-3-large (API stub)", value: "api:text-embedding-3-large" },
   ];
+  const embeddingLaneKey =
+    getModelLaneMeta("rag_embedding_model", settings.rag_embedding_model)?.key || "local";
+  const ragEmbeddingLaneOptions = Array.from(
+    new Set(
+      ragEmbeddingPresets.map(
+        (preset) => getModelLaneMeta("rag_embedding_model", preset.value)?.key || "local",
+      ),
+    ),
+  );
+  const visibleRagEmbeddingPresets =
+    ragEmbeddingLaneOptions.length > 1
+      ? ragEmbeddingPresets.filter(
+          (preset) =>
+            (getModelLaneMeta("rag_embedding_model", preset.value)?.key || "local") ===
+            embeddingLaneKey,
+        )
+      : ragEmbeddingPresets;
 
   const ragClipPresets = [
     { label: "OpenCLIP ViT-B-32 (recommended)", value: "ViT-B-32" },
@@ -1613,7 +2338,7 @@ const Settings = () => {
           local_provider_enable_cors: data.local_provider_enable_cors ?? false,
           local_provider_allow_lan: data.local_provider_allow_lan ?? false,
 
-          static_model: data.static_model || "gpt-4o-mini",
+          static_model: data.static_model || "gpt-5.4-mini",
 
           harmony_format: data.harmony_format ?? false,
 
@@ -1693,7 +2418,7 @@ const Settings = () => {
           rag_chat_min_similarity:
             typeof data.rag_chat_min_similarity === "number"
               ? data.rag_chat_min_similarity
-              : 0.3,
+              : 0.45,
           sae_threads_signal_mode:
             typeof data.sae_threads_signal_mode === "string" &&
             ["embeddings", "hybrid", "sae"].includes(
@@ -1821,9 +2546,6 @@ const Settings = () => {
 
         setUseCustomConvFolder(false);
 
-        // If not using custom folder, let backend pick default by omitting path
-
-        fetchAvailableModels(false ? newSettings.models_folder : undefined);
         fetchRegisteredLocalModels();
 
       })
@@ -1895,7 +2617,7 @@ const Settings = () => {
 
   };
 
-  const refreshProviderRuntime = async (quiet = false) => {
+  const refreshProviderRuntime = async (quiet = false, { refresh = false } = {}) => {
     const providerKey = normalizeModelId(settings.local_provider) || "lmstudio";
     const shouldInspect =
       settings.mode === "local" && MANAGED_LOCAL_PROVIDERS.has(providerKey);
@@ -1910,22 +2632,26 @@ const Settings = () => {
       setProviderRuntimeLoading(true);
     }
     try {
-      const [statusResponse, modelsResponse] = await Promise.all([
-        axios.get("/api/llm/provider/status", {
-          params: { provider: providerKey, quick: true },
-        }),
-        axios.get("/api/llm/provider/models", {
-          params: { provider: providerKey },
-        }),
-      ]);
-      setProviderRuntime(statusResponse?.data?.runtime || null);
-      setProviderModelOptions(
-        Array.isArray(modelsResponse?.data?.models) ? modelsResponse.data.models : [],
+      const response = await axios.get(
+        quiet ? "/api/llm/provider/status" : "/api/llm/provider/models",
+        {
+          params: quiet
+            ? { provider: providerKey, quick: true }
+            : refresh
+              ? { provider: providerKey, refresh: true }
+              : { provider: providerKey },
+        },
       );
+      setProviderRuntime(response?.data?.runtime || null);
+      if (!quiet) {
+        setProviderModelOptions(filterChatCapableProviderModels(response?.data?.models));
+      }
       setProviderRuntimeError("");
     } catch (err) {
       setProviderRuntime(null);
-      setProviderModelOptions([]);
+      if (!quiet) {
+        setProviderModelOptions([]);
+      }
       setProviderRuntimeError(
         err?.response?.data?.detail || "Provider runtime is not reachable right now.",
       );
@@ -1933,6 +2659,77 @@ const Settings = () => {
       if (!quiet) {
         setProviderRuntimeLoading(false);
       }
+    }
+  };
+
+  const refreshLocalRuntime = async (quiet = false) => {
+    const shouldInspect =
+      settings.mode === "local" &&
+      settings.transformer_model &&
+      !isLocalRuntimeEntry(settings.transformer_model);
+    if (!shouldInspect) {
+      setLocalRuntime(null);
+      setLocalRuntimeError("");
+      setLocalRuntimeLoading(false);
+      return;
+    }
+    if (!quiet) {
+      setLocalRuntimeLoading(true);
+    }
+    try {
+      const response = await axios.get("/api/llm/local-status", {
+        params: {
+          model: settings.transformer_model,
+          quick: true,
+        },
+      });
+      setLocalRuntime(response?.data?.runtime || null);
+      setLocalRuntimeError("");
+    } catch (err) {
+      setLocalRuntime(null);
+      setLocalRuntimeError(
+        err?.response?.data?.detail || "Local runtime is not reachable right now.",
+      );
+    } finally {
+      if (!quiet) {
+        setLocalRuntimeLoading(false);
+      }
+    }
+  };
+
+  const runLocalRuntimeAction = async (action) => {
+    const normalizedAction = String(action || "").trim().toLowerCase();
+    if (!normalizedAction || !settings.transformer_model) return;
+    if (normalizedAction === "load" && localRuntimeLoadBlockedReason) {
+      setLocalRuntimeMessage("");
+      setLocalRuntimeError(localRuntimeLoadBlockedReason);
+      return;
+    }
+    setLocalRuntimeActionBusy(normalizedAction);
+    setLocalRuntimeMessage("");
+    setLocalRuntimeError("");
+    try {
+      if (normalizedAction === "load") {
+        await axios.post("/api/llm/load-local", {
+          model: settings.transformer_model,
+        });
+      } else if (normalizedAction === "unload") {
+        await axios.post("/api/llm/unload-local");
+      } else {
+        return;
+      }
+      await refreshLocalRuntime();
+      setLocalRuntimeMessage(
+        normalizedAction === "load"
+          ? "Language runtime load requested."
+          : "Language runtime unloaded.",
+      );
+    } catch (err) {
+      setLocalRuntimeError(
+        err?.response?.data?.detail || "Language runtime action failed.",
+      );
+    } finally {
+      setLocalRuntimeActionBusy("");
     }
   };
 
@@ -1968,13 +2765,37 @@ const Settings = () => {
       }
       await axios.post(`/api/llm/provider/${action}`, payload);
       setProviderActionMessage(actionLabels[action] || "Provider action requested.");
-      await refreshProviderRuntime(true);
+      await refreshProviderRuntime(false, { refresh: true });
     } catch (err) {
       setProviderActionMessage(
         err?.response?.data?.detail || "Provider action failed.",
       );
     } finally {
       setProviderActionBusy("");
+    }
+  };
+
+  const runEmbeddingRuntimeAction = async (action) => {
+    const normalizedAction = String(action || "").trim().toLowerCase();
+    if (!normalizedAction) return;
+    setEmbeddingRuntimeBusy(normalizedAction);
+    setEmbeddingRuntimeMessage("");
+    try {
+      const response = await axios.post(`/api/rag/embeddings/${normalizedAction}`);
+      const detail =
+        response?.data?.embedding_runtime?.state === "loaded"
+          ? "Embedding runtime loaded."
+          : response?.data?.embedding_runtime?.state === "idle"
+            ? "Embedding runtime unloaded."
+            : "Embedding runtime updated.";
+      setEmbeddingRuntimeMessage(detail);
+      await refreshStatus();
+    } catch (err) {
+      setEmbeddingRuntimeMessage(
+        err?.response?.data?.detail || "Embedding runtime action failed.",
+      );
+    } finally {
+      setEmbeddingRuntimeBusy("");
     }
   };
 
@@ -2096,7 +2917,7 @@ const Settings = () => {
 
   // Simple status section for core services (API, backend, WS, MCP)
 
-  const StatusSection = () => {
+  const renderStatusSection = () => {
 
     const rawMcpState =
       svcMcpReachable === null
@@ -2155,7 +2976,11 @@ const Settings = () => {
     }
     const ragLastUpdated = ragHasStatus ? formatIsoDatetime(ragStatus.last_modified) : null;
     const ragError = ragStatus && ragStatus.error ? String(ragStatus.error) : '';
-    const wsLastEventAgo = formatRelativeTime(state.wsLastEventAt);
+    const embeddingRuntime =
+      ragStatus && typeof ragStatus.embedding_runtime === "object"
+        ? ragStatus.embedding_runtime
+        : null;
+  const wsLastEventAgo = formatRelativeTime(state.wsLastEventAt);
     const wsLastEventClock = formatClockTime(state.wsLastEventAt);
     const wsLastEventLabel =
       wsLastEventAgo && wsLastEventClock
@@ -2910,12 +3735,15 @@ const Settings = () => {
 
 
   useEffect(() => {
-
-    // only pass explicit path when using a custom folder
-
+    if (loading || activeSettingsSection !== "models") return;
     fetchAvailableModels(useCustomModelsFolder ? settings.models_folder : undefined);
-
-  }, [settings.models_folder, useCustomModelsFolder]);
+  }, [
+    activeSettingsSection,
+    includeCacheUnfiltered,
+    loading,
+    settings.models_folder,
+    useCustomModelsFolder,
+  ]);
 
   useEffect(() => {
     if (loading) return;
@@ -2929,9 +3757,28 @@ const Settings = () => {
     }
     const id = setInterval(() => {
       refreshProviderRuntime(true);
-    }, 20000);
+    }, PROVIDER_RUNTIME_STATUS_POLL_MS);
     return () => clearInterval(id);
   }, [settings.mode, settings.local_provider]);
+
+  useEffect(() => {
+    if (loading) return;
+    refreshLocalRuntime();
+  }, [loading, settings.mode, settings.transformer_model]);
+
+  useEffect(() => {
+    const shouldPoll =
+      settings.mode === "local" &&
+      settings.transformer_model &&
+      !isLocalRuntimeEntry(settings.transformer_model);
+    if (!shouldPoll) {
+      return undefined;
+    }
+    const id = setInterval(() => {
+      refreshLocalRuntime(true);
+    }, 20000);
+    return () => clearInterval(id);
+  }, [settings.mode, settings.transformer_model]);
 
 
 
@@ -2957,20 +3804,23 @@ const Settings = () => {
     modelFields.forEach((field) => {
 
       const model = settings[field];
+      const catalogModel = resolveLocalCatalogModelId(model);
 
       if (!model) return;
 
       axios
 
-        .get(`/api/models/info/${model}`)
+        .get(`/api/models/info/${encodeURIComponent(catalogModel)}`)
 
         .then((r) => {
 
           setModelInfos((prev) => ({ ...prev, [field]: r.data }));
 
           const repo = String(r.data?.repo_id || "");
-
-          const dl = !!repo && !repo.startsWith("TODO");
+          const dl =
+            typeof r.data?.downloadable === "boolean"
+              ? r.data.downloadable
+              : !!repo && !repo.startsWith("TODO");
 
           setModelDownloadable((prev) => ({ ...prev, [field]: dl }));
 
@@ -2980,9 +3830,8 @@ const Settings = () => {
 
           setModelInfos((prev) => ({ ...prev, [field]: { size: 0 } }));
 
-          // If info lookup fails, still allow download attempt for known families (Gemma 3)
-
-          const fallbackDl = typeof model === 'string' && model.startsWith('gemma-3');
+          // If info lookup fails, still allow download attempt for known downloadable models.
+          const fallbackDl = isKnownDownloadableModel(catalogModel);
 
           setModelDownloadable((prev) => ({ ...prev, [field]: fallbackDl }));
 
@@ -2990,7 +3839,7 @@ const Settings = () => {
 
       axios
 
-        .get(`/api/models/exists/${model}`,
+        .get(`/api/models/exists/${encodeURIComponent(catalogModel)}`,
 
           useCustomModelsFolder && settings.models_folder
 
@@ -3016,7 +3865,7 @@ const Settings = () => {
 
         .get(
 
-          `/api/models/local-size/${model}`,
+          `/api/models/local-size/${encodeURIComponent(catalogModel)}`,
 
           useCustomModelsFolder && settings.models_folder
 
@@ -3042,7 +3891,7 @@ const Settings = () => {
 
         .get(
 
-          `/api/models/verify/${model}`,
+          `/api/models/verify/${encodeURIComponent(catalogModel)}`,
 
           useCustomModelsFolder && settings.models_folder
 
@@ -3252,26 +4101,7 @@ const Settings = () => {
 
 
 
-  const handleChange = (e) => {
-
-    const { name, type, value, checked } = e.target;
-
-    let nextValue;
-    if (type === "checkbox") {
-      nextValue = checked;
-    } else if (FLOAT_SETTING_FIELDS.has(name)) {
-      const parsed = parseFloat(value);
-      nextValue = Number.isFinite(parsed) ? parsed : 0;
-    } else if (INT_SETTING_FIELDS.has(name) || type === "range") {
-      const parsed = parseInt(value, 10);
-      nextValue = Number.isFinite(parsed) ? parsed : 0;
-    } else if (type === "number") {
-      const parsed = parseInt(value, 10);
-      nextValue = Number.isFinite(parsed) ? parsed : 0;
-    } else {
-      nextValue = value;
-    }
-
+  const commitSettingValue = useCallback((name, nextValue) => {
     setSettings((prev) => {
       const next = {
         ...prev,
@@ -3282,6 +4112,9 @@ const Settings = () => {
       }
       if (name === "local_provider") {
         const normalized = normalizeModelId(nextValue);
+        if (isLocalRuntimeEntry(prev.transformer_model)) {
+          next.transformer_model = normalized;
+        }
         if (
           normalized === "ollama" &&
           (prev.local_provider_port === 1234 || !prev.local_provider_port)
@@ -3304,6 +4137,29 @@ const Settings = () => {
       setState((prev) => ({ ...prev, harmonyTouched: true }));
 
     }
+  }, [setState]);
+
+  const handleChange = (e) => {
+
+    const { name, type, value, checked } = e.target;
+
+    let nextValue;
+    if (type === "checkbox") {
+      nextValue = checked;
+    } else if (FLOAT_SETTING_FIELDS.has(name)) {
+      const parsed = parseFloat(value);
+      nextValue = Number.isFinite(parsed) ? parsed : 0;
+    } else if (INT_SETTING_FIELDS.has(name) || type === "range") {
+      const parsed = parseInt(value, 10);
+      nextValue = Number.isFinite(parsed) ? parsed : 0;
+    } else if (type === "number") {
+      const parsed = parseInt(value, 10);
+      nextValue = Number.isFinite(parsed) ? parsed : 0;
+    } else {
+      nextValue = value;
+    }
+
+    commitSettingValue(name, nextValue);
 
   };
 
@@ -3386,33 +4242,77 @@ const Settings = () => {
 
 
   const handleModelsBrowse = () => {
- 
+  
     promptForServerPath("models_folder", "models");
- 
+  
+  };
+
+  const buildGlobalSelectionPatch = (prevState, nextSettings) => {
+    const patch = {};
+    if (nextSettings.model && nextSettings.model !== prevState.apiModel) {
+      patch.apiModel = nextSettings.model;
+    }
+    const selectedLanguageModel =
+      typeof nextSettings.transformer_model === "string"
+        ? nextSettings.transformer_model.trim()
+        : "";
+    if (nextSettings.mode === "local" && selectedLanguageModel) {
+      if (selectedLanguageModel !== prevState.localModel) {
+        patch.localModel = selectedLanguageModel;
+      }
+      if (
+        !isLocalRuntimeEntry(selectedLanguageModel) &&
+        selectedLanguageModel !== prevState.transformerModel
+      ) {
+        patch.transformerModel = selectedLanguageModel;
+      }
+    } else if (
+      nextSettings.mode === "server" &&
+      selectedLanguageModel &&
+      !isLocalRuntimeEntry(selectedLanguageModel) &&
+      selectedLanguageModel !== prevState.transformerModel
+    ) {
+      patch.transformerModel = selectedLanguageModel;
+    }
+    return patch;
   };
 
   useEffect(() => {
-    const next = {};
-    if (settings.model && settings.model !== state.apiModel) {
-      next.apiModel = settings.model;
-    }
-    if (
-      settings.transformer_model &&
-      settings.transformer_model !== state.localModel
-    ) {
-      next.localModel = settings.transformer_model;
-      next.transformerModel = settings.transformer_model;
-    }
+    const next = buildGlobalSelectionPatch(state, settings);
     if (Object.keys(next).length > 0) {
       setState((prev) => ({ ...prev, ...next }));
     }
   }, [
+    settings.mode,
     settings.model,
     settings.transformer_model,
     state.apiModel,
     state.localModel,
+    state.transformerModel,
     setState,
   ]);
+
+  useEffect(() => {
+    if (settings.mode !== "local") return;
+    const selectedLocalModel =
+      typeof state.localModel === "string" ? state.localModel.trim() : "";
+    if (!selectedLocalModel || selectedLocalModel === settings.transformer_model) {
+      return;
+    }
+    setSettings((prev) => {
+      if (prev.mode !== "local" || prev.transformer_model === selectedLocalModel) {
+        return prev;
+      }
+      const next = {
+        ...prev,
+        transformer_model: selectedLocalModel,
+      };
+      if (isLocalRuntimeEntry(selectedLocalModel)) {
+        next.local_provider = normalizeModelId(selectedLocalModel);
+      }
+      return next;
+    });
+  }, [settings.mode, settings.transformer_model, state.localModel]);
 
   const openDownloadsTray = () => {
     try {
@@ -3582,31 +4482,141 @@ const Settings = () => {
     badgeStatus === "offline" ||
     badgeStatus === "loading";
 
+  const providerCapabilities =
+    providerRuntime?.capabilities && typeof providerRuntime.capabilities === "object"
+      ? providerRuntime.capabilities
+      : {};
+  const providerExternalEndpointMode = providerCapabilities.start_stop === false;
+  const providerEndpointReachable =
+    !!providerRuntime?.server_running ||
+    (providerExternalEndpointMode && providerModelOptions.length > 0);
+  const providerRuntimeLastError =
+    typeof providerRuntime?.last_error === "string"
+      ? providerRuntime.last_error.trim()
+      : "";
+  const providerRuntimeDisplayError =
+    providerExternalEndpointMode &&
+    /remote load endpoint is unavailable/i.test(providerRuntimeLastError)
+      ? providerRuntimeError || ""
+      : providerRuntimeError || providerRuntimeLastError;
   const providerRuntimeStatus = !providerRuntimeInspectable
     ? "offline"
     : providerRuntimeLoading && !providerRuntime
       ? "loading"
-      : providerRuntimeError
+      : providerRuntimeDisplayError
         ? "offline"
-        : providerRuntime?.server_running
-          ? providerRuntime?.model_loaded
+        : providerExternalEndpointMode
+          ? providerEndpointReachable
             ? "online"
-            : "degraded"
-          : "offline";
+            : "offline"
+          : providerRuntime?.server_running
+            ? providerRuntime?.model_loaded
+              ? "online"
+              : "degraded"
+            : "offline";
+  const providerRuntimeCheckedAgo = providerRuntime?.checked_at
+    ? formatRelativeTime(providerRuntime.checked_at, runtimeNow)
+    : null;
+  const providerRuntimeCheckedClock = formatClockTime(providerRuntime?.checked_at);
+  const localRuntimePreflight =
+    localRuntime?.preflight && typeof localRuntime.preflight === "object"
+      ? localRuntime.preflight
+      : null;
+  const localRuntimeLoadBlockedReason =
+    localRuntimePreflight && localRuntimePreflight.ready === false
+      ? String(
+          localRuntimePreflight.hint ||
+            "Direct local runtime is not ready yet.",
+        ).trim()
+      : "";
+  const localRuntimeLoadDisabled =
+    !settings.transformer_model ||
+    !!localRuntimeLoading ||
+    localRuntimeActionBusy === "load" ||
+    !!localRuntimeLoadBlockedReason;
+  const localRuntimeTiming = (() => {
+    const loadState = String(localRuntime?.load_state || "").trim().toLowerCase();
+    const startedAgo = localRuntime?.load_started_at
+      ? formatRelativeTime(localRuntime.load_started_at, runtimeNow)
+      : null;
+    const finishedAgo = localRuntime?.load_finished_at
+      ? formatRelativeTime(localRuntime.load_finished_at, runtimeNow)
+      : null;
+    if (loadState === "loading" && startedAgo) {
+      return `Loading started ${startedAgo}.`;
+    }
+    if (loadState === "ready" && finishedAgo) {
+      return `Loaded ${finishedAgo}.`;
+    }
+    if (loadState === "error" && finishedAgo) {
+      return `Failed ${finishedAgo}.`;
+    }
+    return null;
+  })();
+  const providerTargetModel =
+    (
+      (typeof providerRuntime?.effective_model === "string"
+        ? providerRuntime.effective_model
+        : "") ||
+      (typeof providerRuntime?.preferred_model === "string"
+        ? providerRuntime.preferred_model
+        : "") ||
+      settings.local_provider_preferred_model ||
+      ""
+    )
+      .toString()
+      .trim();
   const providerRuntimeSummary = providerRuntime?.loaded_model
-    ? `Loaded: ${providerRuntime.loaded_model}`
-    : providerRuntime?.server_running
-      ? "Server is running without a model loaded."
-      : "Server is not running.";
+    ? isChatCapableProviderModelName(providerRuntime.loaded_model)
+      ? `Loaded: ${providerRuntime.loaded_model}`
+      : `Loaded non-chat model: ${providerRuntime.loaded_model}`
+    : providerExternalEndpointMode
+      ? providerEndpointReachable
+        ? providerTargetModel
+          ? `Endpoint reachable. Target: ${providerTargetModel}.`
+          : "Endpoint reachable."
+        : "Endpoint is not reachable."
+      : providerRuntime?.server_running
+        ? "Server is running without a model loaded."
+        : "Server is not running.";
   const providerRuntimeDetail = !providerRuntimeInspectable
-    ? "Inventory polling is only available for LM Studio and Ollama."
-    : providerRuntimeError
-      ? providerRuntimeError
+    ? "Inventory polling is available for LM Studio, Ollama, or a custom OpenAI-compatible endpoint."
+    : providerRuntimeDisplayError
+      ? providerRuntimeDisplayError
+      : providerRuntime?.loaded_model &&
+          !isChatCapableProviderModelName(providerRuntime.loaded_model)
+        ? `${providerRuntime.loaded_model} looks like an embedding model. Load a language model here for chat requests.`
+      : providerExternalEndpointMode
+        ? providerModelOptions.length > 0
+          ? `${providerModelOptions.length} provider models reported. External HTTP mode keeps start, stop, and model loading outside Float.`
+          : "External HTTP mode reports endpoint reachability here and leaves process control outside Float."
       : providerModelOptions.length > 0
         ? `${providerModelOptions.length} provider models reported.`
         : providerRuntimeLoading
-          ? "Checking provider runtime…"
+          ? "Checking provider runtime..."
           : "No provider models reported yet.";
+  const providerRuntimeFreshnessTooltip = providerRuntimeCheckedAgo
+    ? `Inventory checked ${providerRuntimeCheckedAgo}${
+        providerRuntimeCheckedClock ? ` (${providerRuntimeCheckedClock})` : ""
+      }. Automatic provider refresh runs about once per minute.`
+    : "Inventory has not been checked yet.";
+  const providerRuntimeFreshnessTone = providerRuntimeDisplayError
+    ? "error"
+    : providerRuntime?.loaded_model
+      ? isChatCapableProviderModelName(providerRuntime.loaded_model)
+        ? "ok"
+        : "warn"
+      : providerExternalEndpointMode
+        ? providerEndpointReachable
+          ? "ok"
+          : "idle"
+        : providerRuntime?.server_running || providerModelOptions.length > 0
+          ? "warn"
+        : "idle";
+  const embeddingRuntime =
+    ragStatus && typeof ragStatus.embedding_runtime === "object"
+      ? ragStatus.embedding_runtime
+      : null;
 
   const fieldTooltips = {
 
@@ -3642,9 +4652,12 @@ const Settings = () => {
 
   const voicePresetInput = (
     <div className="model-inline-group">
-      <div className="model-inline voice-inline">
-        <span className="model-inline-label">Voice</span>
+      <div className="model-inline voice-inline model-inline--stacked">
+        <label className="model-inline-label" htmlFor="settings-voice-model">
+          TTS voice preset
+        </label>
         <input
+          id="settings-voice-model"
           name="voice_model"
           value={settings.voice_model || ""}
           onChange={handleChange}
@@ -3661,12 +4674,17 @@ const Settings = () => {
       </div>
       {!isKnownVoicePreset && (
         <div className="status-note warn form-note">
-          Voice preset doesn’t match the selected TTS model. Choose a preset or
-          leave blank for provider defaults.
+          {voicePresetLooksLikeSpeechModel
+            ? "This looks like a speech model id, not a TTS voice preset. Keep transcription and live voice models separate from the TTS preset."
+            : "Voice preset doesn’t match the selected TTS model. Choose a preset or leave blank for provider defaults."}
         </div>
       )}
       <div className="status-note form-note">
-        <em>OpenAI API voices use `tts-1` or `tts-1-hd`. `kitten` and `kokoro` use local voice presets.</em>
+        <em>
+          OpenAI API voices use `tts-1` or `tts-1-hd`. `kitten` and `kokoro`
+          use local voice presets. Live streaming voice stays in the section
+          below.
+        </em>
       </div>
     </div>
   );
@@ -3777,6 +4795,18 @@ const Settings = () => {
 
     : "";
 
+  const harmonyAutoEnabled = state.harmonyTouched !== true;
+
+  const handleHarmonyAutoToggle = (event) => {
+    const checked = !!event.target.checked;
+    if (checked) {
+      setState((prev) => ({ ...prev, harmonyTouched: false }));
+      setSettings((prev) => ({ ...prev, harmony_format: preferHarmony }));
+      return;
+    }
+    setState((prev) => ({ ...prev, harmonyTouched: true }));
+  };
+
 
 
   // Schedule a background download job and broadcast to global DownloadTray
@@ -3882,15 +4912,13 @@ const Settings = () => {
       if (status === 403) {
 
         try {
-
-          if (model.startsWith("gemma-3")) {
-
+          const repoId = String(modelInfos[field]?.repo_id || "").trim();
+          if (repoId && !repoId.startsWith("TODO")) {
+            window.open(`https://huggingface.co/${repoId}`, "_blank");
+          } else if (isGemmaFamilyModel(model)) {
             window.open(`https://huggingface.co/google/${model}`, "_blank");
-
           } else if (model.startsWith("clip-vit")) {
-
             window.open(`https://huggingface.co/openai/${model}`, "_blank");
-
           }
 
         } catch {}
@@ -3910,6 +4938,7 @@ const Settings = () => {
   const handleModelDelete = async (field) => {
 
     const model = settings[field];
+    const catalogModel = resolveLocalCatalogModelId(model);
 
     if (!model) return;
 
@@ -3917,7 +4946,7 @@ const Settings = () => {
 
       setDownloadingModel((prev) => ({ ...prev, [field]: true }));
 
-      await axios.delete(`/api/models/${model}`,
+      await axios.delete(`/api/models/${encodeURIComponent(catalogModel)}`,
 
         useCustomModelsFolder && settings.models_folder
 
@@ -4134,7 +5163,7 @@ const Settings = () => {
       rag_chat_min_similarity:
         typeof s.rag_chat_min_similarity === "number"
           ? s.rag_chat_min_similarity
-          : 0.3,
+          : 0.45,
       sae_threads_signal_mode:
         typeof s.sae_threads_signal_mode === "string"
           ? s.sae_threads_signal_mode
@@ -4253,14 +5282,27 @@ const Settings = () => {
 
 
   const renderModelField = (label, field, suggestions = [], extra = null) => {
+    const isLanguageField = field === "transformer_model";
+    const languageLaneKey = isLanguageField
+      ? settings.mode === "api"
+        ? "api"
+        : "local"
+      : null;
+    const model = isLanguageField
+      ? languageLaneKey === "api"
+        ? settings.model || suggestedApiLangModels[0] || DEFAULT_API_MODELS[0] || ""
+        : settings[field] || ""
+      : settings[field] || "";
 
-    const model = settings[field] || "";
+    const downloadBlocked =
+      (isLanguageField && languageLaneKey === "api") || NON_DOWNLOADABLE.has(model);
 
-    const downloadBlocked = NON_DOWNLOADABLE.has(model);
+    const available = isLanguageField && languageLaneKey === "api" ? true : modelAvailable[field];
 
-    const available = modelAvailable[field];
-
-    const info = modelInfos[field] || { size: 0, repo_id: null };
+    const info =
+      isLanguageField && languageLaneKey === "api"
+        ? { size: 0, repo_id: null }
+        : modelInfos[field] || { size: 0, repo_id: null };
 
     const repoId = info.repo_id || null;
     const requiresAuth = !!info.requires_auth;
@@ -4281,16 +5323,32 @@ const Settings = () => {
 
       localBytes > 0 ? `${(localBytes / 1024 ** 3).toFixed(2)} gb` : "--";
 
-    const modelIsApiOnly = API_ONLY.has(model);
+    const modelIsApiOnly =
+      (isLanguageField && languageLaneKey === "api") || API_ONLY.has(model);
 
-    const downloadable = !modelIsApiOnly && (modelDownloadable[field] ?? true);
+    const downloadable =
+      !modelIsApiOnly &&
+      !(isLanguageField && languageLaneKey === "api") &&
+      (modelDownloadable[field] ?? true);
+    const laneMeta = isLanguageField
+      ? { key: languageLaneKey, label: getLaneDisplayLabel(languageLaneKey) }
+      : getModelLaneMeta(field, model, info);
+    const laneClass = laneMeta ? ` model-lane-${laneMeta.key}` : "";
 
     const optionMeta = (m) => {
       const value = typeof m === "string" ? m.trim() : "";
-      const isApiOnly = Boolean(value && API_ONLY.has(value));
+      const isApiOnly = Boolean(
+        value &&
+          (API_ONLY.has(value) ||
+            (isLanguageField && suggestedApiLangModels.includes(value))),
+      );
       const isSuggested = Boolean(value && suggestions.includes(value));
       const isAvailable = Boolean(value && availableModelSet.has(value));
       const isRegistered = Boolean(value && registeredModelAliasSet.has(value));
+      const optionLaneKey =
+        isLanguageField && suggestedApiLangModels.includes(value)
+          ? "api"
+          : getModelLaneMeta(field, value)?.key || laneMeta?.key || "local";
       const className = `model-option ${
         isApiOnly
           ? "model-option-api"
@@ -4311,6 +5369,7 @@ const Settings = () => {
       return {
         value,
         className,
+        laneKey: optionLaneKey,
         labelText: [
           isRegistered ? `${labelText} (local)` : labelText,
           providerLabel ? `\u00b7 ${providerLabel}` : "",
@@ -4321,198 +5380,203 @@ const Settings = () => {
     };
 
     const registeredOptions = registeredModelOptionsByField[field] || [];
-    const options = [
+    const options = isLanguageField
+      ? [
+          ...suggestions,
+          ...registeredOptions.filter((m) => !suggestions.includes(m)),
+          ...filterAvailableModelsForField(field, availableModels, {
+            includeAll: includeCacheUnfiltered,
+          }).filter((m) => !suggestions.includes(m) && !registeredOptions.includes(m)),
+          ...suggestedApiLangModels,
+        ]
+      : [
+          ...suggestions,
+          ...registeredOptions.filter((m) => !suggestions.includes(m)),
+          ...filterAvailableModelsForField(field, availableModels, {
+            includeAll: includeCacheUnfiltered,
+          }).filter((m) => !suggestions.includes(m) && !registeredOptions.includes(m)),
+        ];
 
-      ...suggestions,
-
-      ...registeredOptions.filter((m) => !suggestions.includes(m)),
-
-      ...filterAvailableModelsForField(field, availableModels, {
-        includeAll: includeCacheUnfiltered,
-      }).filter((m) => !suggestions.includes(m) && !registeredOptions.includes(m)),
-
-    ];
+    const optionEntries = options.map((entry) => optionMeta(entry));
+    if (!optionEntries.some((entry) => entry.value === model) && model) {
+      optionEntries.push(optionMeta(model));
+    }
+    const laneOptions = isLanguageField
+      ? ["api", "local"]
+      : Array.from(new Set(optionEntries.map((entry) => entry.laneKey).filter(Boolean)));
+    const activeLaneKey = isLanguageField
+      ? languageLaneKey
+      : laneMeta?.key || laneOptions[0] || null;
+    const visibleOptionEntries =
+      laneOptions.length > 1
+        ? optionEntries.filter((entry) => entry.laneKey === activeLaneKey)
+        : optionEntries;
 
     return (
 
-      <>
-
-        <label title={fieldTooltips[field] || label}>{label}</label>
-
-        <div
-          className={`model-select-row ${
-            available ? "model-present" : "model-missing"
-          }${extra ? " has-inline" : ""}`}
-        >
-
-          <select
-
-            name={field}
-
-            value={model}
-
-            onChange={handleChange}
-
-            title={fieldTooltips[field] || `Select ${label}`}
-
+      <div className="settings-model-block">
+        <div className="settings-model-heading">
+          <label
+            className="settings-model-heading-main"
+            htmlFor={`settings-model-${field}`}
+            title={fieldTooltips[field] || label}
           >
-
-            {options.map((m) => {
-              const meta = optionMeta(m);
-              return (
-
-              <option key={m} value={m} className={meta.className}>
-
-                {meta.labelText}
-
-              </option>
-
-              );
-            })}
-
-            {!options.includes(model) && model && (
-
-              <option value={model} className={optionMeta(model).className}>
-                {optionMeta(model).labelText}
-              </option>
-
-            )}
-
-          </select>
-
-          <button
-
-            type="button"
-
-            className="icon-btn"
-
-            title={
-
-              downloadBlocked
-
-                ? "Not downloadable (external/API-only)"
-
-                : requiresAuth
-                  ? "Requires Hugging Face auth"
-                  : !downloadable
-                    ? "Download not available (API-only)"
-                    : available && !verified
-
-                    ? "Repair download"
-
-                    : "Download model"
-
-            }
-
-            onClick={() => handleModelDownload(field)}
-
-            disabled={
-              !!downloadingModel[field] ||
-              downloadBlocked ||
-              !downloadable ||
-              (available && verified)
-            }
-
-          >
-
-            ⬇️
-
-          </button>
-
-          {repoId && !String(repoId).startsWith("TODO") && (
-
-            <button
-
-              type="button"
-
-              className="icon-btn"
-
-              title="Open model page"
-
-              onClick={() => window.open(`https://huggingface.co/${repoId}`, "_blank")}
-
-            >
-
-              🔗
-
-            </button>
-
-          )}
-
-          <button
-
-            type="button"
-
-            className="icon-btn"
-
-            title={available ? "Open containing folder" : "Model not present"}
-
-            onClick={async () => {
-
-              try {
-
-                await axios.get(
-
-                  `/api/models/reveal/${model}`,
-
-                  useCustomModelsFolder && settings.models_folder
-
-                    ? { params: { path: settings.models_folder } }
-
-                    : undefined,
-
-                );
-
-              } catch (e) {
-
-                alert("Unable to open folder on host.");
-
+            {label}
+          </label>
+          <div className="settings-model-heading-meta">
+            {renderLaneSelector(field, activeLaneKey, laneOptions, (nextLaneKey) => {
+              if (isLanguageField) {
+                if (nextLaneKey === "api") {
+                  setSettings((prev) => ({
+                    ...prev,
+                    mode: "api",
+                    model:
+                      prev.model ||
+                      suggestedApiLangModels[0] ||
+                      DEFAULT_API_MODELS[0] ||
+                      "",
+                  }));
+                  return;
+                }
+                setSettings((prev) => ({
+                  ...prev,
+                  mode: "local",
+                  transformer_model: prev.transformer_model || suggestions[0] || "",
+                }));
+                return;
               }
-
-            }}
-
-            disabled={!available}
-
-          >
-
-            📂
-
-          </button>
-
-          <button
-
-            type="button"
-
-            className="icon-btn"
-
-            title="Delete model"
-
-            onClick={() => handleModelDelete(field)}
-
-            disabled={!!downloadingModel[field] || !available || downloadBlocked}
-
-          >
-
-            🗑️
-
-          </button>
-
-          <span
-
-            className="model-size"
-
-            title={verified ? "expected / installed size (checksum verified)" : "expected size / installed (checksum pending)"}
-
-          >
-
-            {expectedSizeGB} / {installedSizeGB}{verified ? " ✓" : ""}
-
-          </span>
-          {extra}
-
+              const nextEntry = optionEntries.find((entry) => entry.laneKey === nextLaneKey);
+              if (nextEntry) {
+                commitSettingValue(field, nextEntry.value);
+              }
+            })}
+            {laneMeta && laneOptions.length <= 1 && (
+              <span className={`model-lane-pill model-lane-pill--${laneMeta.key}`}>
+                {laneMeta.label}
+              </span>
+            )}
+          </div>
         </div>
 
-      </>
+        <div className="model-select-stack">
+          <div
+            className={`model-select-row ${
+              available ? "model-present" : "model-missing"
+            }${laneClass}`}
+          >
+            <select
+              id={`settings-model-${field}`}
+              name={isLanguageField && activeLaneKey === "api" ? "model" : field}
+              value={model}
+              onChange={
+                isLanguageField
+                  ? (event) => {
+                      commitSettingValue(
+                        activeLaneKey === "api" ? "model" : field,
+                        event.target.value,
+                      );
+                    }
+                  : handleChange
+              }
+              title={fieldTooltips[field] || `Select ${label}`}
+            >
+              {visibleOptionEntries.map((meta) => {
+                return (
+                  <option key={meta.value} value={meta.value} className={meta.className}>
+                    {meta.labelText}
+                  </option>
+                );
+              })}
+            </select>
+
+            <div className={`model-action-group model-action-group--${activeLaneKey || "local"}`}>
+              <button
+                type="button"
+                className="icon-btn"
+                title={
+                  downloadBlocked
+                    ? "Not downloadable (external/API-only)"
+                    : requiresAuth
+                      ? "Requires Hugging Face auth"
+                      : !downloadable
+                        ? "Download not available (API-only)"
+                        : available && !verified
+                          ? "Repair download"
+                          : "Download model"
+                }
+                onClick={() => handleModelDownload(field)}
+                disabled={
+                  !!downloadingModel[field] ||
+                  downloadBlocked ||
+                  !downloadable ||
+                  (available && verified)
+                }
+              >
+                ⬇️
+              </button>
+
+              {repoId && !String(repoId).startsWith("TODO") && (
+                <button
+                  type="button"
+                  className="icon-btn"
+                  title="Open model page"
+                  onClick={() => window.open(`https://huggingface.co/${repoId}`, "_blank")}
+                >
+                  🔗
+                </button>
+              )}
+
+              <button
+                type="button"
+                className="icon-btn"
+                title={available ? "Open containing folder" : "Model not present"}
+                onClick={async () => {
+                  try {
+                    await axios.get(
+                      `/api/models/reveal/${encodeURIComponent(resolveLocalCatalogModelId(model))}`,
+                      useCustomModelsFolder && settings.models_folder
+                        ? { params: { path: settings.models_folder } }
+                        : undefined,
+                    );
+                  } catch (e) {
+                    alert("Unable to open folder on host.");
+                  }
+                }}
+                disabled={!available}
+              >
+                📂
+              </button>
+
+              <button
+                type="button"
+                className="icon-btn"
+                title="Delete model"
+                onClick={() => handleModelDelete(field)}
+                disabled={!!downloadingModel[field] || !available || downloadBlocked}
+              >
+                🗑️
+              </button>
+            </div>
+
+            <div className="model-row-trailing">
+              {renderCapabilityStrip(field, model, info)}
+              <span
+                className="model-size"
+                title={
+                  verified
+                    ? "expected / installed size (checksum verified)"
+                    : "expected size / installed (checksum pending)"
+                }
+              >
+                {expectedSizeGB} / {installedSizeGB}
+                {verified ? " ✓" : ""}
+              </span>
+            </div>
+          </div>
+
+          {extra && <div className="model-inline-panel">{extra}</div>}
+        </div>
+      </div>
 
     );
 
@@ -4740,11 +5804,11 @@ const Settings = () => {
       .finally(() => {
 
         setSaving(false);
-
+ 
         setState((prev) => ({
-
+ 
           ...prev,
-
+ 
           backendMode: settings.mode,
 
           devices: settings.devices,
@@ -4762,11 +5826,8 @@ const Settings = () => {
               : null),
 
           apiModel: settings.model,
-
-          localModel: settings.transformer_model,
-
-          transformerModel: settings.transformer_model,
-
+          ...buildGlobalSelectionPatch(prev, settings),
+ 
           staticModel: settings.static_model,
 
           approvalLevel: settings.approvalLevel,
@@ -5169,84 +6230,7 @@ const Settings = () => {
 
   return (
 
-    <div className="settings-container">
-
-      <div className="settings-header">
-
-        <h1>Settings</h1>
-
-        <button onClick={handleSave} disabled={saving || !isDirty}>
-
-          {saving ? "Saving..." : "Save"}
-
-        </button>
-
-      </div>
-
-      {!loading && (
-        <section className="settings-toolbar-card settings-section" aria-label="Settings navigation">
-          <div className="settings-card-header">
-            <div>
-              <h2>Search settings</h2>
-              <p className="settings-card-copy">
-                Find settings by keyword, including live streaming, camera, transcript, tools,
-                export, and prompt options.
-              </p>
-            </div>
-          </div>
-          <div className="settings-search-row">
-            <label className="field-label settings-search-label" htmlFor="settings-page-search">
-              <span>Search settings</span>
-            </label>
-            <div className="settings-search-input-row">
-              <input
-                id="settings-page-search"
-                type="search"
-                value={settingsSearch}
-                onChange={(e) => setSettingsSearch(e.target.value)}
-                placeholder="live streaming, api key, gpu, tools, export, prompt..."
-              />
-              {settingsSearch && (
-                <button
-                  type="button"
-                  className="icon-btn settings-search-clear"
-                  onClick={() => setSettingsSearch("")}
-                  style={{ marginTop: 0 }}
-                >
-                  Clear search
-                </button>
-              )}
-            </div>
-          </div>
-          <div className="settings-chip-row" role="navigation" aria-label="Settings sections">
-            {SETTINGS_SECTIONS.map((section) => (
-              <a
-                key={section.id}
-                href={`#settings-${section.id}`}
-                className={`settings-chip${
-                  showSettingsSection(section.id) ? "" : " settings-chip--muted"
-                }`}
-                onClick={() => {
-                  if (settingsSearchTerms.length) {
-                    setSettingsSearch("");
-                  }
-                }}
-              >
-                {section.label}
-              </a>
-            ))}
-          </div>
-          <p className="status-note" aria-live="polite">
-            {settingsSearchTerms.length
-              ? `Showing ${visibleSettingsSections.length} of ${SETTINGS_SECTIONS.length} sections for "${settingsSearch.trim()}".`
-              : "Try broad terms like live streaming, runtime, model, gpu, notification, tools, export, or prompt."}
-          </p>
-        </section>
-      )}
-
-      {/* Consolidated runtime status indicators */}
-
-      {!loading && <StatusSection />}
+    <div className="settings-container" ref={settingsContainerRef}>
 
       {loading ? (
 
@@ -5254,7 +6238,70 @@ const Settings = () => {
 
       ) : (
 
-        <>
+        <div className="settings-shell settings-section">
+          <section className="settings-toolbar-card settings-topbar" ref={settingsToolbarRef}>
+            <div className="settings-topbar-title">
+              <h1>settings</h1>
+            </div>
+            <div className="settings-topbar-search">
+              <label className="settings-topbar-search-label" htmlFor="settings-page-search">
+                Search settings
+              </label>
+              <input
+                id="settings-page-search"
+                type="search"
+                value={settingsSearch}
+                onChange={(e) => setSettingsSearch(e.target.value)}
+                placeholder="search"
+                aria-label="Search settings"
+              />
+              {settingsSearch && (
+                <button
+                  type="button"
+                  className="icon-btn settings-search-clear"
+                  onClick={() => setSettingsSearch("")}
+                  style={{ marginTop: 0 }}
+                  aria-label="Clear search"
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+            <div className="settings-topbar-nav" role="navigation" aria-label="Settings sections">
+              {SETTINGS_SECTIONS.map((section) => {
+                const isVisible = showSettingsSection(section.id);
+                const isActive = activeSettingsSection === section.id;
+                return (
+                  <button
+                    key={section.id}
+                    type="button"
+                    className={`settings-topbar-button${
+                      isActive ? " is-active" : ""
+                    }${isVisible ? "" : " is-filtered"}`}
+                    aria-current={isActive ? "true" : undefined}
+                    aria-label={`${section.label}. ${section.description}`}
+                    title={section.description}
+                    onClick={() => handleSettingsNavClick(section.id)}
+                  >
+                    {section.label}
+                  </button>
+                );
+              })}
+            </div>
+            <div className="settings-topbar-actions">
+              <button onClick={handleSave} disabled={saving || !isDirty}>
+                {saving ? "Saving..." : "Save"}
+              </button>
+            </div>
+          </section>
+          <p className="status-note settings-toolbar-note" aria-live="polite">
+            {settingsSearchTerms.length
+              ? `Showing ${visibleSettingsSections.length} of ${SETTINGS_SECTIONS.length} sections for "${settingsSearch.trim()}".`
+              : "Use the pinned bar to search, jump between sections, and save without leaving the current scroll position."}
+          </p>
+          <div className="settings-content settings-content--full">
+            {/* Consolidated runtime status indicators */}
+            {renderStatusSection()}
 
           {settingsSearchTerms.length > 0 && visibleSettingsSections.length === 0 && (
             <section className="settings-card settings-section">
@@ -5872,48 +6919,57 @@ const Settings = () => {
                     <button
                       type="button"
                       className="icon-btn"
-                      onClick={() => refreshProviderRuntime()}
+                      onClick={() => refreshProviderRuntime(false, { refresh: true })}
                       disabled={providerRuntimeLoading || !providerRuntimeInspectable}
                       style={{ marginTop: 0 }}
                     >
                       {providerRuntimeLoading ? "Refreshing..." : "Refresh"}
                     </button>
-                    <button
-                      type="button"
-                      className="icon-btn"
-                      onClick={() => runProviderAction("start")}
-                      disabled={!providerRuntimeInspectable || !!providerActionBusy}
-                      style={{ marginTop: 0 }}
-                    >
-                      {providerActionBusy === "start" ? "Starting..." : "Start"}
-                    </button>
-                    <button
-                      type="button"
-                      className="icon-btn"
-                      onClick={() => runProviderAction("stop")}
-                      disabled={!providerRuntimeInspectable || !!providerActionBusy}
-                      style={{ marginTop: 0 }}
-                    >
-                      {providerActionBusy === "stop" ? "Stopping..." : "Stop"}
-                    </button>
-                    <button
-                      type="button"
-                      className="icon-btn"
-                      onClick={() => runProviderAction("load")}
-                      disabled={!providerRuntimeInspectable || !!providerActionBusy}
-                      style={{ marginTop: 0 }}
-                    >
-                      {providerActionBusy === "load" ? "Loading..." : "Load preferred"}
-                    </button>
-                    <button
-                      type="button"
-                      className="icon-btn"
-                      onClick={() => runProviderAction("unload")}
-                      disabled={!providerRuntimeInspectable || !!providerActionBusy}
-                      style={{ marginTop: 0 }}
-                    >
-                      {providerActionBusy === "unload" ? "Unloading..." : "Unload"}
-                    </button>
+                    <span
+                      className={`runtime-freshness-indicator ${providerRuntimeFreshnessTone}`}
+                      title={providerRuntimeFreshnessTooltip}
+                      aria-label="Provider inventory freshness"
+                    />
+                    {!providerExternalEndpointMode && (
+                      <>
+                        <button
+                          type="button"
+                          className="icon-btn"
+                          onClick={() => runProviderAction("start")}
+                          disabled={!providerRuntimeInspectable || !!providerActionBusy}
+                          style={{ marginTop: 0 }}
+                        >
+                          {providerActionBusy === "start" ? "Starting..." : "Start"}
+                        </button>
+                        <button
+                          type="button"
+                          className="icon-btn"
+                          onClick={() => runProviderAction("stop")}
+                          disabled={!providerRuntimeInspectable || !!providerActionBusy}
+                          style={{ marginTop: 0 }}
+                        >
+                          {providerActionBusy === "stop" ? "Stopping..." : "Stop"}
+                        </button>
+                        <button
+                          type="button"
+                          className="icon-btn"
+                          onClick={() => runProviderAction("load")}
+                          disabled={!providerRuntimeInspectable || !!providerActionBusy}
+                          style={{ marginTop: 0 }}
+                        >
+                          {providerActionBusy === "load" ? "Loading..." : "Load preferred"}
+                        </button>
+                        <button
+                          type="button"
+                          className="icon-btn"
+                          onClick={() => runProviderAction("unload")}
+                          disabled={!providerRuntimeInspectable || !!providerActionBusy}
+                          style={{ marginTop: 0 }}
+                        >
+                          {providerActionBusy === "unload" ? "Unloading..." : "Unload"}
+                        </button>
+                      </>
+                    )}
                   </div>
                   {providerActionMessage ? (
                     <p className="status-note" style={{ marginTop: 8 }}>
@@ -6023,10 +7079,6 @@ const Settings = () => {
               onChange={(e) => {
                 const next = e.target.checked;
                 setIncludeCacheUnfiltered(next);
-                fetchAvailableModels(
-                  useCustomModelsFolder ? settings.models_folder : undefined,
-                  next,
-                );
               }}
             />
             <span style={{ marginLeft: 6 }}>Show all HF cache models (may include utility/noisy entries)</span>
@@ -6123,91 +7175,300 @@ const Settings = () => {
             </div>
           )}
 
-          {renderModelField(
+          <p className="status-note settings-models-intro">
+            Gemma 4 belongs in the language lane. Speech settings stay on
+            dedicated transcription and synthesis models, while live voice
+            remains the OpenAI Realtime path.
+          </p>
 
-            "Language Model",
+          <div className="settings-models-grid">
+            <div className="settings-subcard">
+              <div className="settings-subcard-header">
+                <div>
+                  <h3>Language runtime</h3>
+                  <p className="settings-subcard-copy">
+                    Primary response model, API/local lane, and tool-formatting defaults.
+                  </p>
+                </div>
+              </div>
 
-            "transformer_model",
+              {renderModelField(
+                "Language Model",
+                "transformer_model",
+                suggestedLangModels,
+              )}
+              {settings.mode === "local" && (
+                <div
+                  className={`model-inline-panel runtime-inline-panel ${
+                    managedLocalRuntimeSelected
+                      ? "runtime-inline-panel--provider"
+                      : "runtime-inline-panel--local"
+                  }`}
+                >
+                  <div className="runtime-inline-header">
+                    <div>
+                      <h4>Runtime</h4>
+                      <p className="status-note form-note">
+                        {managedLocalRuntimeSelected
+                          ? "Provider-backed local runtime status for the selected bridge."
+                          : "Direct local Transformers runtime for the selected language model."}
+                      </p>
+                    </div>
+                    <div className="runtime-inline-actions">
+                      {managedLocalRuntimeSelected ? (
+                        <button
+                          type="button"
+                          className="runtime-inline-btn"
+                          onClick={() => refreshProviderRuntime(false, { refresh: true })}
+                          disabled={providerRuntimeLoading}
+                        >
+                          {providerRuntimeLoading ? "Refreshing..." : "Refresh"}
+                        </button>
+                      ) : (
+                        <>
+                          <button
+                            type="button"
+                            className="runtime-inline-btn"
+                            onClick={() => refreshLocalRuntime()}
+                            disabled={localRuntimeLoading}
+                          >
+                            {localRuntimeLoading ? "Refreshing..." : "Refresh"}
+                          </button>
+                          <button
+                            type="button"
+                            className="runtime-inline-btn"
+                            onClick={() => runLocalRuntimeAction("load")}
+                            disabled={localRuntimeLoadDisabled}
+                            title={localRuntimeLoadBlockedReason || undefined}
+                          >
+                            {localRuntimeActionBusy === "load" ? "Loading..." : "Load"}
+                          </button>
+                          <button
+                            type="button"
+                            className="runtime-inline-btn"
+                            onClick={() => runLocalRuntimeAction("unload")}
+                            disabled={localRuntimeActionBusy === "unload"}
+                          >
+                            {localRuntimeActionBusy === "unload" ? "Unloading..." : "Unload"}
+                          </button>
+                        </>
+                      )}
+                      <button
+                        type="button"
+                        className="runtime-inline-btn"
+                        onClick={() => setLanguageRuntimeCollapsed((prev) => !prev)}
+                        aria-expanded={!languageRuntimeCollapsed}
+                      >
+                        {languageRuntimeCollapsed ? "Expand" : "Collapse"}
+                      </button>
+                    </div>
+                  </div>
+                  {!languageRuntimeCollapsed && (
+                    <div
+                      className="runtime-inline-body"
+                      aria-busy={
+                        managedLocalRuntimeSelected
+                          ? providerRuntimeLoading || !!providerActionBusy
+                          : localRuntimeLoading || !!localRuntimeActionBusy
+                      }
+                    >
+                      {managedLocalRuntimeSelected ? (
+                        <>
+                          <div className="runtime-inline-summary">
+                            <span className="runtime-inline-chip runtime-inline-chip--provider">
+                              {formatLocalRuntimeLabel(settings.transformer_model || selectedProviderKey)}
+                            </span>
+                            <span className="runtime-inline-chip">
+                              {providerRuntime?.model_loaded
+                                ? "loaded"
+                                : providerRuntime?.server_running
+                                  ? "ready"
+                                  : "idle"}
+                            </span>
+                            {(providerRuntimeLoading || providerActionBusy) && (
+                              <span className="runtime-inline-chip runtime-inline-chip--busy">
+                                updating
+                              </span>
+                            )}
+                          </div>
+                          <p className="status-note form-note">
+                            Loaded model: {providerRuntime?.loaded_model || "none"}
+                          </p>
+                          {providerRuntime?.base_url ? (
+                            <p className="status-note form-note">
+                              Endpoint: {providerRuntime.base_url}
+                            </p>
+                          ) : null}
+                          {providerRuntimeError && (
+                            <div className="runtime-inline-message runtime-inline-message--error">
+                              {providerRuntimeError}
+                            </div>
+                          )}
+                          {providerActionMessage && (
+                            <div className="runtime-inline-message">
+                              {providerActionMessage}
+                            </div>
+                          )}
+                        </>
+                      ) : (
+                        <>
+                          <div className="runtime-inline-summary">
+                            <span className="runtime-inline-chip runtime-inline-chip--local">
+                              {settings.transformer_model || "local model"}
+                            </span>
+                            <span className="runtime-inline-chip">
+                              {localRuntime?.load_state || "idle"}
+                            </span>
+                            {(localRuntimeLoading || localRuntimeActionBusy) && (
+                              <span className="runtime-inline-chip runtime-inline-chip--busy">
+                                updating
+                              </span>
+                            )}
+                            {localRuntime?.supports_images ? (
+                              <span className="runtime-inline-chip">vision</span>
+                            ) : null}
+                          </div>
+                          {localRuntime?.effective_model_id &&
+                          normalizeModelId(localRuntime.effective_model_id) !==
+                            normalizeModelId(settings.transformer_model) ? (
+                            <p className="status-note form-note">
+                              Loaded model: {localRuntime.effective_model_id}
+                            </p>
+                          ) : null}
+                          {localRuntime?.active_backend ? (
+                            <p className="status-note form-note">
+                              Backend: {localRuntime.active_backend}
+                              {localRuntime?.local_loader
+                                ? ` · loader: ${localRuntime.local_loader}`
+                                : ""}
+                            </p>
+                          ) : null}
+                          {localRuntimeTiming ? (
+                            <p className="status-note form-note">{localRuntimeTiming}</p>
+                          ) : null}
+                          {localRuntimePreflight?.python_executable ? (
+                            <p className="status-note form-note">
+                              Backend Python: {localRuntimePreflight.python_executable}
+                            </p>
+                          ) : null}
+                          {localRuntimePreflight?.missing_packages?.length ? (
+                            <div className="runtime-inline-message runtime-inline-message--error">
+                              Missing direct-local packages:{" "}
+                              {localRuntimePreflight.missing_packages.join(", ")}.
+                            </div>
+                          ) : null}
+                          {localRuntimeError && (
+                            <div className="runtime-inline-message runtime-inline-message--error">
+                              {localRuntimeError}
+                            </div>
+                          )}
+                          {localRuntime?.load_error && (
+                            <div className="runtime-inline-message runtime-inline-message--error">
+                              {localRuntime.load_error}
+                            </div>
+                          )}
+                          {!localRuntime?.load_error && localRuntimePreflight?.hint && (
+                            <div className="runtime-inline-message runtime-inline-message--error">
+                              {localRuntimePreflight.hint}
+                            </div>
+                          )}
+                          {localRuntimeMessage && (
+                            <div className="runtime-inline-message">
+                              {localRuntimeMessage}
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
 
-            suggestedLangModels,
-
-          )}
-
-          <label
-
-            className={`field-label${harmonyWarning ? " field-label--warn" : ""}`}
-
-            title="Format responses using Harmony metadata when supported"
-
-          >
-
-            <span>Harmony Formatting</span>
-
-            {harmonyWarning && (
-
-              <span
-
-                className="status-dot warn label-dot"
-
-                title={harmonyWarningMessage}
-
-                role="img"
-
-                aria-label={harmonyWarningMessage}
-
-              />
-
-            )}
-
-          </label>
-
-          <input
-
-            name="harmony_format"
-
-            type="checkbox"
-
-            checked={settings.harmony_format}
-
-            onChange={handleChange}
-
-            title="Format responses using Harmony metadata when supported"
-
-          />
-
-          {harmonyWarning && harmonyWarningMessage && (
-
-            <div className="status-note warn form-note" role="note">
-
-              {harmonyWarningMessage}
-
+              <div className={`settings-toggle-card${harmonyWarning ? " settings-toggle-card--warn" : ""}`}>
+                <div className="settings-toggle-copy">
+                  <div className="settings-toggle-title">
+                    <span>Harmony Formatting</span>
+                    {harmonyWarning && (
+                      <span
+                        className="status-dot warn label-dot"
+                        title={harmonyWarningMessage}
+                        role="img"
+                        aria-label={harmonyWarningMessage}
+                      />
+                    )}
+                  </div>
+                  <p className="status-note form-note">
+                    Keeps tool metadata intact for GPT-OSS and similar tool-aware chat models.
+                  </p>
+                  {harmonyWarning && harmonyWarningMessage && (
+                    <div className="status-note warn form-note" role="note">
+                      {harmonyWarningMessage}
+                    </div>
+                  )}
+                </div>
+                <div className="settings-toggle-controls">
+                  <label className="settings-switch-row" htmlFor="harmony-auto-toggle">
+                    <span>Enable automatically</span>
+                    <input
+                      id="harmony-auto-toggle"
+                      type="checkbox"
+                      checked={harmonyAutoEnabled}
+                      onChange={handleHarmonyAutoToggle}
+                      title="Automatically enable Harmony Formatting when the selected model prefers it."
+                    />
+                  </label>
+                  <label className="settings-switch-row" htmlFor="harmony-enable-toggle">
+                    <span>Enabled</span>
+                    <input
+                      id="harmony-enable-toggle"
+                      name="harmony_format"
+                      type="checkbox"
+                      checked={settings.harmony_format}
+                      onChange={handleChange}
+                      title="Format responses using Harmony metadata when supported"
+                    />
+                  </label>
+                </div>
+              </div>
             </div>
 
-          )}
+            <div className="settings-subcard">
+              <div className="settings-subcard-header">
+                <div>
+                  <h3>Speech</h3>
+                  <p className="settings-subcard-copy">
+                    Transcription, synthesis, and TTS voice presets. Gemma 4 is not part of the speech stack in this pass.
+                  </p>
+                </div>
+              </div>
 
-          {renderModelField(
+              {renderModelField(
+                "STT Model",
+                "stt_model",
+                suggestedSttModels,
+              )}
 
-            "STT Model",
+              {renderModelField(
+                "TTS Model",
+                "tts_model",
+                suggestedTtsModels,
+                voicePresetInput,
+              )}
+            </div>
 
-            "stt_model",
-
-            suggestedSttModels,
-
-          )}
-
-          {renderModelField(
-
-            "TTS Model",
-
-            "tts_model",
-
-            suggestedTtsModels,
-            voicePresetInput,
-
-          )}
-
-          <div className="settings-section">
-            <h3>Live streaming</h3>
+            <div className="settings-subcard settings-subcard--wide">
+              <div className="settings-subcard-header">
+                <div>
+                  <h3>Live streaming</h3>
+                  <p className="settings-subcard-copy">
+                    OpenAI Realtime stays the live voice lane. Realtime model and voice are separate from TTS.
+                  </p>
+                </div>
+                <div className="settings-model-heading-meta">
+                  <span className="model-lane-pill model-lane-pill--api">Cloud live</span>
+                  {renderCapabilityStrip("realtime_model", settings.realtime_model)}
+                </div>
+              </div>
             <label title={fieldTooltips.stream_backend}>
               Streaming backend
             </label>
@@ -6246,6 +7507,7 @@ const Settings = () => {
               value={settings.realtime_voice || ""}
               onChange={handleChange}
               title={fieldTooltips.realtime_voice}
+              className={realtimeVoiceIsKnown ? "" : "field-select--warn"}
             >
               {realtimeVoiceOptions.map((voice) => (
                 <option key={voice} value={voice}>
@@ -6259,6 +7521,12 @@ const Settings = () => {
                   </option>
                 )}
             </select>
+            {!realtimeVoiceIsKnown && (
+              <p className="status-note warn form-note">
+                The current live voice is not a supported OpenAI Realtime voice.
+                Speech models like Voxtral do not belong in this selector.
+              </p>
+            )}
 
             <label title="Endpoint used by the backend to mint short-lived OpenAI Realtime client secrets.">
               Realtime session URL
@@ -6332,95 +7600,251 @@ const Settings = () => {
             </p>
           </div>
 
-          <label htmlFor="rag-embedding-model" title="Text embedding model used for semantic search (RAG).">
+            <div className="settings-subcard settings-subcard--wide">
+              <div className="settings-subcard-header">
+                <div>
+                  <h3>Retrieval &amp; vision</h3>
+                  <p className="settings-subcard-copy">
+                    Vision fallback, text embeddings, and image retrieval. EmbeddingGemma
+                    is text-only and does not replace CLIP.
+                  </p>
+                </div>
+              </div>
 
-            RAG embedding model
+              {renderModelField(
+                "Vision Fallback Model",
+                "vision_model",
+                suggestedVisionModels,
+              )}
 
-          </label>
+              <div className="settings-model-block">
+                <div className="settings-model-heading">
+                  <label
+                    className="settings-model-heading-main"
+                    htmlFor="rag-embedding-model"
+                    title="Text embedding model used for semantic search (RAG)."
+                  >
+                    RAG embedding model
+                  </label>
+                  <div className="settings-model-heading-meta">
+                    {renderLaneSelector(
+                      "rag_embedding_model",
+                      embeddingLaneKey,
+                      ragEmbeddingLaneOptions,
+                      (nextLaneKey) => {
+                        const nextPreset = ragEmbeddingPresets.find(
+                          (preset) =>
+                            (getModelLaneMeta(
+                              "rag_embedding_model",
+                              preset.value,
+                            )?.key || "local") === nextLaneKey,
+                        );
+                        if (nextPreset) {
+                          commitSettingValue("rag_embedding_model", nextPreset.value);
+                        }
+                      },
+                    )}
+                    {ragEmbeddingLaneOptions.length <= 1 && (
+                      <span className={`model-lane-pill model-lane-pill--${embeddingLaneKey}`}>
+                        {getLaneDisplayLabel(embeddingLaneKey)}
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <div
+                  className={`model-select-row model-present model-lane-${embeddingLaneKey}`}
+                >
+                  <select
+                    id="rag-embedding-model"
+                    name="rag_embedding_model"
+                    value={settings.rag_embedding_model || ""}
+                    onChange={handleChange}
+                    title="Text embedding model used for semantic search (RAG)."
+                  >
+                    {visibleRagEmbeddingPresets.map((preset) => (
+                      <option key={preset.value} value={preset.value}>
+                        {preset.label}
+                      </option>
+                    ))}
+                    {settings.rag_embedding_model &&
+                      !visibleRagEmbeddingPresets.some(
+                        (preset) => preset.value === settings.rag_embedding_model,
+                      ) && (
+                        <option value={settings.rag_embedding_model}>
+                          {settings.rag_embedding_model}
+                        </option>
+                      )}
+                  </select>
+                  <div className="model-row-trailing">
+                    {renderCapabilityStrip(
+                      "rag_embedding_model",
+                      settings.rag_embedding_model,
+                    )}
+                  </div>
+                </div>
+              </div>
 
-          <div className="model-select-row model-present">
-            <select
-              id="rag-embedding-model"
-              name="rag_embedding_model"
-              value={settings.rag_embedding_model || ""}
-              onChange={handleChange}
-              title="Text embedding model used for semantic search (RAG)."
-            >
-              {ragEmbeddingPresets.map((preset) => (
-                <option key={preset.value} value={preset.value}>
-                  {preset.label}
-                </option>
-              ))}
-              {settings.rag_embedding_model &&
-                !ragEmbeddingPresets.some(
-                  (preset) => preset.value === settings.rag_embedding_model,
-                ) && (
-                  <option value={settings.rag_embedding_model}>
-                    {settings.rag_embedding_model}
-                  </option>
+              <p className="status-note">
+                Values starting with <code>local:</code> attempt to use on-device
+                embeddings. <code>api:</code> entries are optional cloud paths and
+                currently fall back to the hash-based encoder until remote
+                providers are wired up.
+              </p>
+              {String(settings.rag_embedding_model || "").includes("embeddinggemma") && (
+                <p className="status-note form-note">
+                  EmbeddingGemma is included as an opt-in review preset. It is a
+                  text embedding path only, and local loading may need newer
+                  Sentence Transformers support than the current default stack.
+                </p>
+              )}
+              <div
+                className={`model-inline-panel runtime-inline-panel runtime-inline-panel--${embeddingLaneKey}`}
+              >
+                <div className="runtime-inline-header">
+                  <div>
+                    <h4>Embeddings runtime</h4>
+                    <p className="status-note form-note">
+                      Load and unload the text embedding runtime without leaving the models view.
+                    </p>
+                  </div>
+                  <div className="runtime-inline-actions">
+                    <button
+                      type="button"
+                      className="runtime-inline-btn"
+                      onClick={() => refreshStatus()}
+                      disabled={ragState === "loading"}
+                    >
+                      {ragState === "loading" ? "Refreshing..." : "Refresh"}
+                    </button>
+                    {embeddingLaneKey !== "api" && (
+                      <>
+                        <button
+                          type="button"
+                          className="runtime-inline-btn"
+                          onClick={() => runEmbeddingRuntimeAction("load")}
+                          disabled={embeddingRuntimeBusy === "load"}
+                        >
+                          {embeddingRuntimeBusy === "load" ? "Loading..." : "Load"}
+                        </button>
+                        <button
+                          type="button"
+                          className="runtime-inline-btn"
+                          onClick={() => runEmbeddingRuntimeAction("unload")}
+                          disabled={embeddingRuntimeBusy === "unload"}
+                        >
+                          {embeddingRuntimeBusy === "unload" ? "Unloading..." : "Unload"}
+                        </button>
+                      </>
+                    )}
+                    <button
+                      type="button"
+                      className="runtime-inline-btn"
+                      onClick={() => setEmbeddingRuntimeCollapsed((prev) => !prev)}
+                      aria-expanded={!embeddingRuntimeCollapsed}
+                    >
+                      {embeddingRuntimeCollapsed ? "Expand" : "Collapse"}
+                    </button>
+                  </div>
+                </div>
+                {!embeddingRuntimeCollapsed && (
+                  <div
+                    className="runtime-inline-body"
+                    aria-busy={ragState === "loading" || !!embeddingRuntimeBusy}
+                  >
+                    <div className="runtime-inline-summary">
+                      <span className={`runtime-inline-chip runtime-inline-chip--${embeddingLaneKey}`}>
+                        {settings.rag_embedding_model || "simple"}
+                      </span>
+                      <span className="runtime-inline-chip">
+                        {embeddingRuntime?.state || (embeddingLaneKey === "api" ? "remote" : "idle")}
+                      </span>
+                      {(ragState === "loading" || embeddingRuntimeBusy) && (
+                        <span className="runtime-inline-chip runtime-inline-chip--busy">
+                          {embeddingRuntimeBusy ? `${embeddingRuntimeBusy}…` : "refreshing…"}
+                        </span>
+                      )}
+                    </div>
+                    <p className="status-note form-note">
+                      Mode: {embeddingRuntime?.mode || (embeddingLaneKey === "api" ? "api" : "local")}
+                    </p>
+                    {embeddingRuntime?.error && (
+                      <div className="runtime-inline-message runtime-inline-message--error">
+                        {embeddingRuntime.error}
+                      </div>
+                    )}
+                    {embeddingRuntimeMessage && (
+                      <div className="runtime-inline-message">
+                        {embeddingRuntimeMessage}
+                      </div>
+                    )}
+                  </div>
                 )}
-            </select>
-          </div>
+              </div>
 
-          <p className="status-note">
+              <div className="settings-model-block">
+                <div className="settings-model-heading">
+                  <label
+                    className="settings-model-heading-main"
+                    htmlFor="rag-clip-model"
+                    title="CLIP model used for image-aware RAG retrieval."
+                  >
+                    RAG CLIP model
+                  </label>
+                  <div className="settings-model-heading-meta">
+                    <span className="model-lane-pill model-lane-pill--local">Local</span>
+                  </div>
+                </div>
+                <div className="model-select-row model-present model-lane-local">
+                  <select
+                    id="rag-clip-model"
+                    name="rag_clip_model"
+                    value={settings.rag_clip_model || ""}
+                    onChange={handleChange}
+                    title="CLIP model used for image-aware RAG retrieval."
+                  >
+                    {ragClipPresets.map((preset) => (
+                      <option key={preset.value} value={preset.value}>
+                        {preset.label}
+                      </option>
+                    ))}
+                    {settings.rag_clip_model &&
+                      !ragClipPresets.some((preset) => preset.value === settings.rag_clip_model) && (
+                        <option value={settings.rag_clip_model}>{settings.rag_clip_model}</option>
+                      )}
+                  </select>
+                  <div className="model-row-trailing">
+                    {renderCapabilityStrip("rag_clip_model", settings.rag_clip_model)}
+                  </div>
+                </div>
+              </div>
 
-            Values starting with <code>local:</code> attempt to use on-device embeddings;{" "}
+              <p className="status-note">
+                Keep this on an OpenCLIP variant; Vision model selection is separate.
+              </p>
 
-            <code>api:</code> entries are stubbed until remote providers are wired up and currently fall back to the hash-based encoder.
+              <label
+                htmlFor="rag-chat-min-similarity"
+                title="Minimum similarity (0-1) for automatic RAG injection."
+              >
+                RAG min similarity
+              </label>
 
-          </p>
+              <input
+                id="rag-chat-min-similarity"
+                name="rag_chat_min_similarity"
+                type="number"
+                min="0"
+                max="1"
+                step="0.05"
+                value={settings.rag_chat_min_similarity}
+                onChange={handleChange}
+              />
 
-          <label htmlFor="rag-clip-model" title="CLIP model used for image-aware RAG retrieval.">
-            RAG CLIP model
-          </label>
+              <p className="status-note">
+                Lower values include more matches; set to 0 to disable similarity filtering.
+              </p>
 
-          <div className="model-select-row model-present">
-            <select
-              id="rag-clip-model"
-              name="rag_clip_model"
-              value={settings.rag_clip_model || ""}
-              onChange={handleChange}
-              title="CLIP model used for image-aware RAG retrieval."
-            >
-              {ragClipPresets.map((preset) => (
-                <option key={preset.value} value={preset.value}>
-                  {preset.label}
-                </option>
-              ))}
-              {settings.rag_clip_model &&
-                !ragClipPresets.some((preset) => preset.value === settings.rag_clip_model) && (
-                  <option value={settings.rag_clip_model}>{settings.rag_clip_model}</option>
-                )}
-            </select>
-          </div>
-
-          <p className="status-note">
-            Keep this on an OpenCLIP variant; Vision model selection is separate.
-          </p>
-
-          <label
-            htmlFor="rag-chat-min-similarity"
-            title="Minimum similarity (0-1) for automatic RAG injection."
-          >
-            RAG min similarity
-          </label>
-
-          <input
-            id="rag-chat-min-similarity"
-            name="rag_chat_min_similarity"
-            type="number"
-            min="0"
-            max="1"
-            step="0.05"
-            value={settings.rag_chat_min_similarity}
-            onChange={handleChange}
-          />
-
-          <p className="status-note">
-            Lower values include more matches; set to 0 to disable similarity filtering.
-          </p>
-
-          <details className="advanced-block mt-sm">
+              <details className="advanced-block mt-sm">
             <summary>Experimental SAE steering (stub)</summary>
             <div className="advanced-grid">
               <label title="Planned retrieval/clustering path for threads when SAE hooks are available.">
@@ -6542,16 +7966,8 @@ const Settings = () => {
               intervention remains runtime-dependent.
             </p>
           </details>
-
-          {renderModelField(
-
-            "Vision Fallback Model",
-
-            "vision_model",
-
-            suggestedVisionModels,
-
-          )}
+            </div>
+          </div>
 
             </section>
           )}
@@ -7159,7 +8575,7 @@ const Settings = () => {
                 }))
               }
             >
-              {VISUAL_THEME_OPTIONS.map((option) => (
+              {visualThemeOptions.map((option) => (
                 <option key={option.value} value={option.value}>
                   {option.label}
                 </option>
@@ -7169,6 +8585,95 @@ const Settings = () => {
               Dark and light mode still toggle from the top bar; this picker changes the color family
               underneath them.
             </p>
+            <div className="inline-flex" style={{ gap: 10, marginTop: 10, flexWrap: "wrap" }}>
+              <button
+                type="button"
+                className="icon-btn"
+                onClick={openNewThemeEditor}
+                style={{ marginTop: 0 }}
+              >
+                Add new theme
+              </button>
+              {selectedCustomTheme && (
+                <button
+                  type="button"
+                  className="icon-btn"
+                  onClick={() => loadThemeDraft(selectedCustomTheme)}
+                  style={{ marginTop: 0 }}
+                >
+                  Edit selected theme
+                </button>
+              )}
+            </div>
+            <p className="status-note" style={{ marginTop: 8 }}>
+              Built-in themes stay in source control. Custom themes can be created here, edited later,
+              renamed, or deleted, and are stored in the data folder.
+            </p>
+            {showThemeEditor && (
+              <div className="theme-editor-card">
+                <label className="field-label" htmlFor="theme-draft-label">
+                  <span>Theme name</span>
+                </label>
+                <input
+                  id="theme-draft-label"
+                  type="text"
+                  value={themeDraftLabel}
+                  onChange={(event) => setThemeDraftLabel(event.target.value)}
+                  placeholder="Custom Theme"
+                />
+                <div className="theme-slot-grid">
+                  {THEME_SLOT_KEYS.map((slotKey) => (
+                    <label key={slotKey} className="theme-slot-control">
+                      <span>{THEME_SLOT_LABELS[slotKey]}</span>
+                      <input
+                        type="color"
+                        value={themeDraftSlots[slotKey] || "#000000"}
+                        onChange={(event) =>
+                          setThemeDraftSlots((prev) => ({
+                            ...prev,
+                            [slotKey]: event.target.value,
+                          }))
+                        }
+                      />
+                      <code>{themeDraftSlots[slotKey] || "#000000"}</code>
+                    </label>
+                  ))}
+                </div>
+                <div className="inline-flex" style={{ gap: 10, marginTop: 12, flexWrap: "wrap" }}>
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    onClick={saveThemeDraft}
+                    disabled={themeSaveBusy}
+                    style={{ marginTop: 0 }}
+                  >
+                    {themeSaveBusy ? "Saving..." : isEditingCustomTheme ? "Save changes" : "Save theme"}
+                  </button>
+                  {isEditingCustomTheme && (
+                    <button
+                      type="button"
+                      className="icon-btn"
+                      onClick={deleteThemeDraft}
+                      disabled={themeDeleteBusy}
+                      style={{ marginTop: 0 }}
+                    >
+                      {themeDeleteBusy ? "Deleting..." : "Delete theme"}
+                    </button>
+                  )}
+                  {!selectedCustomTheme && (
+                    <button
+                      type="button"
+                      className="icon-btn"
+                      onClick={closeThemeEditor}
+                      style={{ marginTop: 0 }}
+                    >
+                      Cancel
+                    </button>
+                  )}
+                </div>
+                {themeMessage && <p className="status-note" style={{ marginTop: 8 }}>{themeMessage}</p>}
+              </div>
+            )}
           </div>
 
           <div className="settings-section">
@@ -7294,186 +8799,6 @@ const Settings = () => {
               </Link>
             </div>
             {actionHistoryMessage && <p className="status-note">{actionHistoryMessage}</p>}
-          </div>
-
-          <div className="settings-section">
-            <div className="settings-header">
-              <h3>Capture &amp; workflows</h3>
-              <button
-                type="button"
-                className="icon-btn"
-                onClick={refreshWorkflowCatalog}
-                disabled={workflowCatalogLoading}
-                style={{ marginTop: 0 }}
-              >
-                {workflowCatalogLoading ? "Refreshing..." : "Refresh profiles"}
-              </button>
-            </div>
-            <label
-              className="field-label"
-              htmlFor="capture-retention"
-              title="How long transient computer, screen, and camera captures stay available before pruning."
-            >
-              How long transient captures are kept
-            </label>
-            <select
-              id="capture-retention"
-              value={String(captureRetentionDays)}
-              onChange={(event) => setCaptureRetentionDays(Number(event.target.value) || 7)}
-            >
-              {CAPTURE_RETENTION_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-            <label
-              className="field-label"
-              htmlFor="capture-sensitivity"
-              title="Default sensitivity label attached when a capture is created."
-            >
-              Default capture sensitivity
-            </label>
-            <select
-              id="capture-sensitivity"
-              value={captureDefaultSensitivity}
-              onChange={(event) => setCaptureDefaultSensitivity(event.target.value)}
-            >
-              {CAPTURE_SENSITIVITY_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-            <div className="inline-flex" style={{ gap: 12, marginTop: 10, flexWrap: "wrap" }}>
-              <label
-                className="checkbox-row"
-                style={{ display: "inline-flex", gap: 8, alignItems: "center" }}
-              >
-                <input
-                  type="checkbox"
-                  checked={captureAllowModelRawImageAccess}
-                  onChange={(event) =>
-                    setCaptureAllowModelRawImageAccess(event.target.checked)
-                  }
-                />
-                <span>Allow raw image access for supported models</span>
-              </label>
-              <label
-                className="checkbox-row"
-                style={{ display: "inline-flex", gap: 8, alignItems: "center" }}
-              >
-                <input
-                  type="checkbox"
-                  checked={captureAllowSummaryFallback}
-                  onChange={(event) => setCaptureAllowSummaryFallback(event.target.checked)}
-                />
-                <span>Allow summary fallback when raw images are restricted</span>
-              </label>
-            </div>
-            <p className="status-note" style={{ marginTop: 6 }}>
-              Computer observations, camera captures, and screen stills stay transient for this
-              window unless promoted. Promoted captures remain accessible as durable attachments for
-              later memory workflows.
-            </p>
-            <label
-              className="field-label"
-              htmlFor="default-workflow"
-              title="Default workflow profile for new messages and auto-continues."
-            >
-              Default workflow profile
-            </label>
-            <select
-              id="default-workflow"
-              value={defaultWorkflow}
-              onChange={(event) => setDefaultWorkflow(event.target.value)}
-            >
-              {(workflowCatalog.workflows.length
-                ? workflowCatalog.workflows
-                : DEFAULT_WORKFLOW_CATALOG.workflows
-              ).map((workflow) => (
-                <option key={workflow.id} value={workflow.id}>
-                  {workflow.label}
-                </option>
-              ))}
-            </select>
-            <p className="status-note" style={{ marginTop: 6 }}>
-              {(() => {
-                const workflows = workflowCatalog.workflows.length
-                  ? workflowCatalog.workflows
-                  : DEFAULT_WORKFLOW_CATALOG.workflows;
-                const selected =
-                  workflows.find((workflow) => workflow.id === defaultWorkflow) || workflows[0];
-                if (!selected) return "Workflow profiles control reasoning depth, recursion, and tool posture.";
-                const preferredContinue = selected.preferred_continue || "the active workflow";
-                return `${selected.description} Continue defaults prefer ${preferredContinue}.`;
-              })()}
-            </p>
-            <div style={{ marginTop: 12 }}>
-              <div className="field-label" style={{ marginBottom: 8 }}>
-                Enabled modules
-              </div>
-              <div style={{ display: "grid", gap: 8 }}>
-                {(workflowCatalog.modules.length
-                  ? workflowCatalog.modules
-                  : DEFAULT_WORKFLOW_CATALOG.modules
-                ).map((module) => (
-                  <label
-                    key={module.id}
-                    className="checkbox-row"
-                    style={{
-                      display: "grid",
-                      gap: 4,
-                      padding: "10px 12px",
-                      border: "1px solid var(--glass-border)",
-                      borderRadius: 12,
-                    }}
-                  >
-                    <span style={{ display: "inline-flex", gap: 8, alignItems: "center" }}>
-                      <input
-                        type="checkbox"
-                        checked={enabledWorkflowModules.includes(module.id)}
-                        onChange={(event) => {
-                          setEnabledWorkflowModules((prev) => {
-                            const current = Array.isArray(prev) ? prev : [];
-                            if (event.target.checked) {
-                              return Array.from(new Set([...current, module.id]));
-                            }
-                            return current.filter((item) => item !== module.id);
-                          });
-                        }}
-                      />
-                      <strong>{module.label}</strong>
-                      <span className="status-note">({module.status || "live"})</span>
-                    </span>
-                    <span className="status-note" style={{ margin: 0 }}>
-                      {module.description}
-                    </span>
-                  </label>
-                ))}
-              </div>
-            </div>
-            <p className="status-note" style={{ marginTop: 10 }}>
-              Custom add-ons live in{" "}
-              <code>{workflowCatalog.addons_root || DEFAULT_WORKFLOW_CATALOG.addons_root}</code>.
-              {Array.isArray(workflowCatalog.addons) && workflowCatalog.addons.length > 0
-                ? ` ${workflowCatalog.addons.length} add-on${
-                    workflowCatalog.addons.length === 1 ? "" : "s"
-                  } currently registered.`
-                : " Drop sanctioned workflow/module packs there to surface them here later."}
-            </p>
-            <div className="inline-flex" style={{ gap: 10, marginTop: 10, flexWrap: "wrap" }}>
-              <button
-                type="button"
-                className="icon-btn"
-                onClick={handleCaptureWorkflowSave}
-                disabled={captureWorkflowSaving}
-                style={{ marginTop: 0 }}
-              >
-                {captureWorkflowSaving ? "Saving..." : "Save capture defaults"}
-              </button>
-            </div>
-            {captureWorkflowMessage && <p className="status-note">{captureWorkflowMessage}</p>}
           </div>
 
           <div className="settings-section">
@@ -7656,6 +8981,304 @@ const Settings = () => {
             </section>
           )}
 
+          {showSettingsSection("workflows") && (
+            <section
+              id="settings-workflows"
+              className="settings-card settings-section"
+              aria-label="Capture and workflows"
+            >
+              <div className="settings-card-header">
+                <div>
+                  <h2>Capture &amp; Workflows</h2>
+                  <p className="settings-card-copy">
+                    Capture retention plus reusable workflow defaults for prompts, model posture,
+                    permissions, and follow-up hooks.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className="icon-btn"
+                  onClick={refreshWorkflowCatalog}
+                  disabled={workflowCatalogLoading}
+                  style={{ marginTop: 0 }}
+                >
+                  {workflowCatalogLoading ? "Refreshing..." : "Refresh profiles"}
+                </button>
+              </div>
+
+              <div className="settings-section">
+                <p className="status-note">
+                  A workflow is the reusable response profile for a run: prompt stack, default
+                  model posture, enabled modules, and the restrictions or permissions that shape
+                  which hooks can execute. The current UI saves defaults now and leaves richer
+                  conditional editing for the next workflow pass.
+                </p>
+                <label
+                  className="field-label"
+                  htmlFor="capture-retention"
+                  title="How long transient computer, screen, and camera captures stay available before pruning."
+                >
+                  How long transient captures are kept
+                </label>
+                <select
+                  id="capture-retention"
+                  value={String(captureRetentionDays)}
+                  onChange={(event) => setCaptureRetentionDays(Number(event.target.value) || 7)}
+                >
+                  {CAPTURE_RETENTION_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                <label
+                  className="field-label"
+                  htmlFor="capture-sensitivity"
+                  title="Default sensitivity label attached when a capture is created."
+                >
+                  Default capture sensitivity
+                </label>
+                <select
+                  id="capture-sensitivity"
+                  value={captureDefaultSensitivity}
+                  onChange={(event) => setCaptureDefaultSensitivity(event.target.value)}
+                >
+                  {CAPTURE_SENSITIVITY_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                <div className="inline-flex" style={{ gap: 12, marginTop: 10, flexWrap: "wrap" }}>
+                  <label
+                    className="checkbox-row"
+                    style={{ display: "inline-flex", gap: 8, alignItems: "center" }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={captureAllowModelRawImageAccess}
+                      onChange={(event) =>
+                        setCaptureAllowModelRawImageAccess(event.target.checked)
+                      }
+                    />
+                    <span>Allow raw image access for supported models</span>
+                  </label>
+                  <label
+                    className="checkbox-row"
+                    style={{ display: "inline-flex", gap: 8, alignItems: "center" }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={captureAllowSummaryFallback}
+                      onChange={(event) => setCaptureAllowSummaryFallback(event.target.checked)}
+                    />
+                    <span>Allow summary fallback when raw images are restricted</span>
+                  </label>
+                </div>
+                <p className="status-note" style={{ marginTop: 6 }}>
+                  Computer observations, camera captures, and screen stills stay transient for
+                  this window unless promoted. Promoted captures remain accessible as durable
+                  attachments for later memory workflows.
+                </p>
+                <label
+                  className="field-label"
+                  htmlFor="default-workflow"
+                  title="Default workflow profile for new messages and auto-continues."
+                >
+                  Default workflow profile
+                </label>
+                <select
+                  id="default-workflow"
+                  value={defaultWorkflow}
+                  onChange={(event) => setDefaultWorkflow(event.target.value)}
+                >
+                  {workflowProfiles.map((workflow) => (
+                    <option key={workflow.id} value={workflow.id}>
+                      {workflow.label}
+                    </option>
+                  ))}
+                </select>
+                <p className="status-note" style={{ marginTop: 6 }}>
+                  {(() => {
+                    const selected =
+                      workflowProfiles.find((workflow) => workflow.id === defaultWorkflow) ||
+                      workflowProfiles[0];
+                    if (!selected) {
+                      return "Workflow profiles control reasoning depth, recursion, and tool posture.";
+                    }
+                    const preferredContinueLabel =
+                      workflowProfileMap.get(selected.preferred_continue)?.label ||
+                      selected.preferred_continue ||
+                      "the active workflow";
+                    const preferredContinue =
+                      preferredContinueLabel || "the active workflow";
+                    return `${selected.description} Continue defaults prefer ${preferredContinue}.`;
+                  })()}
+                </p>
+                <div className="inline-flex" style={{ gap: 10, marginTop: 10, flexWrap: "wrap" }}>
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    onClick={() => setWorkflowInspectorOpen((current) => !current)}
+                    aria-expanded={workflowInspectorOpen}
+                    aria-controls="workflow-profile-inspector"
+                    style={{ marginTop: 0 }}
+                  >
+                    {workflowInspectorOpen
+                      ? "Hide workflow profiles"
+                      : "Inspect workflow profiles"}
+                  </button>
+                </div>
+                {workflowInspectorOpen && (
+                  <div id="workflow-profile-inspector" className="workflow-profile-grid">
+                    {workflowProfiles.map((workflow) => {
+                      const continueTargets = Array.isArray(workflow.allow_continue_to)
+                        ? workflow.allow_continue_to.filter(
+                            (value) => typeof value === "string" && value.trim(),
+                          )
+                        : [];
+                      const workflowEnabledModules = Array.isArray(workflow.enabled_modules)
+                        ? workflow.enabled_modules.filter(
+                            (value) => typeof value === "string" && value.trim(),
+                          )
+                        : [];
+                      return (
+                        <article
+                          key={workflow.id}
+                          className={`workflow-profile-card${
+                            defaultWorkflow === workflow.id ? " is-selected" : ""
+                          }`}
+                        >
+                          <div className="workflow-profile-header">
+                            <div>
+                              <h3>{workflow.label}</h3>
+                              <p className="status-note">{workflow.description}</p>
+                            </div>
+                            {defaultWorkflow === workflow.id && (
+                              <span className="workflow-profile-badge">Current default</span>
+                            )}
+                          </div>
+                          <div className="workflow-profile-meta">
+                            <span>
+                              Thinking: <strong>{workflow.thinking_default || "auto"}</strong>
+                            </span>
+                            <span>
+                              Continue default:{" "}
+                              <strong>
+                                {workflowProfileMap.get(workflow.preferred_continue)?.label ||
+                                  workflow.preferred_continue ||
+                                  "active workflow"}
+                              </strong>
+                            </span>
+                          </div>
+                          <p className="status-note">
+                            {continueTargets.length
+                              ? `Can continue into ${continueTargets
+                                  .map(
+                                    (target) =>
+                                      workflowProfileMap.get(target)?.label || target,
+                                  )
+                                  .join(", ")}.`
+                              : "Continue targets stay on the active workflow."}
+                          </p>
+                          <div className="workflow-profile-tags">
+                            {workflowEnabledModules.length ? (
+                              workflowEnabledModules.map((moduleId) => {
+                                const moduleMeta = workflowModuleMap.get(moduleId);
+                                return (
+                                  <span
+                                    key={`${workflow.id}-${moduleId}`}
+                                    className="workflow-profile-tag"
+                                    title={moduleMeta?.description || moduleId}
+                                  >
+                                    {moduleMeta?.label || moduleId}
+                                  </span>
+                                );
+                              })
+                            ) : (
+                              <span className="workflow-profile-tag workflow-profile-tag--muted">
+                                No modules listed
+                              </span>
+                            )}
+                          </div>
+                        </article>
+                      );
+                    })}
+                  </div>
+                )}
+                <p className="status-note" style={{ marginTop: 10 }}>
+                  Inspect shows the current built-in profile definitions. Editing the conditional
+                  routing, prompt layers, and permission gates themselves is still the next
+                  workflow pass.
+                </p>
+                <div style={{ marginTop: 12 }}>
+                  <div className="field-label" style={{ marginBottom: 8 }}>
+                    Enabled modules
+                  </div>
+                  <div style={{ display: "grid", gap: 8 }}>
+                    {workflowModules.map((module) => (
+                      <label
+                        key={module.id}
+                        className="checkbox-row"
+                        style={{
+                          display: "grid",
+                          gap: 4,
+                          padding: "10px 12px",
+                          border: "1px solid var(--glass-border)",
+                          borderRadius: 12,
+                        }}
+                      >
+                        <span style={{ display: "inline-flex", gap: 8, alignItems: "center" }}>
+                          <input
+                            type="checkbox"
+                            checked={enabledWorkflowModules.includes(module.id)}
+                            onChange={(event) => {
+                              setEnabledWorkflowModules((prev) => {
+                                const current = Array.isArray(prev) ? prev : [];
+                                if (event.target.checked) {
+                                  return Array.from(new Set([...current, module.id]));
+                                }
+                                return current.filter((item) => item !== module.id);
+                              });
+                            }}
+                          />
+                          <strong>{module.label}</strong>
+                          <span className="status-note">({module.status || "live"})</span>
+                        </span>
+                        <span className="status-note" style={{ margin: 0 }}>
+                          {module.description}
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+                <p className="status-note" style={{ marginTop: 10 }}>
+                  Custom add-ons live in{" "}
+                  <code>{workflowCatalog.addons_root || DEFAULT_WORKFLOW_CATALOG.addons_root}</code>.
+                  {Array.isArray(workflowCatalog.addons) && workflowCatalog.addons.length > 0
+                    ? ` ${workflowCatalog.addons.length} add-on${
+                        workflowCatalog.addons.length === 1 ? "" : "s"
+                      } currently registered.`
+                    : " Drop sanctioned workflow/module packs there to surface them here later."}
+                </p>
+                <div className="inline-flex" style={{ gap: 10, marginTop: 10, flexWrap: "wrap" }}>
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    onClick={handleCaptureWorkflowSave}
+                    disabled={captureWorkflowSaving}
+                    style={{ marginTop: 0 }}
+                  >
+                    {captureWorkflowSaving ? "Saving..." : "Save capture defaults"}
+                  </button>
+                </div>
+                {captureWorkflowMessage && (
+                  <p className="status-note">{captureWorkflowMessage}</p>
+                )}
+              </div>
+            </section>
+          )}
+
           {showSettingsSection("sharing") && (
             <section
               id="settings-sharing"
@@ -7683,7 +9306,7 @@ const Settings = () => {
                   <button
                     type="button"
                     className="icon-btn"
-                    onClick={() => document.getElementById("settings-output")?.scrollIntoView({ behavior: "smooth", block: "start" })}
+                    onClick={() => scrollToSettingsSection("output")}
                     style={{ marginTop: 0 }}
                   >
                     Open sync preview
@@ -8023,7 +9646,8 @@ const Settings = () => {
 
           {message && <p className="settings-message">{message}</p>}
 
-        </>
+          </div>
+        </div>
 
       )}
 

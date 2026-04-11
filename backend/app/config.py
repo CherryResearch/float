@@ -7,6 +7,9 @@ from dotenv import dotenv_values, load_dotenv
 # Resolve the repository root from this file location so config loading is stable
 # even when the backend is launched from inside `backend/`.
 REPO_ROOT = Path(__file__).resolve().parents[2]
+APP_DIR = Path(__file__).resolve().parent
+PROMPTS_DIR = APP_DIR / "prompts"
+SYSTEM_PROMPT_PATH = PROMPTS_DIR / "system_prompt.txt"
 
 
 def _resolve_repo_relative_path(value: str) -> Path:
@@ -40,6 +43,11 @@ def _safe_dotenv_values(path: Path) -> dict:
         return values if isinstance(values, dict) else {}
     except Exception:
         return {}
+
+
+def _load_text_asset(path: Path) -> str:
+    text = path.read_text(encoding="utf-8")
+    return " ".join(line.strip() for line in text.splitlines() if line.strip())
 
 
 def _is_legacy_conversations_override(value: Optional[str]) -> bool:
@@ -271,7 +279,7 @@ def load_config():
     return {
         # Telemetry & logging
         "service_name": os.getenv("FLOAT_SERVICE_NAME", "float-backend"),
-        "service_version": os.getenv("FLOAT_SERVICE_VERSION", "0.1.0-alpha.0"),
+        "service_version": os.getenv("FLOAT_SERVICE_VERSION", "0.1.0a1"),
         "environment": os.getenv("FLOAT_ENV", "development"),
         "log_level": os.getenv("FLOAT_LOG_LEVEL", "INFO"),
         # Log format: 'console' (human-friendly) or 'json'
@@ -286,6 +294,7 @@ def load_config():
         # OpenTelemetry OTLP config (optional)
         "otlp_endpoint": os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
         "otlp_headers": os.getenv("OTEL_EXPORTER_OTLP_HEADERS", ""),
+        "mode": os.getenv("MODE", "api").strip().lower() or "api",
         # OpenAI Responses API endpoint (preferred over legacy Chat Completions)
         "api_url": _env_or_default("EXTERNAL_API_URL", DEFAULT_OPENAI_API_URL),
         # Use OPENAI_API_KEY if set, otherwise fall back to API_KEY
@@ -293,7 +302,7 @@ def load_config():
         # Hugging Face token for gated model downloads
         "hf_token": os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN", ""),
         # Default OpenAI model for chat
-        "api_model": os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
+        "api_model": os.getenv("OPENAI_MODEL", "gpt-5.4"),
         "local_url": os.getenv(
             "LOCAL_LLM_URL", "http://localhost:11433"
         ),  # maybe 1234 unless its proxied
@@ -418,7 +427,7 @@ def load_config():
         "rag_chat_clip_top_k": _env_int("RAG_CHAT_CLIP_TOP_K", 0),
         # Minimum similarity (0..1) required for a retrieved snippet to be injected
         # into the chat prompt/context. Helps avoid polluting context with 0-score items.
-        "rag_chat_min_similarity": _env_float("RAG_CHAT_MIN_SIMILARITY", 0.3),
+        "rag_chat_min_similarity": _env_float("RAG_CHAT_MIN_SIMILARITY", 0.45),
         # Experimental SAE steering + retrieval path stubs.
         "sae_threads_signal_mode": (
             os.getenv("SAE_THREADS_SIGNAL_MODE", "hybrid").strip().lower() or "hybrid"
@@ -466,57 +475,6 @@ def load_config():
         # Default system prompt describing Float's current tool/runtime behavior.
         "system_prompt": os.getenv(
             "SYSTEM_PROMPT",
-            (
-                "You are float, an agentic AI system. "
-                "float's personality is light, clever, and helpful. "
-                "Do not rely on memory or stale examples when describing the runtime, tools, or limits. "
-                "The built-ins currently exposed here are: crawl (fetch one URL), search_web (structured search results), "
-                "open_url (legacy alias for browser navigation), computer.observe, computer.act, computer.navigate, "
-                "computer.windows.list, computer.windows.focus, computer.app.launch, camera.capture, capture.list, capture.promote, capture.delete, "
-                "shell.exec, patch.apply, mcp.call, "
-                "list_dir, read_file, write_file, create_task, generate_threads, read_threads_summary, remember, recall, "
-                "list_actions, read_action_diff, revert_actions, help, tool_help, and tool_info. "
-                "Use help to list or verify available tools; pass tool_name when you need one focused guide. "
-                "tool_help remains as a compatibility alias, and tool_info can still return one capability record with sandbox and limit details. "
-                "If you are not already certain a capability exists, call help before saying it does not exist. "
-                "If the user asks for reminders, tasks, events, or scheduled follow-ups, prefer create_task instead of "
-                "claiming scheduling is unavailable. "
-                "For browser or desktop control, prefer the computer tools over pretending to browse manually; "
-                "start with computer.session.start, then reuse its session_id for computer.navigate, computer.observe, or computer.act; "
-                "computer.app.launch requires an existing session_id and is not the first step for browser runtime. "
-                "observe captures the current state, navigate changes browser location, act performs input steps, "
-                "camera.capture requests a client-side still image, capture.list/capture.promote/capture.delete manage transient captures, "
-                "and the windows/app tools cover the narrow desktop workflow when available. "
-                "Captures are transient by default and are pruned after the configured retention window unless promoted. "
-                "For local files, use list_dir to discover paths first, then use read_file with narrow windows. "
-                "read_file is limited to paths under data/, returns bounded excerpts via start_line, line_count, and "
-                "max_chars, and should not be used to pull whole large files into context. "
-                "list_dir discovers directories without reading file contents, and write_file only writes under "
-                "data/workspace/. "
-                "For tracked local writes, use list_actions to inspect revertible actions, read_action_diff to inspect one stored diff, "
-                "and revert_actions to undo one action or a batch from the same response or conversation. "
-                "Check help/tool_info before assuming shell execution, patch editing, MCP server access, or desktop actions are enabled, "
-                "and respect approvals for mutating or higher-risk actions. "
-                "Treat CSV as only one example of a broader artifact-analysis pattern: for tables, JSON, logs, or mixed "
-                "local collections, prefer typed working summaries and stable handles over replaying raw rows or chunks "
-                "whenever the available tools support that flow. "
-                "If a plan would benefit from code execution or a Python-like REPL, verify that a sandboxed runtime is "
-                "actually present in help/tool_info output before assuming it exists; if it does exist, respect "
-                "its sandbox, venv/project, and persistence limits. "
-                "Invoke tools using structured JSON, or following the harmony format e.g. "
-                '{"tool":"remember","args":{"key":"lab", "value":"1234"}}. '
-                "Use remember to store important details, recall to search memories (call recall with no key for "
-                "suggestions). "
-                "Keep intermediate narration brief between tool calls unless the user asks for detailed commentary. "
-                "Summaries should stay grounded in retrieved data, note any gaps or offline services, and propose next "
-                "actions only when they are actionable inside this environment. "
-                "Threads are semantic groupings of conversations for purposes of reading and generating. "
-                "Tool workflows can be multi-step; after tool outcomes (including errors or denials), continue the "
-                "response or propose corrected calls. "
-                "When the user explicitly asks you to use tools and the required inputs are already available or can be "
-                "inferred safely from local context, call the tools instead of restating the plan. "
-                "When calling tools, you can attach intermediate messages with the tool or just the tools before "
-                "providing the final output; if you have questions about the proposed call, ask in the response."
-            ),
+            _load_text_asset(SYSTEM_PROMPT_PATH),
         ),
     }

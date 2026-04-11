@@ -1,3 +1,5 @@
+import importlib
+
 from .playwright_runtime import PlaywrightComputerRuntime
 from .session_store import ComputerSessionStore
 from .types import (
@@ -8,7 +10,14 @@ from .types import (
     ComputerObservation,
     ComputerSessionState,
 )
-from .windows_runtime import WindowsComputerRuntime
+
+
+def __getattr__(name):
+    if name == "WindowsComputerRuntime":
+        module = importlib.import_module(".windows_runtime", __name__)
+        return module.WindowsComputerRuntime
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "ComputerAction",

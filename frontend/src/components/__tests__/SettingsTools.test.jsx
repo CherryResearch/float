@@ -5,6 +5,11 @@ import "@testing-library/jest-dom";
 import { vi } from "vitest";
 import axios from "axios";
 
+const modelJobsPanelMock = vi.hoisted(() => ({
+  mounts: 0,
+  unmounts: 0,
+}));
+
 vi.mock("../../main", () => {
   const React = require("react");
   return {
@@ -14,7 +19,7 @@ vi.mock("../../main", () => {
         apiProviderStatus: "online",
         approvalLevel: "all",
         transformerModel: "gpt-oss-20b",
-        staticModel: "gpt-4o-mini",
+        staticModel: "gpt-5.4-mini",
         harmonyFormat: false,
         serverUrl: "",
         sttModel: "whisper-1",
@@ -24,8 +29,8 @@ vi.mock("../../main", () => {
         maxContextLength: 2048,
         kvCache: true,
         ramSwap: false,
-        apiModels: ["gpt-4o-mini"],
-        apiModel: "gpt-4o-mini",
+        apiModels: ["gpt-5.4", "gpt-5.4-mini"],
+        apiModel: "gpt-5.4",
       },
       setState: vi.fn(),
     }),
@@ -33,7 +38,16 @@ vi.mock("../../main", () => {
 });
 
 vi.mock("../ModelJobsPanel", () => ({
-  default: () => <div data-testid="model-jobs-panel" />,
+  default: () => {
+    const React = require("react");
+    React.useEffect(() => {
+      modelJobsPanelMock.mounts += 1;
+      return () => {
+        modelJobsPanelMock.unmounts += 1;
+      };
+    }, []);
+    return <div data-testid="model-jobs-panel" />;
+  },
 }));
 
 import Settings from "../Settings";
@@ -44,7 +58,7 @@ const baseState = {
   apiProviderStatus: "online",
   approvalLevel: "all",
   transformerModel: "gpt-oss-20b",
-  staticModel: "gpt-4o-mini",
+  staticModel: "gpt-5.4-mini",
   harmonyFormat: false,
   serverUrl: "",
   sttModel: "whisper-1",
@@ -54,8 +68,8 @@ const baseState = {
   maxContextLength: 2048,
   kvCache: true,
   ramSwap: false,
-  apiModels: ["gpt-4o-mini"],
-  apiModel: "gpt-4o-mini",
+  apiModels: ["gpt-5.4", "gpt-5.4-mini"],
+  apiModel: "gpt-5.4",
   visualTheme: "spring",
   workflowProfile: "default",
   captureRetentionDays: 7,
@@ -88,11 +102,13 @@ const renderWithState = (options = {}) => {
 describe("Settings tools browser", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    modelJobsPanelMock.mounts = 0;
+    modelJobsPanelMock.unmounts = 0;
     settingsResponse = {
       mode: "api",
-      model: "gpt-4o-mini",
+      model: "gpt-5.4",
       transformer_model: "gpt-oss-20b",
-      static_model: "gpt-4o-mini",
+      static_model: "gpt-5.4-mini",
       visual_theme: "spring",
       stt_model: "whisper-1",
       tts_model: "tts-1",
@@ -103,6 +119,7 @@ describe("Settings tools browser", () => {
       devices: [],
     };
     vi.spyOn(axios, "post").mockResolvedValue({ data: {} });
+    vi.spyOn(axios, "delete").mockResolvedValue({ data: {} });
     vi.spyOn(axios, "get").mockImplementation((url) => {
       if (url === "/api/settings") {
         return Promise.resolve({ data: settingsResponse });
@@ -123,6 +140,28 @@ describe("Settings tools browser", () => {
           },
         });
       }
+      if (url === "/api/themes") {
+        return Promise.resolve({
+          data: {
+            themes: [
+              {
+                id: "forest-glass",
+                label: "Forest Glass",
+                slots: {
+                  c1Light: "#d6f5dd",
+                  c1Med: "#3c8f5a",
+                  c1Dark: "#173927",
+                  c2Light: "#f4efc7",
+                  c2Med: "#c6a93e",
+                  c2Dark: "#5e4b12",
+                  veryLight: "#fcfff8",
+                  veryDark: "#08110a",
+                },
+              },
+            ],
+          },
+        });
+      }
       if (url === "/api/workflows/catalog") {
         return Promise.resolve({
           data: {
@@ -131,19 +170,33 @@ describe("Settings tools browser", () => {
                 id: "default",
                 label: "Default",
                 description: "Balanced reasoning with normal tool access and moderate latency.",
+                thinking_default: "auto",
                 preferred_continue: "mini_execution",
+                allow_continue_to: ["default", "mini_execution"],
+                enabled_modules: ["computer_use", "camera_capture", "memory_promotion"],
               },
               {
                 id: "architect_planner",
                 label: "Architect / Planner",
                 description: "Planning-first workflow.",
+                thinking_default: "high",
                 preferred_continue: "mini_execution",
+                allow_continue_to: ["architect_planner", "default", "mini_execution"],
+                enabled_modules: [
+                  "computer_use",
+                  "camera_capture",
+                  "memory_promotion",
+                  "host_shell",
+                ],
               },
               {
                 id: "mini_execution",
                 label: "Mini Execution",
                 description: "Short execution bursts.",
+                thinking_default: "low",
                 preferred_continue: "mini_execution",
+                allow_continue_to: ["mini_execution"],
+                enabled_modules: ["computer_use", "camera_capture"],
               },
             ],
             modules: [
@@ -158,6 +211,18 @@ describe("Settings tools browser", () => {
                 label: "Camera Capture",
                 description: "Still-image capture from a connected camera via the client.",
                 status: "experimental",
+              },
+              {
+                id: "memory_promotion",
+                label: "Memory Promotion",
+                description: "Promote transient captures into durable attachments.",
+                status: "live",
+              },
+              {
+                id: "host_shell",
+                label: "Host Shell",
+                description: "Approval-gated shell access.",
+                status: "live",
               },
             ],
             addons: [],
@@ -286,6 +351,14 @@ describe("Settings tools browser", () => {
             documents: 0,
             size_bytes: 0,
             files: 0,
+            embedding_runtime: {
+              model: "local:all-MiniLM-L6-v2",
+              mode: "sentence_transformer",
+              state: "idle",
+              loaded: false,
+              init_attempted: false,
+              error: null,
+            },
           },
         });
       }
@@ -310,6 +383,34 @@ describe("Settings tools browser", () => {
         return Promise.resolve({
           data: {
             models: ["gpt-oss-20b", "qwen2.5-coder-7b-instruct"],
+            runtime: {
+              provider: "lmstudio",
+              loaded_model: "gpt-oss-20b",
+              effective_model_id: "gpt-oss-20b",
+              checked_at: Math.floor(Date.now() / 1000) - 6,
+            },
+          },
+        });
+      }
+      if (url === "/api/llm/local-status") {
+        return Promise.resolve({
+          data: {
+            runtime: {
+              active_backend: "transformers",
+              effective_model_id: "gemma-4-E2B-it",
+              load_state: "ready",
+              load_finished_at: Math.floor(Date.now() / 1000) - 5,
+              local_loader: "image_text_to_text",
+              supports_images: true,
+              preflight: {
+                ready: false,
+                python_executable: "D:/notebooks/float_dev/backend/.venv/Scripts/python.exe",
+                missing_packages: ["torch", "transformers"],
+                missing_runtime_components: [],
+                hint:
+                  "Direct local loading uses the backend Python at 'D:/notebooks/float_dev/backend/.venv/Scripts/python.exe', but this environment is missing torch, transformers.",
+              },
+            },
           },
         });
       }
@@ -353,6 +454,7 @@ describe("Settings tools browser", () => {
     renderWithState();
 
     expect(await screen.findByText("Workspace & Tools")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^workflows\./i })).toBeInTheDocument();
 
     fireEvent.change(screen.getByRole("searchbox", { name: /search settings/i }), {
       target: { value: "live transcript" },
@@ -360,7 +462,7 @@ describe("Settings tools browser", () => {
 
     await waitFor(() => {
       expect(
-        screen.getByText('Showing 1 of 7 sections for "live transcript".'),
+        screen.getByText('Showing 1 of 8 sections for "live transcript".'),
       ).toBeInTheDocument();
     });
     expect(screen.getByText("Models & Retrieval")).toBeInTheDocument();
@@ -371,6 +473,130 @@ describe("Settings tools browser", () => {
     await waitFor(() => {
       expect(screen.getByText("Workspace & Tools")).toBeInTheDocument();
     });
+  });
+
+  it("uses the in-panel section rail to scroll within settings", async () => {
+    renderWithState();
+
+    expect(await screen.findByRole("heading", { name: "settings" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /output & prompting/i })).toBeInTheDocument();
+
+    const container = document.querySelector(".settings-container");
+    const toolbar = document.querySelector(".settings-topbar");
+    container.scrollTo = vi.fn();
+    Object.defineProperty(toolbar, "offsetHeight", {
+      value: 92,
+      configurable: true,
+    });
+
+    const outputSection = document.getElementById("settings-output");
+    Object.defineProperty(outputSection, "offsetTop", {
+      value: 720,
+      configurable: true,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /^output/i }));
+
+    expect(container.scrollTo).toHaveBeenCalledWith({
+      top: 610,
+      behavior: "smooth",
+    });
+    expect(screen.getByRole("button", { name: /^output/i })).toHaveAttribute(
+      "aria-current",
+      "true",
+    );
+  });
+
+  it("does not remount the model jobs panel on parent rerender", async () => {
+    const setState = vi.fn();
+    const state = { ...baseState };
+    const view = render(
+      <MemoryRouter>
+        <GlobalContext.Provider value={{ state, setState }}>
+          <Settings />
+        </GlobalContext.Provider>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByTestId("model-jobs-panel")).toBeInTheDocument();
+    expect(modelJobsPanelMock.mounts).toBe(1);
+    expect(modelJobsPanelMock.unmounts).toBe(0);
+
+    view.rerender(
+      <MemoryRouter>
+        <GlobalContext.Provider value={{ state, setState }}>
+          <Settings />
+        </GlobalContext.Provider>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByTestId("model-jobs-panel")).toBeInTheDocument();
+    expect(modelJobsPanelMock.mounts).toBe(1);
+    expect(modelJobsPanelMock.unmounts).toBe(0);
+  });
+
+  it("defers the model library scan until the models section is active", async () => {
+    renderWithState();
+
+    expect(await screen.findByRole("heading", { name: "settings" })).toBeInTheDocument();
+    expect(
+      axios.get.mock.calls.filter(([url]) => url === "/api/transformers/models"),
+    ).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole("button", { name: /^models\./i }));
+
+    await waitFor(() => {
+      expect(
+        axios.get.mock.calls.filter(([url]) => url === "/api/transformers/models"),
+      ).toHaveLength(1);
+    });
+  });
+
+  it("uses an API lane for language models and shows discovered endpoint models", async () => {
+    renderWithState();
+
+    const select = await screen.findByLabelText("Language Model");
+    const block = select.closest(".settings-model-block");
+
+    expect(within(block).getByRole("button", { name: "API" })).toBeInTheDocument();
+    expect(within(block).queryByRole("button", { name: /server \/ lan/i })).not.toBeInTheDocument();
+    expect(Array.from(select.options).map((option) => option.textContent)).toEqual(
+      expect.arrayContaining(["gpt-5.4 (API)", "gpt-5.4-mini (API)"]),
+    );
+
+    fireEvent.click(within(block).getByRole("button", { name: "Local" }));
+
+    await waitFor(() => {
+      expect(select.value).toBe("gpt-oss-20b");
+    });
+  });
+
+  it("shows a workflow inspector with profile details", async () => {
+    renderWithState();
+
+    expect(
+      await screen.findByRole("heading", { name: /capture & workflows/i }),
+    ).toBeInTheDocument();
+
+    const inspectButton = screen.getByRole("button", {
+      name: /inspect workflow profiles/i,
+    });
+    expect(inspectButton).toHaveAttribute("aria-expanded", "false");
+    expect(
+      screen.queryByText("Can continue into Architect / Planner, Default, Mini Execution."),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(inspectButton);
+
+    expect(inspectButton).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("Current default")).toBeInTheDocument();
+    expect(
+      screen.getByText("Can continue into Architect / Planner, Default, Mini Execution."),
+    ).toBeInTheDocument();
+    expect(screen.getByTitle("Approval-gated shell access.")).toBeInTheDocument();
+    expect(
+      screen.getByText(/Inspect shows the current built-in profile definitions\./i),
+    ).toBeInTheDocument();
   });
 
   it("shows tool-source status and a no-results state for unmatched filters", async () => {
@@ -515,15 +741,74 @@ describe("Settings tools browser", () => {
     const select = await screen.findByLabelText("Visual theme");
     expect(select).toHaveValue("spring");
     expect(screen.getByRole("option", { name: "Spring" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Ash" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "Cappucino" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "Sunset Citrus" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "Midnight Plum" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Forest Glass" })).toBeInTheDocument();
 
     fireEvent.change(select, { target: { value: "sunset-citrus" } });
 
     await waitFor(() => {
       expect(select).toHaveValue("sunset-citrus");
     });
+  });
+
+  it("creates and deletes a custom theme from settings", async () => {
+    const ThemeHarness = () => {
+      const [state, setState] = React.useState({
+        ...baseState,
+        visualTheme: "spring",
+        customThemes: [],
+      });
+      return (
+        <MemoryRouter>
+          <GlobalContext.Provider value={{ state, setState }}>
+            <Settings />
+          </GlobalContext.Provider>
+        </MemoryRouter>
+      );
+    };
+
+    axios.post.mockImplementation((url, payload) => {
+      if (url === "/api/themes") {
+        return Promise.resolve({
+          data: {
+            status: "saved",
+            theme: {
+              id: payload.id || "custom-sunrise",
+              label: payload.label,
+              slots: payload.slots,
+            },
+          },
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    vi.spyOn(axios, "delete").mockResolvedValue({ data: { status: "deleted" } });
+
+    render(<ThemeHarness />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /add new theme/i }));
+    fireEvent.change(screen.getByLabelText("Theme name"), {
+      target: { value: "Custom Sunrise" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /save theme/i }));
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith("/api/themes", expect.objectContaining({
+        id: null,
+        label: "Custom Sunrise",
+      }));
+    });
+    expect(await screen.findByText("Theme saved.")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /delete theme/i }));
+
+    await waitFor(() => {
+      expect(axios.delete).toHaveBeenCalledWith("/api/themes/custom-sunrise");
+    });
+    expect(await screen.findByText("Theme deleted.")).toBeInTheDocument();
   });
 
   it("explains when inline tool links expand chat cards", async () => {
@@ -600,7 +885,7 @@ describe("Settings tools browser", () => {
     ).toBeInTheDocument();
     expect(screen.queryByText("Inference Device")).not.toBeInTheDocument();
     expect(screen.getByText("Loaded: gpt-oss-20b")).toBeInTheDocument();
-    expect(screen.getByText("2 provider models reported.")).toBeInTheDocument();
+    expect(screen.getByText(/2 provider models reported\./i)).toBeInTheDocument();
 
     const preferredInput = container.querySelector(
       'input[name="local_provider_preferred_model"]',
@@ -608,6 +893,36 @@ describe("Settings tools browser", () => {
     expect(preferredInput).not.toBeNull();
     expect(preferredInput).toHaveAttribute("list", "provider-model-options");
     expect(container.querySelectorAll("#provider-model-options option")).toHaveLength(2);
+  });
+
+  it("polls provider runtime quietly in settings and keeps freshness in a tooltip", async () => {
+    const intervalDelays = [];
+    settingsResponse = {
+      ...settingsResponse,
+      mode: "local",
+      transformer_model: "lmstudio",
+      local_provider: "lmstudio",
+      devices: [],
+    };
+    vi.spyOn(window, "setInterval").mockImplementation((callback, delay) => {
+      intervalDelays.push(delay);
+      return 1;
+    });
+    vi.spyOn(window, "clearInterval").mockImplementation(() => {});
+
+    renderWithState({ transformerModel: "lmstudio" });
+
+    expect(await screen.findByText("Provider bridge runtime")).toBeInTheDocument();
+    expect(screen.getByText("Loaded: gpt-oss-20b")).toBeInTheDocument();
+    expect(screen.getByText(/2 provider models reported\./i)).toBeInTheDocument();
+    expect(screen.queryByText(/Updated /i)).not.toBeInTheDocument();
+    expect(intervalDelays).toContain(60000);
+
+    const freshnessIndicator = screen.getByLabelText("Provider inventory freshness");
+    expect(freshnessIndicator).toHaveAttribute(
+      "title",
+      expect.stringContaining("Automatic provider refresh runs about once per minute."),
+    );
   });
 
   it("offers neat provider bridge actions from settings", async () => {
@@ -639,7 +954,157 @@ describe("Settings tools browser", () => {
         context_length: 8192,
       });
     });
-    expect(await screen.findByText(/Provider load requested for gpt-oss-20b\./i)).toBeInTheDocument();
+    expect(
+      (await screen.findAllByText(/Provider load requested for gpt-oss-20b\./i)).length,
+    ).toBeGreaterThan(0);
+  });
+
+  it("surfaces Gemma 4 E2B as the direct local suggestion without suggesting larger provider-first Gemma 4 variants", async () => {
+    renderWithState();
+
+    const select = await screen.findByLabelText("Language Model");
+    const block = select.closest(".settings-model-block");
+    fireEvent.click(within(block).getByRole("button", { name: "Local" }));
+
+    expect(await screen.findByRole("option", { name: /gemma-4-E2B-it.*direct local/i })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: /gemma-4-E4B-it/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: /gemma-4-31B-it/i })).not.toBeInTheDocument();
+  });
+
+  it("shows capability badges and the EmbeddingGemma preset in the models section", async () => {
+    renderWithState();
+
+    expect(await screen.findByRole("option", { name: /EmbeddingGemma 300M/i })).toBeInTheDocument();
+    expect(screen.getAllByLabelText("Text generation").length).toBeGreaterThan(0);
+    expect(screen.getAllByLabelText("Speech synthesis").length).toBeGreaterThan(0);
+    expect(screen.getAllByLabelText("Image embeddings").length).toBeGreaterThan(0);
+  });
+
+  it("keeps Gemma 4 E2B in the local lane and shows direct runtime details", async () => {
+    settingsResponse = {
+      ...settingsResponse,
+      mode: "local",
+      transformer_model: "gemma-4-E2B-it",
+      devices: [{ id: "cuda:0", type: "cuda", name: "RTX 4070", total_memory_gb: 12 }],
+      cuda_diagnostics: {
+        status: "online",
+        cuda_available: true,
+      },
+    };
+
+    const { container } = renderWithState({
+      localModel: "gemma-4-E2B-it",
+      transformerModel: "gemma-4-E2B-it",
+    });
+
+    expect(await screen.findByDisplayValue("gemma-4-E2B-it")).toBeInTheDocument();
+    expect(
+      screen.getByText(/Direct local Transformers runtime for the selected language model\./i),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Backend: transformers/i)).toBeInTheDocument();
+    expect(screen.getByText(/loader: image_text_to_text/i)).toBeInTheDocument();
+    expect(screen.getByText(/Loaded .*ago\./i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/Backend Python: D:\/notebooks\/float_dev\/backend\/\.venv\/Scripts\/python\.exe/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Missing direct-local packages: torch, transformers\./i),
+    ).toBeInTheDocument();
+
+    const laneRow = container
+      .querySelector("#settings-model-transformer_model")
+      ?.closest(".model-select-row");
+    expect(laneRow).toHaveClass("model-lane-local");
+  });
+
+  it("blocks direct local runtime load when preflight is not ready", async () => {
+    settingsResponse = {
+      ...settingsResponse,
+      mode: "local",
+      transformer_model: "gemma-4-E2B-it",
+    };
+
+    renderWithState({
+      localModel: "gemma-4-E2B-it",
+      transformerModel: "gemma-4-E2B-it",
+    });
+
+    expect(await screen.findByDisplayValue("gemma-4-E2B-it")).toBeInTheDocument();
+
+    const loadButton = screen
+      .getAllByRole("button", { name: /^Load$/i })
+      .find((button) =>
+        button.getAttribute("title")?.match(/missing torch, transformers/i),
+      );
+    expect(loadButton).toBeTruthy();
+    expect(loadButton).toBeDisabled();
+    expect(loadButton).toHaveAttribute(
+      "title",
+      expect.stringMatching(/missing torch, transformers/i),
+    );
+
+    fireEvent.click(loadButton);
+    expect(axios.post).not.toHaveBeenCalledWith(
+      "/api/llm/load-local",
+      expect.anything(),
+    );
+  });
+
+  it("shows an embeddings runtime loading state while the local encoder is being loaded", async () => {
+    let resolveLoad;
+    axios.post.mockImplementation((url) => {
+      if (url === "/api/rag/embeddings/load") {
+        return new Promise((resolve) => {
+          resolveLoad = resolve;
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    renderWithState();
+
+    expect(await screen.findByText("Embeddings runtime")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^Load$/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /Loading\.\.\./i })).toBeDisabled();
+    });
+    expect(screen.getByText(/load…/i)).toBeInTheDocument();
+
+    resolveLoad({
+      data: {
+        embedding_runtime: {
+          model: "local:all-MiniLM-L6-v2",
+          mode: "sentence_transformer",
+          state: "loaded",
+          loaded: true,
+          init_attempted: true,
+          error: null,
+        },
+      },
+    });
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith("/api/rag/embeddings/load");
+    });
+    expect(await screen.findByText(/Embedding runtime loaded\./i)).toBeInTheDocument();
+  });
+
+  it("warns when speech model ids are placed in TTS and live voice fields", async () => {
+    settingsResponse = {
+      ...settingsResponse,
+      voice_model: "voxtral-small-24b-2507",
+      realtime_voice: "voxtral-small-24b-2507",
+    };
+
+    renderWithState();
+
+    expect(
+      await screen.findByText(/speech model id, not a TTS voice preset/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/not a supported OpenAI Realtime voice/i),
+    ).toBeInTheDocument();
   });
 
   it("previews instance sync sections and starts a pull", async () => {

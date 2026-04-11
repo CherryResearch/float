@@ -1793,8 +1793,56 @@
   background: color-mix(in oklab, var(--color-surface) 94%, transparent);
 }
 
+.doc-markdown-preview {
+  display: grid;
+  gap: 0.8rem;
+  font-size: 0.92rem;
+  line-height: 1.6;
+}
+
+.doc-markdown-preview > :first-child {
+  margin-top: 0;
+}
+
+.doc-markdown-preview > :last-child {
+  margin-bottom: 0;
+}
+
+.doc-markdown-preview code {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Courier New", monospace);
+  font-size: 0.94em;
+  padding: 0.1rem 0.3rem;
+  border-radius: 6px;
+  background: color-mix(in oklab, var(--glass-tint) 92%, transparent);
+}
+
+.doc-markdown-preview pre {
+  overflow-x: auto;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: color-mix(in oklab, var(--glass-tint) 94%, transparent);
+  border: 1px solid color-mix(in oklab, var(--glass-border) 75%, transparent);
+}
+
+.doc-markdown-preview pre code {
+  padding: 0;
+  background: transparent;
+}
+
 .doc-inspector-preview {
   margin-bottom: 8px;
+}
+
+.doc-inspector-editor-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 4px;
+}
+
+.doc-inspector-editor-toggle button.active {
+  border-color: color-mix(in oklab, var(--color-primary) 55%, transparent);
+  background: color-mix(in oklab, var(--color-primary) 14%, transparent);
 }
 
 .doc-inspector-editor {
@@ -1809,6 +1857,23 @@
   font-size: 0.84rem;
   line-height: 1.5;
   resize: vertical;
+}
+
+.doc-inspector-table-editor-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.doc-inspector-table-editor input[type="text"] {
+  width: 100%;
+  min-width: 0;
+  padding: 6px 8px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 78%, transparent);
+  background: color-mix(in oklab, var(--glass-tint) 95%, transparent);
+  color: var(--color-text);
 }
 
 .documents-tab .preview {

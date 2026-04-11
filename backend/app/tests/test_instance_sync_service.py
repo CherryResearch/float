@@ -93,7 +93,13 @@ def test_merge_snapshot_renames_conversation_and_updates_portable_state(
         },
     )
     memory_store.save({"alias": {"value": "local", "updated_at": 10.0}})
-    user_settings.save_settings({"theme": "light", "tool_display_mode": "console"})
+    user_settings.save_settings(
+        {
+            "theme": "light",
+            "tool_display_mode": "console",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        }
+    )
 
     snapshot = {
         "sections": {
@@ -325,9 +331,10 @@ def test_merge_snapshot_links_synced_state_to_source_namespace(tmp_path, monkeyp
 
     attachment_meta = sync_module._load_attachment_meta(content_hash)
     assert attachment_meta["relative_path"] == f"laptop/uploads/{content_hash}/note.txt"
-    attachment_target = (
-        blob_store._resolve_data_files_root() / attachment_meta["relative_path"]
+    attachment_target = blob_store.resolve_managed_path(
+        attachment_meta["relative_path"]
     )
+    assert attachment_target is not None
     assert attachment_target.read_bytes() == attachment_bytes
 
     assert calendar_store.load_event("laptop__evt-1")["title"] == "Review"
@@ -438,9 +445,10 @@ def test_merge_snapshot_writes_attachment_knowledge_and_graph(tmp_path, monkeypa
     assert attachment_meta["source_sync_label"] == "remote"
     assert (
         attachment_meta["relative_path"]
-        == f"workspace/sync/remote/{content_hash}/note.txt"
+        == f"sync/remote/workspace/attachments/{content_hash}/note.txt"
     )
-    target = blob_store._resolve_data_files_root() / attachment_meta["relative_path"]
+    target = blob_store.resolve_managed_path(attachment_meta["relative_path"])
+    assert target is not None
     assert target.read_bytes() == attachment_bytes
 
     doc = KnowledgeStore().trace("doc-1")
@@ -575,9 +583,8 @@ def test_merge_snapshot_root_pull_stays_visible_in_root_manifest(tmp_path, monke
     attachment_meta = sync_module._load_attachment_meta(content_hash)
     assert attachment_meta["source_sync_label"] == "Pear"
     assert not attachment_meta.get("source_sync_namespace")
-    attachment_path = (
-        blob_store._resolve_data_files_root() / attachment_meta["relative_path"]
-    )
+    attachment_path = blob_store.resolve_managed_path(attachment_meta["relative_path"])
+    assert attachment_path is not None
     assert attachment_path.read_bytes() == attachment_bytes
     attachment_meta["source_sync_namespace"] = "Pear"
     sync_module._write_attachment_meta(content_hash, attachment_meta)
@@ -721,7 +728,9 @@ def test_namespace_manifest_preserves_original_sync_id(tmp_path, monkeypatch):
     assert item["name"] == "Pear/notes/demo"
 
 
-def test_filter_snapshot_by_item_selections_keeps_selected_records(tmp_path, monkeypatch):
+def test_filter_snapshot_by_item_selections_keeps_selected_records(
+    tmp_path, monkeypatch
+):
     modules = _configure_paths(tmp_path, monkeypatch)
     service = modules["InstanceSyncService"]()
 

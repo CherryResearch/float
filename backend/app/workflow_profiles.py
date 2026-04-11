@@ -127,9 +127,17 @@ def workflow_prompt(
     workflow_name: str | None,
     *,
     modules: Iterable[str] | None = None,
+    include_default_modules: bool = True,
 ) -> str:
     workflow = resolve_workflow_profile(workflow_name)
-    enabled = resolve_modules(workflow.get("id"), modules)
+    if include_default_modules:
+        enabled = resolve_modules(workflow.get("id"), modules)
+    else:
+        enabled = [
+            str(module_id or "").strip()
+            for module_id in (modules or [])
+            if str(module_id or "").strip() in BUILTIN_MODULES
+        ]
     enabled_labels = [
         str(BUILTIN_MODULES[module_id]["label"])
         for module_id in enabled
@@ -137,23 +145,15 @@ def workflow_prompt(
     ]
     workflow_id = str(workflow.get("id") or WORKFLOW_DEFAULT)
     if workflow_id == "architect_planner":
-        guidance = (
-            "Operate in architect/planner mode: decompose tasks carefully, keep the plan coherent, "
-            "and prefer explicit handoff into shorter execution bursts rather than long mutation chains."
-        )
+        guidance = "Plan carefully. Decompose the task, keep the plan coherent, and hand off into shorter execution bursts."
     elif workflow_id == "mini_execution":
-        guidance = (
-            "Operate in mini-execution mode: favor short, low-latency tool loops, minimal narration, "
-            "and narrowly scoped follow-up steps."
-        )
+        guidance = "Keep this turn short and execution-focused. Prefer minimal narration and narrowly scoped follow-up steps."
     else:
-        guidance = (
-            "Operate in the default workflow: balance reasoning quality with execution speed and use tools directly when helpful."
-        )
+        guidance = "Balance reasoning quality with execution speed and use tools directly when helpful."
     modules_text = (
-        f" Enabled modules: {', '.join(enabled_labels)}."
+        f" Enabled modules this turn: {', '.join(enabled_labels)}."
         if enabled_labels
-        else " No optional modules are enabled."
+        else ""
     )
     return guidance + modules_text
 
@@ -165,12 +165,20 @@ def capture_policy_prompt(
     raw_image_access: bool,
     summary_fallback: bool,
 ) -> str:
-    raw_text = "Raw capture images are available to the model when policy allows." if raw_image_access else "Raw capture images may be hidden unless explicitly promoted or approved."
-    summary_text = "Summary fallback is allowed when raw image access is restricted." if summary_fallback else "Do not assume summary fallback is available when raw image access is restricted."
+    raw_text = (
+        "Raw capture images are available to the model when policy allows."
+        if raw_image_access
+        else "Raw capture images may be hidden unless explicitly promoted or approved."
+    )
+    summary_text = (
+        "Summary fallback is allowed when raw image access is restricted."
+        if summary_fallback
+        else "Do not assume summary fallback is available when raw image access is restricted."
+    )
     return (
-        "Capture policy: computer observations and camera captures are transient by default. "
+        "Computer observations and camera captures are transient by default. "
         f"They are retained for about {max(0, int(retention_days))} day(s) unless promoted with capture.promote. "
-        f"The default sensitivity is '{default_sensitivity}'. "
+        f"Default sensitivity: '{default_sensitivity}'. "
         f"{raw_text} {summary_text} "
         "Promoted captures become durable attachments that later turns can reference again."
     )
@@ -189,11 +197,19 @@ def approval_allows_auto(approval_level: str | None, tool_name: str) -> bool:
     return False
 
 
-def continue_transition_allowed(current_workflow: str | None, next_workflow: str | None) -> bool:
+def continue_transition_allowed(
+    current_workflow: str | None, next_workflow: str | None
+) -> bool:
     current = resolve_workflow_profile(current_workflow)
     next_name = resolve_workflow_name(next_workflow)
     allowed = current.get("allow_continue_to") or []
     return next_name in allowed
+
+
+def repo_addons_root() -> Path:
+    root = (app_config.REPO_ROOT / "modules" / "addons").resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 def addons_root() -> Path:
@@ -202,28 +218,33 @@ def addons_root() -> Path:
     return root
 
 
+def addon_roots() -> List[Path]:
+    # Repo add-ons are the tracked defaults; data/ add-ons are local overrides.
+    return [repo_addons_root(), addons_root()]
+
+
 def list_addons() -> List[Dict[str, Any]]:
-    entries: List[Dict[str, Any]] = []
-    root = addons_root()
-    for path in sorted(root.iterdir()):
-        if not path.is_file() or path.suffix.lower() not in {".json"}:
-            continue
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            payload = {}
-        if not isinstance(payload, dict):
-            payload = {}
-        entries.append(
-            {
-                "id": str(payload.get("id") or path.stem),
+    entries_by_id: Dict[str, Dict[str, Any]] = {}
+    for source, root in (("repo", repo_addons_root()), ("local", addons_root())):
+        for path in sorted(root.iterdir()):
+            if not path.is_file() or path.suffix.lower() not in {".json"}:
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            addon_id = str(payload.get("id") or path.stem)
+            entries_by_id[addon_id] = {
+                "id": addon_id,
                 "label": str(payload.get("label") or path.stem),
                 "description": str(payload.get("description") or "").strip(),
                 "status": str(payload.get("status") or "available"),
                 "path": str(path),
+                "source": source,
             }
-        )
-    return entries
+    return sorted(entries_by_id.values(), key=lambda item: item["id"])
 
 
 def workflow_catalog_payload() -> Dict[str, Any]:
@@ -232,4 +253,5 @@ def workflow_catalog_payload() -> Dict[str, Any]:
         "modules": [dict(value) for value in BUILTIN_MODULES.values()],
         "addons": list_addons(),
         "addons_root": str(addons_root()),
+        "addons_roots": [str(path) for path in addon_roots()],
     }

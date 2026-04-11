@@ -4,6 +4,14 @@ import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from app.utils import user_settings
+from app.utils.sync_paths import (
+    clean_relative_path,
+    is_default_workspace_source,
+    join_relative_path,
+    path_token,
+    sync_workspace_root_path_from_namespace,
+    synced_workspace_namespace,
+)
 
 DEFAULT_WORKSPACE_ID = "root"
 DEFAULT_WORKSPACE_NAME = "Main workspace"
@@ -16,47 +24,6 @@ def _slugify(value: Any, fallback: str) -> str:
     return text or fallback
 
 
-def _path_token(value: Any, fallback: str) -> str:
-    text = re.sub(r"[^0-9A-Za-z]+", "-", str(value or "").strip()).strip("-")
-    return text or fallback
-
-
-def _clean_relative_path(value: Any) -> str:
-    raw = str(value or "").strip().replace("\\", "/").lstrip("/")
-    if not raw:
-        return ""
-    parts = [
-        segment for segment in raw.split("/") if segment and segment not in {".", ".."}
-    ]
-    return "/".join(parts)
-
-
-def _join_relative_path(*parts: str) -> str:
-    cleaned = [
-        _clean_relative_path(part) for part in parts if _clean_relative_path(part)
-    ]
-    return "/".join(cleaned)
-
-
-def _is_default_workspace_source(
-    source_workspace_id: Any,
-    source_workspace_name: Any,
-    source_workspace_slug: Any = None,
-) -> bool:
-    workspace_id = str(source_workspace_id or "").strip().lower()
-    workspace_name = str(source_workspace_name or "").strip().lower()
-    workspace_slug = str(source_workspace_slug or "").strip().lower()
-    return workspace_id in {"", DEFAULT_WORKSPACE_ID} or workspace_slug in {
-        "",
-        DEFAULT_WORKSPACE_SLUG,
-    } or workspace_name in {
-        DEFAULT_WORKSPACE_NAME.lower(),
-        "main workspace",
-        "main",
-        "root",
-    }
-
-
 def resolve_synced_workspace_location(
     *,
     parent_profile: Optional[Dict[str, Any]],
@@ -65,37 +32,24 @@ def resolve_synced_workspace_location(
     source_workspace_name: str,
     source_workspace_slug: str = "",
 ) -> Dict[str, Any]:
-    parent_namespace = _clean_relative_path(
-        (parent_profile or {}).get("namespace")
-        if isinstance(parent_profile, dict)
-        else ""
-    )
-    parent_root = _clean_relative_path(
-        (parent_profile or {}).get("root_path")
-        if isinstance(parent_profile, dict)
-        else ""
-    )
-    is_default_workspace = _is_default_workspace_source(
+    _ = parent_profile
+    namespace = synced_workspace_namespace(
+        source_device_name,
         source_workspace_id,
         source_workspace_name,
         source_workspace_slug,
     )
-    device_segment = _path_token(source_device_name or "Remote", "Remote")
-    workspace_segment = _path_token(
-        source_workspace_name or source_workspace_id or "Workspace",
-        "Workspace",
+    is_default_workspace = is_default_workspace_source(
+        source_workspace_id,
+        source_workspace_name,
+        source_workspace_slug,
     )
-    path_parts = [device_segment]
-    if not is_default_workspace:
-        path_parts.append(workspace_segment)
+    path_parts = namespace.split("/") if namespace else [path_token("Remote", "Remote")]
     return {
         "is_default_workspace": is_default_workspace,
         "path_parts": path_parts,
-        "namespace": _join_relative_path(parent_namespace, *path_parts),
-        "root_path": _join_relative_path(
-            parent_root or DEFAULT_WORKSPACE_ROOT,
-            *path_parts,
-        ),
+        "namespace": namespace,
+        "root_path": sync_workspace_root_path_from_namespace(namespace),
         "display_name": (
             source_device_name or "Remote"
             if is_default_workspace
@@ -115,16 +69,16 @@ def normalize_workspace_profile(entry: Any, index: int = 0) -> Dict[str, Any]:
     if workspace_id == DEFAULT_WORKSPACE_ID:
         name = raw_name or DEFAULT_WORKSPACE_NAME
     slug = _slugify(entry.get("slug") or name, DEFAULT_WORKSPACE_SLUG)
-    namespace = _clean_relative_path(entry.get("namespace"))
+    namespace = clean_relative_path(entry.get("namespace"))
     if workspace_id == DEFAULT_WORKSPACE_ID:
         namespace = ""
         slug = DEFAULT_WORKSPACE_SLUG
-    root_path = _clean_relative_path(entry.get("root_path"))
+    root_path = clean_relative_path(entry.get("root_path"))
     if not root_path:
         root_path = (
             DEFAULT_WORKSPACE_ROOT
             if workspace_id == DEFAULT_WORKSPACE_ID
-            else _join_relative_path(DEFAULT_WORKSPACE_ROOT, slug)
+            else join_relative_path(DEFAULT_WORKSPACE_ROOT, slug)
         )
     kind = str(entry.get("kind") or "").strip().lower() or (
         "root" if workspace_id == DEFAULT_WORKSPACE_ID else "local"
@@ -288,7 +242,10 @@ def build_synced_workspace_profile(
     )
     source_device_slug = _slugify(source_device_name or "remote", "remote")
     source_workspace_slug = _slugify(
-        source_workspace_slug or source_workspace_name or source_workspace_id or "workspace",
+        source_workspace_slug
+        or source_workspace_name
+        or source_workspace_id
+        or "workspace",
         "workspace",
     )
     return normalize_workspace_profile(

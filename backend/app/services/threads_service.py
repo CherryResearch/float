@@ -336,9 +336,10 @@ def _ensure_summary_schema(summary: Dict[str, Any]) -> Dict[str, Any]:
     generated_at = metadata.get("generated_at_utc")
     if isinstance(generated_at, str) and generated_at.strip():
         ui_hints["generated_at_utc"] = generated_at.strip()
-    elif isinstance(ui_hints.get("generated_at_utc"), str) and str(
-        ui_hints.get("generated_at_utc")
-    ).strip():
+    elif (
+        isinstance(ui_hints.get("generated_at_utc"), str)
+        and str(ui_hints.get("generated_at_utc")).strip()
+    ):
         metadata["generated_at_utc"] = str(ui_hints.get("generated_at_utc")).strip()
 
     normalized_sae = _normalize_sae_options(
@@ -484,7 +485,9 @@ def _normalize_sae_options(value: Any) -> Dict[str, Any]:
     elif embeddings_fallback_raw is None:
         normalized["embeddings_fallback"] = True
     else:
-        normalized["embeddings_fallback"] = str(embeddings_fallback_raw).strip().lower() in {
+        normalized["embeddings_fallback"] = str(
+            embeddings_fallback_raw
+        ).strip().lower() in {
             "1",
             "true",
             "yes",
@@ -513,11 +516,11 @@ def _cosine_similarity(left: List[float], right: List[float]) -> float:
     left_norm_sq = 0.0
     right_norm_sq = 0.0
     for l_val, r_val in zip(left, right):
-        l = float(l_val)
-        r = float(r_val)
-        numerator += l * r
-        left_norm_sq += l * l
-        right_norm_sq += r * r
+        left_value = float(l_val)
+        right_value = float(r_val)
+        numerator += left_value * right_value
+        left_norm_sq += left_value * left_value
+        right_norm_sq += right_value * right_value
     if left_norm_sq <= 0.0 or right_norm_sq <= 0.0:
         return 0.0
     return float(numerator / (math.sqrt(left_norm_sq) * math.sqrt(right_norm_sq)))
@@ -531,7 +534,11 @@ def _sparse_topk_identity_features(
     if not vector or topk <= 0:
         return {}
     ranked = sorted(
-        ((idx, float(value)) for idx, value in enumerate(vector) if float(value) != 0.0),
+        (
+            (idx, float(value))
+            for idx, value in enumerate(vector)
+            if float(value) != 0.0
+        ),
         key=lambda item: abs(item[1]),
         reverse=True,
     )
@@ -814,9 +821,16 @@ def _generate_threads_via_float(
             for idx, m in enumerate(msgs):
                 if scope_pairs is not None and (name, idx) not in scope_pairs:
                     continue
-                text = m.get("content") or m.get("text") or ""
-                role = m.get("role") or m.get("speaker") or None
-                ts = m.get("timestamp")
+                if isinstance(m, dict):
+                    text = m.get("content") or m.get("text") or ""
+                    role = m.get("role") or m.get("speaker") or None
+                    ts = m.get("timestamp")
+                elif isinstance(m, str):
+                    text = m
+                    role = None
+                    ts = None
+                else:
+                    continue
                 if not text:
                     continue
                 chunks = chunk_text(text)
@@ -930,6 +944,7 @@ def _generate_threads_via_float(
         )
         return base_summary
     except Exception:
+        logger.exception("Thread generation failed while reading conversations")
         return None
 
 
@@ -1055,10 +1070,13 @@ def generate_threads(
             seen: set[Tuple[str, str]] = set()
             embeddings: List[List[float]] = _CACHE.get("embeddings") or []
             nuggets: List[Dict[str, Any]] = _CACHE.get("nuggets") or []
-            sae_proxy_topk = _as_int(
-                merged_sae_options.get("topk"),
-                min_value=1,
-            ) or DEFAULT_SAE_PROXY_TOPK
+            sae_proxy_topk = (
+                _as_int(
+                    merged_sae_options.get("topk"),
+                    min_value=1,
+                )
+                or DEFAULT_SAE_PROXY_TOPK
+            )
             use_sae_proxy = normalized_signal_mode in {"hybrid", "sae"}
             signal_scoring_hints["sae_proxy_available"] = bool(use_sae_proxy)
             signal_scoring_hints["sae_proxy_topk"] = (
@@ -1222,7 +1240,10 @@ def read_summary(summary_path: Optional[Path] = None) -> Dict[str, Any]:
                 if isinstance(normalized_legacy.get("metadata"), dict)
                 else None
             )
-            if not isinstance(legacy_generated_at, str) or not legacy_generated_at.strip():
+            if (
+                not isinstance(legacy_generated_at, str)
+                or not legacy_generated_at.strip()
+            ):
                 try:
                     legacy_generated_at = datetime.fromtimestamp(
                         LEGACY_SUMMARY_PATH.stat().st_mtime,

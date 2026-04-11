@@ -37,6 +37,7 @@ BUILTIN_TOOLS: Dict[str, Callable[..., Any]] = {
     "write_file": local_files.write_file,
     "create_event": calendar_tools.create_event,
     "create_task": calendar_tools.create_task,
+    "list_tasks": calendar_tools.list_tasks,
     "generate_threads": threads.generate_threads_tool,
     "read_threads_summary": threads.read_threads_summary_tool,
     "memory.save": memory.legacy_memory_save,

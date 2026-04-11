@@ -26,7 +26,9 @@ class OllamaAdapter(LocalProviderAdapter):
 
     def _mode(self, cfg: Dict[str, Any]) -> str:
         mode = str(cfg.get("local_provider_mode") or "").strip().lower()
-        return mode if mode in {"local-managed", "remote-unmanaged"} else "local-managed"
+        return (
+            mode if mode in {"local-managed", "remote-unmanaged"} else "local-managed"
+        )
 
     def _host(self, cfg: Dict[str, Any]) -> str:
         host = str(cfg.get("local_provider_host") or "").strip()
@@ -52,7 +54,9 @@ class OllamaAdapter(LocalProviderAdapter):
     def resolve_base_url(self, cfg: Dict[str, Any], *, with_v1: bool) -> str:
         return self._base_url(cfg, with_v1=with_v1)
 
-    def _http_get_json(self, url: str, timeout: float = 2.5) -> Optional[Dict[str, Any]]:
+    def _http_get_json(
+        self, url: str, timeout: float = 2.5
+    ) -> Optional[Dict[str, Any]]:
         try:
             response = requests.get(url, timeout=timeout)
             response.raise_for_status()
@@ -79,7 +83,9 @@ class OllamaAdapter(LocalProviderAdapter):
                     models.append(value.strip())
         return {"ok": True, "models": sorted(set(models))}
 
-    def poll_status(self, cfg: Dict[str, Any], *, quick: bool = False) -> Dict[str, Any]:
+    def poll_status(
+        self, cfg: Dict[str, Any], *, quick: bool = False
+    ) -> Dict[str, Any]:
         base = self._base_url(cfg, with_v1=False)
         timeout = 0.35 if quick else 2.5
         version = self._http_get_json(f"{base}/api/version", timeout=timeout)
@@ -121,7 +127,9 @@ class OllamaAdapter(LocalProviderAdapter):
             },
         }
 
-    def _wait_until_running(self, cfg: Dict[str, Any], timeout_seconds: int = 30) -> bool:
+    def _wait_until_running(
+        self, cfg: Dict[str, Any], timeout_seconds: int = 30
+    ) -> bool:
         deadline = time.time() + max(1, timeout_seconds)
         while time.time() < deadline:
             status = self.poll_status(cfg)
@@ -132,7 +140,10 @@ class OllamaAdapter(LocalProviderAdapter):
 
     def start_server(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
         if self._mode(cfg) == "remote-unmanaged":
-            return {"ok": False, "error": "Remote unmanaged mode does not support start."}
+            return {
+                "ok": False,
+                "error": "Remote unmanaged mode does not support start.",
+            }
         install = self.detect_installation(cfg)
         if not install.get("installed"):
             return {"ok": False, "error": "Ollama CLI was not found."}
@@ -159,10 +170,16 @@ class OllamaAdapter(LocalProviderAdapter):
 
     def stop_server(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
         if self._mode(cfg) == "remote-unmanaged":
-            return {"ok": False, "error": "Remote unmanaged mode does not support stop."}
+            return {
+                "ok": False,
+                "error": "Remote unmanaged mode does not support stop.",
+            }
         process = self._managed_process
         if process is None or process.poll() is not None:
-            return {"ok": False, "error": "Ollama stop is only supported for Float-managed server processes."}
+            return {
+                "ok": False,
+                "error": "Ollama stop is only supported for Float-managed server processes.",
+            }
         try:
             process.terminate()
             process.wait(timeout=8)
@@ -235,7 +252,9 @@ class OllamaAdapter(LocalProviderAdapter):
                 "keep_alive": 0,
             }
             try:
-                response = requests.post(f"{base}/api/generate", json=payload, timeout=60)
+                response = requests.post(
+                    f"{base}/api/generate", json=payload, timeout=60
+                )
                 response.raise_for_status()
             except Exception as exc:
                 errors.append(str(exc))
@@ -275,6 +294,6 @@ class OllamaAdapter(LocalProviderAdapter):
         return {
             "start_stop": mode == "local-managed",
             "load_unload": True,
-            "context_length": False,
+            "context_length": True,
             "logs_stream": mode == "local-managed",
         }

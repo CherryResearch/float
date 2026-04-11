@@ -94,6 +94,22 @@ def _apply_aliases(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             args.pop(alias, None)
         # Common non-schema args emitted by some models/providers.
         args.pop("source", None)
+    elif tool_name == "tool_info":
+        if "tool_name" not in args:
+            tools_value = args.get("tools")
+            if isinstance(tools_value, str) and tools_value.strip():
+                args["tool_name"] = tools_value.strip()
+            elif (
+                isinstance(tools_value, list)
+                and len(tools_value) == 1
+                and isinstance(tools_value[0], str)
+                and tools_value[0].strip()
+            ):
+                args["tool_name"] = tools_value[0].strip()
+            elif isinstance(args.get("name"), str) and str(args.get("name")).strip():
+                args["tool_name"] = str(args["name"]).strip()
+        args.pop("tools", None)
+        args.pop("name", None)
     return args
 
 

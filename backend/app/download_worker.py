@@ -8,13 +8,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import sys
+import os
 from pathlib import Path
 
-from huggingface_hub import snapshot_download
-import os
-
 from app.model_registry import get_download_allow_patterns
+from huggingface_hub import snapshot_download
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -40,16 +38,13 @@ def main(argv: list[str] | None = None) -> int:
     # - If a token is present in environment it will be used to authenticate
     #   against gated repositories (e.g., Gemma). We support both standard
     #   HUGGINGFACE_HUB_TOKEN and a common HF_TOKEN alias.
-    # - If HF transfer is requested but hf_transfer is missing, disable it so
-    #   downloads still proceed instead of failing immediately.
+    # - huggingface-hub 1.x uses Xet for high-performance transfers; translate
+    #   the legacy HF transfer flag if it is still set in the environment.
     if os.getenv("HF_HUB_ENABLE_HF_TRANSFER") == "1":
-        try:
-            import importlib.util as _importlib_util
-
-            if _importlib_util.find_spec("hf_transfer") is None:
-                os.environ.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
-        except Exception:
-            os.environ.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
+        os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
+        os.environ.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
+    else:
+        os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
     token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
     allow_patterns = get_download_allow_patterns(args.model)
     snapshot_download(

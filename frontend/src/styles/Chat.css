@@ -28,12 +28,13 @@
 body.dark-mode .chat-container {
     background:
       var(--glass-sheen-strong),
-      linear-gradient(145deg, color-mix(in oklab, var(--theme-c2-med) 12%, transparent), transparent 58%),
-      radial-gradient(960px 520px at 12% -8%, color-mix(in oklab, var(--theme-c1-dark) 10%, transparent), transparent 78%),
-      radial-gradient(960px 520px at 92% 120%, color-mix(in oklab, var(--theme-c2-med) 10%, transparent), transparent 82%),
-      linear-gradient(188deg, color-mix(in oklab, var(--theme-warm-black) 88%, transparent), color-mix(in oklab, var(--theme-c1-dark) 66%, transparent)),
-      color-mix(in oklab, var(--glass-tint-strong) 14%, transparent);
-    border-color: color-mix(in oklab, var(--theme-c2-med) 30%, var(--glass-border) 70%);
+      linear-gradient(145deg, color-mix(in oklab, var(--color-purple) 12%, transparent), transparent 60%),
+      radial-gradient(960px 520px at 12% -8%, color-mix(in oklab, var(--color-lavender) 10%, transparent), transparent 78%),
+      radial-gradient(960px 520px at 92% 120%, color-mix(in oklab, var(--color-indigo) 12%, transparent), transparent 82%),
+      radial-gradient(720px 380px at 100% 100%, color-mix(in oklab, var(--color-accent) 8%, transparent), transparent 84%),
+      linear-gradient(188deg, color-mix(in oklab, var(--theme-warm-black) 90%, transparent), color-mix(in oklab, var(--theme-c1-dark) 68%, transparent)),
+      color-mix(in oklab, var(--glass-tint-strong) 12%, transparent);
+    border-color: color-mix(in oklab, var(--color-lavender) 28%, var(--glass-border) 72%);
     background-attachment: fixed;
 }
 
@@ -259,7 +260,7 @@ body.dark-mode .chat-container {
     background: color-mix(in oklab, var(--glass-tint) 82%, var(--color-accent) 18%);
     /* In light mode, use black text for readability */
     color: var(--color-black);
-    padding: 7px 14px;
+    padding: 7px 5px;
     border-radius: 16px 16px 4px 16px;
     margin: 6px 0;
     align-self: flex-end;
@@ -270,17 +271,16 @@ body.dark-mode .chat-container {
     -webkit-backdrop-filter: blur(6px) saturate(130%);
 }
 
-/* Preserve white text for user messages in dark mode */
+/* Keep spring dark-mode message text on the same mint-leaning tone. */
+:root[data-visual-theme="spring"] body.dark-mode .user-msg,
+:root[data-visual-theme="spring"] body.dark-mode .ai-msg {
+    color: color-mix(in oklab, var(--theme-c2-light) 56%, var(--theme-very-light) 44%);
+}
+
 body.dark-mode .user-msg {
-    color: var(--color-white);
-    background:
-      linear-gradient(
-        140deg,
-        color-mix(in oklab, var(--theme-c1-dark) 30%, transparent),
-        color-mix(in oklab, var(--theme-c2-light) 18%, transparent)
-      ),
-      color-mix(in oklab, var(--glass-tint) 74%, var(--color-black) 26%);
-    border-color: color-mix(in oklab, var(--theme-c2-med) 30%, var(--glass-border) 70%);
+    color: color-mix(in oklab, var(--theme-c2-light) 56%, var(--theme-very-light) 44%);
+    background: color-mix(in oklab, var(--theme-warm-black) 26%, var(--glass-tint) 74%);
+    border-color: color-mix(in oklab, var(--theme-c2-light) 24%, var(--glass-border) 76%);
     backdrop-filter: blur(7px) saturate(152%);
     -webkit-backdrop-filter: blur(7px) saturate(152%);
 }
@@ -303,7 +303,7 @@ body.dark-mode .user-msg {
     /* nearly-solid light surface with a whisper of glass */
     background: color-mix(in oklab, var(--glass-tint) 92%, var(--color-surface) 8%);
     color: var(--color-text);
-    padding: 7px 14px;
+    padding: 7px 5px;
     border-radius: 16px 16px 16px 4px;
     margin: 6px 0;
     max-width: 76%;
@@ -311,6 +311,20 @@ body.dark-mode .user-msg {
     background-clip: padding-box;
     backdrop-filter: blur(8px) saturate(140%);
     -webkit-backdrop-filter: blur(8px) saturate(140%);
+}
+
+body.dark-mode .ai-msg {
+    color: color-mix(in oklab, var(--theme-very-light) 84%, var(--theme-c1-light) 16%);
+    background:
+      linear-gradient(
+        180deg,
+        color-mix(in oklab, var(--color-lavender) 10%, transparent),
+        transparent 55%
+      ),
+      color-mix(in oklab, var(--theme-warm-black) 14%, var(--glass-tint-strong) 86%);
+    border-color: color-mix(in oklab, var(--color-lavender) 28%, var(--glass-border) 72%);
+    backdrop-filter: blur(8px) saturate(146%);
+    -webkit-backdrop-filter: blur(8px) saturate(146%);
 }
 
 .message-meta {
@@ -1041,7 +1055,7 @@ body.dark-mode .user-msg {
       ),
       radial-gradient(
         880px 520px at 90% 118%,
-        color-mix(in oklab, #ffb4d3 24%, transparent),
+        color-mix(in oklab, var(--color-lavender) 18%, transparent),
         transparent 78%
       ),
       linear-gradient(180deg, var(--glass-tint-strong), transparent),
@@ -1126,22 +1140,42 @@ body.dark-mode .scroll-to-bottom-btn {
   color: var(--color-black);
 }
 
-.input-error {
+.input-alert-stack {
   position: absolute;
-  top: -36px;
-  left: 50%;
-  transform: translateX(-50%);
+  left: 0;
+  right: calc(var(--input-action-rail-width) + 12px);
+  bottom: calc(100% + 10px);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 1465;
+  pointer-events: none;
+}
+
+.input-error {
+  position: relative;
+  width: min(100%, 760px);
+  max-width: calc(100vw - 32px);
+  align-self: center;
   background: color-mix(in oklab, var(--color-error) 80%, transparent);
   color: var(--color-white);
-  padding: 6px 14px;
-  border-radius: 999px;
+  border: 1px solid color-mix(in oklab, var(--color-error) 58%, var(--glass-border) 42%);
+  padding: 10px 14px;
+  border-radius: 16px;
   font-size: 0.85rem;
   box-shadow: var(--glass-shadow);
-  pointer-events: none;
+  pointer-events: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  max-height: min(32vh, 240px);
+  overflow-y: auto;
+  text-align: left;
 }
 
 body.dark-mode .input-error {
   background: color-mix(in oklab, var(--color-error) 70%, var(--color-black) 30%);
+  border-color: color-mix(in oklab, var(--color-error) 62%, var(--glass-border) 38%);
 }
 
 
@@ -1151,24 +1185,25 @@ body.dark-mode .input-box {
     var(--glass-sheen-strong),
     /* primary subtle dark base with a hint of indigo */
     linear-gradient(180deg,
-      color-mix(in oklab, var(--color-black) 88%, var(--color-indigo) 12%),
+      color-mix(in oklab, var(--color-black) 90%, var(--color-indigo) 10%),
       transparent
     ),
-    /* soft violet glow top-left */
+    /* soft lavender glow top-left */
     radial-gradient(520px 260px at 12% 0%,
-      color-mix(in oklab, var(--color-purple) 20%, transparent),
+      color-mix(in oklab, var(--color-lavender) 18%, transparent),
       transparent 70%
     ),
     /* gentle indigo glow bottom-right */
     radial-gradient(520px 260px at 88% 100%,
-      color-mix(in oklab, var(--color-indigo) 18%, transparent),
+      color-mix(in oklab, var(--color-indigo) 14%, transparent),
       transparent 72%
     ),
     radial-gradient(460px 240px at 90% 112%,
-      color-mix(in oklab, #ff84c8 18%, transparent),
-      transparent 74%
-    );
-    border: 1px solid color-mix(in oklab, var(--color-indigo) 38%, var(--glass-border) 62%);
+      color-mix(in oklab, var(--color-accent) 12%, transparent),
+      transparent 78%
+    ),
+    color-mix(in oklab, var(--glass-tint-strong) 94%, transparent);
+    border: 1px solid color-mix(in oklab, var(--color-lavender) 28%, var(--glass-border) 72%);
   }
 
 .input-row {
@@ -1181,6 +1216,183 @@ body.dark-mode .input-box {
 .input-main {
   position: relative;
   width: 100%;
+}
+
+.composer-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+  overflow: hidden;
+  border-radius: inherit;
+}
+
+.composer-overlay-content {
+  min-height: 100%;
+  padding: 16.5px 14px;
+  padding-right: calc(var(--input-action-rail-width) + 18px);
+  color: var(--color-text);
+  font: inherit;
+  line-height: 1.4375em;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.composer-overlay-segment.tool-link,
+.composer-overlay-segment.file-link,
+.composer-overlay-segment.memory-link {
+  text-decoration: underline;
+  text-underline-offset: 0.14em;
+  text-decoration-thickness: 1.5px;
+}
+
+.composer-overlay-segment.tool-link {
+  color: color-mix(in oklab, var(--color-lavender) 74%, var(--color-indigo) 26%);
+}
+
+.composer-overlay-segment.file-link {
+  color: color-mix(in oklab, var(--color-indigo) 66%, var(--color-accent) 34%);
+}
+
+.composer-overlay-segment.memory-link {
+  color: color-mix(in oklab, var(--color-accent) 72%, var(--color-pear-green) 28%);
+}
+
+.composer-overlay-placeholder {
+  color: var(--color-text-muted);
+}
+
+body.dark-mode .composer-overlay-segment.tool-link {
+  color: color-mix(in oklab, var(--color-lavender) 82%, white 18%);
+}
+
+body.dark-mode .composer-overlay-segment.file-link {
+  color: color-mix(in oklab, var(--color-mint-green) 36%, var(--color-lavender) 64%);
+}
+
+body.dark-mode .composer-overlay-segment.memory-link {
+  color: color-mix(in oklab, var(--color-accent) 54%, var(--color-mint-green) 46%);
+}
+
+.composer-command-menu {
+  position: absolute;
+  left: 0;
+  right: calc(var(--input-action-rail-width) + 12px);
+  bottom: calc(100% + 10px);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border-radius: 16px;
+  border: 1px solid color-mix(in oklab, var(--color-lavender) 30%, var(--glass-border) 70%);
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in oklab, var(--glass-tint-strong) 84%, transparent),
+      color-mix(in oklab, var(--color-surface) 22%, transparent)
+    ),
+    color-mix(in oklab, var(--glass-tint) 92%, transparent);
+  box-shadow: 0 18px 32px rgba(8, 10, 20, 0.2);
+  backdrop-filter: blur(18px) saturate(160%);
+  -webkit-backdrop-filter: blur(18px) saturate(160%);
+  overscroll-behavior: contain;
+  scroll-padding-block: 8px;
+  z-index: 5;
+}
+
+.composer-command-menu-floating {
+  position: fixed;
+  right: auto;
+  bottom: auto;
+  max-height: min(280px, 45vh);
+  overflow-y: auto;
+  transform: translateY(-100%);
+  z-index: 3605;
+}
+
+.composer-command-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease,
+    box-shadow 120ms ease,
+    transform 120ms ease;
+}
+
+.composer-command-option:hover {
+  background: color-mix(in oklab, var(--color-lavender) 18%, transparent);
+  border-color: color-mix(in oklab, var(--color-lavender) 44%, var(--glass-border) 56%);
+}
+
+.composer-command-option.is-active,
+.composer-command-option[aria-selected="true"] {
+  background: color-mix(in oklab, var(--color-lavender) 26%, transparent);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in oklab, var(--color-lavender) 34%, transparent),
+    0 8px 18px rgba(8, 10, 20, 0.12);
+  border-color: color-mix(in oklab, var(--color-lavender) 52%, var(--glass-border) 48%);
+  transform: translateY(-1px);
+}
+
+.composer-command-option.is-active .composer-command-label,
+.composer-command-option[aria-selected="true"] .composer-command-label,
+.composer-command-option:hover {
+  color: color-mix(in oklab, var(--color-text) 80%, white 20%);
+}
+
+.composer-command-kind {
+  flex: 0 0 auto;
+  min-width: 58px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: lowercase;
+}
+
+.composer-command-kind.kind-tool {
+  background: color-mix(in oklab, var(--color-lavender) 18%, transparent);
+  color: color-mix(in oklab, var(--color-indigo) 70%, var(--color-lavender) 30%);
+}
+
+.composer-command-kind.kind-file {
+  background: color-mix(in oklab, var(--color-indigo) 14%, transparent);
+  color: color-mix(in oklab, var(--color-indigo) 74%, var(--color-accent) 26%);
+}
+
+.composer-command-kind.kind-memory {
+  background: color-mix(in oklab, var(--color-accent) 14%, transparent);
+  color: color-mix(in oklab, var(--color-accent) 70%, var(--color-pear-green) 30%);
+}
+
+.composer-command-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.composer-command-label {
+  font-weight: 600;
+  color: var(--color-text);
+  word-break: break-word;
+}
+
+.composer-command-description,
+.composer-command-empty {
+  font-size: 0.8rem;
+  color: var(--color-text-muted);
 }
 
 .composer-resize-edge {
@@ -1244,6 +1456,11 @@ body.dark-mode .composer-resize-edge::before {
   .input-box .MuiInputBase-input {
     max-height: min(76vh, calc(100vh - var(--topbar-total-height) - 56px));
     overflow-y: auto !important;
+    color: var(--color-text, #f0f3ff) !important;
+    caret-color: var(--color-text);
+    position: relative;
+    z-index: 2;
+    -webkit-text-fill-color: var(--color-text, #f0f3ff);
   }
   .input-box .MuiOutlinedInput-notchedOutline {
     border: none !important;
@@ -1390,7 +1607,7 @@ body.dark-mode .composer-resize-edge::before {
   box-shadow: var(--glass-shadow);
   backdrop-filter: blur(18px) saturate(160%);
   -webkit-backdrop-filter: blur(18px) saturate(160%);
-  z-index: 3200;
+  z-index: 3600;
 }
 
 .chat-settings-list,

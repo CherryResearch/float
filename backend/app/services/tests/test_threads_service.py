@@ -15,7 +15,9 @@ sys.modules.setdefault("app", app_pkg)
 
 services_pkg = types.ModuleType("app.services")
 services_pkg.__path__ = [str(SERVICES)]
-services_pkg.RAG_IMPORT_ERROR = RuntimeError("stub services init for isolated test loading")
+services_pkg.RAG_IMPORT_ERROR = RuntimeError(
+    "stub services init for isolated test loading"
+)
 sys.modules.setdefault("app.services", services_pkg)
 
 utils_pkg = types.ModuleType("app.utils")
@@ -48,6 +50,7 @@ spec_cs = importlib.util.spec_from_file_location(
 conversation_store = importlib.util.module_from_spec(spec_cs)
 sys.modules["app.utils.conversation_store"] = conversation_store
 spec_cs.loader.exec_module(conversation_store)
+sys.modules["app.utils"].conversation_store = conversation_store
 
 spec_sts = importlib.util.spec_from_file_location(
     "app.services.semantic_tags_service", SERVICES / "semantic_tags_service.py"
@@ -141,9 +144,7 @@ def test_generate_threads_writes_summary_file(monkeypatch, tmp_path):
     generated_at = on_disk.get("metadata", {}).get("generated_at_utc")
     assert isinstance(generated_at, str) and generated_at
     assert (
-        on_disk.get("metadata", {})
-        .get("ui_hints", {})
-        .get("generated_at_utc")
+        on_disk.get("metadata", {}).get("ui_hints", {}).get("generated_at_utc")
         == generated_at
     )
     assert (
@@ -212,6 +213,57 @@ def test_generate_threads_keeps_topic_inference_without_key(monkeypatch, tmp_pat
         openai_key=None,
     )
     assert observed["infer_topics"] is True
+
+
+def test_generate_threads_tolerates_string_message_entries(monkeypatch, tmp_path):
+    _setup_conversations_map(
+        tmp_path,
+        {
+            "conv1": [
+                "legacy string message",
+                {"content": "dict message"},
+                123,
+            ]
+        },
+    )
+
+    observed = {}
+
+    def fake_embed_texts(texts):
+        observed["texts"] = list(texts)
+        return [[1.0] for _ in texts], object()
+
+    def fake_cluster_texts(embeddings, **_kwargs):
+        return [0 for _ in embeddings], 1
+
+    def fake_summarize(
+        nuggets,
+        labels,
+        embeddings,
+        embedder,
+        k,
+        *args,
+        **kwargs,
+    ):
+        return {
+            "tag_counts": {},
+            "cluster_count": 1,
+            "clusters": {},
+            "threads": {},
+            "metadata": {},
+        }, {}
+
+    monkeypatch.setattr(threads_service, "embed_texts", fake_embed_texts)
+    monkeypatch.setattr(threads_service, "cluster_texts", fake_cluster_texts)
+    monkeypatch.setattr(threads_service, "summarize_clusters", fake_summarize)
+
+    result = threads_service.generate_threads(
+        summary_out=tmp_path / "summary.json",
+        infer_topics=False,
+    )
+
+    assert result.get("cluster_count") == 1
+    assert observed["texts"] == ["legacy string message", "dict message"]
 
 
 def test_generate_threads_respects_explicit_k_option(monkeypatch, tmp_path):
@@ -484,7 +536,10 @@ def test_generate_threads_hybrid_blend_changes_manual_assignment(monkeypatch, tm
     assert not high_blend.get("threads", {}).get("Topic Broad")
     assert low_blend.get("threads", {}).get("Topic Broad")
     assert not low_blend.get("threads", {}).get("Topic Specific")
-    assert low_blend.get("metadata", {}).get("ui_hints", {}).get("thread_signal_blend") == 0.1
+    assert (
+        low_blend.get("metadata", {}).get("ui_hints", {}).get("thread_signal_blend")
+        == 0.1
+    )
 
 
 def test_generate_threads_coalesces_meal_party_labels(monkeypatch, tmp_path):
@@ -805,4 +860,7 @@ def test_read_summary_adds_generated_timestamp_from_file_mtime(tmp_path):
     result = threads_service.read_summary(out_path)
     generated_at = result.get("metadata", {}).get("generated_at_utc")
     assert isinstance(generated_at, str) and generated_at
-    assert result.get("metadata", {}).get("ui_hints", {}).get("generated_at_utc") == generated_at
+    assert (
+        result.get("metadata", {}).get("ui_hints", {}).get("generated_at_utc")
+        == generated_at
+    )

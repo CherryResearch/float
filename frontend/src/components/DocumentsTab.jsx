@@ -1,7 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import axios from "axios";
 import { useNavigate } from "react-router-dom";
+import CsvTableEditor from "./CsvTableEditor";
 import CsvTablePreview from "./CsvTablePreview";
+import MarkdownPreview from "./MarkdownPreview";
 import MediaViewer from "./MediaViewer";
 import FilterBar from "./FilterBar";
 import { TABULAR_DOC_EXTENSIONS } from "../utils/csvPreview";
@@ -252,6 +254,32 @@ const getDocPreviewKind = (doc) => {
   return "other";
 };
 
+const getDocExtension = (doc) => {
+  if (!doc || typeof doc !== "object") return "";
+  const meta = doc.meta && typeof doc.meta === "object" ? doc.meta : {};
+  const candidates = [
+    getDocOpenUrl(doc),
+    meta.relative_path,
+    meta.source,
+    doc.baseName,
+    meta.filename,
+    meta.title,
+  ];
+  for (const candidate of candidates) {
+    const extension = getDocumentExtension(candidate);
+    if (extension) return extension;
+  }
+  return "";
+};
+
+const isMarkdownDoc = (doc) => {
+  if (!doc || typeof doc !== "object") return false;
+  const meta = doc.meta && typeof doc.meta === "object" ? doc.meta : {};
+  const extension = getDocExtension(doc);
+  const kind = String(meta.kind || meta.type || "").trim().toLowerCase();
+  return MARKDOWN_DOC_EXTENSIONS.has(extension) || (!extension && kind === "markdown");
+};
+
 const isTabularDoc = (doc) => {
   if (!doc || typeof doc !== "object") return false;
   const meta = doc.meta && typeof doc.meta === "object" ? doc.meta : {};
@@ -277,23 +305,9 @@ const describeDocEditingProfile = (doc) => {
     };
   }
   const meta = doc.meta && typeof doc.meta === "object" ? doc.meta : {};
-  const candidates = [
-    getDocOpenUrl(doc),
-    meta.relative_path,
-    meta.source,
-    doc.baseName,
-    meta.filename,
-    meta.title,
-  ];
-  let extension = "";
-  for (const candidate of candidates) {
-    extension = getDocumentExtension(candidate);
-    if (extension) break;
-  }
+  const extension = getDocExtension(doc);
   const kind = String(meta.kind || meta.type || "").trim().toLowerCase();
-  const isMarkdown =
-    MARKDOWN_DOC_EXTENSIONS.has(extension) ||
-    (!extension && kind === "markdown");
+  const isMarkdown = isMarkdownDoc(doc);
   const isEditableText =
     EDITABLE_TEXT_DOC_EXTENSIONS.has(extension) ||
     (!extension && TEXT_NOTE_DOC_KINDS.has(kind));
@@ -311,11 +325,11 @@ const describeDocEditingProfile = (doc) => {
   }
   if (isTabularDoc(doc)) {
     return {
-      editable: false,
+      editable: true,
       formatLabel: "Tabular document",
-      editButtonLabel: "Edit text",
-      saveButtonLabel: "Save text",
-      helperText: "Table-like files stay read-only here. Open the source file to edit them externally.",
+      editButtonLabel: "Edit CSV",
+      saveButtonLabel: "Save CSV",
+      helperText: "Inline editing is enabled for CSV-like workspace files.",
     };
   }
   const previewKind = getDocPreviewKind(doc);
@@ -530,6 +544,7 @@ const DocumentsTab = ({ focusId = null }) => {
   const [activeDoc, setActiveDoc] = useState(null);
   const [activeDocMode, setActiveDocMode] = useState("view");
   const [activeDocBody, setActiveDocBody] = useState("");
+  const [activeDocEditorSurface, setActiveDocEditorSurface] = useState("text");
   const [activeDocLoading, setActiveDocLoading] = useState(false);
   const [activeDocSaving, setActiveDocSaving] = useState(false);
   const [activeDocError, setActiveDocError] = useState("");
@@ -590,6 +605,7 @@ const DocumentsTab = ({ focusId = null }) => {
     const nextMode = mode === "edit" && profile.editable ? "edit" : "view";
     setActiveDoc(doc);
     setActiveDocMode(nextMode);
+    setActiveDocEditorSurface(nextMode === "edit" && isTabularDoc(doc) ? "table" : "text");
     setActiveDocError(mode === "edit" && !profile.editable ? profile.helperText : "");
     setActiveDocLoading(true);
     try {
@@ -1286,6 +1302,7 @@ const DocumentsTab = ({ focusId = null }) => {
     setActiveDocBody("");
     setActiveDocError("");
     setActiveDocMode("view");
+    setActiveDocEditorSurface("text");
   }, [activeDocSaving]);
 
   const openDoc = useCallback(
@@ -1495,6 +1512,7 @@ const DocumentsTab = ({ focusId = null }) => {
   const activeDocOpenUrl = useMemo(() => getDocOpenUrl(activeDoc), [activeDoc]);
   const activeDocPreviewKind = useMemo(() => getDocPreviewKind(activeDoc), [activeDoc]);
   const activeDocIsTabular = useMemo(() => isTabularDoc(activeDoc), [activeDoc]);
+  const activeDocIsMarkdown = useMemo(() => isMarkdownDoc(activeDoc), [activeDoc]);
   const activeDocProfile = useMemo(() => describeDocEditingProfile(activeDoc), [activeDoc]);
   const canPreviewActiveDoc =
     Boolean(activeDocOpenUrl) && activeDocPreviewKind !== "other";
@@ -1950,7 +1968,10 @@ const DocumentsTab = ({ focusId = null }) => {
               {activeDocProfile.editable && activeDocMode === "view" ? (
                 <button
                   type="button"
-                  onClick={() => setActiveDocMode("edit")}
+                  onClick={() => {
+                    setActiveDocMode("edit");
+                    setActiveDocEditorSurface(activeDocIsTabular ? "table" : "text");
+                  }}
                   title={activeDocProfile.editButtonLabel}
                 >
                   {activeDocProfile.editButtonLabel}
@@ -1958,6 +1979,26 @@ const DocumentsTab = ({ focusId = null }) => {
               ) : null}
               {activeDocProfile.editable && activeDocMode === "edit" ? (
                 <>
+                  {activeDocIsTabular ? (
+                    <div className="doc-inspector-editor-toggle" role="group" aria-label="CSV editor mode">
+                      <button
+                        type="button"
+                        className={activeDocEditorSurface === "table" ? "active" : ""}
+                        onClick={() => setActiveDocEditorSurface("table")}
+                        disabled={activeDocSaving}
+                      >
+                        Table
+                      </button>
+                      <button
+                        type="button"
+                        className={activeDocEditorSurface === "text" ? "active" : ""}
+                        onClick={() => setActiveDocEditorSurface("text")}
+                        disabled={activeDocSaving}
+                      >
+                        Raw text
+                      </button>
+                    </div>
+                  ) : null}
                   <button
                     type="button"
                     onClick={saveActiveDoc}
@@ -1969,7 +2010,10 @@ const DocumentsTab = ({ focusId = null }) => {
                   <button
                     type="button"
                     className="ghost"
-                    onClick={() => setActiveDocMode("view")}
+                    onClick={() => {
+                      setActiveDocMode("view");
+                      setActiveDocEditorSurface("text");
+                    }}
                     disabled={activeDocSaving}
                   >
                     Cancel edit
@@ -1991,12 +2035,20 @@ const DocumentsTab = ({ focusId = null }) => {
           {activeDocLoading ? (
             <div className="status-note">Loading document...</div>
           ) : activeDocMode === "edit" ? (
-            <textarea
-              className="doc-inspector-editor"
-              rows={10}
-              value={activeDocBody}
-              onChange={(event) => setActiveDocBody(event.target.value)}
-            />
+            activeDocIsTabular && activeDocEditorSurface === "table" ? (
+              <CsvTableEditor
+                text={activeDocBody}
+                onChange={setActiveDocBody}
+                disabled={activeDocSaving}
+              />
+            ) : (
+              <textarea
+                className="doc-inspector-editor"
+                rows={10}
+                value={activeDocBody}
+                onChange={(event) => setActiveDocBody(event.target.value)}
+              />
+            )
           ) : (
             <>
               {canPreviewActiveDoc ? (
@@ -2011,6 +2063,8 @@ const DocumentsTab = ({ focusId = null }) => {
               {activeDocBody ? (
                 activeDocIsTabular ? (
                   <CsvTablePreview text={activeDocBody} />
+                ) : activeDocIsMarkdown ? (
+                  <MarkdownPreview text={activeDocBody} />
                 ) : (
                   <pre className="doc-inspector-body">{activeDocBody}</pre>
                 )

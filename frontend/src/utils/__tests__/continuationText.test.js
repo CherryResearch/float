@@ -3,11 +3,18 @@ import { describe, expect, it } from "vitest";
 import {
   isContinuationPlaceholderText,
   mergeContinuationText,
+  stripInlineToolPlaceholders,
 } from "../continuationText";
 
 describe("continuationText", () => {
-  it("treats inline tool placeholders as replaceable continuation stubs", () => {
-    expect(isContinuationPlaceholderText("Checking docs first.[[tool_call:0]]")).toBe(true);
+  it("treats standalone inline tool placeholders as replaceable continuation stubs", () => {
+    expect(isContinuationPlaceholderText("[[tool_call:0]]")).toBe(true);
+  });
+
+  it("keeps completed assistant text with inline tool links renderable", () => {
+    const text = "Checking docs first.[[tool_call:0]]Done.";
+    expect(stripInlineToolPlaceholders(text)).toBe("Checking docs first. Done.");
+    expect(isContinuationPlaceholderText(text)).toBe(false);
   });
 
   it("replaces pending tool stub text instead of appending the continuation", () => {

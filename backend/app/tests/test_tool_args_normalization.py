@@ -144,3 +144,18 @@ def test_tool_info_defaults_are_applied():
     args = normalize_tool_args("tool_info", {"tool_name": "search_web"})
     assert args["tool_name"] == "search_web"
     assert args["include_schema"] is True
+
+
+def test_tool_info_accepts_single_tools_alias():
+    from app.utils.tool_args import normalize_tool_args
+
+    args = normalize_tool_args("tool_info", {"tools": ["write_file"]})
+    assert args["tool_name"] == "write_file"
+    assert args["include_schema"] is True
+
+
+def test_routes_normalize_camera_alias():
+    from app.routes import _normalize_tool_name
+
+    assert _normalize_tool_name("camera") == "camera.capture"
+    assert _normalize_tool_name(" camera.capture ") == "camera.capture"

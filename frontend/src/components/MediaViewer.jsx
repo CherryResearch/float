@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import axios from "axios";
 import { useNavigate } from "react-router-dom";
 import "../styles/MediaViewer.css";
@@ -234,7 +235,7 @@ const MediaViewer = ({
     setOpen(true);
   };
 
-  const closeViewer = () => setOpen(false);
+  const closeViewer = useCallback(() => setOpen(false), []);
 
   const handlePreviewKey = (event) => {
     if (event.key === "Enter" || event.key === " ") {
@@ -466,6 +467,30 @@ const MediaViewer = ({
       window.removeEventListener("wheel", handleWheelCapture, true);
     };
   }, [isZoomable, open]);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!open || !(dialog instanceof HTMLDialogElement)) {
+      return undefined;
+    }
+    if (!dialog.open) {
+      try {
+        dialog.showModal();
+      } catch {
+        dialog.setAttribute("open", "");
+      }
+    }
+    return () => {
+      if (!dialog.open) {
+        return;
+      }
+      try {
+        dialog.close();
+      } catch {
+        dialog.removeAttribute("open");
+      }
+    };
+  }, [open]);
 
   useEffect(() => {
     if (!open || !activeHash) {
@@ -765,15 +790,15 @@ const MediaViewer = ({
     }
   };
 
-  const goPrev = () => {
+  const goPrev = useCallback(() => {
     if (!hasCarousel) return;
     setActiveIndex((prev) => (prev - 1 + viewerItems.length) % viewerItems.length);
-  };
+  }, [hasCarousel, viewerItems.length]);
 
-  const goNext = () => {
+  const goNext = useCallback(() => {
     if (!hasCarousel) return;
     setActiveIndex((prev) => (prev + 1) % viewerItems.length);
-  };
+  }, [hasCarousel, viewerItems.length]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -932,6 +957,341 @@ const MediaViewer = ({
     if (!Number.isFinite(raw)) return;
     setZoomValue(raw / 100);
   };
+  const viewerDialog =
+    open && typeof document !== "undefined"
+      ? createPortal(
+          <dialog
+            ref={dialogRef}
+            className="viewer-dialog"
+            onClick={closeViewer}
+            onClose={() => setOpen(false)}
+            onWheelCapture={(event) => {
+              if (isZoomable && event.ctrlKey) {
+                event.preventDefault();
+              }
+            }}
+            onCancel={(event) => {
+              event.preventDefault();
+              closeViewer();
+            }}
+          >
+            <div
+              className="viewer-surface"
+              style={viewerSurfaceStyle}
+              role="document"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="viewer-header">
+                {hasCarousel ? (
+                  <div className="viewer-counter">
+                    {activeIndex + 1} / {viewerItems.length}
+                  </div>
+                ) : (
+                  <span className="viewer-counter" />
+                )}
+                <button
+                  type="button"
+                  className="viewer-close"
+                  aria-label="Close viewer"
+                  onClick={closeViewer}
+                >
+                  {"x"}
+                </button>
+              </div>
+              <div className="viewer-toolbar">
+                {isZoomable ? (
+                  <div className="toolbar-group">
+                    <button
+                      type="button"
+                      className="viewer-btn"
+                      onClick={() => adjustZoom(-ZOOM_STEP)}
+                      disabled={zoom <= ZOOM_MIN}
+                      title="Zoom out (Ctrl + wheel)"
+                    >
+                      -
+                    </button>
+                    <button
+                      type="button"
+                      className="viewer-btn"
+                      onClick={() => adjustZoom(ZOOM_STEP)}
+                      disabled={zoom >= ZOOM_MAX}
+                      title="Zoom in (Ctrl + wheel)"
+                    >
+                      +
+                    </button>
+                    <button
+                      type="button"
+                      className="viewer-btn"
+                      onClick={resetZoom}
+                      disabled={Math.abs(zoom - 1) < 0.01}
+                      title="Reset zoom"
+                    >
+                      reset
+                    </button>
+                    <span className="zoom-indicator">{zoomPercent}%</span>
+                    <input
+                      className="zoom-slider"
+                      type="range"
+                      min={zoomMinPercent}
+                      max={zoomMaxPercent}
+                      step={Math.round(ZOOM_STEP * 100)}
+                      value={zoomPercent}
+                      onChange={handleZoomSliderChange}
+                      aria-label="Zoom level"
+                    />
+                  </div>
+                ) : (
+                  <span className="toolbar-spacer" />
+                )}
+                <div className="toolbar-group">
+                  {activeKind === "image" && (
+                    <button
+                      type="button"
+                      className="viewer-btn viewer-btn--mint"
+                      onClick={() => {
+                        setCaptionError("");
+                        if (showCaptionEditButton) {
+                          setCaptionEditOpen(true);
+                          setCaptionDraft(storedCaption);
+                          return;
+                        }
+                        setCaptionEditOpen((prev) => !prev);
+                      }}
+                      disabled={captionLoading}
+                      title={
+                        showCaptionEditButton
+                          ? "Edit stored caption text."
+                          : "Generate and index a retrieval caption, then store a readable caption."
+                      }
+                    >
+                      {showCaptionEditButton ? "edit caption" : "caption image"}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="viewer-btn"
+                    onClick={() => window.open(activeSrc, "_blank", "noopener,noreferrer")}
+                    title="Open this file directly in a new tab"
+                  >
+                    open file
+                  </button>
+                  {activeHash && (
+                    <button
+                      type="button"
+                      className="viewer-btn viewer-btn--mint"
+                      onClick={handleReveal}
+                      disabled={revealBusy}
+                      title="Reveal this attachment folder in your OS file browser. If blocked, the path will be shown below."
+                    >
+                      {revealBusy ? "opening..." : "open folder"}
+                    </button>
+                  )}
+                </div>
+              </div>
+              <div className="viewer-file-title" title={activeName}>
+                {activeName}
+              </div>
+              <div className="viewer-meta">
+                <span className="viewer-meta-items">
+                  {activeExtension ? `.${activeExtension}` : "file"}
+                  {activeSize ? ` | ${formatBytes(activeSize)}` : ""}
+                  {activeUploadedAt ? ` | ${formatUploadedAt(activeUploadedAt)}` : ""}
+                  {activeHash ? ` | ${activeHash.slice(0, 12)}...` : ""}
+                </span>
+              </div>
+              {activeStatusDetails.length > 0 && (
+                <div className="viewer-status-note">
+                  {activeStatusDetails.join(" | ")}
+                </div>
+              )}
+              <div className="viewer-main">
+                {hasCarousel && (
+                  <button
+                    type="button"
+                    className="viewer-nav viewer-nav--prev"
+                    aria-label="Previous media"
+                    title="Previous item"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      goPrev();
+                    }}
+                  >
+                    {"<"}
+                  </button>
+                )}
+                <div
+                  ref={mediaWrapperRef}
+                  className={`viewer-media-wrapper ${
+                    isZoomable ? "viewer-media-wrapper--zoomable" : ""
+                  }${isZoomed ? " viewer-media-wrapper--zoomed" : ""}${
+                    isPanning ? " is-panning" : ""
+                  }`}
+                  style={viewerMediaWrapperStyle}
+                  onWheelCapture={handleViewerWheel}
+                  onWheel={handleViewerWheel}
+                  onPointerDown={beginPan}
+                  onPointerMove={movePan}
+                  onPointerUp={endPan}
+                  onPointerCancel={endPan}
+                  onPointerLeave={(event) => {
+                    if (isPanning) endPan(event);
+                  }}
+                >
+                  {renderMedia(activeSrc, activeAlt, activeKind, "viewer")}
+                </div>
+                {hasCarousel && (
+                  <button
+                    type="button"
+                    className="viewer-nav viewer-nav--next"
+                    aria-label="Next media"
+                    title="Next item"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      goNext();
+                    }}
+                  >
+                    {">"}
+                  </button>
+                )}
+              </div>
+              {captionEditOpen && activeKind === "image" && (
+                <div className="viewer-caption-editor">
+                  <textarea
+                    value={captionDraft}
+                    onChange={(event) => setCaptionDraft(event.target.value)}
+                    placeholder="Write or generate a caption..."
+                    rows={3}
+                  />
+                  <div className="viewer-caption-actions">
+                    <button
+                      type="button"
+                      className="viewer-btn"
+                      onClick={generateCaption}
+                      disabled={captionGenerating}
+                      title="Generate and index retrieval embeddings, then save a readable caption."
+                    >
+                      {captionGenerating ? "generating..." : "generate"}
+                    </button>
+                    <button
+                      type="button"
+                      className="viewer-btn"
+                      onClick={saveCaption}
+                      disabled={captionSaving || !captionDraft.trim()}
+                      title="Save the current human-readable caption"
+                    >
+                      {captionSaving ? "saving..." : "save"}
+                    </button>
+                    <button
+                      type="button"
+                      className="viewer-btn"
+                      onClick={deleteCaption}
+                      disabled={captionDeleting || (!captionDraft.trim() && !storedCaption)}
+                      title="Delete the stored caption for this attachment"
+                    >
+                      {captionDeleting ? "deleting..." : "delete"}
+                    </button>
+                    <button
+                      type="button"
+                      className="viewer-btn"
+                      onClick={loadCaptionModelInfo}
+                      disabled={captionModelInfoBusy}
+                      title="Show model details used for captioning and retrieval. Change these in Settings > Models."
+                    >
+                      {captionModelInfoBusy ? "loading models..." : "models"}
+                    </button>
+                    <button
+                      type="button"
+                      className="viewer-btn"
+                      onClick={() => {
+                        setCaptionEditOpen(false);
+                        setCaptionDraft(storedCaption || "");
+                      }}
+                      title="Close caption editor"
+                    >
+                      close
+                    </button>
+                  </div>
+                  {!activeHash && (
+                    <div className="viewer-status-note">
+                      Save/delete require an uploaded attachment item.
+                    </div>
+                  )}
+                  {captionModelInfoError && (
+                    <div className="viewer-status-note">{captionModelInfoError}</div>
+                  )}
+                  {captionModelInfo && (
+                    <div className="viewer-status-note">
+                      caption model: {captionModelInfo.visionModel} | text embeddings:{" "}
+                      {captionModelInfo.ragEmbeddingModel} | image embeddings:{" "}
+                      {captionModelInfo.ragClipModel}
+                    </div>
+                  )}
+                </div>
+              )}
+              {!captionEditOpen && displayCaption && (
+                <div className="viewer-caption-wrap">
+                  <button
+                    type="button"
+                    className="viewer-caption viewer-caption-btn"
+                    onClick={() => {
+                      setCaptionError("");
+                      setCaptionDraft(displayCaption);
+                      setCaptionEditOpen(true);
+                    }}
+                    title="Caption saved. Click to edit or regenerate."
+                  >
+                    {displayCaption}
+                  </button>
+                  <div className="viewer-caption-aside">
+                    {activeCaptionStatus && (
+                      <span className="viewer-caption-badge" title={`caption: ${activeCaptionStatus}`}>
+                        {activeCaptionStatus}
+                      </span>
+                    )}
+                    {activePlaceholderCaption && (
+                      <span className="viewer-caption-badge viewer-caption-badge--placeholder">
+                        placeholder
+                      </span>
+                    )}
+                    {activeHash && (
+                      <button
+                        type="button"
+                        className="viewer-caption-saved viewer-caption-saved-btn"
+                        title="Saved for retrieval. Click to open Memory focused to this image key."
+                        onClick={handleViewSavedMemory}
+                      >
+                        {"\u2713"} saved
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+              {error && <div className="viewer-error">{error}</div>}
+              {captionError && <div className="viewer-error">{captionError}</div>}
+              {revealInfo?.path && (
+                <div className="viewer-status">
+                  stored at <code>{revealInfo.path}</code>
+                  {typeof revealInfo.opened === "boolean" && (
+                    <span className="viewer-status-note">
+                      {revealInfo.opened
+                        ? " (opened in system file browser)"
+                        : " (could not open automatically)"}
+                    </span>
+                  )}
+                  {!revealInfo.opened && revealInfo.open_uri && (
+                    <span className="viewer-status-note">
+                      {" "}
+                      fallback: <code>{revealInfo.open_uri}</code>
+                    </span>
+                  )}
+                </div>
+              )}
+              {revealError && <div className="viewer-error">{revealError}</div>}
+            </div>
+          </dialog>,
+          document.body,
+        )
+      : null;
 
   return (
     <div className="media-viewer">
@@ -950,337 +1310,7 @@ const MediaViewer = ({
           open in viewer
         </button>
       )}
-      {open && (
-        <dialog
-          ref={dialogRef}
-          className="viewer-dialog"
-          open
-          onClick={closeViewer}
-          onWheelCapture={(event) => {
-            if (isZoomable && event.ctrlKey) {
-              event.preventDefault();
-            }
-          }}
-          onCancel={(event) => {
-            event.preventDefault();
-            closeViewer();
-          }}
-        >
-          <div
-            className="viewer-surface"
-            style={viewerSurfaceStyle}
-            role="document"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <div className="viewer-header">
-              {hasCarousel ? (
-                <div className="viewer-counter">
-                  {activeIndex + 1} / {viewerItems.length}
-                </div>
-              ) : (
-                <span className="viewer-counter" />
-              )}
-              <button
-                type="button"
-                className="viewer-close"
-                aria-label="Close viewer"
-                onClick={closeViewer}
-              >
-                {"x"}
-              </button>
-            </div>
-            <div className="viewer-toolbar">
-              {isZoomable ? (
-                <div className="toolbar-group">
-                  <button
-                    type="button"
-                    className="viewer-btn"
-                    onClick={() => adjustZoom(-ZOOM_STEP)}
-                    disabled={zoom <= ZOOM_MIN}
-                    title="Zoom out (Ctrl + wheel)"
-                  >
-                    -
-                  </button>
-                  <button
-                    type="button"
-                    className="viewer-btn"
-                    onClick={() => adjustZoom(ZOOM_STEP)}
-                    disabled={zoom >= ZOOM_MAX}
-                    title="Zoom in (Ctrl + wheel)"
-                  >
-                    +
-                  </button>
-                  <button
-                    type="button"
-                    className="viewer-btn"
-                    onClick={resetZoom}
-                    disabled={Math.abs(zoom - 1) < 0.01}
-                    title="Reset zoom"
-                  >
-                    reset
-                  </button>
-                  <span className="zoom-indicator">{zoomPercent}%</span>
-                  <input
-                    className="zoom-slider"
-                    type="range"
-                    min={zoomMinPercent}
-                    max={zoomMaxPercent}
-                    step={Math.round(ZOOM_STEP * 100)}
-                    value={zoomPercent}
-                    onChange={handleZoomSliderChange}
-                    aria-label="Zoom level"
-                  />
-                </div>
-              ) : (
-                <span className="toolbar-spacer" />
-              )}
-              <div className="toolbar-group">
-                {activeKind === "image" && (
-                  <button
-                    type="button"
-                    className="viewer-btn viewer-btn--mint"
-                    onClick={() => {
-                      setCaptionError("");
-                      if (showCaptionEditButton) {
-                        setCaptionEditOpen(true);
-                        setCaptionDraft(storedCaption);
-                        return;
-                      }
-                      setCaptionEditOpen((prev) => !prev);
-                    }}
-                    disabled={captionLoading}
-                    title={
-                      showCaptionEditButton
-                        ? "Edit stored caption text."
-                        : "Generate and index a retrieval caption, then store a readable caption."
-                    }
-                  >
-                    {showCaptionEditButton ? "edit caption" : "caption image"}
-                  </button>
-                )}
-                <button
-                  type="button"
-                  className="viewer-btn"
-                  onClick={() => window.open(activeSrc, "_blank", "noopener,noreferrer")}
-                  title="Open this file directly in a new tab"
-                >
-                  open file
-                </button>
-                {activeHash && (
-                  <button
-                    type="button"
-                    className="viewer-btn viewer-btn--mint"
-                    onClick={handleReveal}
-                    disabled={revealBusy}
-                    title="Reveal this attachment folder in your OS file browser. If blocked, the path will be shown below."
-                  >
-                    {revealBusy ? "opening..." : "open folder"}
-                  </button>
-                )}
-              </div>
-            </div>
-            <div className="viewer-file-title" title={activeName}>
-              {activeName}
-            </div>
-            <div className="viewer-meta">
-              <span className="viewer-meta-items">
-                {activeExtension ? `.${activeExtension}` : "file"}
-                {activeSize ? ` | ${formatBytes(activeSize)}` : ""}
-                {activeUploadedAt ? ` | ${formatUploadedAt(activeUploadedAt)}` : ""}
-                {activeHash ? ` | ${activeHash.slice(0, 12)}...` : ""}
-              </span>
-            </div>
-            {activeStatusDetails.length > 0 && (
-              <div className="viewer-status-note">
-                {activeStatusDetails.join(" | ")}
-              </div>
-            )}
-            <div className="viewer-main">
-              {hasCarousel && (
-                <button
-                  type="button"
-                  className="viewer-nav viewer-nav--prev"
-                  aria-label="Previous media"
-                  title="Previous item"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    goPrev();
-                  }}
-                >
-                  {"<"}
-                </button>
-              )}
-              <div
-                ref={mediaWrapperRef}
-                className={`viewer-media-wrapper ${
-                  isZoomable ? "viewer-media-wrapper--zoomable" : ""
-                }${isZoomed ? " viewer-media-wrapper--zoomed" : ""}${
-                  isPanning ? " is-panning" : ""
-                }`}
-                style={viewerMediaWrapperStyle}
-                onWheelCapture={handleViewerWheel}
-                onWheel={handleViewerWheel}
-                onPointerDown={beginPan}
-                onPointerMove={movePan}
-                onPointerUp={endPan}
-                onPointerCancel={endPan}
-                onPointerLeave={(event) => {
-                  if (isPanning) endPan(event);
-                }}
-              >
-                {renderMedia(activeSrc, activeAlt, activeKind, "viewer")}
-              </div>
-              {hasCarousel && (
-                <button
-                  type="button"
-                  className="viewer-nav viewer-nav--next"
-                  aria-label="Next media"
-                  title="Next item"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    goNext();
-                  }}
-                >
-                  {">"}
-                </button>
-              )}
-            </div>
-            {captionEditOpen && activeKind === "image" && (
-              <div className="viewer-caption-editor">
-                <textarea
-                  value={captionDraft}
-                  onChange={(event) => setCaptionDraft(event.target.value)}
-                  placeholder="Write or generate a caption..."
-                  rows={3}
-                />
-                <div className="viewer-caption-actions">
-                  <button
-                    type="button"
-                    className="viewer-btn"
-                    onClick={generateCaption}
-                    disabled={captionGenerating}
-                    title="Generate and index retrieval embeddings, then save a readable caption."
-                  >
-                    {captionGenerating ? "generating..." : "generate"}
-                  </button>
-                  <button
-                    type="button"
-                    className="viewer-btn"
-                    onClick={saveCaption}
-                    disabled={captionSaving || !captionDraft.trim()}
-                    title="Save the current human-readable caption"
-                  >
-                    {captionSaving ? "saving..." : "save"}
-                  </button>
-                  <button
-                    type="button"
-                    className="viewer-btn"
-                    onClick={deleteCaption}
-                    disabled={captionDeleting || (!captionDraft.trim() && !storedCaption)}
-                    title="Delete the stored caption for this attachment"
-                  >
-                    {captionDeleting ? "deleting..." : "delete"}
-                  </button>
-                  <button
-                    type="button"
-                    className="viewer-btn"
-                    onClick={loadCaptionModelInfo}
-                    disabled={captionModelInfoBusy}
-                    title="Show model details used for captioning and retrieval. Change these in Settings > Models."
-                  >
-                    {captionModelInfoBusy ? "loading models..." : "models"}
-                  </button>
-                  <button
-                    type="button"
-                    className="viewer-btn"
-                    onClick={() => {
-                      setCaptionEditOpen(false);
-                      setCaptionDraft(storedCaption || "");
-                    }}
-                    title="Close caption editor"
-                  >
-                    close
-                  </button>
-                </div>
-                {!activeHash && (
-                  <div className="viewer-status-note">
-                    Save/delete require an uploaded attachment item.
-                  </div>
-                )}
-                {captionModelInfoError && (
-                  <div className="viewer-status-note">{captionModelInfoError}</div>
-                )}
-                {captionModelInfo && (
-                  <div className="viewer-status-note">
-                    caption model: {captionModelInfo.visionModel} | text embeddings:{" "}
-                    {captionModelInfo.ragEmbeddingModel} | image embeddings:{" "}
-                    {captionModelInfo.ragClipModel}
-                  </div>
-                )}
-              </div>
-            )}
-            {!captionEditOpen && displayCaption && (
-              <div className="viewer-caption-wrap">
-                <button
-                  type="button"
-                  className="viewer-caption viewer-caption-btn"
-                  onClick={() => {
-                    setCaptionError("");
-                    setCaptionDraft(displayCaption);
-                    setCaptionEditOpen(true);
-                  }}
-                  title="Caption saved. Click to edit or regenerate."
-                >
-                  {displayCaption}
-                </button>
-                <div className="viewer-caption-aside">
-                  {activeCaptionStatus && (
-                    <span className="viewer-caption-badge" title={`caption: ${activeCaptionStatus}`}>
-                      {activeCaptionStatus}
-                    </span>
-                  )}
-                  {activePlaceholderCaption && (
-                    <span className="viewer-caption-badge viewer-caption-badge--placeholder">
-                      placeholder
-                    </span>
-                  )}
-                  {activeHash && (
-                    <button
-                      type="button"
-                      className="viewer-caption-saved viewer-caption-saved-btn"
-                      title="Saved for retrieval. Click to open Memory focused to this image key."
-                      onClick={handleViewSavedMemory}
-                    >
-                      {"\u2713"} saved
-                    </button>
-                  )}
-                </div>
-              </div>
-            )}
-            {error && <div className="viewer-error">{error}</div>}
-            {captionError && <div className="viewer-error">{captionError}</div>}
-            {revealInfo?.path && (
-              <div className="viewer-status">
-                stored at <code>{revealInfo.path}</code>
-                {typeof revealInfo.opened === "boolean" && (
-                  <span className="viewer-status-note">
-                    {revealInfo.opened
-                      ? " (opened in system file browser)"
-                      : " (could not open automatically)"}
-                  </span>
-                )}
-                {!revealInfo.opened && revealInfo.open_uri && (
-                  <span className="viewer-status-note">
-                    {" "}
-                    fallback: <code>{revealInfo.open_uri}</code>
-                  </span>
-                )}
-              </div>
-            )}
-            {revealError && <div className="viewer-error">{revealError}</div>}
-          </div>
-        </dialog>
-      )}
+      {viewerDialog}
     </div>
   );
 };

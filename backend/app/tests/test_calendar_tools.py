@@ -167,3 +167,75 @@ def test_create_event_alias_persists_calendar_event(tmp_path, monkeypatch):
     assert event["title"] == "Night reminder"
     assert event["timezone"] == "America/Vancouver"
     assert event["end_time"] - event["start_time"] == pytest.approx(30 * 60)
+
+
+def test_list_tasks_returns_upcoming_events_by_default(tmp_path, monkeypatch):
+    from app.tools.calendar import create_task, list_tasks
+
+    monkeypatch.setattr(calendar_store, "EVENTS_DIR", tmp_path, raising=False)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+
+    create_args = {
+        "title": "Future reminder",
+        "start_time": "2099-04-12T09:00:00Z",
+        "timezone": "UTC",
+    }
+    create_signature = generate_signature("tester", "create_task", create_args)
+    create_task(user="tester", signature=create_signature, **create_args)
+    calendar_store.save_event(
+        "past-reminder",
+        {
+            "id": "past-reminder",
+            "title": "Past reminder",
+            "start_time": 1609459200,
+            "end_time": 1609462800,
+            "timezone": "UTC",
+            "status": "scheduled",
+        },
+    )
+
+    args = {"status": "", "include_past": False, "limit": 20}
+    signature = generate_signature("tester", "list_tasks", args)
+    result = list_tasks(user="tester", signature=signature, **args)
+
+    assert result["count"] == 1
+    assert result["events"][0]["title"] == "Future reminder"
+    assert result["total_matches"] == 1
+
+
+def test_list_tasks_filters_status_and_can_include_past(tmp_path, monkeypatch):
+    from app.tools.calendar import list_tasks
+
+    monkeypatch.setattr(calendar_store, "EVENTS_DIR", tmp_path, raising=False)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+
+    calendar_store.save_event(
+        "done-item",
+        {
+            "id": "done-item",
+            "title": "Done item",
+            "start_time": 1609459200,
+            "end_time": 1609462800,
+            "timezone": "UTC",
+            "status": "acknowledged",
+        },
+    )
+    calendar_store.save_event(
+        "scheduled-item",
+        {
+            "id": "scheduled-item",
+            "title": "Scheduled item",
+            "start_time": 1609459200,
+            "end_time": 1609462800,
+            "timezone": "UTC",
+            "status": "scheduled",
+        },
+    )
+
+    args = {"status": "acknowledged", "include_past": True, "limit": 5}
+    signature = generate_signature("tester", "list_tasks", args)
+    result = list_tasks(user="tester", signature=signature, **args)
+
+    assert result["count"] == 1
+    assert result["events"][0]["id"] == "done-item"
+    assert result["filters"]["limit"] == 5

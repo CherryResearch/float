@@ -17,6 +17,31 @@ def test_tool_specs_endpoint_returns_schemas(tmp_path, monkeypatch):
         calendar_store, "EVENTS_DIR", tmp_path / "calendar", raising=False
     )
     calendar_store.EVENTS_DIR.mkdir(parents=True, exist_ok=True)
+    expected_tools = [
+        "remember",
+        "recall",
+        "help",
+        "tool_help",
+        "tool_info",
+        "list_actions",
+        "read_action_diff",
+        "revert_actions",
+        "create_event",
+        "create_task",
+        "list_tasks",
+        "list_dir",
+        "read_file",
+        "computer.observe",
+        "computer.act",
+        "shell.exec",
+        "patch.apply",
+    ]
+    monkeypatch.setattr(
+        app.state.memory_manager,
+        "list_tools",
+        lambda: list(expected_tools),
+        raising=False,
+    )
 
     client = TestClient(app)
     resp = client.get("/api/tools/specs")
@@ -89,6 +114,12 @@ def test_tool_specs_endpoint_returns_schemas(tmp_path, monkeypatch):
     assert "start" in create_task_props
     assert "grounded_at" in create_task_props
     assert "status" in create_task_props
+    list_tasks = next((t for t in tools if t.get("name") == "list_tasks"), None)
+    assert list_tasks is not None
+    list_tasks_props = list_tasks["parameters"].get("properties") or {}
+    assert "status" in list_tasks_props
+    assert "include_past" in list_tasks_props
+    assert "limit" in list_tasks_props
     list_dir = next((t for t in tools if t.get("name") == "list_dir"), None)
     assert list_dir is not None
     list_dir_props = list_dir["parameters"].get("properties") or {}

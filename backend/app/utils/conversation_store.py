@@ -136,8 +136,32 @@ def _iter_conversation_files() -> List[Path]:
     for path in CONV_DIR.rglob("*.json"):
         if path.name.endswith(".meta.json"):
             continue
+        if not _looks_like_conversation_array_file(path):
+            continue
         files.append(path)
     return files
+
+
+def _looks_like_conversation_array_file(path: Path) -> bool:
+    """Cheaply filter out non-conversation JSON artifacts.
+
+    Conversation history files are JSON arrays. A few other repo-local helper
+    artifacts live under the same tree as JSON objects, so we inspect only the
+    first non-whitespace character instead of fully parsing every file during
+    listing.
+    """
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            while True:
+                chunk = handle.read(256)
+                if not chunk:
+                    return False
+                for char in chunk:
+                    if char.isspace():
+                        continue
+                    return char == "["
+    except Exception:
+        return False
 
 
 def _is_empty_conversation_file(path: Path) -> bool:
@@ -343,8 +367,14 @@ def load_conversation(name: str) -> List[Dict[str, Any]]:
     fp = _path(name)
     if not fp.exists():
         return []
-    with fp.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with fp.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return []
+    if isinstance(payload, list):
+        return payload
+    return []
 
 
 def get_or_create_conversation_id(name: str) -> str:

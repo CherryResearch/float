@@ -13,7 +13,7 @@ import axios from "axios";
 import { ensureServiceWorker } from "./utils/push";
 import { shouldRefreshProviderModels } from "./utils/providerProbe";
 import { ensureDeviceAndToken } from "./utils/sync";
-import { isGptOssModel } from "./utils/modelUtils";
+import { isGptOssModel, isLocalRuntimeEntry } from "./utils/modelUtils";
 import ReactDOM from "react-dom/client";
 import App from "./components/App"; // Clean import path
 import { ThemeProvider, createTheme } from "@mui/material/styles";
@@ -23,6 +23,7 @@ import {
   DEFAULT_VISUAL_THEME,
   getMuiPaletteOptions,
   normalizeVisualTheme,
+  registerCustomThemes,
 } from "./theme";
 import {
   normalizeToolDisplayMode,
@@ -73,6 +74,68 @@ const parseStoredJsonArray = (value) => {
   }
 };
 
+const parseStoredThemes = (value) => {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+};
+
+const normalizeBackendMode = (value) => {
+  const raw = String(value || "").trim().toLowerCase();
+  if (raw === "local-cloud" || raw === "cloud") return "server";
+  if (raw === "local-small" || raw === "local-static") return "local";
+  if (raw === "local" || raw === "server" || raw === "api") return raw;
+  return "api";
+};
+
+const applyBackendRuntimeSelection = (prev, data = {}) => {
+  const next = { ...prev };
+  let changed = false;
+  const nextBackendMode = normalizeBackendMode(data.mode || prev.backendMode);
+  if (nextBackendMode !== prev.backendMode) {
+    next.backendMode = nextBackendMode;
+    changed = true;
+  }
+  const incomingApiModel =
+    typeof data.model === "string" && data.model.trim() ? data.model.trim() : "";
+  if (incomingApiModel && incomingApiModel !== prev.apiModel) {
+    next.apiModel = incomingApiModel;
+    changed = true;
+  }
+  if (typeof data.server_url === "string" && data.server_url !== prev.serverUrl) {
+    next.serverUrl = data.server_url;
+    changed = true;
+  }
+  const incomingTransformer =
+    typeof data.transformer_model === "string" ? data.transformer_model.trim() : "";
+  if (nextBackendMode === "local" && incomingTransformer) {
+    if (incomingTransformer !== prev.localModel) {
+      next.localModel = incomingTransformer;
+      changed = true;
+    }
+    if (
+      !isLocalRuntimeEntry(incomingTransformer) &&
+      incomingTransformer !== prev.transformerModel
+    ) {
+      next.transformerModel = incomingTransformer;
+      changed = true;
+    }
+  } else if (
+    nextBackendMode === "server" &&
+    incomingTransformer &&
+    !isLocalRuntimeEntry(incomingTransformer) &&
+    incomingTransformer !== prev.transformerModel
+  ) {
+    next.transformerModel = incomingTransformer;
+    changed = true;
+  }
+  return changed ? next : prev;
+};
+
 // Create a Context for the global state
 export const GlobalContext = createContext();
 
@@ -84,26 +147,21 @@ const GlobalProvider = ({ children }) => {
     const storedHistory = localStorage.getItem("history");
     const storedLevel = localStorage.getItem("approvalLevel") || "all";
     const storedTheme = localStorage.getItem("theme") || "light";
+    const storedCustomThemes = parseStoredThemes(localStorage.getItem("customThemes"));
+    registerCustomThemes(storedCustomThemes);
     const storedVisualTheme = normalizeVisualTheme(
       localStorage.getItem("visualTheme") || DEFAULT_VISUAL_THEME,
     );
     const storedBackendModeRaw =
       localStorage.getItem("backendMode") || "api";
-    const storedBackendMode =
-      storedBackendModeRaw === "local-cloud"
-        ? "server"
-        : storedBackendModeRaw === "cloud"
-        ? "server"
-        : ["local-small", "local-static"].includes(storedBackendModeRaw)
-        ? "local"
-        : storedBackendModeRaw;
-    const storedApiModel = localStorage.getItem("apiModel") || "gpt-5";
+    const storedBackendMode = normalizeBackendMode(storedBackendModeRaw);
+    const storedApiModel = localStorage.getItem("apiModel") || "gpt-5.4";
     const storedLocalModel =
       localStorage.getItem("localModel") || "mistral:7b";
     const storedTransformerModel =
       localStorage.getItem("transformerModel") || "gpt-oss-20b";
     const storedStaticModel =
-      localStorage.getItem("staticModel") || "gpt-4o-mini";
+      localStorage.getItem("staticModel") || "gpt-5.4-mini";
     const storedHarmonyFormatRaw = localStorage.getItem("harmonyFormat");
     const storedHarmonyFormat = storedHarmonyFormatRaw === "true";
     const storedHarmonyTouched = localStorage.getItem("harmonyTouched") === "true";
@@ -285,6 +343,7 @@ const GlobalProvider = ({ children }) => {
       thinkingMode: storedThinkingMode,
       toolDisplayMode: storedToolDisplayMode,
       toolLinkBehavior: storedToolLinkBehavior,
+      customThemes: storedCustomThemes,
     };
   });
   const [userSettingsLoaded, setUserSettingsLoaded] = useState(false);
@@ -293,6 +352,7 @@ const GlobalProvider = ({ children }) => {
     apiModelsUpdatedAt: null,
     apiProviderStatus: "unknown",
   });
+  registerCustomThemes(Array.isArray(state.customThemes) ? state.customThemes : []);
 
   useEffect(() => {
     apiProbeStateRef.current = {
@@ -406,11 +466,15 @@ const GlobalProvider = ({ children }) => {
       lastUserSettingsRef.current = null;
       return;
     }
-    axios
-      .get("/api/user-settings")
-      .then((res) => {
-        const data = res.data;
+    Promise.all([axios.get("/api/themes"), axios.get("/api/user-settings")])
+      .then(([themesRes, settingsRes]) => {
+        const customThemes = Array.isArray(themesRes?.data?.themes)
+          ? themesRes.data.themes
+          : [];
+        registerCustomThemes(customThemes);
+        const data = settingsRes.data;
         setState((prev) => {
+          const nextCustomThemes = customThemes;
           const nextApproval = data.approval_level || prev.approvalLevel;
           const nextTheme = data.theme || prev.theme;
           const nextVisualTheme = normalizeVisualTheme(
@@ -492,6 +556,7 @@ const GlobalProvider = ({ children }) => {
             approvalLevel: nextApproval,
             theme: nextTheme,
             visualTheme: nextVisualTheme,
+            customThemes: nextCustomThemes,
             toolDisplayMode: nextToolDisplay,
             toolLinkBehavior: nextToolLink,
             liveTranscriptEnabled: nextLiveTranscriptEnabled,
@@ -591,6 +656,14 @@ const GlobalProvider = ({ children }) => {
   useEffect(() => {
     localStorage.setItem("visualTheme", normalizeVisualTheme(state.visualTheme));
   }, [state.visualTheme]);
+
+  useEffect(() => {
+    registerCustomThemes(Array.isArray(state.customThemes) ? state.customThemes : []);
+    localStorage.setItem(
+      "customThemes",
+      JSON.stringify(Array.isArray(state.customThemes) ? state.customThemes : []),
+    );
+  }, [state.customThemes]);
 
   useEffect(() => {
     if (state.toolDisplayMode) {
@@ -940,13 +1013,14 @@ const GlobalProvider = ({ children }) => {
     userSettingsLoaded,
   ]);
 
+  const settingsSyncReady =
+    state.backendMode !== "api" ||
+    state.apiStatus === "online" ||
+    state.apiStatus === "bypassed";
+
   useEffect(() => {
     let cancelled = false;
-    const ready =
-      state.backendMode !== "api" ||
-      state.apiStatus === "online" ||
-      state.apiStatus === "bypassed";
-    if (!ready) {
+    if (!settingsSyncReady) {
       return () => {
         cancelled = true;
       };
@@ -959,6 +1033,11 @@ const GlobalProvider = ({ children }) => {
         setState((prev) => {
           const next = { ...prev };
           let changed = false;
+          const runtimeSelection = applyBackendRuntimeSelection(prev, data);
+          if (runtimeSelection !== prev) {
+            Object.assign(next, runtimeSelection);
+            changed = true;
+          }
           if (typeof data.dev_mode !== "undefined" && Boolean(data.dev_mode) !== prev.devMode) {
             next.devMode = Boolean(data.dev_mode);
             changed = true;
@@ -984,7 +1063,7 @@ const GlobalProvider = ({ children }) => {
     return () => {
       cancelled = true;
     };
-  }, [state.backendMode, state.apiStatus]);
+  }, [settingsSyncReady, state.apiStatus]);
 
   const muiTheme = useMemo(
     () =>

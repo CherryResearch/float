@@ -46,6 +46,19 @@ class PlaywrightComputerRuntime(ComputerRuntime):
             raise RuntimeError(f"Browser session '{session_id}' is not active")
         return handle
 
+    def _close_handle(self, session_id: str) -> Dict[str, Any]:
+        handle = self._sessions.pop(session_id, None) or {}
+        browser = handle.get("browser")
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+        profile_dir = handle.get("profile_dir")
+        if isinstance(profile_dir, Path):
+            shutil.rmtree(profile_dir, ignore_errors=True)
+        return {"status": "stopped", "session_id": session_id}
+
     def _save_screenshot(self, session_id: str, page) -> Path:
         target = self.screenshot_root / f"{session_id}-{int(time.time() * 1000)}.png"
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -131,17 +144,7 @@ class PlaywrightComputerRuntime(ComputerRuntime):
             raise normalized_exc from exc
 
     def stop_session(self, session: ComputerSessionState) -> Dict[str, Any]:
-        handle = self._sessions.pop(session.id, None) or {}
-        browser = handle.get("browser")
-        if browser is not None:
-            try:
-                browser.close()
-            except Exception:
-                pass
-        profile_dir = handle.get("profile_dir")
-        if isinstance(profile_dir, Path):
-            shutil.rmtree(profile_dir, ignore_errors=True)
-        return {"status": "stopped", "session_id": session.id}
+        return self._close_handle(session.id)
 
     def observe(self, session: ComputerSessionState) -> Dict[str, Any]:
         handle = self._page_handle(session.id)
@@ -200,3 +203,21 @@ class PlaywrightComputerRuntime(ComputerRuntime):
         observed["summary"] = f"Applied {len(applied)} browser action(s)"
         observed["actions"] = applied
         return observed
+
+    def shutdown(self) -> Dict[str, Any]:
+        closed_sessions: List[str] = []
+        for session_id in list(self._sessions):
+            self._close_handle(session_id)
+            closed_sessions.append(session_id)
+        if self._playwright is not None:
+            try:
+                self._playwright.stop()
+            except Exception:
+                pass
+            finally:
+                self._playwright = None
+        return {
+            "status": "stopped",
+            "runtime": self.name,
+            "closed_sessions": closed_sessions,
+        }

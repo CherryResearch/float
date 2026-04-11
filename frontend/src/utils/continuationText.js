@@ -5,15 +5,22 @@ export const CONTINUATION_PLACEHOLDER_PATTERNS = [
   /^I couldn't finish the continuation from tool results\./i,
 ];
 
-const INLINE_TOOL_PLACEHOLDER_RE = /\[\[tool_call:\d+\]\]/;
+const INLINE_TOOL_PLACEHOLDER_RE = /\[\[tool_call:\d+\]\]/g;
 
 const normalizeContinuationValue = (value) => String(value || "").replace(/\s+/g, " ").trim();
+
+export const stripInlineToolPlaceholders = (value) =>
+  String(value || "")
+    .replace(INLINE_TOOL_PLACEHOLDER_RE, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 
 export const isContinuationPlaceholderText = (value) => {
   const trimmed = String(value || "").trim();
   if (!trimmed) return false;
-  if (INLINE_TOOL_PLACEHOLDER_RE.test(trimmed)) return true;
-  return CONTINUATION_PLACEHOLDER_PATTERNS.some((pattern) => pattern.test(trimmed));
+  const stripped = stripInlineToolPlaceholders(trimmed);
+  if (!stripped) return true;
+  return CONTINUATION_PLACEHOLDER_PATTERNS.some((pattern) => pattern.test(stripped));
 };
 
 export const mergeContinuationText = (existingText, continuation, metadata = {}) => {

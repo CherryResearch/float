@@ -29,7 +29,9 @@ def _make_app(monkeypatch, search_dirs):
     from app import routes
 
     # Force model_search_dirs to use our temporary paths
-    monkeypatch.setattr(app_config, "model_search_dirs", lambda custom_path=None: search_dirs)
+    monkeypatch.setattr(
+        app_config, "model_search_dirs", lambda custom_path=None: search_dirs
+    )
 
     app = FastAPI()
     app.include_router(routes.router, prefix="/api")
@@ -49,6 +51,7 @@ def test_transformer_models_filters_hf_cache_noise(tmp_path: Path, monkeypatch):
     _make_dummy_model(repo_dir, "gpt-oss-20b")
     # HF cache entries: one allowed, one noise
     _make_dummy_model(hf_cache, "models--meta-llama--Llama-3.1-8B")
+    _make_dummy_model(hf_cache, "models--google--gemma-4-E2B-it")
     _make_dummy_model(hf_cache, "models--sentence-transformers--all-MiniLM-L6-v2")
 
     client = _make_app(monkeypatch, [repo_dir, hf_cache])
@@ -59,17 +62,22 @@ def test_transformer_models_filters_hf_cache_noise(tmp_path: Path, monkeypatch):
 
     assert "gpt-oss-20b" in models
     assert "Llama-3.1-8B" in models  # allowed HF cache entry
+    assert "gemma-4-E2B-it" in models
     assert "all-MiniLM-L6-v2" not in models  # filtered HF noise by default
 
 
-def test_transformer_models_can_include_cache_noise_when_requested(tmp_path: Path, monkeypatch):
+def test_transformer_models_can_include_cache_noise_when_requested(
+    tmp_path: Path, monkeypatch
+):
     hf_cache = tmp_path / ".cache" / "huggingface" / "hub"
     hf_cache.mkdir(parents=True, exist_ok=True)
     _make_dummy_model(hf_cache, "models--sentence-transformers--all-MiniLM-L6-v2")
 
     client = _make_app(monkeypatch, [hf_cache])
 
-    resp = client.get("/api/transformers/models", params={"include_cache_unfiltered": True})
+    resp = client.get(
+        "/api/transformers/models", params={"include_cache_unfiltered": True}
+    )
     assert resp.status_code == 200
     models = resp.json().get("models", [])
     assert "all-MiniLM-L6-v2" in models

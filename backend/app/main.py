@@ -1,8 +1,8 @@
 import asyncio
 import logging
 import os
-from datetime import datetime, timezone
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 import app.config as config
 import app.hooks_auto_title as _hooks_auto_title  # noqa: F401 - register auto-title hook
@@ -11,7 +11,6 @@ import app.routes as routes
 import app.routes_tools as routes_tools
 import app.services as services
 from api.live import router as live_router
-from api.sync import router as sync_router
 from app import hooks
 from app import routes as routes_module
 from app import tools
@@ -27,20 +26,25 @@ from app.utils.hardware import (
     pick_default_device,
     torch_cuda_diagnostics,
 )
+from app.utils.server_shutdown import shutdown_server_resources
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from workers.task_evaluator import evaluate_pending_tasks
 from workers.scheduled_tool_runner import scheduled_tool_runner
+from workers.task_evaluator import evaluate_pending_tasks
 
 logger = logging.getLogger(__name__)
 
 logger.info("App is loading :3")
 
-# Prefer faster HF downloads by default (user can override via env)
-os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+# Prefer faster HF downloads by default (user can override via env).
+# huggingface-hub 1.x routes high-performance transfers through Xet.
+if os.environ.get("HF_HUB_ENABLE_HF_TRANSFER") == "1":
+    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
+    os.environ.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
+os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
 
 
 @asynccontextmanager
@@ -68,11 +72,13 @@ async def lifespan(app: FastAPI):
             def _emit_action_event(payload: dict) -> None:
                 if not isinstance(payload, dict):
                     return
+
                 async def _publish() -> None:
                     try:
                         await broker.publish(payload)
                     except Exception:
                         pass
+
                 try:
                     running = asyncio.get_running_loop()
                 except RuntimeError:
@@ -96,6 +102,18 @@ async def lifespan(app: FastAPI):
         jobmon.cancel()
         scheduled_tools.cancel()
         await asyncio.gather(worker, jobmon, scheduled_tools, return_exceptions=True)
+        shutdown_summary = shutdown_server_resources(
+            app,
+            provider_manager=getattr(routes_module, "provider_manager", None),
+            terminate_job_proc=getattr(routes_module, "_terminate_proc", None),
+        )
+        if (
+            shutdown_summary.get("terminated_model_jobs")
+            or shutdown_summary.get("computer")
+            or shutdown_summary.get("providers")
+            or shutdown_summary.get("errors")
+        ):
+            logger.info("Server shutdown cleanup: %s", shutdown_summary)
 
 
 # Initialize FastAPI
@@ -156,6 +174,16 @@ def read_root():
 # Load configurations
 try:
     config = config.load_config()  # Correctly call `load_config`
+    configured_mode = (
+        routes_module._normalize_llm_mode(config.get("mode"))
+        or routes_module._normalize_llm_mode(
+            getattr(routes_module.llm_service, "mode", None)
+        )
+        or "api"
+    )
+    config["mode"] = configured_mode
+    routes_module.llm_service.mode = configured_mode
+    routes_module.llm_service.config = config
     # Attach the loaded configuration to the application
     models_dir = config.get("models_folder")
     try:
@@ -210,9 +238,6 @@ try:
     livekit_service = services.LiveKitService(config)
     logger.info("LiveKitService initialized.")
 
-    sync_service = services.SyncService(os.getenv("SYNC_SECRET", "change-me"))
-    logger.info("SyncService initialized.")
-
     action_history_service = services.ActionHistoryService(config)
     logger.info("ActionHistoryService initialized.")
 
@@ -223,7 +248,6 @@ try:
     app.state.memory_manager = memory_manager
     app.state.rag_handler = rag_handler
     app.state.livekit_service = livekit_service
-    app.state.sync_service = sync_service
     app.state.action_history_service = action_history_service
     app.state.computer_service = computer_service
     # Broadcast stream so multiple consumers (main UI, dev panel, etc.) all see events.
@@ -247,7 +271,9 @@ try:
         # tools are optional; continue if import fails
         pass
     try:
-        from app.tools.actions import set_action_history_service as _set_action_history  # type: ignore
+        from app.tools.actions import (
+            set_action_history_service as _set_action_history,  # type: ignore
+        )
 
         _set_action_history(action_history_service)
         logger.info("Action history tools bound to ActionHistoryService")
@@ -265,7 +291,6 @@ except Exception as e:
 # Expose routes under both legacy "/" and current "/api" prefixes.
 # Keeping both avoids breaking older clients and satisfies internal tests.
 app.include_router(live_router)
-app.include_router(sync_router)
 app.include_router(routes.router)
 app.include_router(routes.router, prefix="/api")
 app.include_router(routes_tools.router)

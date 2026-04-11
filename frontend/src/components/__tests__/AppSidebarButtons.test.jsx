@@ -78,6 +78,7 @@ describe("App sidebar open buttons", () => {
   beforeEach(() => {
     vi.resetModules();
     globalThis.WebSocket = MockWebSocket;
+    window.history.pushState({}, "", "/");
     Object.defineProperty(window, "innerWidth", {
       configurable: true,
       writable: true,
@@ -148,5 +149,13 @@ describe("App sidebar open buttons", () => {
       expect(document.querySelector(".sidebar.left-sidebar")).toHaveClass("collapsed"),
     );
     expect(screen.getByTitle("Show history sidebar")).toBeInTheDocument();
+  });
+
+  test("settings route uses the inner settings scroll shell", async () => {
+    window.history.pushState({}, "", "/settings");
+    const { default: App } = await import("../App");
+    render(<App />);
+
+    expect(document.querySelector(".main-chat")).toHaveClass("main-chat--settings");
   });
 });

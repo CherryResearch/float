@@ -34,12 +34,17 @@ class DummyHfApi:
         raise RuntimeError("offline")
 
 
-def test_model_job_create_dedupes_and_resumes(monkeypatch, tmp_path: Path):
+@pytest.mark.parametrize("model_name", ["kokoro", "gemma-4-E2B-it"])
+def test_model_job_create_dedupes_and_resumes(
+    monkeypatch, tmp_path: Path, model_name: str
+):
     from app import routes
 
     start_calls = {"count": 0, "pid": 1000}
 
-    def fake_start_download_process(repo_id: str, target_dir: Path, model_alias: str | None = None):
+    def fake_start_download_process(
+        repo_id: str, target_dir: Path, model_alias: str | None = None
+    ):
         start_calls["count"] += 1
         start_calls["pid"] += 1
         return DummyProc(start_calls["pid"])
@@ -55,14 +60,14 @@ def test_model_job_create_dedupes_and_resumes(monkeypatch, tmp_path: Path):
     app.state.config = {"models_folder": str(tmp_path / "models")}
     client = TestClient(app)
 
-    resp1 = client.post("/api/models/jobs", json={"model": "kokoro"})
+    resp1 = client.post("/api/models/jobs", json={"model": model_name})
     assert resp1.status_code == 200
     job1 = resp1.json().get("job") or {}
     job_id = job1.get("id")
     assert job_id
     assert start_calls["count"] == 1
 
-    resp2 = client.post("/api/models/jobs", json={"model": "kokoro"})
+    resp2 = client.post("/api/models/jobs", json={"model": model_name})
     assert resp2.status_code == 200
     job2 = resp2.json().get("job") or {}
     assert job2.get("id") == job_id
@@ -72,7 +77,7 @@ def test_model_job_create_dedupes_and_resumes(monkeypatch, tmp_path: Path):
     assert paused.status_code == 200
     assert (paused.json().get("job") or {}).get("status") == "paused"
 
-    resp3 = client.post("/api/models/jobs", json={"model": "kokoro"})
+    resp3 = client.post("/api/models/jobs", json={"model": model_name})
     assert resp3.status_code == 200
     job3 = resp3.json().get("job") or {}
     assert job3.get("id") == job_id

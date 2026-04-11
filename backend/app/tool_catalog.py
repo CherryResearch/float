@@ -531,6 +531,22 @@ _BUILTIN_TOOL_CATALOG: Dict[str, Dict[str, Any]] = {
         can_access=["local calendar/task storage"],
         cannot_access=["external calendar providers or unrelated filesystem paths"],
     ),
+    "list_tasks": _entry(
+        category="calendar",
+        summary="List saved task/calendar events from local Float storage.",
+        description=(
+            "Reads saved task/event payloads from Float's local calendar store and "
+            "returns a bounded list, with optional filtering for status or historical entries."
+        ),
+        runtime={"executor": "backend_python", "network": False, "filesystem": True},
+        sandbox={"read_roots": ["data/databases/calendar_events/"]},
+        limits={"default_limit": 20, "max_limit": 100},
+        freshness={"type": "live_local_state"},
+        persistence={"writes_state": False},
+        safety={"risk_level": "low", "default_approval": "auto"},
+        can_access=["local calendar/task storage"],
+        cannot_access=["external calendar providers or unrelated filesystem paths"],
+    ),
     "memory.save": _entry(
         category="memory",
         summary="Legacy compatibility wrapper for saving a memory entry.",
@@ -612,6 +628,7 @@ def _display_name(tool_name: str) -> str:
         "read_threads_summary": "Read Threads Summary",
         "create_event": "Create Event",
         "create_task": "Create Task",
+        "list_tasks": "List Tasks",
         "memory.save": "Memory Save",
     }
     if tool_name in special:

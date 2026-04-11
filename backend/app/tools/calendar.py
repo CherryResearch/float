@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+import time
 from typing import Any, Dict, Optional
 
 from app.schemas import CalendarEvent
@@ -228,6 +229,42 @@ def _normalize_actions(value: Any) -> list[Dict[str, Any]]:
     return normalized
 
 
+def _coerce_limit(value: Any, *, default: int = 20, maximum: int = 100) -> int:
+    try:
+        candidate = int(value)
+    except Exception:
+        return default
+    return max(1, min(maximum, candidate))
+
+
+def _matches_status(event: Dict[str, Any], expected: Optional[str]) -> bool:
+    if not expected:
+        return True
+    return _normalize_status(event.get("status")) == _normalize_status(expected)
+
+
+def _is_upcoming(event: Dict[str, Any], now_ts: float) -> bool:
+    end_time = event.get("end_time")
+    start_time = event.get("start_time")
+    try:
+        if end_time is not None:
+            return float(end_time) >= now_ts
+        if start_time is not None:
+            return float(start_time) >= now_ts
+    except Exception:
+        return True
+    return True
+
+
+def _sort_key(event: Dict[str, Any]) -> tuple[float, str]:
+    start_time = event.get("start_time")
+    try:
+        normalized_start = float(start_time)
+    except Exception:
+        normalized_start = float("inf")
+    return (normalized_start, str(event.get("id") or ""))
+
+
 def _save_task_event(args: Dict[str, Any]) -> Dict[str, Any]:
     title = _normalize_optional_str(
         args.get("title") or args.get("summary") or args.get("name")
@@ -265,7 +302,10 @@ def _save_task_event(args: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("create_task requires a 'start_time'")
 
     end_time = _coerce_timestamp(
-        args.get("end_time") or args.get("end") or args.get("ends_at") or args.get("end_at"),
+        args.get("end_time")
+        or args.get("end")
+        or args.get("ends_at")
+        or args.get("end_at"),
         timezone_name=timezone_name,
         grounded_at=grounded_at,
     )
@@ -324,3 +364,44 @@ def create_event(*, user: str, signature: str, **payload: Any) -> Dict[str, Any]
     args = dict(payload)
     verify_signature(signature, user, "create_event", args)
     return _save_task_event(args)
+
+
+def list_tasks(
+    status: str = "",
+    include_past: bool = False,
+    limit: int = 20,
+    *,
+    user: str,
+    signature: str,
+) -> Dict[str, Any]:
+    """List saved task/calendar events from local storage."""
+
+    payload = {
+        "status": status,
+        "include_past": bool(include_past),
+        "limit": _coerce_limit(limit),
+    }
+    verify_signature(signature, user, "list_tasks", payload)
+
+    now_ts = time.time()
+    events: list[Dict[str, Any]] = []
+    for event_id in calendar_store.list_events():
+        event = calendar_store.load_event(event_id)
+        if not isinstance(event, dict) or not event:
+            continue
+        normalized = dict(event)
+        normalized.setdefault("id", event_id)
+        if not _matches_status(normalized, _normalize_optional_str(status)):
+            continue
+        if not include_past and not _is_upcoming(normalized, now_ts):
+            continue
+        events.append(normalized)
+
+    events.sort(key=_sort_key)
+    limited = events[: payload["limit"]]
+    return {
+        "count": len(limited),
+        "total_matches": len(events),
+        "filters": payload,
+        "events": limited,
+    }

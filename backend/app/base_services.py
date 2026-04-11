@@ -4,12 +4,16 @@ import base64
 import copy
 import gc
 import hashlib
+import importlib
+import importlib.metadata as importlib_metadata
 import importlib.util
+import io
 import json
 import logging
 import mimetypes
 import os
 import re
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -38,7 +42,9 @@ from app.utils.graph_store import GraphStore
 from app.utils.hardware import gpu_memory_snapshot, system_memory_snapshot
 from app.utils.http_client import http_session as _real_http_session
 from app.utils.llm_server_log import log_event as log_llm_server_event
+from app.utils.oai_api_capture import write_capture as write_oai_api_capture
 from app.utils.stream_sanitize import InlineToolStreamFilter
+from packaging.version import InvalidVersion, Version
 
 
 # Provide a shim so tests can monkeypatch either app.base_services.http_session.post
@@ -54,8 +60,14 @@ from app.utils.harmony import Message, Role  # envelope utilities (shimmed)
 
 _TRANSFORMERS_COMPONENTS_LOADED = False
 _AUTO_MODEL_FOR_CAUSAL_LM = None
+_AUTO_MODEL_FOR_IMAGE_TEXT_TO_TEXT = None
+_AUTO_MODEL_FOR_MULTIMODAL_LM = None
+_AUTO_PROCESSOR = None
 _AUTO_TOKENIZER = None
 AutoModelForCausalLM = None
+AutoModelForImageTextToText = None
+AutoModelForMultimodalLM = None
+AutoProcessor = None
 AutoTokenizer = None
 _TRANSFORMERS_ATTN_LOADED = False
 _FLASH_ATTN_AVAILABLE_FN = None
@@ -64,30 +76,153 @@ _TORCH_IMPORT_ATTEMPTED = False
 _TORCH_MODULE = None
 
 
-def _get_transformers_components():
+def _set_transformers_component_cache(
+    causal_lm: Any,
+    image_text_to_text: Any,
+    multimodal_lm: Any,
+    processor: Any,
+    tokenizer: Any,
+) -> None:
     global _TRANSFORMERS_COMPONENTS_LOADED
     global _AUTO_MODEL_FOR_CAUSAL_LM
+    global _AUTO_MODEL_FOR_IMAGE_TEXT_TO_TEXT
+    global _AUTO_MODEL_FOR_MULTIMODAL_LM
+    global _AUTO_PROCESSOR
     global _AUTO_TOKENIZER
     global AutoModelForCausalLM
+    global AutoModelForImageTextToText
+    global AutoModelForMultimodalLM
+    global AutoProcessor
     global AutoTokenizer
-    if AutoModelForCausalLM is not None or AutoTokenizer is not None:
-        _AUTO_MODEL_FOR_CAUSAL_LM = AutoModelForCausalLM
-        _AUTO_TOKENIZER = AutoTokenizer
-        _TRANSFORMERS_COMPONENTS_LOADED = True
-        return _AUTO_MODEL_FOR_CAUSAL_LM, _AUTO_TOKENIZER
+    _AUTO_MODEL_FOR_CAUSAL_LM = causal_lm
+    _AUTO_MODEL_FOR_IMAGE_TEXT_TO_TEXT = image_text_to_text
+    _AUTO_MODEL_FOR_MULTIMODAL_LM = multimodal_lm
+    _AUTO_PROCESSOR = processor
+    _AUTO_TOKENIZER = tokenizer
+    AutoModelForCausalLM = causal_lm
+    AutoModelForImageTextToText = image_text_to_text
+    AutoModelForMultimodalLM = multimodal_lm
+    AutoProcessor = processor
+    AutoTokenizer = tokenizer
+    _TRANSFORMERS_COMPONENTS_LOADED = True
+
+
+def _read_transformers_components(module: Any) -> Tuple[Any, Any, Any, Any, Any]:
+    return (
+        getattr(module, "AutoModelForCausalLM", None),
+        getattr(module, "AutoModelForImageTextToText", None),
+        getattr(module, "AutoModelForMultimodalLM", None),
+        getattr(module, "AutoProcessor", None),
+        getattr(module, "AutoTokenizer", None),
+    )
+
+
+def _get_transformers_components():
+    if (
+        AutoModelForCausalLM is not None
+        or AutoTokenizer is not None
+        or AutoModelForImageTextToText is not None
+        or AutoModelForMultimodalLM is not None
+        or AutoProcessor is not None
+    ):
+        _set_transformers_component_cache(
+            AutoModelForCausalLM,
+            AutoModelForImageTextToText,
+            AutoModelForMultimodalLM,
+            AutoProcessor,
+            AutoTokenizer,
+        )
+        return (
+            _AUTO_MODEL_FOR_CAUSAL_LM,
+            _AUTO_MODEL_FOR_IMAGE_TEXT_TO_TEXT,
+            _AUTO_MODEL_FOR_MULTIMODAL_LM,
+            _AUTO_PROCESSOR,
+            _AUTO_TOKENIZER,
+        )
     if not _TRANSFORMERS_COMPONENTS_LOADED:
         try:  # pragma: no cover - optional dependency
-            from transformers import AutoModelForCausalLM, AutoTokenizer
+            import transformers as _transformers
 
-            _AUTO_MODEL_FOR_CAUSAL_LM = AutoModelForCausalLM
-            _AUTO_TOKENIZER = AutoTokenizer
+            components = _read_transformers_components(_transformers)
+            _set_transformers_component_cache(*components)
         except Exception:  # pragma: no cover - allow tests without transformers
-            _AUTO_MODEL_FOR_CAUSAL_LM = None
-            _AUTO_TOKENIZER = None
-        _TRANSFORMERS_COMPONENTS_LOADED = True
-    AutoModelForCausalLM = _AUTO_MODEL_FOR_CAUSAL_LM
-    AutoTokenizer = _AUTO_TOKENIZER
-    return _AUTO_MODEL_FOR_CAUSAL_LM, _AUTO_TOKENIZER
+            _set_transformers_component_cache(None, None, None, None, None)
+    return (
+        _AUTO_MODEL_FOR_CAUSAL_LM,
+        _AUTO_MODEL_FOR_IMAGE_TEXT_TO_TEXT,
+        _AUTO_MODEL_FOR_MULTIMODAL_LM,
+        _AUTO_PROCESSOR,
+        _AUTO_TOKENIZER,
+    )
+
+
+def _reload_transformers_components() -> Tuple[Any, Any, Any, Any, Any]:
+    try:  # pragma: no cover - optional dependency
+        existing = sys.modules.get("transformers")
+        if existing is None:
+            import transformers as _transformers
+        else:
+            _transformers = importlib.reload(existing)
+        components = _read_transformers_components(_transformers)
+        _set_transformers_component_cache(*components)
+    except Exception:  # pragma: no cover
+        _set_transformers_component_cache(None, None, None, None, None)
+    return (
+        _AUTO_MODEL_FOR_CAUSAL_LM,
+        _AUTO_MODEL_FOR_IMAGE_TEXT_TO_TEXT,
+        _AUTO_MODEL_FOR_MULTIMODAL_LM,
+        _AUTO_PROCESSOR,
+        _AUTO_TOKENIZER,
+    )
+
+
+def _missing_transformers_components_for_loader(
+    loader: str,
+    *,
+    causal_lm: Any,
+    image_text_to_text: Any,
+    multimodal_lm: Any,
+    processor: Any,
+    tokenizer: Any,
+) -> List[str]:
+    missing: List[str] = []
+    if loader == "image_text_to_text":
+        if processor is None:
+            missing.append("AutoProcessor")
+        if multimodal_lm is None and image_text_to_text is None:
+            missing.append("AutoModelForMultimodalLM or AutoModelForImageTextToText")
+        return missing
+    if tokenizer is None:
+        missing.append("AutoTokenizer")
+    if causal_lm is None:
+        missing.append("AutoModelForCausalLM")
+    return missing
+
+
+def _resolve_transformers_components_for_loader(
+    loader: str, *, allow_reload: bool
+) -> Tuple[Tuple[Any, Any, Any, Any, Any], List[str], bool]:
+    components = _get_transformers_components()
+    missing = _missing_transformers_components_for_loader(
+        loader,
+        causal_lm=components[0],
+        image_text_to_text=components[1],
+        multimodal_lm=components[2],
+        processor=components[3],
+        tokenizer=components[4],
+    )
+    if missing and allow_reload:
+        components = _reload_transformers_components()
+        missing = _missing_transformers_components_for_loader(
+            loader,
+            causal_lm=components[0],
+            image_text_to_text=components[1],
+            multimodal_lm=components[2],
+            processor=components[3],
+            tokenizer=components[4],
+        )
+        return components, missing, True
+    return components, missing, False
 
 
 def _get_transformers_attention_helpers():
@@ -149,6 +284,170 @@ class _LazyTorchProxy:
 
 torch = _LazyTorchProxy()  # type: ignore
 
+
+def _safe_package_version(package_name: str) -> Optional[str]:
+    try:
+        return importlib_metadata.version(package_name)
+    except Exception:
+        return None
+
+
+def _installed_transformers_meets_declared_version(
+    installed_version: Optional[str], declared_version: Optional[str]
+) -> bool:
+    installed_raw = str(installed_version or "").strip()
+    declared_raw = str(declared_version or "").strip()
+    if not installed_raw or not declared_raw:
+        return False
+    try:
+        installed = Version(installed_raw)
+        declared = Version(declared_raw)
+    except InvalidVersion:
+        return installed_raw == declared_raw
+    if installed.base_version == declared.base_version:
+        return True
+    return installed >= declared
+
+
+def _read_local_json(path: Optional[Path], filename: str) -> Dict[str, Any]:
+    if path is None:
+        return {}
+    target = path / filename
+    if not target.exists():
+        return {}
+    try:
+        with target.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _local_checkpoint_metadata(path: Optional[Path]) -> Dict[str, Any]:
+    config_data = _read_local_json(path, "config.json")
+    processor_data = _read_local_json(path, "processor_config.json")
+    architectures = config_data.get("architectures")
+    architecture = ""
+    if isinstance(architectures, list):
+        architecture = next(
+            (str(entry).strip() for entry in architectures if str(entry).strip()),
+            "",
+        )
+    processor_class = str(processor_data.get("processor_class") or "").strip()
+    model_type = str(config_data.get("model_type") or "").strip()
+    declared_transformers_version = str(
+        config_data.get("transformers_version") or ""
+    ).strip()
+    gemma4_markers = " ".join(
+        filter(
+            None,
+            [
+                architecture,
+                processor_class,
+                model_type,
+                declared_transformers_version,
+            ],
+        )
+    ).lower()
+    family = "gemma4" if "gemma4" in gemma4_markers else ""
+    return {
+        "family": family,
+        "architecture": architecture,
+        "processor_class": processor_class,
+        "model_type": model_type,
+        "declared_transformers_version": declared_transformers_version,
+    }
+
+
+def _build_local_checkpoint_compatibility_message(
+    *,
+    model_name: str,
+    load_target: str,
+    search_dirs: Sequence[Path],
+    resolved_dir: Optional[Path],
+    stage: Literal["processor", "model"],
+    exc: Exception,
+) -> Optional[str]:
+    metadata = _local_checkpoint_metadata(resolved_dir)
+    if metadata.get("family") != "gemma4":
+        return None
+
+    lowered = str(exc).lower()
+    compact_error = _compact_exception_text(exc)
+    incompatible_processor = (
+        "unrecognized processing class" in lowered
+        or "can't instantiate a processor" in lowered
+        or "cannot instantiate a processor" in lowered
+    )
+    incompatible_model = (
+        "unrecognized configuration class" in lowered
+        or "unknown configuration class" in lowered
+        or "does not recognize this architecture" in lowered
+        or "is not supported for this model type" in lowered
+    )
+    if stage == "processor" and not incompatible_processor:
+        if "torchvision" not in lowered:
+            return None
+    if stage == "model" and not incompatible_model:
+        return None
+
+    searched = ", ".join(str(p) for p in search_dirs)
+    installed_version = _safe_package_version("transformers") or "unknown"
+    declared_version = metadata.get("declared_transformers_version") or "unknown"
+    if stage == "processor" and "torchvision" in lowered:
+        package_versions = {
+            "torch": _safe_package_version("torch") or "missing",
+            "torchvision": _safe_package_version("torchvision") or "missing",
+            "transformers": _safe_package_version("transformers") or "missing",
+        }
+        version_summary = ", ".join(
+            f"{name}={value}" for name, value in package_versions.items()
+        )
+        return (
+            f"Failed to load processor for '{model_name}' from '{load_target}'. "
+            f"Local Gemma 4 direct loading requires torchvision in Float's backend "
+            f"Python environment ({sys.executable}; {version_summary}). "
+            f"{_float_local_torch_install_guidance()} "
+            f"Original error: {compact_error}"
+        )
+    stage_descriptor = (
+        metadata.get("processor_class")
+        if stage == "processor"
+        else metadata.get("architecture") or metadata.get("model_type") or "Gemma4"
+    )
+    return (
+        f"Failed to load {stage} for '{model_name}' from '{load_target}'. "
+        f"Local Gemma 4 files were found (searched: {searched}), but the installed "
+        f"transformers runtime ({installed_version}) does not recognize "
+        f"'{stage_descriptor}'. The checkpoint declares transformers "
+        f"{declared_version}. Upgrade transformers for direct local Gemma 4 support "
+        f"or use the provider/server lane meanwhile. Original error: {compact_error}"
+    )
+
+
+def _compact_exception_text(exc: Exception) -> str:
+    return " ".join(str(exc or "").split())
+
+
+def _float_local_torch_install_guidance() -> str:
+    cuda_example = (
+        "poetry run uv pip install --upgrade --force-reinstall --index-url "
+        "https://download.pytorch.org/whl/cu128 "
+        "torch==2.7.1+cu128 torchvision==0.22.1+cu128 torchaudio==2.7.1+cu128"
+    )
+    cpu_example = (
+        "poetry run uv pip install --upgrade --force-reinstall --index-url "
+        "https://download.pytorch.org/whl/cpu "
+        "torch==2.7.1+cpu torchvision==0.22.1+cpu torchaudio==2.7.1+cpu"
+    )
+    return (
+        "See README.md or docs/environment setup.md for the Float-specific install "
+        "steps. Install matching torch/torchvision/torchaudio wheels into the Poetry "
+        f"environment, for example CUDA: `{cuda_example}` or CPU fallback: "
+        f"`{cpu_example}`. Restart Float after installation."
+    )
+
+
 from workers.multimodal import (
     VisionCaptioner,
     is_placeholder_caption,
@@ -156,13 +455,23 @@ from workers.multimodal import (
 )
 
 from . import config as app_config
-from .model_registry import resolve_model_alias
+from .model_registry import (
+    canonical_model_alias,
+    get_local_loader,
+    model_supports_images,
+    resolve_model_alias,
+)
 from .tool_catalog import get_tool_catalog_entry
 from .utils import memory_store, verify_signature
 from .utils.local_model_registry import resolve_registered_model_path
 from .utils.time_resolution import normalize_temporal_references
 
 _ALLOWED_OPENAI_ROLES = {"assistant", "user", "system", "tool", "developer", "function"}
+_OPENAI_ROLE_ALIASES = {
+    "ai": "assistant",
+    "bot": "assistant",
+    "human": "user",
+}
 _VISION_NATIVE_MODEL_HINTS = (
     "gpt-4o",
     "gpt-4.1",
@@ -226,6 +535,7 @@ def _normalize_chat_role(role_value: Any, default: str = "user") -> str:
         if suffix.lower() in _ALLOWED_OPENAI_ROLES:
             candidate = suffix
     lowered = candidate.lower()
+    lowered = _OPENAI_ROLE_ALIASES.get(lowered, lowered)
     if lowered not in _ALLOWED_OPENAI_ROLES:
         return default
     return lowered or default
@@ -247,7 +557,9 @@ def _model_supports_native_images(model_name: Any) -> bool:
     return any(token in normalized for token in _VISION_NATIVE_MODEL_HINTS)
 
 
-def _convert_tools_for_openai(tools: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _convert_tools_for_openai(
+    tools: Sequence[Dict[str, Any]], *, responses_api: bool = False
+) -> List[Dict[str, Any]]:
     """Convert Float tool definitions into the shape expected by OpenAI APIs."""
     converted: List[Dict[str, Any]] = []
     native_passthrough_types = {
@@ -298,15 +610,25 @@ def _convert_tools_for_openai(tools: Sequence[Dict[str, Any]]) -> List[Dict[str,
                 "type": "object",
                 "properties": dict(params) if isinstance(params, dict) else {},
             }
-        tool_entry: Dict[str, Any] = {
-            "type": "function",
-            "function": {
+        tool_parameters = params or {"type": "object", "properties": {}}
+        if responses_api:
+            tool_entry = {
+                "type": "function",
                 "name": name,
-                "parameters": params or {"type": "object", "properties": {}},
-            },
-        }
-        if description:
-            tool_entry["function"]["description"] = description
+                "parameters": tool_parameters,
+            }
+            if description:
+                tool_entry["description"] = description
+        else:
+            tool_entry = {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "parameters": tool_parameters,
+                },
+            }
+            if description:
+                tool_entry["function"]["description"] = description
         converted.append(tool_entry)
     return converted
 
@@ -453,20 +775,53 @@ def _resolve_hf_snapshot_path(
 def _resolve_local_model_dir(
     search_roots: List["os.PathLike[str]"], model_name: str
 ) -> Optional[Path]:
-    registered = resolve_registered_model_path(model_name, for_loading=True)
+    resolved_name = str(canonical_model_alias(model_name) or model_name).strip()
+    registered = resolve_registered_model_path(resolved_name, for_loading=True)
     if registered is not None:
         return registered
     for root in map(Path, search_roots):
-        direct = root / model_name
+        direct = root / resolved_name
         try:
             if direct.exists() and direct.is_dir():
                 return direct
         except Exception:
             pass
-        snap = _resolve_hf_snapshot_path(root, model_name)
+        snap = _resolve_hf_snapshot_path(root, resolved_name)
         if snap is not None:
             return snap
     return None
+
+
+def _extract_attachment_hash(url_value: Any) -> Optional[str]:
+    if not url_value:
+        return None
+    try:
+        parsed = urlparse(str(url_value))
+        path = parsed.path or ""
+    except Exception:
+        path = str(url_value)
+    segments = [segment for segment in path.split("/") if segment]
+    for idx, segment in enumerate(segments):
+        if segment == "attachments" and idx + 1 < len(segments):
+            return segments[idx + 1]
+    return None
+
+
+def _open_local_image(raw: bytes):
+    try:
+        from PIL import Image
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "Pillow is required for local multimodal image loading"
+        ) from exc
+    handle = Image.open(io.BytesIO(raw))
+    try:
+        return handle.convert("RGB")
+    finally:
+        try:
+            handle.close()
+        except Exception:
+            pass
 
 
 class ModelContext:
@@ -554,7 +909,9 @@ class LLMService:
         self.config = config or app_config.load_config()
         self.dynamic_process = None
         self.local_model = None
+        self.local_processor = None
         self.local_tokenizer = None
+        self._loaded_local_model_name: Optional[str] = None
         default_prompt = self.config.get("system_prompt", "")
         self.contexts: Dict[str, ModelContext] = {
             "default": ModelContext(system_prompt=default_prompt)
@@ -573,6 +930,8 @@ class LLMService:
         self._last_memory_snapshot: Optional[Dict[str, Any]] = None
         self._local_quant_method: Optional[str] = None
         self._local_backend_active: Optional[str] = "transformers"
+        self._local_loader: str = "causal_lm"
+        self._local_supports_images: bool = False
         self._local_load_state: str = "idle"
         self._local_load_error: Optional[str] = None
         self._local_load_started_at: Optional[float] = None
@@ -613,12 +972,145 @@ class LLMService:
         return None
 
     def _local_model_name(self, override_model_name: Optional[str] = None) -> str:
-        return str(
+        selected = str(
             override_model_name
             or self.config.get("local_model")
             or self.config.get("transformer_model")
             or "gpt2"
         )
+        return str(canonical_model_alias(selected) or selected)
+
+    def _active_local_model_name(self) -> str:
+        return str(self._loaded_local_model_name or self._local_model_name())
+
+    @staticmethod
+    def _coerce_local_text(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+            parts: List[str] = []
+            for item in value:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if text:
+                        parts.append(str(text))
+                elif item is not None:
+                    parts.append(str(item))
+            return "\n".join(part for part in parts if part)
+        return str(value)
+
+    def _collect_local_multimodal_images(
+        self,
+        attachments: Sequence[Dict[str, Any]] | None,
+        ctx: ModelContext,
+    ) -> Tuple[List[Any], List[Dict[str, Any]]]:
+        images: List[Any] = []
+        ignored: List[Dict[str, Any]] = []
+        seen_keys: Set[str] = set()
+
+        def _add_ignored(name: str, reason: str) -> None:
+            ignored.append({"name": name or "attachment", "reason": reason})
+
+        def _maybe_open_image_bytes(raw: bytes, name: str) -> None:
+            try:
+                images.append(_open_local_image(raw))
+            except Exception as exc:
+                _add_ignored(name, str(exc))
+
+        for entry in attachments or []:
+            if not isinstance(entry, dict):
+                continue
+            label = str(entry.get("name") or "attachment")
+            mime = str(entry.get("type") or "").lower()
+            if mime and not mime.startswith("image/"):
+                _add_ignored(label, "unsupported_media")
+                continue
+            key = (
+                str(entry.get("content_hash") or "").strip()
+                or str(entry.get("url") or "").strip()
+                or str(entry.get("path") or "").strip()
+                or label
+            )
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            content_hash = entry.get("content_hash") or _extract_attachment_hash(
+                entry.get("url")
+            )
+            if content_hash:
+                try:
+                    raw = load_blob(content_hash)
+                except Exception:
+                    _add_ignored(label, "missing_blob")
+                    continue
+                _maybe_open_image_bytes(raw, label)
+                continue
+            path_value = str(entry.get("path") or "").strip()
+            if path_value:
+                try:
+                    _maybe_open_image_bytes(Path(path_value).read_bytes(), label)
+                except Exception:
+                    _add_ignored(label, "missing_file")
+                continue
+            _add_ignored(label, "missing_image_reference")
+
+        try:
+            context_images = (
+                list(ctx.metadata.get("images", []))
+                if isinstance(ctx.metadata, dict)
+                else []
+            )
+        except Exception:
+            context_images = []
+        for entry in context_images:
+            if not isinstance(entry, dict):
+                continue
+            path_value = str(entry.get("path") or "").strip()
+            if not path_value or path_value in seen_keys:
+                continue
+            seen_keys.add(path_value)
+            try:
+                _maybe_open_image_bytes(
+                    Path(path_value).read_bytes(), Path(path_value).name
+                )
+            except Exception:
+                _add_ignored(Path(path_value).name, "missing_file")
+
+        return images, ignored
+
+    def _build_local_multimodal_messages(
+        self,
+        prompt: str,
+        ctx: ModelContext,
+        image_count: int,
+    ) -> List[Dict[str, Any]]:
+        messages: List[Dict[str, Any]] = []
+        if ctx.system_prompt:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": ctx.system_prompt}],
+                }
+            )
+        for msg in ctx.messages:
+            role = _normalize_chat_role(msg.get("role"), default="user")
+            content = self._coerce_local_text(msg.get("content"))
+            if not content:
+                continue
+            messages.append(
+                {"role": role, "content": [{"type": "text", "text": content}]}
+            )
+        user_content: List[Dict[str, Any]] = [
+            {"type": "image"} for _ in range(image_count)
+        ]
+        if prompt:
+            user_content.append({"type": "text", "text": prompt})
+        if not user_content:
+            user_content = [{"type": "text", "text": ""}]
+        messages.append({"role": "user", "content": user_content})
+        return messages
 
     @staticmethod
     def _format_bytes(value: Optional[int]) -> str:
@@ -1112,6 +1604,132 @@ class LLMService:
             summary["warning"] = "No model shard files (.safetensors/.bin) were found."
         return summary
 
+    def local_runtime_preflight(
+        self, model_name: Optional[str] = None
+    ) -> Dict[str, Any]:
+        target_name = model_name or self._local_model_name()
+        if not target_name:
+            return {
+                "ready": False,
+                "model": "",
+                "reason": "no-model",
+                "hint": "Select a local language model before loading the direct local runtime.",
+            }
+        search_dirs = app_config.model_search_dirs(self.config.get("models_folder"))
+        resolved_dir = _resolve_local_model_dir(search_dirs, target_name)
+        metadata = _local_checkpoint_metadata(resolved_dir)
+        loader = get_local_loader(target_name)
+        package_versions = {
+            "torch": _safe_package_version("torch"),
+            "torchvision": _safe_package_version("torchvision"),
+            "transformers": _safe_package_version("transformers"),
+            "accelerate": _safe_package_version("accelerate"),
+        }
+        missing_required = [
+            package_name
+            for package_name in ("torch", "transformers")
+            if not package_versions.get(package_name)
+        ]
+        if (
+            metadata.get("family") == "gemma4"
+            and loader == "image_text_to_text"
+            and not package_versions.get("torchvision")
+        ):
+            missing_required.append("torchvision")
+        (
+            _,
+            missing_runtime_components,
+            retried_runtime_import,
+        ) = _resolve_transformers_components_for_loader(
+            loader,
+            allow_reload=not missing_required
+            and bool(package_versions.get("transformers")),
+        )
+        recommended = []
+        if loader == "image_text_to_text" and not package_versions.get("accelerate"):
+            recommended.append("accelerate")
+        if loader == "image_text_to_text" and not package_versions.get("torchvision"):
+            recommended.append("torchvision")
+        searched = ", ".join(str(path) for path in search_dirs)
+        hint_parts: List[str] = []
+        if missing_required:
+            hint_parts.append(
+                f"Direct local loading uses the backend Python at '{sys.executable}', "
+                f"but this environment is missing {', '.join(missing_required)}."
+            )
+            if "torchvision" in missing_required:
+                hint_parts.append(
+                    "Direct local Gemma 4 also needs torchvision in the backend environment."
+                )
+                hint_parts.append(_float_local_torch_install_guidance())
+            else:
+                hint_parts.append(
+                    "Run `poetry install` from the repo root or install the missing packages into that interpreter."
+                )
+        if resolved_dir is None:
+            hint_parts.append(
+                f"Model files for '{target_name}' were not found in the configured search paths: {searched}."
+            )
+            normalized_target = str(target_name or "").strip().lower()
+            if (
+                normalized_target.startswith("gemma-4-")
+                and "e2b" not in normalized_target
+            ):
+                hint_parts.append(
+                    "Float's direct local Gemma 4 path currently targets gemma-4-E2B-it. "
+                    "Use local/lmstudio, local/ollama, or another server/provider lane "
+                    "for larger Gemma 4 variants."
+                )
+        if missing_runtime_components:
+            hint_parts.append(
+                "The installed transformers build does not expose the runtime classes required "
+                f"for this loader ({', '.join(missing_runtime_components)}). "
+                "Upgrade transformers in the backend environment and retry."
+            )
+            if retried_runtime_import:
+                hint_parts.append(
+                    "Float retried the transformers import in-process; if you just "
+                    "upgraded packages, restart Float and retry."
+                )
+        declared_transformers_version = metadata.get("declared_transformers_version")
+        installed_transformers_version = package_versions.get("transformers")
+        if (
+            metadata.get("family") == "gemma4"
+            and installed_transformers_version
+            and declared_transformers_version
+            and not _installed_transformers_meets_declared_version(
+                installed_transformers_version, declared_transformers_version
+            )
+        ):
+            hint_parts.append(
+                f"This Gemma 4 checkpoint declares transformers {declared_transformers_version}; "
+                f"the current environment reports {installed_transformers_version}. "
+                "If processor/model loading fails, upgrade transformers in this backend environment."
+            )
+        return {
+            "ready": not missing_required
+            and not missing_runtime_components
+            and resolved_dir is not None,
+            "model": target_name,
+            "reason": None
+            if not missing_required
+            and not missing_runtime_components
+            and resolved_dir is not None
+            else "preflight-failed",
+            "loader": loader,
+            "supports_images": bool(model_supports_images(target_name)),
+            "python_executable": sys.executable,
+            "python_version": sys.version.split()[0],
+            "model_path": str(resolved_dir) if resolved_dir is not None else None,
+            "searched_paths": [str(path) for path in search_dirs],
+            "package_versions": package_versions,
+            "missing_packages": missing_required,
+            "missing_runtime_components": missing_runtime_components,
+            "recommended_packages": recommended,
+            "checkpoint_metadata": metadata,
+            "hint": " ".join(hint_parts).strip() or None,
+        }
+
     def _parse_timeout_config(self) -> float:
         """Resolve the HTTP request timeout setting in seconds."""
 
@@ -1508,6 +2126,7 @@ class LLMService:
         session_id: str,
         stream_consumer: Optional[Callable[[Dict[str, Any]], None]],
         stream_message_id: Optional[str],
+        capture_raw_api: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Consume a streamed chat completion and return accumulated output."""
 
@@ -1619,6 +2238,71 @@ class LLMService:
         idle_elapsed: Optional[float] = None
         output_source: Optional[str] = None
         current_source: Optional[str] = None
+        response_id: Optional[str] = None
+        previous_response_id: Optional[str] = None
+        output_ids: List[str] = []
+        capture_stream_api = bool(
+            capture_raw_api
+            and getattr(self, "mode", None) == "api"
+            and url.endswith("/responses")
+        )
+        captured_stream_events: List[Dict[str, Any]] = []
+        final_response_payload: Optional[Dict[str, Any]] = None
+
+        def _extract_output_ids(raw_output: Any) -> List[str]:
+            if not isinstance(raw_output, list):
+                return []
+            return [
+                str(item.get("id")).strip()
+                for item in raw_output
+                if isinstance(item, dict) and str(item.get("id") or "").strip()
+            ]
+
+        def _merge_response_metadata(candidate: Any) -> None:
+            nonlocal response_model
+            nonlocal response_id
+            nonlocal previous_response_id
+            nonlocal output_ids
+            nonlocal final_response_payload
+
+            if not isinstance(candidate, dict):
+                return
+
+            nested_response = candidate.get("response")
+            sources: List[Dict[str, Any]] = []
+            if isinstance(nested_response, dict):
+                sources.append(nested_response)
+                if nested_response:
+                    final_response_payload = dict(nested_response)
+            sources.append(candidate)
+
+            candidate_type = str(candidate.get("type") or "").strip().lower()
+            if (
+                final_response_payload is None
+                and candidate_type in {"response.completed", "response.done"}
+                and any(
+                    candidate.get(key) is not None
+                    for key in ("id", "output", "output_text", "previous_response_id")
+                )
+            ):
+                final_response_payload = dict(candidate)
+
+            for source in sources:
+                raw_response_id = source.get("id")
+                if isinstance(raw_response_id, str) and raw_response_id.strip():
+                    response_id = raw_response_id.strip()
+                raw_previous_response_id = source.get("previous_response_id")
+                if (
+                    isinstance(raw_previous_response_id, str)
+                    and raw_previous_response_id.strip()
+                ):
+                    previous_response_id = raw_previous_response_id.strip()
+                model_value = source.get("model")
+                if isinstance(model_value, str) and model_value.strip():
+                    response_model = model_value.strip()
+                extracted_output_ids = _extract_output_ids(source.get("output"))
+                if extracted_output_ids:
+                    output_ids = extracted_output_ids
 
         def _append_text(text: str) -> None:
             nonlocal output_source
@@ -1807,6 +2491,13 @@ class LLMService:
                     chunk = json.loads(line)
                 except Exception:
                     continue
+                if capture_stream_api and isinstance(chunk, dict):
+                    try:
+                        captured_stream_events.append(copy.deepcopy(chunk))
+                    except Exception:
+                        captured_stream_events.append(dict(chunk))
+                if isinstance(chunk, dict):
+                    _merge_response_metadata(chunk)
                 if response_model is None and isinstance(chunk, dict):
                     model_value = chunk.get("model")
                     if isinstance(model_value, str) and model_value.strip():
@@ -2157,6 +2848,43 @@ class LLMService:
                         )
                     except Exception:
                         pass
+        if response_id:
+            metadata["response_id"] = response_id
+        if previous_response_id:
+            metadata["previous_response_id"] = previous_response_id
+        if output_ids:
+            metadata["output_ids"] = output_ids
+        if capture_stream_api:
+            response_payload: Dict[str, Any] = {}
+            if isinstance(final_response_payload, dict) and final_response_payload:
+                response_payload = dict(final_response_payload)
+            if response_id and not str(response_payload.get("id") or "").strip():
+                response_payload["id"] = response_id
+            if (
+                previous_response_id
+                and not str(response_payload.get("previous_response_id") or "").strip()
+            ):
+                response_payload["previous_response_id"] = previous_response_id
+            if response_model and not str(response_payload.get("model") or "").strip():
+                response_payload["model"] = response_model
+            if output_ids and not isinstance(response_payload.get("output"), list):
+                response_payload["output"] = [{"id": item_id} for item_id in output_ids]
+            if text and not str(response_payload.get("output_text") or "").strip():
+                response_payload["output_text"] = text
+            if captured_stream_events:
+                response_payload["stream_events"] = captured_stream_events
+            try:
+                capture_path = write_oai_api_capture(
+                    endpoint=url,
+                    request_payload=payload if isinstance(payload, dict) else {},
+                    response_payload=response_payload,
+                    session_id=session_id,
+                    message_id=stream_message_id,
+                )
+            except Exception:
+                capture_path = None
+            if capture_path:
+                metadata["oai_api_log_path"] = capture_path
 
         if getattr(self, "mode", None) == "server":
             try:
@@ -2270,10 +2998,13 @@ class LLMService:
         stripped = (url or "").strip()
         if not stripped:
             return stripped
+        candidate = stripped
+        if "://" not in candidate and not candidate.startswith("/"):
+            candidate = f"http://{candidate}"
         try:
-            parsed = urlparse(stripped)
+            parsed = urlparse(candidate)
         except Exception:
-            return stripped
+            return candidate
         path = parsed.path or ""
         trimmed_path = path.rstrip("/")
         lower = trimmed_path.lower()
@@ -2695,6 +3426,7 @@ class LLMService:
             pass
         # Build messages for chat API using Harmony envelope
         messages: List[Dict[str, Any]] = []
+        attachment_seen_keys: Set[str] = set()
         if ctx.system_prompt:
             messages.append(
                 Message.from_role_and_content(Role.SYSTEM, ctx.system_prompt).to_dict()
@@ -2715,7 +3447,11 @@ class LLMService:
             meta_attachments = (
                 metadata.get("attachments") if isinstance(metadata, dict) else None
             )
-            msg_dict, _ = _merge_attachments(msg_dict, meta_attachments)
+            msg_dict, attachment_seen_keys = _merge_attachments(
+                msg_dict,
+                meta_attachments,
+                attachment_seen_keys,
+            )
             iso_text = _coerce_iso_timestamp(metadata)
             msg_dict = _inject_timestamp_content(msg_dict, iso_text)
             messages.append(msg_dict)
@@ -2742,13 +3478,21 @@ class LLMService:
                     continue
             if attachment_queue:
                 prompt_entry = Message.from_role_and_content(Role.USER, "").to_dict()
-                prompt_entry, _ = _merge_attachments(prompt_entry, attachment_queue)
+                prompt_entry, attachment_seen_keys = _merge_attachments(
+                    prompt_entry,
+                    attachment_queue,
+                    attachment_seen_keys,
+                )
                 attachment_queue = []
                 messages.append(prompt_entry)
         else:
             prompt_entry = Message.from_role_and_content(Role.USER, prompt).to_dict()
             if attachment_queue:
-                prompt_entry, _ = _merge_attachments(prompt_entry, attachment_queue)
+                prompt_entry, attachment_seen_keys = _merge_attachments(
+                    prompt_entry,
+                    attachment_queue,
+                    attachment_seen_keys,
+                )
                 attachment_queue = []
             prompt_entry = _inject_timestamp_content(
                 prompt_entry, _coerce_iso_timestamp(prompt_metadata)
@@ -2832,7 +3576,6 @@ class LLMService:
             else:
                 normalized_messages.append({"role": "user", "content": str(msg)})
         messages = normalized_messages
-        tool_definitions = _convert_tools_for_openai(ctx.tools)
 
         structured_content_present = any(
             isinstance(m.get("content"), list) for m in messages
@@ -2847,6 +3590,9 @@ class LLMService:
         # Prefer Responses API for GPT‑5; honor explicit /responses in URL
         use_responses = configured_url.endswith(suffix_resp) or lower_model.startswith(
             "gpt-5"
+        )
+        tool_definitions = _convert_tools_for_openai(
+            ctx.tools, responses_api=use_responses
         )
         # Derive final URL if switching from chat to responses
         url = configured_url
@@ -3014,6 +3760,7 @@ class LLMService:
             True if allow_responses_stream is None else bool(allow_responses_stream)
         )
         native_tools_present = _contains_native_openai_tool(tool_definitions)
+        capture_raw_api = bool(kwargs.get("capture_raw_api"))
         streaming_enabled = bool(stream_consumer) and (
             allow_responses_stream or not url.endswith(suffix_resp)
         )
@@ -3069,6 +3816,7 @@ class LLMService:
                     session_id,
                     stream_consumer,
                     stream_message_id,
+                    capture_raw_api=capture_raw_api,
                 )
                 if streamed is not None:
                     if use_server:
@@ -3320,17 +4068,72 @@ class LLMService:
                     pass
         # Parse JSON
         data = response.json()
+        if capture_raw_api and self.mode == "api":
+            try:
+                capture_path = write_oai_api_capture(
+                    endpoint=url,
+                    request_payload=payload if isinstance(payload, dict) else {},
+                    response_payload=data if isinstance(data, dict) else {},
+                    session_id=session_id,
+                    message_id=stream_message_id,
+                )
+            except Exception:
+                capture_path = None
+        else:
+            capture_path = None
         response_model: Optional[str] = None
+        response_id: Optional[str] = None
+        previous_response_id: Optional[str] = None
+        output_ids: List[str] = []
         if isinstance(data, dict):
+            raw_response_id = data.get("id")
+            if isinstance(raw_response_id, str) and raw_response_id.strip():
+                response_id = raw_response_id.strip()
+            raw_previous_response_id = data.get("previous_response_id")
+            if (
+                isinstance(raw_previous_response_id, str)
+                and raw_previous_response_id.strip()
+            ):
+                previous_response_id = raw_previous_response_id.strip()
             model_value = data.get("model")
             if isinstance(model_value, str) and model_value.strip():
                 response_model = model_value.strip()
+            output = data.get("output")
+            if isinstance(output, list):
+                output_ids = [
+                    str(item.get("id")).strip()
+                    for item in output
+                    if isinstance(item, dict) and str(item.get("id") or "").strip()
+                ]
             if response_model is None:
                 response_obj = data.get("response")
                 if isinstance(response_obj, dict):
+                    if response_id is None:
+                        nested_response_id = response_obj.get("id")
+                        if (
+                            isinstance(nested_response_id, str)
+                            and nested_response_id.strip()
+                        ):
+                            response_id = nested_response_id.strip()
+                    if previous_response_id is None:
+                        nested_previous_id = response_obj.get("previous_response_id")
+                        if (
+                            isinstance(nested_previous_id, str)
+                            and nested_previous_id.strip()
+                        ):
+                            previous_response_id = nested_previous_id.strip()
                     model_value = response_obj.get("model")
                     if isinstance(model_value, str) and model_value.strip():
                         response_model = model_value.strip()
+                    if not output_ids:
+                        nested_output = response_obj.get("output")
+                        if isinstance(nested_output, list):
+                            output_ids = [
+                                str(item.get("id")).strip()
+                                for item in nested_output
+                                if isinstance(item, dict)
+                                and str(item.get("id") or "").strip()
+                            ]
         # Extract assistant reply and any reasoning/thought content
         thought = ""
         message: Dict[str, Any] = {}
@@ -3489,6 +4292,14 @@ class LLMService:
             result["metadata"]["model_received"] = response_model
         if requested_model:
             result["metadata"]["model_requested"] = requested_model
+        if response_id:
+            result["metadata"]["response_id"] = response_id
+        if previous_response_id:
+            result["metadata"]["previous_response_id"] = previous_response_id
+        if output_ids:
+            result["metadata"]["output_ids"] = output_ids
+        if capture_path:
+            result["metadata"]["oai_api_log_path"] = capture_path
         if requested_model and response_model and response_model != requested_model:
             result["metadata"]["model_mismatch"] = True
             result["metadata"].setdefault(
@@ -3548,73 +4359,156 @@ class LLMService:
 
     def _load_local_model(self, override_model_name: str | None = None) -> None:
         """Lazily load a local transformers model and tokenizer."""
-        if self.local_model is not None and self.local_tokenizer is not None:
+        model_name = self._local_model_name(override_model_name)
+        local_loader = get_local_loader(model_name)
+        supports_images = model_supports_images(model_name)
+        if (
+            self.local_model is not None
+            and self._loaded_local_model_name
+            and self._loaded_local_model_name != model_name
+        ):
+            self.unload_local_model()
+        if self.local_model is not None and (
+            self.local_tokenizer is not None or self.local_processor is not None
+        ):
+            self._local_loader = local_loader
+            self._local_supports_images = supports_images
             self._local_load_state = "ready"
             self._local_backend_active = "transformers"
             return
-        AutoModelForCausalLM, AutoTokenizer = _get_transformers_components()
-        if AutoTokenizer is None or AutoModelForCausalLM is None:
-            self._local_load_state = "error"
-            self._local_load_error = "transformers library is required for local mode"
-            self._local_load_finished_at = time.time()
-            raise ImportError("transformers library is required for local mode")
-
         self._local_load_state = "loading"
         self._local_load_error = None
         self._local_load_started_at = time.time()
         self._local_load_finished_at = None
         try:
+            preflight = self.local_runtime_preflight(model_name)
+            if not preflight.get("ready"):
+                raise RuntimeError(
+                    str(preflight.get("hint") or "Local runtime preflight failed.")
+                )
+            (
+                (
+                    AutoModelForCausalLM,
+                    AutoModelForImageTextToText,
+                    AutoModelForMultimodalLM,
+                    AutoProcessor,
+                    AutoTokenizer,
+                ),
+                missing_runtime_components,
+                retried_runtime_import,
+            ) = _resolve_transformers_components_for_loader(
+                local_loader,
+                allow_reload=True,
+            )
+            multimodal_model_cls = (
+                AutoModelForMultimodalLM or AutoModelForImageTextToText
+            )
+            if local_loader == "image_text_to_text":
+                if AutoProcessor is None or multimodal_model_cls is None:
+                    retry_hint = (
+                        " Float retried the transformers import in-process; restart Float "
+                        "if you recently upgraded the backend environment."
+                        if retried_runtime_import
+                        else ""
+                    )
+                    raise RuntimeError(
+                        "transformers multimodal components are required for local mode "
+                        f"({', '.join(missing_runtime_components) or 'multimodal loader'})."
+                        f"{retry_hint}"
+                    )
+            elif AutoTokenizer is None or AutoModelForCausalLM is None:
+                retry_hint = (
+                    " Float retried the transformers import in-process; restart Float "
+                    "if you recently upgraded the backend environment."
+                    if retried_runtime_import
+                    else ""
+                )
+                raise RuntimeError(
+                    "transformers library is required for local mode "
+                    f"({', '.join(missing_runtime_components) or 'causal loader'})."
+                    f"{retry_hint}"
+                )
             self._configure_torch_threads()
             if self.enable_ram_swap:
                 os.environ.setdefault(
                     "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:true"
                 )
 
-            model_name = override_model_name or (
-                self.config.get("local_model")
-                or self.config.get("transformer_model")
-                or "gpt2"
-            )
-
             search_dirs = app_config.model_search_dirs(self.config.get("models_folder"))
             resolved_dir = _resolve_local_model_dir(search_dirs, model_name)
             load_target = str(resolved_dir) if resolved_dir is not None else model_name
 
-            tokenizer_kwargs: Dict[str, Any] = {"local_files_only": True}
-            if self.max_context_length:
-                tokenizer_kwargs["model_max_length"] = self.max_context_length
-            if self.allow_remote_code:
-                tokenizer_kwargs["trust_remote_code"] = True
+            self.local_processor = None
+            self.local_tokenizer = None
+            self._local_loader = local_loader
+            self._local_supports_images = supports_images
 
-            tokenizer_errors: List[Exception] = []
-
-            def _try_load_tokenizer(use_fast: Optional[bool]) -> Optional[Any]:
-                kwargs = dict(tokenizer_kwargs)
-                if use_fast is not None:
-                    kwargs["use_fast"] = use_fast
+            if local_loader == "image_text_to_text":
+                processor_kwargs: Dict[str, Any] = {"local_files_only": True}
+                if self.allow_remote_code:
+                    processor_kwargs["trust_remote_code"] = True
                 try:
-                    return AutoTokenizer.from_pretrained(load_target, **kwargs)
-                except (
-                    Exception
-                ) as exc:  # pragma: no cover - converts raise various errors
-                    tokenizer_errors.append(exc)
-                    return None
-
-            self.local_tokenizer = _try_load_tokenizer(None)
-            if self.local_tokenizer is None:
-                self.local_tokenizer = _try_load_tokenizer(False)
-            if self.local_tokenizer is None:
-                logger.exception("Failed to load tokenizer for %s", load_target)
-                searched = ", ".join(str(p) for p in search_dirs)
-                last_exc = (
-                    tokenizer_errors[-1]
-                    if tokenizer_errors
-                    else RuntimeError("unknown tokenizer error")
+                    self.local_processor = AutoProcessor.from_pretrained(
+                        load_target, **processor_kwargs
+                    )
+                except Exception as exc:
+                    logger.exception("Failed to load processor for %s", load_target)
+                    compatibility_message = (
+                        _build_local_checkpoint_compatibility_message(
+                            model_name=model_name,
+                            load_target=load_target,
+                            search_dirs=search_dirs,
+                            resolved_dir=resolved_dir,
+                            stage="processor",
+                            exc=exc,
+                        )
+                    )
+                    if compatibility_message:
+                        raise RuntimeError(compatibility_message) from exc
+                    searched = ", ".join(str(p) for p in search_dirs)
+                    raise RuntimeError(
+                        f"Failed to load processor for '{model_name}' from '{load_target}'. "
+                        f"Ensure the model files exist locally (searched: {searched}). "
+                        f"Original error: {_compact_exception_text(exc)}"
+                    ) from exc
+                self.local_tokenizer = getattr(
+                    self.local_processor, "tokenizer", self.local_processor
                 )
-                raise RuntimeError(
-                    f"Failed to load tokenizer for '{model_name}' from '{load_target}'. "
-                    f"Ensure the model files exist locally (searched: {searched}). Original error: {last_exc}"
-                ) from last_exc
+            else:
+                tokenizer_kwargs: Dict[str, Any] = {"local_files_only": True}
+                if self.max_context_length:
+                    tokenizer_kwargs["model_max_length"] = self.max_context_length
+                if self.allow_remote_code:
+                    tokenizer_kwargs["trust_remote_code"] = True
+
+                tokenizer_errors: List[Exception] = []
+
+                def _try_load_tokenizer(use_fast: Optional[bool]) -> Optional[Any]:
+                    kwargs = dict(tokenizer_kwargs)
+                    if use_fast is not None:
+                        kwargs["use_fast"] = use_fast
+                    try:
+                        return AutoTokenizer.from_pretrained(load_target, **kwargs)
+                    except Exception as exc:  # pragma: no cover - raise shape varies
+                        tokenizer_errors.append(exc)
+                        return None
+
+                self.local_tokenizer = _try_load_tokenizer(None)
+                if self.local_tokenizer is None:
+                    self.local_tokenizer = _try_load_tokenizer(False)
+                if self.local_tokenizer is None:
+                    logger.exception("Failed to load tokenizer for %s", load_target)
+                    searched = ", ".join(str(p) for p in search_dirs)
+                    last_exc = (
+                        tokenizer_errors[-1]
+                        if tokenizer_errors
+                        else RuntimeError("unknown tokenizer error")
+                    )
+                    raise RuntimeError(
+                        f"Failed to load tokenizer for '{model_name}' from '{load_target}'. "
+                        f"Ensure the model files exist locally (searched: {searched}). "
+                        f"Original error: {_compact_exception_text(last_exc)}"
+                    ) from last_exc
 
             quant_method: Optional[str] = None
             available_variants: List[str] = []
@@ -3686,9 +4580,14 @@ class LLMService:
                 )
 
             try:
-                self.local_model = AutoModelForCausalLM.from_pretrained(
-                    load_target, **model_kwargs
-                )
+                if local_loader == "image_text_to_text":
+                    self.local_model = multimodal_model_cls.from_pretrained(
+                        load_target, **model_kwargs
+                    )
+                else:
+                    self.local_model = AutoModelForCausalLM.from_pretrained(
+                        load_target, **model_kwargs
+                    )
             except Exception as exc:
                 logger.exception("Failed to load local model %s", load_target)
                 try:
@@ -3703,10 +4602,21 @@ class LLMService:
                     )
                 except Exception:
                     pass
+                compatibility_message = _build_local_checkpoint_compatibility_message(
+                    model_name=model_name,
+                    load_target=load_target,
+                    search_dirs=search_dirs,
+                    resolved_dir=resolved_dir,
+                    stage="model",
+                    exc=exc,
+                )
+                if compatibility_message:
+                    raise RuntimeError(compatibility_message) from exc
                 searched = ", ".join(str(p) for p in search_dirs)
                 raise RuntimeError(
                     f"Failed to load model '{model_name}' from '{load_target}'. "
-                    f"Verify the checkpoint is complete (searched: {searched}). Original error: {exc}"
+                    f"Verify the checkpoint is complete (searched: {searched}). "
+                    f"Original error: {_compact_exception_text(exc)}"
                 ) from exc
             logger.info("Using cached model", extra={"model": load_target})
             self._configure_generation_features()
@@ -3714,6 +4624,7 @@ class LLMService:
                 self.local_model.eval()
             except Exception:  # pragma: no cover - some models may not implement eval
                 pass
+            self._loaded_local_model_name = model_name
             self._local_backend_active = "transformers"
             self._local_load_state = "ready"
             self._local_load_finished_at = time.time()
@@ -3741,6 +4652,7 @@ class LLMService:
             self._local_load_state = "error"
             self._local_load_error = message
             self._local_load_finished_at = time.time()
+            self._loaded_local_model_name = None
             if wrapped_exc is not None:
                 raise wrapped_exc from exc
             raise
@@ -3751,17 +4663,23 @@ class LLMService:
         if (
             self.local_model is not None
             or self.local_tokenizer is not None
+            or self.local_processor is not None
             or self._local_load_state in {"loading", "ready", "error"}
         ):
             mode_value = "local"
-        model_name = self._local_model_name()
+        model_name = self._active_local_model_name()
         active_backend = self._local_backend_active or "transformers"
-        loaded = bool(self.local_model and self.local_tokenizer)
+        loaded = bool(
+            self.local_model and (self.local_tokenizer or self.local_processor)
+        )
         status: Dict[str, Any] = {
             "mode": mode_value,
             "model": model_name,
+            "effective_model_id": resolve_model_alias(model_name),
             "loaded": loaded,
             "active_backend": active_backend,
+            "local_loader": self._local_loader,
+            "supports_images": bool(self._local_supports_images),
             "load_state": self._local_load_state,
             "load_error": self._local_load_error,
             "load_started_at": self._local_load_started_at,
@@ -3775,6 +4693,7 @@ class LLMService:
             "cuda_bf16_supported": None,
             "ram_swap_enabled": bool(self.enable_ram_swap),
         }
+        status["preflight"] = self.local_runtime_preflight(model_name)
         if torch and torch.cuda.is_available():
             try:
                 status["cuda_bf16_supported"] = torch.cuda.is_bf16_supported()
@@ -3810,13 +4729,19 @@ class LLMService:
 
     def unload_local_model(self) -> Dict[str, Any]:
         """Release local model weights and clear cached state."""
-        released = bool(self.local_model or self.local_tokenizer)
+        released = bool(
+            self.local_model or self.local_tokenizer or self.local_processor
+        )
         self.local_model = None
+        self.local_processor = None
         self.local_tokenizer = None
+        self._loaded_local_model_name = None
         self._kv_cache.clear()
         self._last_memory_snapshot = None
         self._local_quant_method = None
         self._local_backend_active = None
+        self._local_loader = "causal_lm"
+        self._local_supports_images = False
         self._local_load_state = "idle"
         self._local_load_error = None
         self._local_load_started_at = None
@@ -3839,9 +4764,14 @@ class LLMService:
         self._load_local_model(override_model_name=override_model_name)
         return {
             "loaded": bool(
-                self.local_model is not None and self.local_tokenizer is not None
+                self.local_model is not None
+                and (
+                    self.local_tokenizer is not None or self.local_processor is not None
+                )
             ),
             "backend": "transformers",
+            "local_loader": self._local_loader,
+            "supports_images": bool(self._local_supports_images),
         }
 
     def _generate_via_local(
@@ -3851,35 +4781,66 @@ class LLMService:
         # Allow per‑request override of model selection
         override = kwargs.get("model")
         self._load_local_model(override_model_name=override)
-        context_prompt = ctx.system_prompt + "\n" if ctx.system_prompt else ""
-        for msg in ctx.messages:
-            role = msg.get("role")
-            content = msg.get("content")
-            context_prompt += f"{role}: {content}\n"
-        # Fallback: if images attached in context, add textual stubs so local text-only models
-        # are aware that images exist. Real captioning handled by vision worker in future.
-        try:
-            images = (
-                list(ctx.metadata.get("images", []))
-                if isinstance(ctx.metadata, dict)
-                else []
+        prompt_text = self._coerce_local_text(prompt)
+        attachments_param = kwargs.get("attachments")
+        if isinstance(attachments_param, dict):
+            attachments_param = [attachments_param]
+        attachments = [
+            att for att in (attachments_param or []) if isinstance(att, dict)
+        ]
+        ignored_attachments: List[Dict[str, Any]] = []
+        if (
+            self._local_loader == "image_text_to_text"
+            and self.local_processor is not None
+        ):
+            images, ignored_attachments = self._collect_local_multimodal_images(
+                attachments, ctx
             )
-            for entry in images[:3]:
-                p = Path(str(entry.get("path", ""))).name
-                sc = entry.get("score")
-                if sc is not None:
-                    context_prompt += f"image: {p} (score {sc})\n"
-                else:
-                    context_prompt += f"image: {p}\n"
-        except Exception:
-            pass
-        full_prompt = context_prompt + prompt
-        inputs = self.local_tokenizer(
-            full_prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=self.max_context_length,
-        )
+            messages = self._build_local_multimodal_messages(
+                prompt_text, ctx, len(images)
+            )
+            prompt_payload = self.local_processor.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            processor_kwargs: Dict[str, Any] = {"return_tensors": "pt"}
+            if images:
+                processor_kwargs["images"] = images
+            inputs = self.local_processor(
+                text=prompt_payload,
+                **processor_kwargs,
+            )
+        else:
+            context_prompt = ctx.system_prompt + "\n" if ctx.system_prompt else ""
+            for msg in ctx.messages:
+                role = msg.get("role")
+                content = msg.get("content")
+                context_prompt += f"{role}: {content}\n"
+            # Text-only local models still receive lightweight image stubs so
+            # the turn remains understandable when the context contains images.
+            try:
+                images = (
+                    list(ctx.metadata.get("images", []))
+                    if isinstance(ctx.metadata, dict)
+                    else []
+                )
+                for entry in images[:3]:
+                    p = Path(str(entry.get("path", ""))).name
+                    sc = entry.get("score")
+                    if sc is not None:
+                        context_prompt += f"image: {p} (score {sc})\n"
+                    else:
+                        context_prompt += f"image: {p}\n"
+            except Exception:
+                pass
+            full_prompt = context_prompt + prompt_text
+            inputs = self.local_tokenizer(
+                full_prompt,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.max_context_length,
+            )
         if torch and self.local_model is not None:
             try:
                 target_device = getattr(self.local_model, "device", None)
@@ -3952,8 +4913,18 @@ class LLMService:
             except Exception:
                 pass
 
-        text = self.local_tokenizer.decode(decode_ids, skip_special_tokens=True)
-        return {"text": text, "thought": "", "tools_used": [], "metadata": {}}
+        decoder = self.local_tokenizer or self.local_processor
+        if decoder is None:
+            raise RuntimeError("Local decoder is unavailable")
+        text = decoder.decode(decode_ids, skip_special_tokens=True)
+        metadata: Dict[str, Any] = {
+            "active_backend": self._local_backend_active or "transformers",
+            "local_loader": self._local_loader,
+            "supports_images": bool(self._local_supports_images),
+        }
+        if ignored_attachments:
+            metadata["ignored_attachments"] = ignored_attachments
+        return {"text": text, "thought": "", "tools_used": [], "metadata": metadata}
 
     def estimate_vram(self, context_length: int) -> float:
         """Estimate VRAM usage in megabytes for a given context length."""
@@ -5084,7 +6055,11 @@ class MemoryManager:
         return True
 
     def export_items(
-        self, *, for_external: bool = False, allow_protected: bool = False
+        self,
+        *,
+        for_external: bool = False,
+        allow_protected: bool = False,
+        include_pruned: bool = False,
     ) -> dict[str, dict]:
         """Return a mapping of key->item for safe use.
 
@@ -5093,7 +6068,10 @@ class MemoryManager:
         never export values; callers may choose to surface only metadata.
         """
         out: dict[str, dict] = {}
-        for k, it in self.iter_items(include_pruned=False, touch=False):
+        for k, it in self.iter_items(
+            include_pruned=include_pruned,
+            touch=False,
+        ):
             if it is None:
                 continue
             entry = dict(it)

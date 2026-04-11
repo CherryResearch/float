@@ -97,6 +97,7 @@ class ChatRequest(BaseModel):
     message_id: Optional[str] = None  # noqa: used for client correlation only
     model: Optional[str] = None
     mode: Optional[str] = None
+    response_format: Optional[str] = None
     attachments: List[Attachment] = Field(default_factory=list)
     vision_workflow: Optional[str] = "auto"
     use_rag: Optional[bool] = True

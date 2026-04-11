@@ -796,6 +796,40 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
             }
         },
     ),
+    "list_tasks": _spec(
+        "list_tasks",
+        "List saved calendar tasks/events from local Float storage.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "title": "Status filter",
+                    "default": "",
+                },
+                "include_past": {
+                    "type": "boolean",
+                    "title": "Include past events",
+                    "default": False,
+                },
+                "limit": {
+                    "type": "integer",
+                    "title": "Max events",
+                    "default": 20,
+                    "minimum": 1,
+                    "maximum": 100,
+                },
+            },
+        },
+        metadata={
+            "ui": {
+                "status": {"advanced": True},
+                "include_past": {"advanced": True},
+                "limit": {"advanced": True},
+            }
+        },
+    ),
     "create_task": _spec(
         "create_task",
         "Create or update a calendar task/event that appears in upcoming tasks and can optionally carry structured follow-up actions.",

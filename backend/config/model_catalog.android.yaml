@@ -1,0 +1,24 @@
+client: android
+inherits: model_catalog.yaml
+
+policies:
+  server_first: true
+  allow_direct_local_downloads: false
+  allow_provider_models: true
+
+models:
+  llm:
+    defaults:
+      api: gpt-5-mini
+      server_lan: gemma-4-E2B-it
+    allowed_provider_models:
+      - gemma-4-E2B-it
+      - gemma-4-E4B-it
+    hidden_provider_models:
+      - gemma-4-26B-A4B-it
+      - gemma-4-31B-it
+    blocked_local_models:
+      - gemma-4-E2B-it
+      - gemma-4-E4B-it
+      - gemma-4-26B-A4B-it
+      - gemma-4-31B-it

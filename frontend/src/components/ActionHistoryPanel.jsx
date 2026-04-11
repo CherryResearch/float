@@ -419,12 +419,12 @@ const ActionHistoryPanel = ({
               {typeof onToggleCollapsed === "function" ? (
                 <button
                   type="button"
-                  className={`agent-card-control-btn${collapsed ? " is-active" : ""}`}
+                  className={`agent-card-control-btn agent-card-control-symbol${collapsed ? " is-active" : ""}`}
                   onClick={onToggleCollapsed}
                   aria-label={collapsed ? "Expand write history" : "Minimize write history"}
                   title={collapsed ? "Expand write history" : "Minimize write history"}
                 >
-                  {collapsed ? "expand" : "minimize"}
+                  {collapsed ? "+" : "-"}
                 </button>
               ) : null}
               {typeof onHide === "function" ? (
@@ -560,7 +560,7 @@ const ActionHistoryPanel = ({
                             <div className="action-row-actions">
                               <button
                                 type="button"
-                                className={`agent-card-control-btn${isCompact ? " is-active" : ""}`}
+                                className={`agent-card-control-btn agent-card-control-symbol${isCompact ? " is-active" : ""}`}
                                 onClick={() => {
                                   setCollapsedActions((prev) => ({
                                     ...prev,
@@ -579,7 +579,7 @@ const ActionHistoryPanel = ({
                                 aria-label={isCompact ? `Expand ${summary}` : `Minimize ${summary}`}
                                 title={isCompact ? `Expand ${summary}` : `Minimize ${summary}`}
                               >
-                                {isCompact ? "expand" : "minimize"}
+                                {isCompact ? "+" : "-"}
                               </button>
                               <button
                                 type="button"

@@ -70,4 +70,28 @@ describe("ModelJobsPanel", () => {
       expect(screen.getByText("paused")).toBeInTheDocument();
     });
   });
+
+  it("renders Gemma 4 local download jobs", async () => {
+    axiosMocks.get.mockResolvedValueOnce({
+      data: {
+        jobs: [
+          {
+            id: "job-gemma",
+            model: "gemma-4-E2B-it",
+            status: "running",
+            downloaded: 25,
+            total: 100,
+            percent: 0.25,
+            path: "D:/models/gemma-4-E2B-it",
+            updated_at: 1700000002,
+          },
+        ],
+      },
+    });
+
+    render(<ModelJobsPanel />);
+
+    expect(await screen.findByText("gemma-4-E2B-it")).toBeInTheDocument();
+    expect(screen.getByText(/25%/i)).toBeInTheDocument();
+  });
 });

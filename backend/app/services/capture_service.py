@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,7 +20,22 @@ def _sha256_bytes(data: bytes) -> str:
 
 def _safe_name(value: str, default: str = "capture.png") -> str:
     raw = Path(str(value or default)).name.strip()
-    return raw or default
+    raw = raw or default
+    parsed = Path(raw)
+    suffix = "".join(parsed.suffixes) or Path(default).suffix or ".png"
+    stem = (
+        parsed.name[: -len(suffix)]
+        if suffix and parsed.name.endswith(suffix)
+        else parsed.stem
+    )
+    stem = stem.strip(" ._-") or "capture"
+    max_name_length = 120
+    if len(stem) + len(suffix) <= max_name_length:
+        return f"{stem}{suffix}"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    keep = max(1, max_name_length - len(suffix) - len(digest) - 1)
+    trimmed_stem = stem[:keep].rstrip(" ._-") or "capture"
+    return f"{trimmed_stem}-{digest}{suffix}"
 
 
 def _iso(value: float) -> str:
@@ -57,7 +71,11 @@ class CaptureService:
 
     def default_sensitivity(self) -> str:
         settings = user_settings.load_settings()
-        value = str(settings.get("capture_default_sensitivity") or "personal").strip().lower()
+        value = (
+            str(settings.get("capture_default_sensitivity") or "personal")
+            .strip()
+            .lower()
+        )
         return value if value in SENSITIVITY_VALUES else "personal"
 
     def _meta_path(self, capture_id: str) -> Path:
@@ -95,16 +113,21 @@ class CaptureService:
 
     def _descriptor(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         capture_id = str(payload.get("capture_id") or "")
-        content_type = str(payload.get("content_type") or "image/png").strip() or "image/png"
+        content_type = (
+            str(payload.get("content_type") or "image/png").strip() or "image/png"
+        )
         descriptor = {
             "capture_id": capture_id,
             "source": str(payload.get("source") or "").strip() or "capture",
-            "filename": str(payload.get("filename") or "capture.png").strip() or "capture.png",
+            "filename": str(payload.get("filename") or "capture.png").strip()
+            or "capture.png",
             "content_type": content_type,
             "content_hash": str(payload.get("content_hash") or "").strip(),
             "transient": bool(payload.get("transient", True)),
             "promoted": bool(payload.get("promoted", False)),
-            "sensitivity": str(payload.get("sensitivity") or self.default_sensitivity()),
+            "sensitivity": str(
+                payload.get("sensitivity") or self.default_sensitivity()
+            ),
             "created_at": payload.get("created_at"),
             "created_at_iso": payload.get("created_at_iso"),
             "updated_at": payload.get("updated_at"),
@@ -182,14 +205,22 @@ class CaptureService:
         capture_id = str(uuid4())
         safe_name = _safe_name(filename)
         now = time.time()
-        retention_value = self.default_retention_days() if retention_days is None else max(0, int(retention_days))
-        expires_at = (datetime.now(tz=timezone.utc) + timedelta(days=retention_value)).timestamp()
+        retention_value = (
+            self.default_retention_days()
+            if retention_days is None
+            else max(0, int(retention_days))
+        )
+        expires_at = (
+            datetime.now(tz=timezone.utc) + timedelta(days=retention_value)
+        ).timestamp()
         normalized_source = str(source or "capture").strip().lower() or "capture"
         target_dir = (self.transient_root / normalized_source).resolve()
         target_dir.mkdir(parents=True, exist_ok=True)
         target = (target_dir / f"{capture_id}-{safe_name}").resolve()
         target.write_bytes(data)
-        normalized_sensitivity = str(sensitivity or self.default_sensitivity()).strip().lower()
+        normalized_sensitivity = (
+            str(sensitivity or self.default_sensitivity()).strip().lower()
+        )
         if normalized_sensitivity not in SENSITIVITY_VALUES:
             normalized_sensitivity = self.default_sensitivity()
         payload = {
@@ -273,7 +304,9 @@ class CaptureService:
                 self._write_meta(capture_meta)
             except Exception:
                 pass
-        return self._descriptor(self._read_meta(str(capture["capture_id"])) or capture_meta)
+        return self._descriptor(
+            self._read_meta(str(capture["capture_id"])) or capture_meta
+        )
 
     def list_captures(self, *, source: str | None = None) -> List[Dict[str, Any]]:
         self.prune_expired()
@@ -285,7 +318,11 @@ class CaptureService:
                 continue
             if not isinstance(payload, dict):
                 continue
-            if source and str(payload.get("source") or "").strip().lower() != str(source).strip().lower():
+            if (
+                source
+                and str(payload.get("source") or "").strip().lower()
+                != str(source).strip().lower()
+            ):
                 continue
             target = self._resolve_path(payload)
             if target is None or not target.exists():

@@ -97,7 +97,76 @@ def test_tool_help_tool_help_mentions_create_task_discovery():
     notes = " ".join(str(note) for note in entry.get("notes", []))
     lowered = notes.lower()
     assert "create_task" in lowered
+    assert "list_tasks" in lowered
     assert "scheduler" in lowered
+
+
+def test_help_special_modules_returns_workflow_catalog():
+    from app.tools.tool_help import help_tool
+
+    args = {
+        "tool_name": "modules",
+        "detail": "rich",
+        "include_schema": False,
+        "max_tools": 8,
+    }
+    signature = generate_signature("tester", "help", args)
+    result = help_tool(user="tester", signature=signature, **args)
+    assert result["count"] == 1
+    entry = result["tools"][0]
+    assert entry["name"] == "modules"
+    assert isinstance(entry.get("workflows"), list)
+    assert isinstance(entry.get("modules"), list)
+    notes = " ".join(str(note) for note in entry.get("notes", []))
+    assert "workflow" in notes.lower()
+    assert "add-ons" in notes.lower()
+
+
+def test_help_special_skills_returns_skill_catalog():
+    from app.tools.tool_help import help_tool
+
+    args = {
+        "tool_name": "skills",
+        "detail": "rich",
+        "include_schema": False,
+        "max_tools": 8,
+    }
+    signature = generate_signature("tester", "help", args)
+    result = help_tool(user="tester", signature=signature, **args)
+    assert result["count"] == 1
+    entry = result["tools"][0]
+    assert entry["name"] == "skills"
+    assert "skills_root" in entry
+    notes = " ".join(str(note) for note in entry.get("notes", []))
+    lowered = notes.lower()
+    assert "markdown" in lowered
+    assert "not yet dynamically injected" in lowered
+
+
+def test_tool_info_special_modules_returns_catalog_entry():
+    from app.tools.tool_help import tool_info
+
+    args = {
+        "tool_name": "modules",
+        "include_schema": False,
+    }
+    signature = generate_signature("tester", "tool_info", args)
+    result = tool_info(user="tester", signature=signature, **args)
+    assert result["name"] == "modules"
+    assert result["category"] == "runtime"
+
+
+def test_tool_info_special_skills_returns_catalog_entry():
+    from app.tools.tool_help import tool_info
+
+    args = {
+        "tool_name": "skills",
+        "include_schema": False,
+    }
+    signature = generate_signature("tester", "tool_info", args)
+    result = tool_info(user="tester", signature=signature, **args)
+    assert result["name"] == "skills"
+    assert result["category"] == "runtime"
 
 
 def test_tool_help_list_actions_mentions_revert_batches():
@@ -259,7 +328,27 @@ def test_tool_help_brief_list_mode_honors_limit():
     result = tool_help(user="tester", signature=signature, **args)
     assert result["count"] == 3
     assert len(result["tools"]) == 3
-    assert all("name" in item for item in result["tools"])
+    assert result["total_count"] >= result["count"]
+    assert result["tools"] == ["help", "tool_help", "recall"]
+    assert result["remaining_count"] == result["total_count"] - result["count"]
+    assert "tool_info" in result["more_tools"]
+
+
+def test_tool_help_brief_list_mode_surfaces_tail_tools_when_truncated():
+    from app.tools.tool_help import tool_help
+
+    args = {
+        "tool_name": "",
+        "detail": "brief",
+        "include_schema": False,
+        "max_tools": 20,
+    }
+    signature = generate_signature("tester", "tool_help", args)
+    result = tool_help(user="tester", signature=signature, **args)
+    assert result["count"] == 20
+    assert "write_file" in result["tools"]
+    assert "create_task" in result["tools"]
+    assert result["remaining_count"] > 0
 
 
 def test_help_alias_uses_compact_defaults():
@@ -274,8 +363,16 @@ def test_help_alias_uses_compact_defaults():
     signature = generate_signature("tester", "help", args)
     result = help_tool(user="tester", signature=signature, **args)
     assert result["count"] == 8
-    assert all("schema" not in item for item in result["tools"])
-    assert all("notes" not in item for item in result["tools"])
+    assert result["tools"] == [
+        "help",
+        "tool_help",
+        "tool_info",
+        "list_actions",
+        "create_task",
+        "memory.save",
+        "remember",
+        "recall",
+    ]
 
 
 def test_tool_info_returns_single_catalog_entry():
@@ -291,3 +388,16 @@ def test_tool_info_returns_single_catalog_entry():
     assert result["category"] == "files"
     assert result["sandbox"]["read_roots"] == ["data/"]
     assert "input_schema" in result
+
+
+def test_tool_info_unknown_tool_returns_did_you_mean():
+    from app.tools.tool_help import tool_info
+
+    args = {
+        "tool_name": "writefile",
+        "include_schema": False,
+    }
+    signature = generate_signature("tester", "tool_info", args)
+    result = tool_info(user="tester", signature=signature, **args)
+    assert result["error"] == "unknown_tool"
+    assert "write_file" in result.get("did_you_mean", [])

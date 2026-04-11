@@ -217,6 +217,15 @@ describe("Chat vision integration", () => {
               origin,
               relative_path: `${root}/${hash}/${file.name}`,
             };
+          } else if (this.url === "/api/captures/upload") {
+            const file = body.get("file");
+            payload = {
+              url: `/api/captures/capture-1/${file.name}`,
+              capture_id: "capture-1",
+              transient: true,
+              origin: "captured",
+              relative_path: `captures/transient/capture-1/${file.name}`,
+            };
           } else if (this.url === "/api/chat") {
             payload = {
               message: "vision answer",
@@ -333,20 +342,38 @@ describe("Chat vision integration", () => {
 
     await waitFor(() =>
       expect(
-        xhrRequests.some((request) => request.url === "/api/attachments/upload"),
+        xhrRequests.some((request) => request.url === "/api/captures/upload"),
       ).toBe(true),
     );
 
     const uploadCall = xhrRequests.find(
-      (request) => request.url === "/api/attachments/upload",
+      (request) => request.url === "/api/captures/upload",
     );
     expect(uploadCall).toBeTruthy();
     const formData = uploadCall.body;
-    expect(formData.get("origin")).toBe("captured");
-    expect(formData.get("capture_source")).toBe("chat_camera");
+    expect(formData.get("source")).toBe("camera");
 
     await waitFor(() => expect(stopTrack).toHaveBeenCalled());
     expect(await screen.findByLabelText("Vision mode")).toBeInTheDocument();
+  });
+
+  it("shows the browser camera permission detail when access is denied", async () => {
+    const getUserMedia = vi
+      .fn()
+      .mockRejectedValue(new Error("Permission denied by browser"));
+    Object.defineProperty(navigator, "mediaDevices", {
+      value: { getUserMedia },
+      configurable: true,
+    });
+
+    renderChat();
+    fireEvent.click(screen.getByRole("button", { name: /open attachments/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /capture from camera/i }));
+
+    expect(getUserMedia).toHaveBeenCalledTimes(1);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Permission denied by browser",
+    );
   });
 
   it("pastes image clipboard items into attachments", async () => {

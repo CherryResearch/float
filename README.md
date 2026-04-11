@@ -29,6 +29,17 @@ float leverages advanced language models and a modular architecture to provide a
 - *persistence* float is intended to spend more time observing and thinking than responding: independently reasoning about memories, priorities, or tasks while the user is not connected, watching through a live-mode stream, and long-form rolling conversations with context compacting.
 - *proactive* float aims to grow into the ability to message the user directly for clarification while reasoning and to suggest tasks and events (for example, a "project review").
 
+## Command entry shortcuts
+Float's composer understands inline command tokens so you can trigger tools or search helpers without leaving the textarea. Typing `%{toolname}` (e.g. `%remember ...`) immediately flags the name as a tool call, `./` starts file search, `//` starts embedded-memory search, and `.//` blends both result sets. Suggestions appear alphabetically (like a terminal's `Tab` completion), render with a hyperlink-like treatment, and backspace at the end of a linked argument removes the link without losing the text.
+
+| Trigger | Behavior |
+| --- | --- |
+| `%{toolname}` (for example `%remember ...`) | Calls a registered tool with the rest of the line as the payload. Suggestions are alphabetical and Tab accepts the highlighted entry before you finish typing the arguments. |
+| `./` (file search) and `//` (memory search) | Begin inline lookups scoped to repository/file contents or saved memories. Results look like links you can click to insert structured context; Tab cycles through matches in lexical order. |
+| `.//` | Performs a blended search across both files and memories so a single lookup can pull from either surface without switching commands. |
+
+These inline tokens remain clickable until you delete the trailing space or the entire link, and hitting Backspace when your cursor sits just after the linked text automatically unlinks it so you can edit the raw words.
+
 ## Architecture
 
 - **Language Models**: Local Transformers (GPT-OSS, Qwen 3, Llama 3.1, Gemma) plus OpenAI-compatible API endpoints (OpenAI Responses, LM Studio/Ollama/custom servers). Defaults focus on `gpt-5.4` (API) and `gpt-oss-20b` (local).
@@ -112,13 +123,23 @@ The provider path uses an OpenAI-compatible transport such as `http://<host>:<po
 If local Transformers fails on BF16/MXFP4/CUDA mismatches, switch to a managed quantized runtime such as `lmstudio` or `ollama`.
 If the model you have is a raw `.gguf`, do not treat it like a direct local Transformers checkpoint. Run it behind LM Studio, Ollama, or another OpenAI-compatible server first.
 
+### Gemma 4 runtime lanes
+
+Gemma 4 now follows an explicit three-lane split in Float:
+
+- `Cloud API`: keep OpenAI Realtime for live voice and live-session transport.
+- `Server/LAN`: use LM Studio or another OpenAI-compatible endpoint for larger Gemma 4 deployments such as `gemma-4-E4B-it`, `gemma-4-26B-A4B-it`, and `gemma-4-31B-it`.
+- `Local (on-device)`: direct local Transformers support now targets `gemma-4-E2B-it` as the first real Gemma 4 checkpoint.
+
+Direct local Gemma 4 uses Hugging Face's multimodal `AutoProcessor` + `AutoModelForImageTextToText` path, so `gemma-4-E2B-it` can handle text-only turns and still-image plus text turns locally. The larger Gemma 4 checkpoints remain provider/server-first in this pass and are intentionally not exposed as built-in direct-download recommendations.
+
 Routing snapshot:
 
 - Chat uses `api`, `local`, or `server` mode.
 - Text embeddings use `rag_embedding_model` (`local:*`, `api:*`, or `simple`) and do not automatically follow `server_url`.
 - TTS uses OpenAI `tts-1` / `tts-1-hd` or local `kitten` / `kokoro` style models.
 - Live voice uses OpenAI Realtime by default, with LiveKit kept as a fallback transport.
-- The public runtime overview lives in `docs/feature_overviews/models-and-runtime-modes.md`, with setup details in `docs/environment setup.md`.
+- The public capability-by-mode overview lives in `docs/feature_overviews/models-and-runtime-modes.md`.
 
 ## Private Sync, Streaming, and Workspaces
 Float should treat sync and live streaming as device-trust problems, not public-account problems.
@@ -184,7 +205,7 @@ If you want one Float instance to reach another machine without exposing it publ
 
 For more detail, see:
 - `docs/feature_overviews/device-sync-and-streaming.md`
-- `docs/data_directory.md`
+- `docs/feature_overviews/conversations-history-and-storage.md`
 
 
 ## Notebooks
@@ -268,6 +289,18 @@ Runtime artifacts live under `data/` (gitignored so installs stay private):
 
 See `docs/data_directory.md` for the full layout and usage notes; conversation history lives under `data/conversations/` (legacy `conversations/` is auto-migrated on startup when `FLOAT_CONV_DIR` is unset) and `blobs/` remains beside the repo for now.
 
+## Personalizing float
+
+Float is intended to be customized in layers rather than only through one giant prompt edit.
+
+- Add-ons are packages of skills (markdown descriptive files), tools (callable Python scripts), and assets (any other files needed, such as images or reference files).
+- You can edit Float's base system prompt in `backend/app/config.py`.
+- Built-in tools are part of the backend itself; users are not generally expected to edit them directly, and add-ons are the cleaner extension point for adding new behavior.
+- Workflows are lightweight behavior profiles that decide how Float should approach a task, including its default reasoning style and which modules are enabled for that run.
+- Themes are customizable from Settings: you can create a new theme, choose values for the eight palette slots, save it, rename it, edit it later, or delete it. User-created themes live under `data/themes/`.
+
+For more detail, see `docs/feature_overviews/personalization-and-modules.md`.
+
 ### Voice Setup
 
 Float now has two voice transport paths:
@@ -339,17 +372,16 @@ Harmony-formatted responses.
 
 - System prompt: `backend/app/config.py` (override with `SYSTEM_PROMPT` in `.env`).
 - Built-in tool registry: `backend/app/tools/__init__.py` (`BUILTIN_TOOLS`) and UI schemas in `backend/app/tool_specs.py`.
-- Public feature overviews: `docs/feature_overviews/README.md`, `docs/feature_overviews/tools-and-actions.md`, and `docs/feature_overviews/models-and-runtime-modes.md`.
+- Public feature overviews: `docs/feature_overviews/README.md`, `docs/feature_overviews/tools-and-actions.md`, `docs/feature_overviews/models-and-runtime-modes.md`, and `docs/feature_overviews/personalization-and-modules.md`.
 - Workflow runbooks and provider/mode coverage: `docs/feature_overviews/voice-live-and-passthrough.md` and `docs/feature_overviews/models-and-runtime-modes.md`. Model readiness defaults live in `backend/config/model_catalog.yaml`.
-- SAE inspection and steering remain roadmap work and are not part of the public alpha surface.
+- Modules/add-ons overview: `docs/feature_overviews/personalization-and-modules.md`.
+- SAE inspection/steering is still experimental and not part of the current public snapshot.
 
 ## Companion Codex Skills
 
 Float-specific Codex skills live in a separate repository so the app code and the Codex-facing skill prompts can evolve independently:
 
 - `https://github.com/CherryResearch/float-codex-skills`
-
-That repo is intended for Codex skill content and helper workflows related to Float. Keep it separate from this application repo unless a change specifically belongs in Float itself.
 
 ### Docker Deployment
 
@@ -436,4 +468,3 @@ assigned to the project operator under the
 
 This repository is licensed under the GNU Affero General Public License,
 version 3 only. See [LICENSE](LICENSE).
-

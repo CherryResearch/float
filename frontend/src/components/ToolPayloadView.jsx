@@ -147,6 +147,57 @@ const getPreferredAttachment = (payload, data, session) => {
   return candidates.find((item) => isPlainObject(item)) || null;
 };
 
+const normalizeAttachmentCandidate = (candidate) => {
+  if (!isPlainObject(candidate)) return null;
+  const captureId = getString(candidate.capture_id || candidate.captureId || candidate.id || "");
+  const url =
+    getString(candidate.url || candidate.href || "") || captureUrlFromId(captureId);
+  if (!url) return null;
+  return {
+    url,
+    name:
+      getString(candidate.name || candidate.filename || candidate.title || "") ||
+      basenameFromPath(url) ||
+      "capture.png",
+    type: getString(candidate.type || candidate.content_type || ""),
+    captureId,
+    source: getString(
+      candidate.capture_source || candidate.source || candidate.origin || "",
+    ),
+  };
+};
+
+const normalizeCaptureItem = (candidate) => {
+  if (!isPlainObject(candidate)) return null;
+  const attachment = normalizeAttachmentCandidate(
+    candidate.attachment || candidate.attachment_ref || candidate,
+  );
+  const captureId = getString(
+    candidate.capture_id || candidate.captureId || candidate.id || attachment?.captureId || "",
+  );
+  const filename =
+    getString(candidate.filename || candidate.name || attachment?.name || "") ||
+    basenameFromPath(attachment?.url || "") ||
+    (captureId ? `${captureId}.png` : "");
+  if (!attachment && !filename && !captureId) return null;
+  return {
+    attachment:
+      attachment ||
+      normalizeAttachmentCandidate({
+        capture_id: captureId,
+        filename,
+      }),
+    captureId,
+    filename,
+    source: getString(
+      candidate.capture_source || candidate.source || attachment?.source || "",
+    ),
+    transient:
+      typeof candidate.transient === "boolean" ? candidate.transient : null,
+    promoted: typeof candidate.promoted === "boolean" ? candidate.promoted : null,
+  };
+};
+
 export const extractComputerPayload = (payload, toolName) => {
   const label = typeof toolName === "string" ? toolName.toLowerCase() : "";
   if (!payload || typeof payload !== "object") return null;
@@ -228,6 +279,46 @@ export const extractComputerPayload = (payload, toolName) => {
     lastScreenshotPath,
     captureId,
     session,
+  };
+};
+
+export const extractCapturePayload = (payload, toolName) => {
+  const label = typeof toolName === "string" ? toolName.toLowerCase() : "";
+  if (!payload || typeof payload !== "object") return null;
+  if (!label.startsWith("capture.") && label !== "camera.capture") return null;
+  const data = isPlainObject(payload.data) ? payload.data : payload;
+  const summary = getString(payload.summary || data.summary || payload.message || data.message || "");
+  const directCandidates = [
+    payload.capture,
+    data.capture,
+    payload.attachment,
+    data.attachment,
+    label === "camera.capture" ? data : null,
+  ]
+    .map(normalizeCaptureItem)
+    .filter(Boolean);
+  const listedItems = [
+    ...(Array.isArray(payload.captures) ? payload.captures : []),
+    ...(Array.isArray(data.captures) ? data.captures : []),
+  ]
+    .map(normalizeCaptureItem)
+    .filter(Boolean);
+  const items = [...directCandidates, ...listedItems].filter(
+    (item, index, arr) =>
+      arr.findIndex(
+        (other) =>
+          other.captureId &&
+          item.captureId &&
+          other.captureId === item.captureId,
+      ) === index || !item.captureId,
+  );
+  if (!summary && !items.length) return null;
+  return {
+    summary,
+    items,
+    count:
+      getNumber(payload.count ?? data.count) ??
+      (items.length > 0 ? items.length : null),
   };
 };
 
@@ -377,6 +468,59 @@ const renderComputerPayload = (computer, onOpenComputerSession = null) => (
   </div>
 );
 
+const renderCapturePayload = (capture) => (
+  <div className="tool-capture-card">
+    {capture.summary && (
+      <div className="tool-computer-summary">{capture.summary}</div>
+    )}
+    {typeof capture.count === "number" && capture.count > 1 && (
+      <div className="tool-computer-session-meta">
+        <span>{capture.count} captures</span>
+      </div>
+    )}
+    {capture.items.length > 0 ? (
+      <div className="tool-list">
+        {capture.items.map((item, idx) => (
+          <div key={item.captureId || `capture-${idx}`} className="tool-list-item">
+            {item.attachment?.url && (
+              <a
+                className="tool-computer-link"
+                href={item.attachment.url}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                <img
+                  src={item.attachment.url}
+                  alt={item.filename || item.attachment.name || "Captured image"}
+                  className="tool-computer-image"
+                  loading="lazy"
+                />
+              </a>
+            )}
+            {(item.filename || item.captureId) && (
+              <div className="tool-computer-session-meta">
+                {item.filename && <span>{item.filename}</span>}
+                {item.captureId && <span>{item.captureId}</span>}
+              </div>
+            )}
+            {(item.source || item.promoted !== null || item.transient !== null) && (
+              <div className="tool-computer-meta">
+                {item.source && <span>{item.source}</span>}
+                {item.promoted !== null && (
+                  <span>{item.promoted ? "promoted" : "transient"}</span>
+                )}
+                {item.transient === false && item.promoted === null && <span>saved</span>}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    ) : (
+      <div className="tool-payload-empty">No captures.</div>
+    )}
+  </div>
+);
+
 export const summarizeToolPayload = (value, toolName = null) => {
   const normalized = normalizeToolPayload(value);
   if (normalized === null || typeof normalized === "undefined") return "";
@@ -385,6 +529,13 @@ export const summarizeToolPayload = (value, toolName = null) => {
   const computer = extractComputerPayload(payload, toolName);
   if (computer) {
     return computer.summary || computer.currentUrl || computer.activeWindow || "computer update";
+  }
+  const capture = extractCapturePayload(payload, toolName);
+  if (capture) {
+    if (capture.summary) return capture.summary;
+    if (capture.items[0]?.filename) return capture.items[0].filename;
+    if (typeof capture.count === "number") return `${capture.count} capture(s)`;
+    return "capture update";
   }
   const search = extractSearchPayload(payload, toolName);
   if (search && (search.query || search.items.length)) {
@@ -413,19 +564,23 @@ const ToolPayloadView = ({
   const { payload, status, ok, message } = unwrapToolOutcome(normalized);
   const search = extractSearchPayload(payload, toolName);
   const computer = extractComputerPayload(payload, toolName);
+  const capture = extractCapturePayload(payload, toolName);
   const statusKey = status ? String(status).toLowerCase() : "";
   const showStatus = !!status;
   const classes = [
     "tool-payload",
     `tool-payload-${kind}`,
     compact ? "compact" : "",
-    computer?.attachment?.url ? "tool-payload-has-media" : "",
+    computer?.attachment?.url || capture?.items.some((item) => item.attachment?.url)
+      ? "tool-payload-has-media"
+      : "",
   ]
     .filter(Boolean)
     .join(" ");
 
   const content = (() => {
     if (computer) return renderComputerPayload(computer, onOpenComputerSession);
+    if (capture) return renderCapturePayload(capture);
     if (search) return renderSearchResults(search);
     if (Array.isArray(payload)) return renderArrayPayload(payload);
     if (isPlainObject(payload)) return renderKeyValueList(payload);

@@ -39,7 +39,6 @@ dist/
 data/threads/
 summary.json
 conversations/
-models/
 test_logs.json
 user_settings.json
 devices.json
@@ -53,3 +52,4 @@ blobs/
 .tmp_pytest/
 .tmp_pytest_run/
 .tmp_manual_data/
+.playwright-cli/

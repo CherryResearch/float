@@ -24,6 +24,7 @@ data/
     downloaded/                # assets fetched by approved tools
     workspace/                 # root workspace plus named workspace roots / nested sync copies
   models/                      # default download/cache target for local models
+  themes/                      # user-created visual themes saved from Settings
   workspace/                   # tool-writable scratch space for general workflows
 ```
 
@@ -35,6 +36,8 @@ Conversation history lives under `data/conversations/` (legacy `conversations/` 
 - Use project-relative paths (`Path(__file__).resolve().parents[2] / "data" / ...`) so the same layout works on Windows and Linux.
 - Documents/knowledge folder-ingest defaults to `data/files/workspace` so UI workflows stay inside the managed sandbox.
 - Named workspace profiles typically live under `data/files/workspace/<slug>/` unless the user points them somewhere else.
+- `data/modules/` is optional. When used, it acts as the local untracked override area for add-on manifests and related module assets, while repo-shipped content lives under the tracked root `modules/` tree.
+- `data/themes/` is the local storage area for user-created or edited visual themes saved from Settings.
 - Imported nested sync copies can create deeper workspace roots beneath an existing workspace, and synced attachments may also keep custody paths like `workspace/sync/<source>/...` so source ownership stays visible after sync.
 - Tools should request:
   - Read access for everything under `data/`.
@@ -43,6 +46,15 @@ Conversation history lives under `data/conversations/` (legacy `conversations/` 
 - RAG "memorize"/"forget" operations work on `data/databases/chroma/`: they add/remove vector rows keyed to the knowledge item while leaving the underlying file/text in `data/files` or the knowledge store untouched.
 - The backend seeds missing directories at startup; scripts can assume the tree exists.
 - Before adding a new artifact type, update this document and the README so agents know where to write.
+
+## Tracked vs Local Module Assets
+
+- `modules/` at the repo root is the tracked home for shipped module assets.
+- `modules/skills/` holds the base skills Float ships with.
+- `modules/addons/` is for repo-shipped workflow add-on manifests that should be discoverable in git.
+- `data/modules/addons/` is optional and is for local or user-installed add-on manifests when a machine wants untracked overrides.
+- If an add-on id exists in both places, the local `data/` copy should override the tracked repo copy.
+- Legacy `models/` at the repo root is documentation-only. Keep placeholder README files there, but store actual checkpoints in `data/models/`.
 
 ## Recent Migrations
 

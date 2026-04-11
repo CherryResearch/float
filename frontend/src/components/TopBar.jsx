@@ -13,8 +13,13 @@ import {
   isLocalRuntimeEntry,
   LOCAL_RUNTIME_ENTRIES,
   normalizeModelId,
+  resolveConcreteModelSelection,
+  resolveLocalCatalogModelId,
+  resolveModelForMode,
+  resolveRequestModelForMode,
   SUGGESTED_LOCAL_MODELS,
 } from "../utils/modelUtils";
+import { providerRuntimeHasChatModel } from "../utils/providerRuntime";
 import "../styles/TopBar.css";
 
 const suggestedLangModels = SUGGESTED_LOCAL_MODELS;
@@ -22,12 +27,58 @@ const mobileTopbarQuery =
   "(max-width: 600px), (orientation: portrait) and (max-width: 900px)";
 const EMPTY_GLOBAL_STATE = Object.freeze({});
 const NOOP_SET_STATE = () => {};
+const LOCAL_PROVIDER_STATUS_POLL_MS = 60000;
 
 const fireAndForget = (request) => {
   if (request && typeof request.catch === "function") {
     request.catch(() => {});
   }
 };
+
+const buildLocalSettingsPayload = (selection) => {
+  const value = typeof selection === "string" ? selection.trim() : "";
+  if (!value) {
+    return {};
+  }
+  if (isLocalRuntimeEntry(value)) {
+    return { local_provider: normalizeModelId(value) };
+  }
+  return { transformer_model: value };
+};
+
+const buildServerProbeTargets = (serverUrl) => {
+  const value = typeof serverUrl === "string" ? serverUrl.trim() : "";
+  if (!value) {
+    return [];
+  }
+  try {
+    const url = new URL(value, window.location.href);
+    const origin = `${url.protocol}//${url.host}`;
+    const path = url.pathname.replace(/\/+$/, "");
+    const candidates = new Set();
+    const addTarget = (pathname) => {
+      candidates.add(`${origin}${pathname}`);
+    };
+    if (/\/models$/i.test(path)) {
+      addTarget(path || "/models");
+    } else if (/\/v\d+$/i.test(path)) {
+      addTarget(`${path}/models`);
+    } else {
+      addTarget(`${path || ""}/v1/models`);
+      addTarget(`${path || ""}/models`);
+    }
+    if (path) {
+      addTarget("/v1/models");
+      addTarget("/models");
+    }
+    return Array.from(candidates);
+  } catch {
+    return [];
+  }
+};
+
+const serverProbeReached = (response) =>
+  Boolean(response) && (response.ok || response.status === 401 || response.status === 403);
 
 const formatRelativeTime = (timestamp) => {
   if (timestamp == null) return null;
@@ -54,6 +105,26 @@ const formatClockTime = (timestamp) => {
     minute: "2-digit",
     second: "2-digit",
   });
+};
+
+const resolveProviderRuntimeHealth = (runtime) => {
+  const loadedModel =
+    typeof runtime?.loaded_model === "string" ? runtime.loaded_model.trim() : "";
+  const effectiveModel =
+    typeof runtime?.effective_model_id === "string"
+      ? runtime.effective_model_id.trim()
+      : typeof runtime?.effective_model === "string"
+        ? runtime.effective_model.trim()
+        : "";
+  const preferredModel =
+    typeof runtime?.preferred_model === "string" ? runtime.preferred_model.trim() : "";
+  if (providerRuntimeHasChatModel(runtime)) {
+    return "online";
+  }
+  if (runtime?.server_running || runtime?.installed || loadedModel || effectiveModel || preferredModel) {
+    return "degraded";
+  }
+  return "offline";
 };
 
 const generateDefaultSessionName = (timestamp = Date.now()) => {
@@ -138,15 +209,54 @@ const TopBar = () => {
       ...(Array.isArray(suggestedLangModels) ? suggestedLangModels : []),
     ];
     const deduped = Array.from(new Set(base));
-    const current = state.transformerModel;
+    const current =
+      resolveConcreteModelSelection(state.transformerModel) ||
+      resolveConcreteModelSelection(state.localModel);
     if (current && !deduped.includes(current)) {
       return [current, ...deduped];
     }
     return deduped;
-  }, [state.transformerModel, registeredTransformerAliases]);
+  }, [state.localModel, state.transformerModel, registeredTransformerAliases]);
+  const configuredLocalSelection =
+    (typeof state.localModel === "string" ? state.localModel.trim() : "") ||
+    resolveConcreteModelSelection(state.transformerModel);
+  const currentServerModel =
+    resolveConcreteModelSelection(state.transformerModel) ||
+    resolveConcreteModelSelection(state.localModel);
+  const selectedModelValue =
+    state.backendMode === "server"
+      ? currentServerModel
+      : resolveModelForMode({
+          backendMode: state.backendMode,
+          apiModel: state.apiModel,
+          transformerModel: state.transformerModel,
+          localModel: state.localModel,
+        });
 
   const setBackendMode = (mode) => {
     setState((prev) => ({ ...prev, backendMode: mode }));
+    const payload = { mode };
+    if (mode === "api") {
+      if (state.apiModel) {
+        payload.openai_model = state.apiModel;
+      }
+    } else if (mode === "local") {
+      Object.assign(payload, buildLocalSettingsPayload(configuredLocalSelection));
+    } else if (mode === "server") {
+      const serverSelection = resolveRequestModelForMode({
+        backendMode: "server",
+        apiModel: state.apiModel,
+        transformerModel: state.transformerModel,
+        localModel: state.localModel,
+      });
+      if (serverSelection) {
+        payload.transformer_model = serverSelection;
+      }
+      if (typeof state.serverUrl === "string") {
+        payload.server_url = state.serverUrl;
+      }
+    }
+    fireAndForget(axios.post("/api/settings", payload));
   };
 
   const modeDisplayLabel = (mode) => {
@@ -257,7 +367,7 @@ const TopBar = () => {
       >
         {modeDisplayLabel(state.backendMode)}
       </button>
-      {state.backendMode === "server" ? (
+      {state.backendMode === "server" && (
         <input
           className="server-ip-input"
           type="text"
@@ -271,47 +381,45 @@ const TopBar = () => {
           }}
           title="Server/LAN URL"
         />
-      ) : (
-        <select
-          className="model-select"
-          value={
-            state.backendMode === "api"
-              ? state.apiModel
-              : state.backendMode === "server"
-                ? state.transformerModel
-                : state.localModel
-          }
-          onChange={handleModelChange}
-          title="Select model"
-        >
-          {state.backendMode === "api" ? (
-            <>
-              <optgroup label="defaults">
-                {apiModelGroups.defaults.map((m) => {
-                  const disabled =
-                    apiModelsAvailableSet.size > 0 && !apiModelsAvailableSet.has(m);
-                  const label = disabled ? `${m} (unavailable)` : m;
-                  return (
-                    <option key={m} value={m} disabled={disabled}>
-                      {label}
-                    </option>
-                  );
-                })}
+      )}
+      <select
+        className="model-select"
+        value={selectedModelValue}
+        onChange={handleModelChange}
+        title="Select model"
+      >
+        {state.backendMode === "api" ? (
+          <>
+            <optgroup label="defaults">
+              {apiModelGroups.defaults.map((m) => {
+                const disabled =
+                  apiModelsAvailableSet.size > 0 && !apiModelsAvailableSet.has(m);
+                const label = disabled ? `${m} (unavailable)` : m;
+                return (
+                  <option key={m} value={m} disabled={disabled}>
+                    {label}
+                  </option>
+                );
+              })}
+            </optgroup>
+            {apiModelGroups.extras.length > 0 && (
+              <optgroup
+                label={`available${apiModelsAvailable.length ? ` (${apiModelsAvailable.length})` : ""}`}
+              >
+                {apiModelGroups.extras.map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
               </optgroup>
-              {apiModelGroups.extras.length > 0 && (
-                <optgroup
-                  label={`available${apiModelsAvailable.length ? ` (${apiModelsAvailable.length})` : ""}`}
-                >
-                  {apiModelGroups.extras.map((m) => (
-                    <option key={m} value={m}>
-                      {m}
-                    </option>
-                  ))}
-                </optgroup>
-              )}
-            </>
-          ) : (
-            (state.backendMode === "server" ? serverModelOptions : localModelOptions).map(
+            )}
+          </>
+        ) : (
+          <>
+            {state.backendMode === "server" && !selectedModelValue && (
+              <option value="">select server model</option>
+            )}
+            {(state.backendMode === "server" ? serverModelOptions : localModelOptions).map(
               (m) => (
                 <option key={m} value={m}>
                   {state.backendMode === "local" && isLocalRuntimeEntry(m)
@@ -319,10 +427,10 @@ const TopBar = () => {
                     : m}
                 </option>
               ),
-            )
-          )}
-        </select>
-      )}
+            )}
+          </>
+        )}
+      </select>
       <button
         type="button"
         className="chip approval-chip"
@@ -356,17 +464,15 @@ const TopBar = () => {
       // Persist so Settings + background jobs remain consistent.
       fireAndForget(axios.post("/api/settings", { openai_model: value }));
     } else if (state.backendMode === "local") {
-      setState((prev) => ({ ...prev, localModel: value }));
-      // Persist local transformers model to backend so LLMService can load it
-      const payload = { transformer_model: value };
-      if (isLocalRuntimeEntry(value)) {
-        payload.local_provider = normalizeModelId(value);
-      }
-      fireAndForget(axios.post("/api/settings", payload));
+      setState((prev) => ({
+        ...prev,
+        localModel: value,
+        ...(!isLocalRuntimeEntry(value) ? { transformerModel: value } : {}),
+      }));
+      fireAndForget(axios.post("/api/settings", buildLocalSettingsPayload(value)));
     } else {
-      // server mode uses transformerModel catalog
       setState((prev) => ({ ...prev, transformerModel: value }));
-      // For server mode, this is also passed per-request
+      fireAndForget(axios.post("/api/settings", { transformer_model: value }));
     }
   };
 
@@ -538,34 +644,17 @@ const TopBar = () => {
       }
       try {
         setServerStatus("loading");
-        const url = new URL(state.serverUrl, window.location.href);
-        const base = url.href.replace(/\/$/, "");
-        const origin = `${url.protocol}//${url.host}`;
-        const healthTargets = Array.from(new Set([`${base}/health`, `${origin}/health`]));
-        let healthOk = false;
-        for (const target of healthTargets) {
+        const probeTargets = buildServerProbeTargets(state.serverUrl);
+        let reachable = false;
+        for (const target of probeTargets) {
           const res = await fetch(target, { method: "GET" }).catch(() => null);
-          if (res && res.ok) {
-            healthOk = true;
+          if (serverProbeReached(res)) {
+            reachable = true;
             break;
           }
         }
-        if (!healthOk) {
-          const reachTargets = Array.from(new Set([base, origin]));
-          let reachable = false;
-          for (const target of reachTargets) {
-            const head = await fetch(target, { method: "HEAD" }).catch(() => null);
-            if (head && head.ok) {
-              reachable = true;
-              break;
-            }
-          }
-          if (aborted) return;
-          setServerStatus(reachable ? "online" : "offline");
-        } else {
-          if (aborted) return;
-          setServerStatus("online");
-        }
+        if (aborted) return;
+        setServerStatus(reachable ? "online" : "offline");
       } catch {
         if (!aborted) setServerStatus("offline");
       }
@@ -581,6 +670,8 @@ const TopBar = () => {
   // Resolve local model readiness by checking backend for model presence
   useEffect(() => {
     let canceled = false;
+    let pollId = null;
+    let isInitialCheck = true;
     const checkLocal = async () => {
       const modelName = state.localModel;
       if (!modelName) {
@@ -588,24 +679,30 @@ const TopBar = () => {
         return;
       }
       try {
-        setLocalStatus("loading");
+        if (isInitialCheck) {
+          setLocalStatus("loading");
+        }
         if (isLocalRuntimeEntry(modelName)) {
-          const providerResp = await axios.get("/api/llm/provider/status", {
-            params: { provider: normalizeModelId(modelName) },
-          });
+          const providerResp = await axios.get(
+            isInitialCheck ? "/api/llm/provider/models" : "/api/llm/provider/status",
+            {
+              params: isInitialCheck
+                ? { provider: normalizeModelId(modelName) }
+                : { provider: normalizeModelId(modelName), quick: true },
+            },
+          );
+          const runtime =
+            providerResp?.data?.runtime && typeof providerResp.data.runtime === "object"
+              ? providerResp.data.runtime
+              : {};
           if (canceled) return;
-          const runtime = providerResp?.data?.runtime || {};
-          if (runtime.model_loaded) {
-            setLocalStatus("online");
-          } else if (runtime.server_running || runtime.installed) {
-            setLocalStatus("degraded");
-          } else {
-            setLocalStatus("offline");
-          }
+          setLocalStatus(resolveProviderRuntimeHealth(runtime));
+          isInitialCheck = false;
           return;
         }
+        const catalogModel = resolveLocalCatalogModelId(modelName);
         const resp = await axios.get(
-          `/api/models/verify/${encodeURIComponent(modelName)}`,
+          `/api/models/verify/${encodeURIComponent(catalogModel)}`,
         );
         if (canceled) return;
         const data = resp.data || {};
@@ -616,17 +713,28 @@ const TopBar = () => {
         } else {
           setLocalStatus("offline");
         }
+        isInitialCheck = false;
       } catch {
         if (!canceled) setLocalStatus("offline");
+      } finally {
+        isInitialCheck = false;
       }
     };
     if (state.backendMode === "local") {
       checkLocal();
+      if (isLocalRuntimeEntry(state.localModel)) {
+        pollId = window.setInterval(() => {
+          checkLocal();
+        }, LOCAL_PROVIDER_STATUS_POLL_MS);
+      }
     } else {
       setLocalStatus("offline");
     }
     return () => {
       canceled = true;
+      if (pollId) {
+        window.clearInterval(pollId);
+      }
     };
   }, [state.backendMode, state.localModel]);
 

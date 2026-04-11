@@ -273,19 +273,24 @@ const MemoryTab = ({ focusKey = null }) => {
   const filterBarRef = useRef(null);
   const [filterBarHeight, setFilterBarHeight] = useState(0);
 
-  const load = async () => {
+  const load = async (includeArchived = showArchived) => {
     try {
-      const res = await axios.get("/api/memory", { params: { detailed: true } });
+      const res = await axios.get("/api/memory", {
+        params: {
+          detailed: true,
+          include_archived: !!includeArchived,
+        },
+      });
       const rows = (res.data?.items || []).map((it) => ({
         key: it.key,
         value: it.value,
         importance: it.importance ?? 1.0,
         created_at: it.created_at,
         updated_at: it.updated_at,
-        last_accessed: it.last_accessed,
+        last_accessed: it.last_accessed_at ?? it.last_accessed,
         evergreen: it.evergreen ?? true,
         end_time: it.end_time ?? null,
-        archived: !!it.archived,
+        archived: Boolean(it.archived ?? it.pruned_at),
         sensitivity: (it.sensitivity || "mundane").toLowerCase(),
         hint: it.hint || "",
         pinned: !!it.pinned,
@@ -307,8 +312,8 @@ const MemoryTab = ({ focusKey = null }) => {
   };
 
   useEffect(() => {
-    load();
-  }, []);
+    load(showArchived);
+  }, [showArchived]);
 
   useEffect(() => {
     if (!focusKey) return;

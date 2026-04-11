@@ -199,6 +199,100 @@ export const parseCsvPreview = (text, options = {}) => {
   };
 };
 
+export const parseCsvDocument = (text, options = {}) => {
+  const normalized = String(text || "").replace(/^\uFEFF/, "");
+  const delimiter = options.delimiter || detectDelimiter(normalized);
+
+  const rows = [];
+  let totalColumns = 0;
+  let inQuotes = false;
+  let currentCell = "";
+  let currentRow = [];
+  let touchedRow = false;
+
+  const commitCell = () => {
+    currentRow.push(currentCell);
+    currentCell = "";
+  };
+
+  const commitRow = () => {
+    if (!touchedRow && !currentCell && currentRow.length === 0) {
+      currentCell = "";
+      currentRow = [];
+      return;
+    }
+    commitCell();
+    totalColumns = Math.max(totalColumns, currentRow.length);
+    rows.push(currentRow);
+    currentCell = "";
+    currentRow = [];
+    touchedRow = false;
+  };
+
+  for (let index = 0; index < normalized.length; index += 1) {
+    const char = normalized[index];
+    if (char === '"') {
+      touchedRow = true;
+      if (inQuotes && normalized[index + 1] === '"') {
+        currentCell += '"';
+        index += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+    if (!inQuotes && char === delimiter) {
+      touchedRow = true;
+      commitCell();
+      continue;
+    }
+    if (!inQuotes && (char === "\n" || char === "\r")) {
+      if (char === "\r" && normalized[index + 1] === "\n") {
+        index += 1;
+      }
+      commitRow();
+      continue;
+    }
+    currentCell += char;
+    if (char.trim()) touchedRow = true;
+  }
+
+  commitRow();
+
+  return {
+    delimiter,
+    rows,
+    totalRows: rows.length,
+    totalColumns,
+  };
+};
+
+export const ensureRectangularRows = (rows, columnCount) =>
+  (Array.isArray(rows) ? rows : []).map((row) => {
+    const cells = Array.isArray(row) ? [...row] : [];
+    while (cells.length < columnCount) {
+      cells.push("");
+    }
+    return cells.slice(0, columnCount);
+  });
+
+const needsCsvQuotes = (value, delimiter) =>
+  value.includes('"') || value.includes("\n") || value.includes("\r") || value.includes(delimiter);
+
+export const serializeCsvDocument = (rows, options = {}) => {
+  const delimiter = options.delimiter || DEFAULT_DELIMITER;
+  const safeRows = Array.isArray(rows) ? rows : [];
+  return safeRows
+    .map((row) =>
+      (Array.isArray(row) ? row : []).map((value) => {
+        const text = String(value ?? "");
+        if (!needsCsvQuotes(text, delimiter)) return text;
+        return `"${text.replace(/"/g, '""')}"`;
+      }).join(delimiter),
+    )
+    .join("\n");
+};
+
 export const shouldUseFirstRowAsHeader = (rows) => {
   if (!Array.isArray(rows) || rows.length < 2) return false;
   const firstRow = rows[0].map((cell) => String(cell || "").trim()).filter(Boolean);
