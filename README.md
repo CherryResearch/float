@@ -10,6 +10,8 @@ please know: float is still in the early stages of development. feedback, testin
 
 float leverages advanced language models and a modular architecture to provide a robust platform for learning and interaction. It integrates with various tools and APIs to enhance its capabilities. I started working on this app to have a space to learn about AI and create a central, user-controlled platform for researching inference techniques and building domain-specific reinforcement learning sets.
 
+![Float UI snapshot](docs/ui-snapshot-2026-04-12.png)
+
 ## Status (Working Now vs Planned)
 
 ### Working now (alpha)
