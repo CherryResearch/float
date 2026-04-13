@@ -16,13 +16,13 @@ float leverages advanced language models and a modular architecture to provide a
 
 ### Working now (alpha)
 - Multi-mode chat (API, local, server) with model selection and conversation history stored under `data/conversations/`.
+- Privacy levels for memories to prevent automatic RAG uploading secrets to cloud.
 - Built-in tools with approvals and scheduling; tool calls and thought/tool streams show up in the Agent Console.
 - Browser-first computer use with shared session-backed tools, screenshot results in chat, native OpenAI computer-tool passthrough for API mode, and an experimental Windows desktop runtime.
 - Memory + RAG (Chroma) with Knowledge UI, plus threads/semantic tagging.
 - Attachments + media viewer for images, PDFs, and common audio formats.
 - Calendar events + scheduled actions/tasks.
-- Conversation export/import (markdown/json/text) and history management.
-- Conversation import can also ingest OpenAI-style export ZIPs from the History sidebar via file upload (MD/JSON/text/ZIP), currently by selecting a zip and saving a new conversation, but this flow is not yet manually smoke-tested.
+- Conversation export/import (markdown/json/text) and history management, can ingest OpenAI-style export ZIPs from the History sidebar via file upload (MD/JSON/text/ZIP), currently by selecting a zip and saving a new conversation, but this flow is not yet manually smoke-tested.
 
 ### Planned / In progress
 - *workflows* chain together models to create a smooth and customizable experience; bounded recursion allows for more complex behavior.
@@ -32,7 +32,7 @@ float leverages advanced language models and a modular architecture to provide a
 - *proactive* float aims to grow into the ability to message the user directly for clarification while reasoning and to suggest tasks and events (for example, a "project review").
 
 ## Command entry shortcuts
-Float's composer understands inline command tokens so you can trigger tools or search helpers without leaving the textarea. Typing `%{toolname}` (e.g. `%remember ...`) immediately flags the name as a tool call, `./` starts file search, `//` starts embedded-memory search, and `.//` blends both result sets. Suggestions appear alphabetically (like a terminal's `Tab` completion), render with a hyperlink-like treatment, and backspace at the end of a linked argument removes the link without losing the text.
+float's composer understands inline command tokens so you can trigger tools or search helpers without leaving the textarea. Typing `%{toolname}` (e.g. `%remember ...`) immediately flags the name as a tool call, `./` starts file search, `//` starts embedded-memory search, and `.//` blends both result sets. Suggestions appear alphabetically (like a terminal's `Tab` completion), render with a hyperlink-like treatment, and backspace at the end of a linked argument removes the link without losing the text.
 
 | Trigger | Behavior |
 | --- | --- |
@@ -454,7 +454,7 @@ Additional suggested options (kept available, not restricted):
 - `gemma-2b` / `gemma-7b` *(transformers/OSS)*
 - `gemini-3` *(API)*
 - `mistral-7b` *(transformers/OSS)*
-
+  
 You can point to any endpoint+API key+model combo; presets are hardcoded for convenience, and custom entries are allowed. Hugging Face cache clutter (showing unrelated tiny models) is known; the list will be filtered per modality as the download UX improves. Some downloads may need a manual HF fetch and then selection from `data/models/` until reliability is improved.
 
 > GPT-OSS can handle roughly 7B-20B locally on a modern GPU. 120B-class models usually require a remote GPT-OSS server or multi-GPU setup.
