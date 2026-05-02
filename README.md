@@ -4,7 +4,7 @@ float is an experimental local-first learning agent designed to run on locally m
 
 please know: float is still in the early stages of development. feedback, testing, and suggestions would be appreciated.
 
-<img width="180" alt="float logo" src="docs/resources/floatlogo.png" />
+<img alt="float logo" src="docs/resources/floatlogo_transparent.png" />
 
 ## Overview
 
