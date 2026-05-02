@@ -110,6 +110,13 @@ const extractSearchPayload = (payload, toolName) => {
   const warning = getString(payload.warning || payload.warn || "");
   const toolLabel = typeof toolName === "string" ? toolName.toLowerCase() : "";
   const isSearchTool = toolLabel.includes("search");
+  const hasSearchMetadata =
+    !!query ||
+    !!region ||
+    typeof count === "number" ||
+    typeof maxResults === "number" ||
+    !!warning ||
+    Array.isArray(results);
   const hasSearchShape =
     Array.isArray(results) &&
     results.some(
@@ -117,7 +124,7 @@ const extractSearchPayload = (payload, toolName) => {
         isPlainObject(item) &&
         (item.title || item.name || item.label || item.url || item.link || item.href),
     );
-  if (!isSearchTool && !query && !hasSearchShape) return null;
+  if ((!isSearchTool && !query && !hasSearchShape) || !hasSearchMetadata) return null;
 
   const items = Array.isArray(results)
     ? results.map(normalizeSearchItem).filter(Boolean)
@@ -131,6 +138,58 @@ const extractSearchPayload = (payload, toolName) => {
     warning,
     items,
     hasResults: items.length > 0,
+  };
+};
+
+const isHelpToolName = (toolName) => {
+  const label = typeof toolName === "string" ? toolName.trim().toLowerCase() : "";
+  return label === "help" || label === "tool_help" || label === "tool_info";
+};
+
+const normalizeToolMenuItem = (item) => {
+  if (typeof item === "string" && item.trim()) {
+    return { name: item.trim(), summary: "" };
+  }
+  if (!isPlainObject(item)) return null;
+  const name = getString(item.name || item.id || item.tool || "");
+  if (!name) return null;
+  return {
+    name,
+    summary: getString(item.summary || item.description || ""),
+    category: getString(item.category || ""),
+    status: getString(item.status || ""),
+  };
+};
+
+const extractToolMenuPayload = (payload, toolName) => {
+  if (!payload || typeof payload !== "object") return null;
+  const data = isPlainObject(payload.data) ? payload.data : payload;
+  if (!isPlainObject(data)) return null;
+  const rawTools = Array.isArray(data.tools) ? data.tools : [];
+  const items = rawTools.map(normalizeToolMenuItem).filter(Boolean);
+  const rawMoreTools = Array.isArray(data.more_tools) ? data.more_tools : [];
+  const moreTools = rawMoreTools
+    .map((item) => (typeof item === "string" ? item.trim() : ""))
+    .filter(Boolean);
+  const hasMenuShape =
+    items.length > 0 ||
+    moreTools.length > 0 ||
+    typeof data.total_count === "number" ||
+    typeof data.remaining_count === "number";
+  if (!hasMenuShape || (!isHelpToolName(toolName) && !Array.isArray(data.tools))) {
+    return null;
+  }
+  const query = isPlainObject(data.query) ? data.query : {};
+  return {
+    items,
+    moreTools,
+    count: getNumber(data.count) ?? items.length,
+    totalCount: getNumber(data.total_count) ?? items.length + moreTools.length,
+    remainingCount: getNumber(data.remaining_count) ?? moreTools.length,
+    detail: getString(query.detail || data.detail || ""),
+    filteredBy: getString(data.filtered_by || data.tool_name || query.tool_name || ""),
+    failedCall: getString(data.failed_call || ""),
+    message: getString(data.message || data.hint || ""),
   };
 };
 
@@ -422,6 +481,47 @@ const renderSearchResults = (search) => {
   );
 };
 
+const renderToolMenuPayload = (menu) => {
+  const metaParts = [];
+  if (typeof menu.count === "number") metaParts.push(`${menu.count} shown`);
+  if (typeof menu.totalCount === "number") metaParts.push(`${menu.totalCount} total`);
+  if (typeof menu.remainingCount === "number" && menu.remainingCount > 0) {
+    metaParts.push(`${menu.remainingCount} more`);
+  }
+  if (menu.detail) metaParts.push(menu.detail);
+  if (menu.filteredBy) metaParts.push(`filter: ${menu.filteredBy}`);
+
+  return (
+    <div className="tool-menu-payload">
+      {menu.failedCall && <div className="tool-menu-warning">{menu.failedCall}</div>}
+      {menu.message && <div className="tool-menu-message">{menu.message}</div>}
+      {metaParts.length > 0 && (
+        <div className="tool-menu-meta">{metaParts.join(" | ")}</div>
+      )}
+      {menu.items.length > 0 ? (
+        <ul className="tool-menu-list">
+          {menu.items.map((item) => (
+            <li key={item.name} className="tool-menu-item">
+              <code>{item.name}</code>
+              {item.summary && <span>{item.summary}</span>}
+              {(item.category || item.status) && (
+                <small>{[item.category, item.status].filter(Boolean).join(" / ")}</small>
+              )}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <div className="tool-payload-empty">No tools matched.</div>
+      )}
+      {menu.moreTools.length > 0 && (
+        <div className="tool-menu-more" title={menu.moreTools.join(", ")}>
+          more: {menu.moreTools.join(", ")}
+        </div>
+      )}
+    </div>
+  );
+};
+
 const renderComputerPayload = (computer, onOpenComputerSession = null) => (
   <div className="tool-computer-card">
     {computer.attachment?.url && (
@@ -526,6 +626,16 @@ export const summarizeToolPayload = (value, toolName = null) => {
   if (normalized === null || typeof normalized === "undefined") return "";
   const { payload, message } = unwrapToolOutcome(normalized);
   if (message) return message;
+  const toolMenu = extractToolMenuPayload(payload, toolName);
+  if (toolMenu) {
+    const names = toolMenu.items.map((item) => item.name).filter(Boolean);
+    const preview = names.slice(0, 4).join(", ");
+    const total =
+      typeof toolMenu.totalCount === "number" && toolMenu.totalCount > names.length
+        ? ` of ${toolMenu.totalCount}`
+        : "";
+    return preview ? `tools${total}: ${preview}` : "tool menu";
+  }
   const computer = extractComputerPayload(payload, toolName);
   if (computer) {
     return computer.summary || computer.currentUrl || computer.activeWindow || "computer update";
@@ -563,6 +673,7 @@ const ToolPayloadView = ({
   if (normalized === null || typeof normalized === "undefined") return null;
   const { payload, status, ok, message } = unwrapToolOutcome(normalized);
   const search = extractSearchPayload(payload, toolName);
+  const toolMenu = extractToolMenuPayload(payload, toolName);
   const computer = extractComputerPayload(payload, toolName);
   const capture = extractCapturePayload(payload, toolName);
   const statusKey = status ? String(status).toLowerCase() : "";
@@ -579,6 +690,7 @@ const ToolPayloadView = ({
     .join(" ");
 
   const content = (() => {
+    if (toolMenu) return renderToolMenuPayload(toolMenu);
     if (computer) return renderComputerPayload(computer, onOpenComputerSession);
     if (capture) return renderCapturePayload(capture);
     if (search) return renderSearchResults(search);

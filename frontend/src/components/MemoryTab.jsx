@@ -7,19 +7,16 @@ import {
   buildMemorySearchText,
   getMemoryFilterTimestamp,
   normalizeDateBoundary,
+  normalizeMemorySearchText,
   serializeMemoryValue,
 } from "../utils/memoryPanel";
+import {
+  MEMORY_SENSITIVITY_OPTIONS,
+  getSensitivityTooltip,
+} from "../utils/privacyLevels";
 
 const toLocal = (ts) => (ts ? new Date(ts * 1000).toLocaleString() : "-");
 const toLocalDate = (ts) => (ts ? new Date(ts * 1000).toLocaleDateString() : "-");
-
-const SENSITIVITY_OPTIONS = [
-  "mundane",
-  "public",
-  "personal",
-  "protected",
-  "secret",
-];
 
 const MemoryEditor = ({ item, onClose, onSave }) => {
   const [keyText, setKeyText] = useState(item?.key || "");
@@ -159,12 +156,13 @@ const MemoryEditor = ({ item, onClose, onSave }) => {
             />
           </label>
           <label className="memory-field">
-            <span>Sensitivity</span>
+            <span title={getSensitivityTooltip(sensitivity)}>Sensitivity</span>
             <select
               value={sensitivity}
               onChange={(e) => setSensitivity(e.target.value)}
+              title={getSensitivityTooltip(sensitivity)}
             >
-              {SENSITIVITY_OPTIONS.map((s) => (
+              {MEMORY_SENSITIVITY_OPTIONS.map((s) => (
                 <option key={s} value={s}>
                   {s}
                 </option>
@@ -348,7 +346,7 @@ const MemoryTab = ({ focusKey = null }) => {
   }, [selectedKey]);
 
   const filtered = useMemo(() => {
-    const q = filter.trim().toLowerCase();
+    const q = normalizeMemorySearchText(filter);
     let rows = showArchived ? items : items.filter((r) => !r.archived);
     const fromTs = normalizeDateBoundary(dateFrom, "start");
     const toTs = normalizeDateBoundary(dateTo, "end");
@@ -732,10 +730,12 @@ const MemoryTab = ({ focusKey = null }) => {
         >
           <div className="memory-filter-row">
             <label className="memory-filter-label">
-              sensitivity
+              <span title="Filter by the stored sensitivity label. Protected and secret stay local by default.">
+                sensitivity
+              </span>
               <select value={sensFilter} onChange={(e) => setSensFilter(e.target.value)}>
                 <option value="">all</option>
-                {SENSITIVITY_OPTIONS.map((s) => (
+                {MEMORY_SENSITIVITY_OPTIONS.map((s) => (
                   <option key={s} value={s}>{s}</option>
                 ))}
               </select>
@@ -829,9 +829,13 @@ const MemoryTab = ({ focusKey = null }) => {
             <input type="datetime-local" value={newEnd} onChange={(e) => setNewEnd(e.target.value)} />
           </label>
           <label>
-            sensitivity
-            <select value={newSensitivity} onChange={(e) => setNewSensitivity(e.target.value)}>
-              {SENSITIVITY_OPTIONS.map((s) => (
+            <span title={getSensitivityTooltip(newSensitivity)}>sensitivity</span>
+            <select
+              value={newSensitivity}
+              onChange={(e) => setNewSensitivity(e.target.value)}
+              title={getSensitivityTooltip(newSensitivity)}
+            >
+              {MEMORY_SENSITIVITY_OPTIONS.map((s) => (
                 <option key={s} value={s}>{s}</option>
               ))}
             </select>
@@ -914,10 +918,7 @@ const MemoryTab = ({ focusKey = null }) => {
               onClick={() => setSelectedKey((prev) => (prev === row.key ? null : row.key))}
             >
               <td>{row.key}</td>
-              <td title={
-                row.sensitivity === 'secret' ? 'secret: never exported; encrypt recommended' :
-                row.sensitivity === 'protected' ? 'protected: excluded from external APIs by default' : row.sensitivity
-              }>
+              <td title={getSensitivityTooltip(row.sensitivity)}>
                 <span className={`sens-badge sens-${row.sensitivity}`}>{row.sensitivity}</span>
                 {row.hint && <span className="hint-badge" title={`hint: ${row.hint}`}>?</span>}
                 {isMemorized(row) && (
@@ -1129,8 +1130,8 @@ const MemoryTab = ({ focusKey = null }) => {
                 <dd>{selected.archived ? "yes" : "no"}</dd>
               </div>
               <div>
-                <dt title="Controls what can be sent to external APIs">sensitivity</dt>
-                <dd>{selected.sensitivity}</dd>
+                <dt title={getSensitivityTooltip(selected.sensitivity)}>sensitivity</dt>
+                <dd title={getSensitivityTooltip(selected.sensitivity)}>{selected.sensitivity}</dd>
               </div>
               <div>
                 <dt title="Higher importance increases retrieval priority">importance</dt>

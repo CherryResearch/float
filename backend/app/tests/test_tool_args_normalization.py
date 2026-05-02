@@ -66,6 +66,9 @@ def test_tool_decision_returns_structured_error_on_invalid_args(client):
     assert res.status_code == 200
     body = res.json()
     assert body["status"] == "error"
+    data = body.get("result", {}).get("data") or {}
+    assert data.get("recovery_tool") == "help"
+    assert data.get("recovery_args", {}).get("failed_tool_name") == "search_web"
     payload_result = body.get("result") or body.get("error") or ""
     if isinstance(payload_result, dict):
         payload_result = payload_result.get("message") or ""
@@ -77,9 +80,12 @@ def test_tool_help_defaults_are_applied():
 
     args = normalize_tool_args("tool_help", {})
     assert args["tool_name"] == ""
-    assert args["detail"] == "brief"
+    assert args["detail"] == "names"
     assert args["include_schema"] is False
-    assert args["max_tools"] == 8
+    assert args["max_tools"] == 50
+    assert args["failed_tool_name"] == ""
+    assert args["failed_args"] == {}
+    assert args["failed_error"] == ""
 
 
 def test_help_defaults_are_applied():
@@ -87,9 +93,78 @@ def test_help_defaults_are_applied():
 
     args = normalize_tool_args("help", {})
     assert args["tool_name"] == ""
-    assert args["detail"] == "brief"
+    assert args["detail"] == "names"
     assert args["include_schema"] is False
-    assert args["max_tools"] == 8
+    assert args["max_tools"] == 50
+    assert args["failed_tool_name"] == ""
+    assert args["failed_args"] == {}
+    assert args["failed_error"] == ""
+
+
+def test_tool_help_full_detail_alias_is_canonicalized():
+    from app.utils.tool_args import normalize_tool_args
+
+    args = normalize_tool_args(
+        "tool_help",
+        {"tool_name": "write_file", "detail": "full", "include_schema": "true", "max_tools": "1"},
+    )
+    assert args["tool_name"] == "write_file"
+    assert args["detail"] == "rich"
+    assert args["include_schema"] is True
+    assert args["max_tools"] == 1
+
+
+def test_tool_help_full_detail_alias_invokes_through_route(client):
+    client.post("/tools/register", json={"name": "tool_help"})
+    res = client.post(
+        "/tools/invoke",
+        json={
+            "name": "tool_help",
+            "args": {
+                "tool_name": "write_file",
+                "detail": "full",
+                "include_schema": True,
+                "max_tools": 1,
+            },
+        },
+    )
+    assert res.status_code == 200
+    result = res.json()["result"]
+    assert result["status"] == "invoked"
+    assert result["ok"] is True
+    assert result["data"]["query"]["detail"] == "rich"
+    assert result["data"]["tools"][0]["name"] == "write_file"
+
+
+def test_memory_save_accepts_content_alias():
+    from app.utils.tool_args import normalize_tool_args
+
+    args = normalize_tool_args(
+        "memory.save",
+        {"content": "Food diary entry", "tags": ["food diary"]},
+    )
+
+    assert args["text"] == "Food diary entry"
+    assert args["tags"] == ["food diary"]
+    assert "content" not in args
+
+
+def test_remember_and_write_file_accept_common_text_aliases():
+    from app.utils.tool_args import normalize_tool_args
+
+    remember_args = normalize_tool_args(
+        "remember",
+        {"key": "food_diary", "content": "Food diary entry"},
+    )
+    write_args = normalize_tool_args(
+        "write_file",
+        {"path": "notes/food.txt", "text": "Food diary entry"},
+    )
+
+    assert remember_args == {"key": "food_diary", "value": "Food diary entry"}
+    assert write_args["path"] == "notes/food.txt"
+    assert write_args["content"] == "Food diary entry"
+    assert "text" not in write_args
 
 
 def test_list_dir_defaults_are_applied():
@@ -144,6 +219,9 @@ def test_tool_info_defaults_are_applied():
     args = normalize_tool_args("tool_info", {"tool_name": "search_web"})
     assert args["tool_name"] == "search_web"
     assert args["include_schema"] is True
+    assert args["failed_tool_name"] == ""
+    assert args["failed_args"] == {}
+    assert args["failed_error"] == ""
 
 
 def test_tool_info_accepts_single_tools_alias():
@@ -159,3 +237,10 @@ def test_routes_normalize_camera_alias():
 
     assert _normalize_tool_name("camera") == "camera.capture"
     assert _normalize_tool_name(" camera.capture ") == "camera.capture"
+
+
+def test_routes_suggest_memory_read_compatibility_names():
+    from app.routes import _suggest_tool_names
+
+    suggestions = _suggest_tool_names("memory.read")
+    assert suggestions[:3] == ["recall", "remember", "memory.save"]

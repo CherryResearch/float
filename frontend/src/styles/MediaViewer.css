@@ -477,6 +477,33 @@
   flex-wrap: wrap;
 }
 
+.viewer-provenance-panel {
+  border: 1px solid color-mix(in oklab, var(--glass-border) 84%, transparent);
+  border-radius: 10px;
+  background: color-mix(in oklab, var(--glass-tint) 78%, rgba(12, 15, 24, 0.62));
+  padding: 0.6rem 0.7rem;
+}
+
+.viewer-provenance-grid {
+  display: grid;
+  grid-template-columns: minmax(110px, 0.32fr) minmax(0, 1fr);
+  gap: 0.35rem 0.8rem;
+  margin: 0;
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.viewer-provenance-grid dt {
+  margin: 0;
+  color: var(--color-text-muted, rgba(255, 255, 255, 0.68));
+}
+
+.viewer-provenance-grid dd {
+  margin: 0;
+  color: var(--color-text, #f8f8f8);
+  overflow-wrap: anywhere;
+}
+
 .viewer-status {
   color: var(--color-muted, rgba(255, 255, 255, 0.7));
   display: flex;
@@ -504,6 +531,10 @@
 
   .viewer-caption-aside {
     justify-content: flex-start;
+  }
+
+  .viewer-provenance-grid {
+    grid-template-columns: 1fr;
   }
 }
 

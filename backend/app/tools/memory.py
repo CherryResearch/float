@@ -22,12 +22,17 @@ import re
 import time
 from typing import Any, Dict, Optional
 
+from app.services import privacy_filter_service
 from app.services.rag_provider import (
     get_clip_rag_service,
     get_rag_service,
     try_ingest_text,
 )
 from app.utils import verify_signature
+from app.utils.workspace_registry import (
+    load_workspace_state,
+    workspace_item_exclusion_reason,
+)
 
 _MANAGER = None
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -188,6 +193,7 @@ def _vectorize_memory_entry(
     last_confirmed_at: Optional[float] = None,
     pruned_at: Optional[float] = None,
     rag_excluded: Optional[bool] = None,
+    privacy_metadata: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
     value_text = _value_to_text(value)
     if not value_text:
@@ -235,6 +241,9 @@ def _vectorize_memory_entry(
         metadata["pruned_at"] = pruned_at
     if rag_excluded is not None:
         metadata["rag_excluded"] = rag_excluded
+    for field, value in dict(privacy_metadata or {}).items():
+        if field == "sensitivity_source" or str(field).startswith("privacy_filter_"):
+            metadata[field] = value
     doc_id = try_ingest_text(cleaned, metadata, mirror_vector=mirror_vector)
     if _MANAGER is not None and doc_id:
         try:
@@ -249,6 +258,51 @@ def _vectorize_memory_entry(
         except Exception:
             pass
     return doc_id
+
+
+def _maybe_queue_reflection_after_save(
+    *,
+    key: str,
+    prompt: Optional[str],
+    run_now: bool,
+    source_tool: str,
+) -> Optional[Dict[str, Any]]:
+    try:
+        item = _MANAGER.get_item(key, include_pruned=True, touch=False)
+    except TypeError:
+        item = _MANAGER.get_item(key) if _MANAGER is not None else None
+    except Exception:
+        item = None
+    if isinstance(item, dict):
+        sensitivity = str(item.get("sensitivity") or "mundane").lower()
+        if sensitivity in {"protected", "secret"}:
+            return {
+                "status": "skipped",
+                "reason": f"{sensitivity}_memory_not_reflected",
+            }
+    try:
+        from app.tools import reflections as reflection_tools
+
+        service = reflection_tools._service()  # type: ignore[attr-defined]
+        question = (
+            _normalize_optional_str(prompt)
+            or f"Review this newly saved memory for one useful follow-up: {key}"
+        )
+        task = service.create_task(
+            title=f"Reflect on memory: {key}",
+            question=question,
+            source="tool",
+            patience=1,
+            memory_keys=[key],
+            metadata={"created_by": source_tool, "memory_key": key},
+        )
+        result: Dict[str, Any] = {"status": "queued", "task_id": task.get("id")}
+        if run_now:
+            result["run"] = service.run_task(str(task.get("id")), force=True)
+            result["status"] = "ran"
+        return result
+    except Exception as exc:
+        return {"status": "error", "reason": str(exc)}
 
 
 def legacy_memory_save(*, user: str, signature: str, **payload: Any) -> Dict[str, Any]:
@@ -273,10 +327,24 @@ def legacy_memory_save(*, user: str, signature: str, **payload: Any) -> Dict[str
     )
     privacy = _normalize_optional_str(args.get("privacy"))
     source = _normalize_optional_str(args.get("source"))
+    reflect_after_save = bool(args.get("reflect_after_save"))
+    reflection_prompt = _normalize_optional_str(args.get("reflection_prompt"))
+    reflection_run_now = bool(args.get("reflection_run_now"))
 
     if _MANAGER is None:
         raise RuntimeError("memory manager not available")
     key = _derive_memory_key(_MANAGER, key_hint, namespace, text)
+    explicit_sensitivity = _privacy_to_sensitivity(privacy)
+    privacy_decision = privacy_filter_service.decide_sensitivity(
+        text,
+        explicit_sensitivity=explicit_sensitivity,
+        purpose="memory.save",
+    )
+    effective_sensitivity = (
+        privacy_decision.applied_sensitivity
+        if privacy_decision.applied_sensitivity is not None
+        else explicit_sensitivity
+    )
 
     record: Dict[str, Any] = {"text": text.strip()}
     if namespace:
@@ -299,18 +367,40 @@ def legacy_memory_save(*, user: str, signature: str, **payload: Any) -> Dict[str
         None,
         None,
         None,
-        _privacy_to_sensitivity(privacy),
+        effective_sensitivity,
         None,
     )
+    privacy_updates = privacy_filter_service.metadata_updates(privacy_decision)
+    if privacy_updates:
+        try:
+            _MANAGER.update_item_fields(key, privacy_updates)
+        except Exception:
+            pass
+    try:
+        indexed_item = _MANAGER.get_item(key, include_pruned=True, touch=False) or {}
+    except TypeError:
+        indexed_item = _MANAGER.get_item(key) or {}
     _vectorize_memory_entry(
         key,
         record,
         namespace=namespace,
         tags=normalized_tags,
         mirror_vector=bool(record.get("vectorize")),
-        sensitivity=_privacy_to_sensitivity(privacy),
+        sensitivity=effective_sensitivity,
+        privacy_metadata=indexed_item if isinstance(indexed_item, dict) else None,
     )
-    return {"status": "ok", "key": key}
+    result = {"status": "ok", "key": key}
+    privacy_notice = privacy_filter_service.notice(privacy_decision)
+    if privacy_notice:
+        result["privacy_filter_notice"] = privacy_notice
+    if reflect_after_save:
+        result["reflection"] = _maybe_queue_reflection_after_save(
+            key=key,
+            prompt=reflection_prompt,
+            run_now=reflection_run_now,
+            source_tool="memory.save",
+        )
+    return result
 
 
 def remember(
@@ -330,6 +420,9 @@ def remember(
     occurs_at: Optional[float] | object = _DEFAULT,
     review_at: Optional[float] | object = _DEFAULT,
     decay_at: Optional[float] | object = _DEFAULT,
+    reflect_after_save: bool | object = _DEFAULT,
+    reflection_prompt: Optional[str] | object = _DEFAULT,
+    reflection_run_now: bool | object = _DEFAULT,
 ) -> str:
     """Store a memory item with optional importance, pinning, and sensitivity levels.
 
@@ -362,6 +455,12 @@ def remember(
         payload["review_at"] = review_at
     if decay_at is not _DEFAULT:
         payload["decay_at"] = decay_at
+    if reflect_after_save is not _DEFAULT:
+        payload["reflect_after_save"] = reflect_after_save
+    if reflection_prompt is not _DEFAULT:
+        payload["reflection_prompt"] = reflection_prompt
+    if reflection_run_now is not _DEFAULT:
+        payload["reflection_run_now"] = reflection_run_now
     verify_signature(
         signature,
         user,
@@ -371,6 +470,27 @@ def remember(
     if _MANAGER is None:
         raise RuntimeError("memory manager not available")
     stored_value = _html_unescape_deep(value)
+    explicit_sensitivity = None if sensitivity is _DEFAULT else sensitivity
+    try:
+        existing_item = _MANAGER.get_item(key, include_pruned=True, touch=False) or {}
+    except TypeError:
+        existing_item = _MANAGER.get_item(key) or {}
+    privacy_decision = privacy_filter_service.decide_sensitivity(
+        _value_to_text(stored_value),
+        explicit_sensitivity=explicit_sensitivity,
+        existing_sensitivity=existing_item.get("sensitivity")
+        if isinstance(existing_item, dict)
+        else None,
+        existing_sensitivity_source=existing_item.get("sensitivity_source")
+        if isinstance(existing_item, dict)
+        else None,
+        purpose="memory_tool",
+    )
+    effective_sensitivity = (
+        privacy_decision.applied_sensitivity
+        if privacy_decision.applied_sensitivity is not None
+        else explicit_sensitivity
+    )
     extra_kwargs = {}
     if pinned is not _DEFAULT:
         extra_kwargs["pinned"] = pinned
@@ -393,10 +513,16 @@ def remember(
         None,
         None,
         None,
-        None if sensitivity is _DEFAULT else sensitivity,
+        effective_sensitivity,
         None if hint is _DEFAULT else hint,
         **extra_kwargs,
     )
+    privacy_updates = privacy_filter_service.metadata_updates(privacy_decision)
+    if privacy_updates:
+        try:
+            _MANAGER.update_item_fields(key, privacy_updates)
+        except Exception:
+            pass
     try:
         item = _MANAGER.get_item(key, include_pruned=True, touch=False) or {}
     except TypeError:
@@ -424,8 +550,31 @@ def remember(
             last_confirmed_at=item.get("last_confirmed_at"),
             pruned_at=item.get("pruned_at"),
             rag_excluded=item.get("rag_excluded"),
+            privacy_metadata=item,
         )
-    return "ok"
+    privacy_notice = privacy_filter_service.notice(privacy_decision)
+    status_text = f"ok ({privacy_notice})" if privacy_notice else "ok"
+    if reflect_after_save is not _DEFAULT and bool(reflect_after_save):
+        reflection = _maybe_queue_reflection_after_save(
+            key=key,
+            prompt=None
+            if reflection_prompt is _DEFAULT
+            else _normalize_optional_str(reflection_prompt),
+            run_now=False
+            if reflection_run_now is _DEFAULT
+            else bool(reflection_run_now),
+            source_tool="remember",
+        )
+        if isinstance(reflection, dict):
+            reflection_status = reflection.get("status") or "unknown"
+            task_id = reflection.get("task_id")
+            if task_id:
+                status_text = (
+                    f"{status_text}; reflection {reflection_status}: {task_id}"
+                )
+            else:
+                status_text = f"{status_text}; reflection {reflection_status}"
+    return status_text
 
 
 def recall(
@@ -487,8 +636,43 @@ def recall(
     image_limit = max(1, min(image_limit, 10))
     requested_key = "" if key is _DEFAULT else str(key or "")
     candidate_key = requested_key.strip()
+    workspace_recall_profiles = load_workspace_state()[0]
 
-    def _item_allowed(item: Any) -> bool:
+    def _memory_recall_candidates(key_name: str, item: Any) -> list[str]:
+        payload = item if isinstance(item, dict) else {}
+        values = [
+            key_name,
+            payload.get("source_sync_relative_path"),
+            payload.get("source_path"),
+            payload.get("source"),
+            payload.get("root_source"),
+            payload.get("title"),
+            payload.get("hint"),
+        ]
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            text = str(value or "").strip().replace("\\", "/")
+            if not text:
+                continue
+            lowered = text.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            normalized.append(text)
+        return normalized
+
+    def _item_allowed(item: Any, key_name: str = "") -> bool:
+        if isinstance(item, dict) and (
+            workspace_item_exclusion_reason(
+                namespace=item.get("source_sync_namespace"),
+                values=_memory_recall_candidates(key_name, item),
+                profiles=workspace_recall_profiles,
+                purpose="default_recall",
+            )
+            is not None
+        ):
+            return False
         if not for_external_flag:
             return True
         if not isinstance(item, dict):
@@ -561,7 +745,7 @@ def recall(
         ranked: list[tuple[float, float, str, Any]] = []
         for key_str, raw_item in store_items:
             item = raw_item if isinstance(raw_item, dict) else {"value": raw_item}
-            if not _item_allowed(item):
+            if not _item_allowed(item, key_str):
                 continue
             multiplier = _lifecycle_multiplier(item)
             if multiplier <= 0:
@@ -593,7 +777,7 @@ def recall(
         q = query.lower()
         for key_str, raw_item in store_items:
             item = raw_item if isinstance(raw_item, dict) else {"value": raw_item}
-            if not _item_allowed(item):
+            if not _item_allowed(item, key_str):
                 continue
             multiplier = _lifecycle_multiplier(item)
             if multiplier <= 0:
@@ -692,11 +876,55 @@ def recall(
                 return False
             if lvl == "protected" and for_external_flag and not allow_protected_flag:
                 return False
+            if (
+                workspace_item_exclusion_reason(
+                    namespace=canonical_item.get("source_sync_namespace")
+                    or meta.get("source_sync_namespace"),
+                    values=_memory_recall_candidates(memory_key, canonical_item)
+                    + [
+                        value
+                        for value in (
+                            meta.get("source"),
+                            meta.get("root_source"),
+                            meta.get("source_path"),
+                            meta.get("relative_path"),
+                        )
+                        if value
+                    ],
+                    profiles=workspace_recall_profiles,
+                    purpose="default_recall",
+                )
+                is not None
+            ):
+                return False
             return True
         lvl = str(meta.get("sensitivity", "mundane")).lower()
         if lvl == "secret" and for_external_flag:
             return False
         if lvl == "protected" and for_external_flag and not allow_protected_flag:
+            return False
+        if (
+            workspace_item_exclusion_reason(
+                namespace=meta.get("source_sync_namespace"),
+                values=[
+                    value
+                    for value in (
+                        meta.get("source"),
+                        meta.get("root_source"),
+                        meta.get("source_path"),
+                        meta.get("relative_path"),
+                        meta.get("content_hash"),
+                        meta.get("filename"),
+                        meta.get("key"),
+                        meta.get("title"),
+                    )
+                    if value
+                ],
+                profiles=workspace_recall_profiles,
+                purpose="default_recall",
+            )
+            is not None
+        ):
             return False
         return True
 
@@ -958,7 +1186,7 @@ def recall(
         allowed_keys: list[str] = []
         for key_str, raw_item in store_items:
             entry = raw_item if isinstance(raw_item, dict) else {"value": raw_item}
-            if _item_allowed(entry):
+            if _item_allowed(entry, key_str):
                 allowed_keys.append(key_str)
         prefix_hits = [k for k in allowed_keys if k.lower().startswith(query)]
         fuzzy_key: str | None = None

@@ -1,18 +1,19 @@
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Protocol
 
 import requests
+from app.model_registry import model_supports_images
 
 import jwt
-
 
 DEFAULT_REALTIME_SESSION_URL = "https://api.openai.com/v1/realtime/client_secrets"
 DEFAULT_REALTIME_CONNECT_URL = "https://api.openai.com/v1/realtime/calls"
 DEFAULT_REALTIME_MODEL = "gpt-realtime"
 DEFAULT_REALTIME_VOICE = "alloy"
 DEFAULT_REALTIME_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
+DEFAULT_LIVE_AGENT_MODE = "local"
 REALTIME_VOICE_OPTIONS = {
     "alloy",
     "ash",
@@ -27,11 +28,84 @@ REALTIME_VOICE_OPTIONS = {
 }
 
 
+def _first_non_empty(*values: Any) -> str:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _normalize_stream_backend(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"api", "livekit", "local"}:
+        return raw
+    return "api"
+
+
+def _normalize_live_agent_mode(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"api", "local", "server"}:
+        return raw
+    return DEFAULT_LIVE_AGENT_MODE
+
+
+class LiveSessionTransportAdapter(Protocol):
+    def connect(self, identity: str, room: str) -> Dict[str, Any]:
+        """Return transport-specific connection details."""
+
+
+class OpenAIRealtimeTransportAdapter:
+    def __init__(self, service: "LiveKitService") -> None:
+        self.service = service
+
+    def connect(self, identity: str, room: str) -> Dict[str, Any]:
+        return self.service._create_realtime_session(identity, room)
+
+
+class LiveKitTransportAdapter:
+    def __init__(self, service: "LiveKitService") -> None:
+        self.service = service
+
+    def connect(self, identity: str, room: str) -> Dict[str, Any]:
+        self.service.create_room(room)
+        token = self.service.generate_token(identity, room)
+        return {
+            "provider": "livekit",
+            "url": self.service.url,
+            "token": token,
+            "transport": "livekit",
+            "source": "live",
+        }
+
+
+class LocalBridgeTransportAdapter:
+    def __init__(self, service: "LiveKitService") -> None:
+        self.service = service
+
+    def connect(self, identity: str, room: str) -> Dict[str, Any]:
+        return {
+            "provider": "float-local-live",
+            "transport": "local-bridge",
+            "source": "live",
+            "session_id": f"local-live-{uuid.uuid4()}",
+            "identity": identity,
+            "room": room,
+            "status": "planned",
+            "detail": (
+                "Local live bridge is selected, but browser duplex audio is not wired yet."
+            ),
+            "mode": self.service.live_agent_mode,
+            "response_model": self.service._resolve_live_response_model(
+                "float-local-live"
+            ),
+        }
+
+
 class LiveKitService:
     """Live streaming helper that supports LiveKit or OpenAI Realtime."""
 
     def __init__(self, config: dict):
-        self.mode = (config.get("stream_backend") or "livekit").lower()
+        self.mode = _normalize_stream_backend(config.get("stream_backend"))
         self.rooms: set[str] = set()
         self.config = config
 
@@ -46,6 +120,15 @@ class LiveKitService:
         self.realtime_voice = config.get(
             "realtime_voice",
             config.get("voice_model", DEFAULT_REALTIME_VOICE),
+        )
+        self.live_agent_mode = _normalize_live_agent_mode(config.get("live_agent_mode"))
+        self.live_agent_model = _first_non_empty(config.get("live_agent_model"))
+        self.live_multimodal_model = _first_non_empty(
+            config.get("live_multimodal_model")
+        )
+        self.caption_model = _first_non_empty(config.get("vision_model"))
+        self.provider_preferred_model = _first_non_empty(
+            config.get("local_provider_preferred_model")
         )
         self.realtime_base_url = config.get(
             "realtime_base_url", DEFAULT_REALTIME_SESSION_URL
@@ -66,6 +149,11 @@ class LiveKitService:
             os.getenv("OPENAI_REALTIME_TURN_DETECTION", "server_vad").strip()
             or "server_vad"
         )
+        self._adapters: dict[str, LiveSessionTransportAdapter] = {
+            "api": OpenAIRealtimeTransportAdapter(self),
+            "local": LocalBridgeTransportAdapter(self),
+            "livekit": LiveKitTransportAdapter(self),
+        }
 
     # ------------------------------------------------------------------
     # LiveKit helpers
@@ -95,6 +183,96 @@ class LiveKitService:
             },
         }
         return jwt.encode(payload, self.secret, algorithm="HS256")
+
+    # ------------------------------------------------------------------
+    # Runtime profile helpers
+    def _resolve_live_response_model(self, transport_provider: str) -> str:
+        explicit = self.live_agent_model
+        if explicit:
+            return explicit
+        if transport_provider == "openai-realtime":
+            return _first_non_empty(self.realtime_model, DEFAULT_REALTIME_MODEL)
+        return self.provider_preferred_model
+
+    def _resolve_live_multimodal_model(self, response_model: str) -> str:
+        if self.live_multimodal_model:
+            return self.live_multimodal_model
+        if response_model and model_supports_images(response_model):
+            return response_model
+        if (
+            self.provider_preferred_model
+            and self.provider_preferred_model != response_model
+            and model_supports_images(self.provider_preferred_model)
+        ):
+            return self.provider_preferred_model
+        return ""
+
+    def _build_live_runtime_profile(
+        self,
+        *,
+        transport_backend: str,
+        transport_provider: str,
+        response_mode: str | None = None,
+        response_model: str | None = None,
+        voice: str | None = None,
+    ) -> Dict[str, Any]:
+        effective_mode = _normalize_live_agent_mode(
+            response_mode
+            or (
+                "api"
+                if transport_provider == "openai-realtime"
+                else self.live_agent_mode
+            )
+        )
+        effective_model = _first_non_empty(
+            response_model, self._resolve_live_response_model(transport_provider)
+        )
+        multimodal_model = self._resolve_live_multimodal_model(effective_model)
+        runtime: Dict[str, Any] = {
+            "source": "live",
+            "transport_backend": _normalize_stream_backend(transport_backend),
+            "provider": transport_provider,
+            "mode": effective_mode,
+            "response_model": effective_model,
+            "multimodal_model": multimodal_model,
+            "caption_model": self.caption_model,
+            "stt_model": _first_non_empty(self.config.get("stt_model")),
+            "tts_model": _first_non_empty(self.config.get("tts_model")),
+            "voice_model": _first_non_empty(voice, self.config.get("voice_model")),
+            "supports_visual_input": bool(multimodal_model or self.caption_model),
+        }
+        return runtime
+
+    def _attach_live_runtime(
+        self,
+        payload: Dict[str, Any],
+        *,
+        transport_provider: str,
+        transport_backend: str | None = None,
+        response_mode: str | None = None,
+        response_model: str | None = None,
+        voice: str | None = None,
+    ) -> Dict[str, Any]:
+        enriched = dict(payload)
+        runtime = self._build_live_runtime_profile(
+            transport_backend=transport_backend or self.mode,
+            transport_provider=transport_provider,
+            response_mode=response_mode,
+            response_model=response_model,
+            voice=voice,
+        )
+        enriched.setdefault("source", runtime["source"])
+        enriched.setdefault(
+            "transport",
+            "webrtc" if transport_provider == "openai-realtime" else transport_provider,
+        )
+        enriched["runtime"] = runtime
+        enriched["mode"] = runtime["mode"]
+        enriched["model"] = runtime["response_model"]
+        enriched["response_model"] = runtime["response_model"]
+        enriched["multimodal_model"] = runtime["multimodal_model"]
+        enriched["caption_model"] = runtime["caption_model"]
+        return enriched
 
     # ------------------------------------------------------------------
     # OpenAI Realtime helpers
@@ -164,7 +342,9 @@ class LiveKitService:
             raise RuntimeError(message) from exc
 
         data = response.json()
-        session_data = data.get("session") if isinstance(data.get("session"), dict) else data
+        session_data = (
+            data.get("session") if isinstance(data.get("session"), dict) else data
+        )
         client_secret = None
         if isinstance(data.get("value"), str):
             client_secret = data["value"]
@@ -173,39 +353,58 @@ class LiveKitService:
         elif isinstance(data.get("client_secret"), str):
             client_secret = data["client_secret"]
         if not client_secret:
-            raise RuntimeError("OpenAI Realtime session response did not include a client secret")
-        return {
-            "provider": "openai-realtime",
-            "url": self.realtime_connect_url,
-            "client_secret": client_secret,
-            "expires_at": data.get("expires_at")
-            or (
-                session_data.get("expires_at")
-                if isinstance(session_data, dict)
-                else None
-            ),
-            "model": (
+            raise RuntimeError(
+                "OpenAI Realtime session response did not include a client secret"
+            )
+        return self._attach_live_runtime(
+            {
+                "provider": "openai-realtime",
+                "url": self.realtime_connect_url,
+                "client_secret": client_secret,
+                "expires_at": data.get("expires_at")
+                or (
+                    session_data.get("expires_at")
+                    if isinstance(session_data, dict)
+                    else None
+                ),
+                "session": session_data,
+                "session_id": (
+                    session_data.get("id") if isinstance(session_data, dict) else None
+                ),
+                "voice": voice,
+            },
+            transport_provider="openai-realtime",
+            response_mode="api",
+            response_model=(
                 session_data.get("model")
                 if isinstance(session_data, dict)
                 else self.realtime_model
             ),
-            "session": session_data,
-            "session_id": (
-                session_data.get("id") if isinstance(session_data, dict) else None
-            ),
-            "voice": voice,
-        }
+            voice=voice,
+        )
 
     # ------------------------------------------------------------------
     def connect(self, identity: str, room: str) -> Dict[str, Any]:
         """Return connection details for the configured streaming backend."""
-        if self.mode == "api":
-            return self._create_realtime_session(identity, room)
-
-        # Default to LiveKit for backwards compatibility
-        self.create_room(room)
-        token = self.generate_token(identity, room)
-        return {"provider": "livekit", "url": self.url, "token": token}
+        adapter = self._adapters.get(self.mode)
+        if adapter is None:
+            raise RuntimeError(f"Unsupported live streaming backend: {self.mode}")
+        payload = adapter.connect(identity, room)
+        provider = _first_non_empty(payload.get("provider"))
+        response_model = _first_non_empty(
+            payload.get("response_model"), payload.get("model")
+        )
+        response_mode = _first_non_empty(payload.get("mode"))
+        voice = _first_non_empty(payload.get("voice"))
+        if not isinstance(payload.get("runtime"), dict):
+            payload = self._attach_live_runtime(
+                payload,
+                transport_provider=provider or self.mode,
+                response_mode=response_mode or None,
+                response_model=response_model or None,
+                voice=voice or None,
+            )
+        return payload
 
     @property
     def is_api_mode(self) -> bool:

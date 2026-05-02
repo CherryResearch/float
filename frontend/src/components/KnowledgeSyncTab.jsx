@@ -1,6 +1,17 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import axios from "axios";
+import StateInspector from "./StateInspector";
 import "../styles/ProgressBar.css";
+import { buildSyncOwnershipInspectorRows } from "../utils/stateExplanations";
+import {
+  WORKSPACE_PRIVATE_PATTERNS_HELP,
+  WORKSPACE_PRIVACY_OPTIONS,
+  getWorkspacePrivacyTooltip,
+  normalizeWorkspacePrivacyMode,
+  normalizeWorkspacePrivatePatterns,
+  workspacePrivatePatternsText,
+  workspaceSyncBlocked,
+} from "../utils/privacyLevels";
 
 const DEFAULT_EXPORT_DEFAULTS = {
   format: "md",
@@ -10,6 +21,29 @@ const DEFAULT_EXPORT_DEFAULTS = {
 };
 
 const DEVICE_SCOPE_OPTIONS = ["sync", "stream", "files"];
+const DEVICE_SCOPE_HELP = {
+  sync: "Allows manifest comparison and selected pull or push of conversations, knowledge, settings, calendars, and attachments.",
+  stream: "Allows temporary live session signaling between paired devices. It does not copy stored data by itself.",
+  files: "Allows file and blob upload or download for attachments and legacy transfer paths.",
+};
+const SCOPE_ROW_HELP =
+  "Allowed scopes control what this paired device can do. Sync moves data, stream handles live signaling, and files handles blob transfer.";
+const REMOTE_URL_HELP =
+  "Use the other Float instance's reachable URL. The host or port can change; Float treats the saved device fingerprint as identity and the URL as a reachability hint.";
+const LAN_VISIBILITY_HELP =
+  "Allow private-network devices to pair, request sync tokens, and pull or push data from this Float instance. Public internet sync is not supported yet.";
+const ONLINE_VISIBILITY_HELP =
+  "Reserved for a future gateway path. Public internet sync is not supported yet. If you need https://, the remote or tunnel must already terminate TLS.";
+const PAIRING_CODE_HELP =
+  "One-time code for mutual trust setup. Generate it on the device you want to receive sync or stream access.";
+const WORKSPACE_MAPPING_HELP =
+  "Choose which local and remote workspaces participate in preview and apply. Merge writes into the selected destination. Import nested creates a nested imported workspace instead. Broader workspace switching is still planned.";
+const REFRESH_TRUST_HELP =
+  "Re-fetch the remote trust record and allowed scopes from the paired device.";
+const REVOKE_REMOTE_HELP =
+  "Remove the trust record on the remote device and delete the saved pair here.";
+const CHECK_REMOTE_HELP =
+  "Probe the URL you entered. If this is a saved pair at a new port, Float updates the saved URL only after the remote fingerprint matches.";
 const SYNC_ACTION_NAMES = new Set(["sync_pull", "sync_ingest"]);
 const SYNC_PROGRESS_PRESETS = {
   preview: {
@@ -93,8 +127,7 @@ const buildWorkspaceId = () =>
     : `workspace-${Date.now()}`;
 
 const coerceWorkspaceProfiles = (value) => {
-  const seen = new Set(["root"]);
-  const root = {
+  let root = {
     id: "root",
     name: "Main workspace",
     slug: "main",
@@ -107,7 +140,26 @@ const coerceWorkspaceProfiles = (value) => {
     source_device_name: "",
     source_workspace_id: "",
     source_workspace_name: "",
+    privacy_mode: "default",
+    private_patterns: [],
   };
+  if (Array.isArray(value)) {
+    const rootEntry = value.find(
+      (entry) => entry && typeof entry === "object" && String(entry.id || "").trim() === "root",
+    );
+    if (rootEntry) {
+      root = {
+        ...root,
+        name:
+          typeof rootEntry.name === "string" && rootEntry.name.trim()
+            ? rootEntry.name.trim()
+            : root.name,
+        privacy_mode: normalizeWorkspacePrivacyMode(rootEntry.privacy_mode),
+        private_patterns: normalizeWorkspacePrivatePatterns(rootEntry.private_patterns),
+      };
+    }
+  }
+  const seen = new Set(["root"]);
   const profiles = [root];
   if (!Array.isArray(value)) return profiles;
   value.forEach((entry, index) => {
@@ -153,6 +205,8 @@ const coerceWorkspaceProfiles = (value) => {
         typeof entry.source_workspace_name === "string"
           ? entry.source_workspace_name.trim()
           : "",
+      privacy_mode: normalizeWorkspacePrivacyMode(entry.privacy_mode),
+      private_patterns: normalizeWorkspacePrivatePatterns(entry.private_patterns),
     });
   });
   return profiles;
@@ -163,6 +217,9 @@ const workspaceById = (profiles, workspaceId) =>
 
 const workspaceLabel = (profiles, workspaceId) =>
   workspaceById(profiles, workspaceId)?.name || workspaceId || "workspace";
+
+const workspacePrivacyLabel = (profile) =>
+  normalizeWorkspacePrivacyMode(profile?.privacy_mode);
 
 const coerceSavedPeers = (value) =>
   Array.isArray(value)
@@ -215,6 +272,49 @@ const isSyncRequestCancelled = (error, controller) => {
     return true;
   }
   return error?.code === "ERR_CANCELED" || error?.name === "CanceledError";
+};
+
+const createSyncOperationId = (kind) => {
+  const prefix = String(kind || "sync").trim().toLowerCase() || "sync";
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `${prefix}-${crypto.randomUUID()}`;
+  }
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+};
+
+const syncOperationKindLabel = (kind) => {
+  const key = String(kind || "").trim().toLowerCase();
+  if (key === "check") return "Check remote";
+  if (key === "preview") return "Preview";
+  if (key === "pull") return "Pull";
+  if (key === "push") return "Push";
+  return key ? key.replace(/_/g, " ") : "Sync";
+};
+
+const syncOperationStatusLabel = (status) => {
+  const key = String(status || "").trim().toLowerCase();
+  if (key === "cancel_requested") return "Cancel requested";
+  if (key === "completed") return "Completed";
+  if (key === "failed") return "Failed";
+  if (key === "running") return "Running";
+  return key ? key.replace(/_/g, " ") : "Unknown";
+};
+
+const describeSyncOperation = (operation) => {
+  if (!operation || typeof operation !== "object") return "None";
+  const parts = [
+    syncOperationKindLabel(operation.kind),
+    syncOperationStatusLabel(operation.status),
+  ];
+  const remote =
+    String(operation.remote_label || "").trim() ||
+    String(operation.remote_url || "").trim();
+  if (remote) parts.push(remote);
+  if (operation.started_at || operation.finished_at) {
+    parts.push(formatDateTime(operation.finished_at || operation.started_at));
+  }
+  if (operation.cancel_requested) parts.push("cancel requested");
+  return parts.filter(Boolean).join(" - ");
 };
 
 const formatDateTime = (value) => {
@@ -331,6 +431,21 @@ const describePeerStatus = (peer, options = {}) => {
   return { key: "saved", label: "saved target" };
 };
 
+const describePeerIdentityStatus = (status) => {
+  const state = String(status?.identity_state || "").trim();
+  if (state === "verified") return "same saved device";
+  if (state === "mismatch") return "different Float identity";
+  if (state === "missing_remote_identity") return "no remote fingerprint";
+  if (state === "unanchored") return "fingerprint not saved yet";
+  if (state === "unpaired") return "not compared to a saved pair";
+  return "";
+};
+
+const shortFingerprint = (value) => {
+  const text = String(value || "").trim();
+  return text ? text.slice(0, 8) : "";
+};
+
 const coerceSyncActions = (value) =>
   Array.isArray(value)
     ? value
@@ -355,6 +470,55 @@ const describeSyncHistoryStatus = (action) => {
     return { key: "approved", label: "incoming push" };
   }
   return { key: "paired", label: "pull" };
+};
+
+const describeLatestSyncActivity = (action) => {
+  if (!action || typeof action !== "object") return "";
+  const summary = String(action.summary || "").trim() || "Sync activity";
+  const itemCount = Number(action.item_count || 0);
+  const itemLabel =
+    itemCount > 0 ? `${itemCount} changed item${itemCount === 1 ? "" : "s"}` : "";
+  const createdAt = formatDateTime(action.created_at || action.created_at_ts);
+  return `Last completed sync: ${summary}${itemLabel ? `, ${itemLabel}` : ""} at ${createdAt}.`;
+};
+
+const describeSyncOwnershipTarget = (summary) => {
+  const target =
+    summary?.outbound_target && typeof summary.outbound_target === "object"
+      ? summary.outbound_target
+      : {};
+  const mode = String(target.mode || "").trim().toLowerCase();
+  const remoteUrl = String(target.remote_url || "").trim();
+  const peerLabel = String(target.peer_label || "").trim();
+  if (mode === "saved_peer" && remoteUrl) {
+    return peerLabel ? `${peerLabel} at ${remoteUrl}` : remoteUrl;
+  }
+  if (mode === "manual_url" && remoteUrl) {
+    return `${remoteUrl} (manual URL)`;
+  }
+  return "None saved";
+};
+
+const describeSyncOwnershipTargetNote = (summary) => {
+  const target =
+    summary?.outbound_target && typeof summary.outbound_target === "object"
+      ? summary.outbound_target
+      : {};
+  const mode = String(target.mode || "").trim().toLowerCase();
+  const remoteUrl = String(target.remote_url || "").trim();
+  if (mode === "saved_peer" && remoteUrl) {
+    return "Default outbound sync is pinned to a saved paired device.";
+  }
+  if (mode === "manual_url" && remoteUrl) {
+    return "Current outbound sync uses a manual URL. Save it as a pair to pin the remote fingerprint before routine use.";
+  }
+  return "No default outbound target is configured yet.";
+};
+
+const looksLikeLegacyBrowserName = (value) => {
+  const lowered = String(value || "").trim().toLowerCase();
+  if (!lowered) return false;
+  return lowered.startsWith("mozilla/5.0") || lowered.includes("applewebkit");
 };
 
 const SyncLabelText = ({ text, tooltip }) => (
@@ -450,6 +614,14 @@ const KnowledgeSyncTab = () => {
       : "No active remote";
   const recentSyncActions = useMemo(() => syncHistory.slice(0, 8), [syncHistory]);
   const activeSyncLabel = syncActionBusy || (syncBusy ? "preview" : "");
+  const latestSyncActivityLabel = recentSyncActions.length
+    ? describeLatestSyncActivity(recentSyncActions[0])
+    : "";
+  const buildSyncOperationOwner = () =>
+    deviceDisplayName ||
+    overview?.current_device?.display_name ||
+    overview?.current_device?.hostname ||
+    "local user";
 
   const clearSyncProgressTimers = () => {
     syncProgressTimersRef.current.forEach((timer) => window.clearTimeout(timer));
@@ -476,7 +648,7 @@ const KnowledgeSyncTab = () => {
     const phases = Array.isArray(preset.phases) && preset.phases.length
       ? preset.phases
       : [{ label: "Working…", progress: 0.2, delayMs: 0 }];
-    const requestId = `${kind}-${Date.now()}`;
+    const requestId = createSyncOperationId(kind);
     const controller =
       typeof AbortController !== "undefined" ? new AbortController() : null;
     clearSyncProgressTimers();
@@ -513,6 +685,20 @@ const KnowledgeSyncTab = () => {
   const cancelActiveSync = () => {
     const activeRequest = syncRequestRef.current;
     if (!activeRequest?.controller || activeRequest.controller.signal.aborted) return;
+    if (activeRequest.id) {
+      axios
+        .post(`/api/sync/operations/${encodeURIComponent(activeRequest.id)}/cancel`)
+        .catch(() => {});
+    }
+    setSyncProgress((prev) =>
+      prev && prev.id === activeRequest.id
+        ? {
+            ...prev,
+            detail: "Cancel requested.",
+            note: "Float is stopping the local request wait; remote work may continue if already accepted.",
+          }
+        : prev,
+    );
     activeRequest.controller.abort("user_cancelled");
   };
 
@@ -646,7 +832,7 @@ const KnowledgeSyncTab = () => {
       sync_link_to_source_device: !!syncLinkToSourceDevice,
       sync_source_namespace: resolvedSourceNamespace,
       sync_saved_peers: savedPeers,
-      workspace_profiles: workspaceProfiles.filter((profile) => profile.id !== "root"),
+      workspace_profiles: workspaceProfiles,
       active_workspace_id: activeWorkspaceId || "root",
       sync_selected_workspace_ids: normalizeWorkspaceIdList(selectedWorkspaceIds).length
         ? normalizeWorkspaceIdList(selectedWorkspaceIds)
@@ -745,6 +931,14 @@ const KnowledgeSyncTab = () => {
       coerceWorkspaceProfiles(
         prev.map((profile) => {
           if (profile.id !== workspaceId) return profile;
+          const nextPrivacyMode =
+            updates?.privacy_mode !== undefined
+              ? normalizeWorkspacePrivacyMode(updates.privacy_mode)
+              : normalizeWorkspacePrivacyMode(profile.privacy_mode);
+          const nextPrivatePatterns =
+            updates?.private_patterns !== undefined
+              ? normalizeWorkspacePrivatePatterns(updates.private_patterns)
+              : normalizeWorkspacePrivatePatterns(profile.private_patterns);
           if (profile.id === "root") {
             return {
               ...profile,
@@ -752,6 +946,8 @@ const KnowledgeSyncTab = () => {
                 typeof updates?.name === "string" && updates.name.trim()
                   ? updates.name.trim()
                   : profile.name,
+              privacy_mode: nextPrivacyMode,
+              private_patterns: nextPrivatePatterns,
             };
           }
           const nextName =
@@ -769,6 +965,8 @@ const KnowledgeSyncTab = () => {
             slug: slugifyWorkspaceToken(nextName || profile.name || workspaceId),
             namespace: nextNamespace,
             root_path: String(nextRootPath || "").trim() || profile.root_path,
+            privacy_mode: nextPrivacyMode,
+            private_patterns: nextPrivatePatterns,
           };
         }),
       ),
@@ -810,6 +1008,8 @@ const KnowledgeSyncTab = () => {
       source_device_name: "",
       source_workspace_id: "",
       source_workspace_name: "",
+      privacy_mode: "default",
+      private_patterns: [],
     };
     setWorkspaceProfiles((prev) => coerceWorkspaceProfiles([...prev, nextProfile]));
     setSelectedWorkspaceIds((prev) =>
@@ -853,7 +1053,7 @@ const KnowledgeSyncTab = () => {
     try {
       await persistSyncPreferences(
         {
-          workspace_profiles: normalizedWorkspaceProfiles.filter((profile) => profile.id !== "root"),
+          workspace_profiles: normalizedWorkspaceProfiles,
           active_workspace_id: activeWorkspaceId || "root",
           sync_selected_workspace_ids: normalizedSelectedWorkspaceIds,
         },
@@ -979,12 +1179,28 @@ const KnowledgeSyncTab = () => {
       return null;
     }
     setPeerStatusBusy(true);
+    const operationId = createSyncOperationId("check");
     try {
-      const res = await axios.post("/api/sync/peer/status", { remote_url: remoteUrl });
+      const res = await axios.post("/api/sync/peer/status", {
+        remote_url: remoteUrl,
+        paired_device: selectedPeerId ? buildPairedDevicePayload() : null,
+        update_saved_peer: !!selectedPeerId && remoteAddressDirty,
+        operation_id: operationId,
+        operation_owner: buildSyncOperationOwner(),
+      });
+      const nextStatus = res?.data || null;
       if (syncRemoteUrlRef.current === remoteUrl) {
-        setPeerStatus(res?.data || null);
+        setPeerStatus(nextStatus);
+        const updatedPeer = coerceSavedPeers(
+          nextStatus?.paired_device ? [nextStatus.paired_device] : [],
+        )[0];
+        if (updatedPeer) {
+          mergePairedDeviceRecord(updatedPeer);
+          setSyncRemoteUrl(updatedPeer.remote_url);
+          setMessage(`Verified ${updatedPeer.label}; saved URL updated.`);
+        }
       }
-      return res?.data || null;
+      return nextStatus;
     } catch (error) {
       const nextStatus = {
         reachable: false,
@@ -1013,6 +1229,12 @@ const KnowledgeSyncTab = () => {
       setMessage("Paired devices used here must include the sync scope.");
       return;
     }
+    if (selectedPeerId && remoteAddressDirty) {
+      setMessage(
+        "Check remote before previewing from a changed address. Float will update the saved URL only if the fingerprint matches.",
+      );
+      return;
+    }
     setSyncBusy(true);
     setMessage("");
     const { controller, requestId } = startSyncProgress("preview");
@@ -1027,6 +1249,8 @@ const KnowledgeSyncTab = () => {
           local_target_workspace_id: localTargetWorkspaceId || activeWorkspaceId || "root",
           remote_target_workspace_id: remoteTargetWorkspaceId || "root",
           paired_device: buildPairedDevicePayload(),
+          operation_id: requestId,
+          operation_owner: buildSyncOperationOwner(),
           ...syncOptionsPayload,
         },
         controller ? { signal: controller.signal } : undefined,
@@ -1125,6 +1349,12 @@ const KnowledgeSyncTab = () => {
       setMessage("Paired devices used here must include the sync scope.");
       return;
     }
+    if (selectedPeerId && remoteAddressDirty) {
+      setMessage(
+        "Check remote before syncing with a changed address. Float will update the saved URL only if the fingerprint matches.",
+      );
+      return;
+    }
     setSyncActionBusy(direction);
     setMessage("");
     setSyncItemReview(null);
@@ -1143,6 +1373,8 @@ const KnowledgeSyncTab = () => {
           remote_target_workspace_id: remoteTargetWorkspaceId || "root",
           item_selections: itemSelections,
           paired_device: buildPairedDevicePayload(),
+          operation_id: requestId,
+          operation_owner: buildSyncOperationOwner(),
           ...syncOptionsPayload,
         },
         controller ? { signal: controller.signal } : undefined,
@@ -1543,9 +1775,74 @@ const KnowledgeSyncTab = () => {
   const legacyInboundDevices = Array.isArray(overview?.legacy_inbound_devices)
     ? overview.legacy_inbound_devices
     : [];
+  const trustedInboundDevices = inboundDevices.filter(
+    (device) => !looksLikeLegacyBrowserName(device?.name) && !device?.legacy_browser_record,
+  );
+  const visibleLegacyInboundDevices = [
+    ...legacyInboundDevices,
+    ...inboundDevices.filter(
+      (device) => looksLikeLegacyBrowserName(device?.name) || device?.legacy_browser_record,
+    ),
+  ].filter(
+    (device, index, list) =>
+      list.findIndex((entry) => String(entry?.id || "").trim() === String(device?.id || "").trim())
+      === index,
+  );
   const pendingReviews = Array.isArray(overview?.sync_reviews?.pending) ? overview.sync_reviews.pending : [];
   const recentReviews = Array.isArray(overview?.sync_reviews?.recent) ? overview.sync_reviews.recent : [];
   const deviceCounts = overview?.device_counts || {};
+  const syncOwnershipSummary =
+    overview?.egress_summary && typeof overview.egress_summary === "object"
+      ? overview.egress_summary
+      : null;
+  const syncOperations =
+    overview?.sync_operations && typeof overview.sync_operations === "object"
+      ? overview.sync_operations
+      : {};
+  const activeSyncOperation =
+    syncOperations.active_operation && typeof syncOperations.active_operation === "object"
+      ? syncOperations.active_operation
+      : null;
+  const lastSyncOperation =
+    syncOperations.last_attempt && typeof syncOperations.last_attempt === "object"
+      ? syncOperations.last_attempt
+      : null;
+  const syncOwnershipTargetLabel = describeSyncOwnershipTarget(syncOwnershipSummary);
+  const syncOwnershipTargetNote = describeSyncOwnershipTargetNote(syncOwnershipSummary);
+  const syncOwnershipLanEnabled =
+    syncOwnershipSummary?.inbound_visibility?.lan_enabled === true || !!syncVisibleOnLan;
+  const syncOwnershipPushMode =
+    String(syncOwnershipSummary?.push_review_mode || "").trim().toLowerCase() === "auto_accept"
+      ? "Auto-accept"
+      : "Review required";
+  const syncOwnershipSavedPeerCount =
+    Number.isFinite(syncOwnershipSummary?.saved_peer_count)
+      ? Number(syncOwnershipSummary.saved_peer_count)
+      : savedPeers.length;
+  const syncOwnershipUnfinishedNote =
+    String(syncOwnershipSummary?.unfinished_notice || "").trim()
+    || "Backend retry ownership is not fully tracked yet.";
+  const activeSyncOperationDescription = activeSyncOperation
+    ? describeSyncOperation(activeSyncOperation)
+    : "none";
+  const lastSyncOperationDescription = lastSyncOperation
+    ? describeSyncOperation(lastSyncOperation)
+    : "none recorded";
+  const syncOwnershipInspectorRows = buildSyncOwnershipInspectorRows({
+    syncOwnershipSummary: {
+      ...syncOwnershipSummary,
+      source_namespace:
+        deviceDisplayName ||
+        overview?.current_device?.display_name ||
+        overview?.current_device?.hostname ||
+        syncOwnershipSummary?.source_namespace,
+      default_target_label: syncOwnershipTargetLabel,
+    },
+    activeOperation: activeSyncOperation,
+    lastOperation: lastSyncOperation,
+    activeDescription: activeSyncOperationDescription,
+    lastDescription: lastSyncOperationDescription,
+  });
   const pullSections = Array.isArray(syncPreview?.pull_sections)
     ? syncPreview.pull_sections
     : Array.isArray(syncPreview?.sections)
@@ -1599,6 +1896,89 @@ const KnowledgeSyncTab = () => {
       </div>
 
       {message ? <p className="status-note">{message}</p> : null}
+      {!syncProgress && latestSyncActivityLabel ? (
+        <p
+          className="status-note"
+          title="Most recent completed sync action recorded locally."
+        >
+          {latestSyncActivityLabel}
+        </p>
+      ) : null}
+      <section className="knowledge-sync-card knowledge-sync-card--compact-status">
+        <div className="knowledge-sync-section-head">
+          <h4>
+            <SyncLabelText
+              text="Sync ownership"
+              tooltip="Summarizes the default outbound target, inbound exposure, and push review posture for this device."
+            />
+          </h4>
+          <StateInspector
+            title="Why this sync state is shown"
+            summary="This card is built from local sync overview, egress defaults, and active/last sync operation telemetry."
+            rows={syncOwnershipInspectorRows}
+            ariaLabel="Explain sync ownership state"
+          />
+          <span className={`knowledge-sync-target-status is-${syncOwnershipLanEnabled ? "paired" : "saved"}`}>
+            {syncOwnershipSummary?.private_network_only ? "private only" : "review"}
+          </span>
+        </div>
+        <p className="status-note">
+          Outbound target, inbound exposure, and review posture for this device.
+        </p>
+        <dl className="knowledge-sync-meta">
+          <div>
+            <dt>Default outbound</dt>
+            <dd>{syncOwnershipTargetLabel}</dd>
+          </div>
+          <div>
+            <dt>Inbound exposure</dt>
+            <dd>{syncOwnershipLanEnabled ? "LAN enabled" : "Local only"}</dd>
+          </div>
+          <div>
+            <dt>Push handling</dt>
+            <dd>{syncOwnershipPushMode}</dd>
+          </div>
+          <div>
+            <dt>Saved peers</dt>
+            <dd>{syncOwnershipSavedPeerCount}</dd>
+          </div>
+          <div>
+            <dt>Active request</dt>
+            <dd>{activeSyncOperation ? activeSyncOperationDescription : "None"}</dd>
+          </div>
+          <div>
+            <dt>Last attempt</dt>
+            <dd>{lastSyncOperation ? lastSyncOperationDescription : "None recorded"}</dd>
+          </div>
+        </dl>
+        <div className="knowledge-sync-preview-chip-row">
+          <span className="knowledge-sync-preview-chip">
+            <strong>egress</strong>
+            <span>Private reachable addresses only</span>
+          </span>
+          <span className="knowledge-sync-preview-chip">
+            <strong>outbound</strong>
+            <span>{syncOwnershipSummary?.outbound_target?.mode === "saved_peer" ? "Pinned pair" : syncOwnershipSummary?.outbound_target?.mode === "manual_url" ? "Manual URL" : "Unset"}</span>
+          </span>
+          <span className="knowledge-sync-preview-chip">
+            <strong>push</strong>
+            <span>{syncOwnershipPushMode}</span>
+          </span>
+          <span className="knowledge-sync-preview-chip">
+            <strong>operation</strong>
+            <span>{activeSyncOperation ? syncOperationStatusLabel(activeSyncOperation.status) : "Idle"}</span>
+          </span>
+        </div>
+        <div className="knowledge-sync-section-stack">
+          <span className="status-note">{syncOwnershipTargetNote}</span>
+          <span
+            className="status-note"
+            title="This gap is tracked intentionally as part of the spring-cleaning pass."
+          >
+            Unfinished: {syncOwnershipUnfinishedNote}
+          </span>
+        </div>
+      </section>
       {syncProgress ? (
         <section
           className={`knowledge-sync-progress knowledge-sync-progress--${syncProgress.tone || "preview"}`}
@@ -1614,7 +1994,13 @@ const KnowledgeSyncTab = () => {
                 {syncProgress.active ? "running" : "ready"}
               </span>
               {syncProgress.active ? (
-                <button type="button" className="icon-btn" onClick={cancelActiveSync}>
+                <button
+                  type="button"
+                  className="icon-btn"
+                  onClick={cancelActiveSync}
+                  title="Record cancel intent and stop waiting on the current sync request."
+                  aria-label={`Stop ${activeSyncLabel || "sync"} request`}
+                >
                   Stop {activeSyncLabel || "sync"}
                 </button>
               ) : null}
@@ -1684,14 +2070,14 @@ const KnowledgeSyncTab = () => {
             />
           </label>
           <div className="knowledge-sync-card-subtle">
-            <strong
-              title="Workspace profiles describe named roots and namespaces for sync and document organization. The root workspace stays un-namespaced; imported nested workspaces appear here automatically after import-mode pulls."
-            >
+            <strong title={WORKSPACE_MAPPING_HELP}>
               Workspaces
             </strong>
             <div className="knowledge-sync-workspace-list">
               {localWorkspaceProfiles.map((profile) => {
                 const imported = profile.imported === true || profile.kind === "synced";
+                const privacyMode = workspacePrivacyLabel(profile);
+                const privacyTooltip = getWorkspacePrivacyTooltip(privacyMode);
                 return (
                   <article
                     key={`workspace-${profile.id}`}
@@ -1723,15 +2109,23 @@ const KnowledgeSyncTab = () => {
                             });
                           }}
                         />
-                        <span>sync</span>
+                        <span title={privacyTooltip}>sync</span>
                       </label>
-                      <span
-                        className={`knowledge-sync-target-status is-${
-                          imported ? "connected" : profile.is_root ? "paired" : "saved"
-                        }`}
-                      >
-                        {imported ? "imported" : profile.is_root ? "root" : "local"}
-                      </span>
+                      <div className="knowledge-sync-workspace-badges">
+                        <span
+                          className={`knowledge-sync-target-status is-${
+                            imported ? "connected" : profile.is_root ? "paired" : "saved"
+                          }`}
+                        >
+                          {imported ? "imported" : profile.is_root ? "root" : "local"}
+                        </span>
+                        <span
+                          className={`knowledge-sync-target-status is-${privacyMode}`}
+                          title={privacyTooltip}
+                        >
+                          {privacyMode}
+                        </span>
+                      </div>
                     </div>
                     <input
                       type="text"
@@ -1771,11 +2165,57 @@ const KnowledgeSyncTab = () => {
                           placeholder="data/files/workspace/work"
                         />
                       </label>
+                      <label className="field-label">
+                        <span title={privacyTooltip}>Workspace privacy</span>
+                        <select
+                          aria-label={`Workspace privacy for ${profile.name}`}
+                          value={privacyMode}
+                          onChange={(event) =>
+                            updateWorkspaceProfile(profile.id, {
+                              privacy_mode: event.target.value,
+                            })
+                          }
+                          title={privacyTooltip}
+                        >
+                          {WORKSPACE_PRIVACY_OPTIONS.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
                     </div>
+                    <label className="field-label">
+                      <span title={WORKSPACE_PRIVATE_PATTERNS_HELP}>Private match rules</span>
+                      <textarea
+                        aria-label={`Private match rules for ${profile.name}`}
+                        value={workspacePrivatePatternsText(profile.private_patterns)}
+                        onChange={(event) =>
+                          updateWorkspaceProfile(profile.id, {
+                            private_patterns: event.target.value,
+                          })
+                        }
+                        rows={3}
+                        placeholder={"notes/private/*\n*.pem"}
+                        title={WORKSPACE_PRIVATE_PATTERNS_HELP}
+                      />
+                    </label>
                     {imported ? (
                       <div className="status-note">
                         Source: {profile.source_device_name || "remote"} /{" "}
                         {profile.source_workspace_name || profile.name}
+                      </div>
+                    ) : null}
+                    {workspaceSyncBlocked(privacyMode) ? (
+                      <div className="status-note" title={privacyTooltip}>
+                        This workspace stays out of sync and default recall while privacy is{" "}
+                        {privacyMode}.
+                      </div>
+                    ) : null}
+                    {normalizeWorkspacePrivatePatterns(profile.private_patterns).length ? (
+                      <div className="status-note" title={WORKSPACE_PRIVATE_PATTERNS_HELP}>
+                        Private rules active:{" "}
+                        {normalizeWorkspacePrivatePatterns(profile.private_patterns).length}
                       </div>
                     ) : null}
                     {!profile.is_root ? (
@@ -1848,7 +2288,7 @@ const KnowledgeSyncTab = () => {
             </div>
           </dl>
           <div className="knowledge-sync-section-head">
-            <strong title="LAN visibility can be changed live. Public internet access stays blocked for now.">
+            <strong title={LAN_VISIBILITY_HELP}>
               Device visibility
             </strong>
             <span className="status-note">
@@ -1856,10 +2296,7 @@ const KnowledgeSyncTab = () => {
             </span>
           </div>
           <div className="knowledge-sync-visibility-grid">
-            <label
-              className="knowledge-sync-visibility-card"
-              title="Allow private-network devices to pair, request sync tokens, and pull or push data from this Float instance."
-            >
+            <label className="knowledge-sync-visibility-card" title={LAN_VISIBILITY_HELP}>
               <div className="knowledge-sync-visibility-header">
                 <div className="knowledge-sync-section-stack">
                   <strong>Visible on LAN</strong>
@@ -1912,10 +2349,7 @@ const KnowledgeSyncTab = () => {
                   : "Incoming pushes wait in the review list below until you approve them."}
               </span>
             </label>
-            <div
-              className="knowledge-sync-visibility-card is-disabled"
-              title="Reserved for a future gateway path. Public internet device access is still off."
-            >
+            <div className="knowledge-sync-visibility-card is-disabled" title={ONLINE_VISIBILITY_HELP}>
               <div className="knowledge-sync-visibility-header">
                 <div className="knowledge-sync-section-stack">
                   <strong>Visible online</strong>
@@ -1927,7 +2361,7 @@ const KnowledgeSyncTab = () => {
                 <span className="knowledge-sync-url-label">Internet URL</span>
                 <code>{internetUrl || "Not configured."}</code>
               </div>
-              <span className="status-note">Public connections stay off for now.</span>
+              <span className="status-note">Public internet sync is not supported yet.</span>
             </div>
           </div>
           <button type="button" className="icon-btn" onClick={saveDeviceSettings} disabled={savingPrefs}>
@@ -1935,10 +2369,7 @@ const KnowledgeSyncTab = () => {
           </button>
           <div className="knowledge-sync-card-subtle">
             <strong>
-              <SyncLabelText
-                text="Pairing code"
-                tooltip="One-time code for mutual trust setup. Generate it on the device you want to receive sync or stream access."
-              />
+              <SyncLabelText text="Pairing code" tooltip={PAIRING_CODE_HELP} />
             </strong>
             <span>
               Generate a one-time code on this device, then enter it from another trusted device.
@@ -1948,6 +2379,7 @@ const KnowledgeSyncTab = () => {
               className="icon-btn"
               onClick={createPairingOffer}
               disabled={pairBusy || !syncVisibleOnLan}
+              title={PAIRING_CODE_HELP}
             >
               {pairBusy ? "Creating..." : "Generate pairing code"}
             </button>
@@ -1988,7 +2420,7 @@ const KnowledgeSyncTab = () => {
           <label className="field-label" htmlFor="sync-target-url">
             <SyncLabelText
               text="Remote Float URL"
-              tooltip="Use the other device's private reachable address here. Public internet URLs are intentionally unsupported right now."
+              tooltip={REMOTE_URL_HELP}
             />
           </label>
           <input
@@ -2000,7 +2432,7 @@ const KnowledgeSyncTab = () => {
           />
           {remoteAddressDirty ? (
             <p className="status-note">
-              Unsaved address change. Save or pair again to replace the stored URL for this device.
+              Address change. Check remote to update this saved pair if the fingerprint matches; pair again if it is a different Float instance.
             </p>
           ) : null}
           {syncRemoteUrl.trim() ? (
@@ -2012,6 +2444,15 @@ const KnowledgeSyncTab = () => {
                     className={`knowledge-sync-target-status is-${
                       peerStatusBusy ? "pending" : peerStatus?.reachable ? "paired" : peerStatus ? "legacy" : "saved"
                     }`}
+                    title={
+                      peerStatusBusy
+                        ? "Checking the remote URL now."
+                        : peerStatus?.reachable
+                          ? "The remote URL responded and the device is reachable."
+                          : peerStatus
+                            ? "The remote URL did not respond as expected."
+                            : "No remote check has been run yet."
+                    }
                   >
                     {peerStatusBusy
                       ? "checking"
@@ -2026,6 +2467,7 @@ const KnowledgeSyncTab = () => {
                     className="icon-btn"
                     onClick={checkPeerStatus}
                     disabled={peerStatusBusy}
+                    title={CHECK_REMOTE_HELP}
                   >
                     {peerStatusBusy ? "Checking..." : "Check remote"}
                   </button>
@@ -2035,12 +2477,31 @@ const KnowledgeSyncTab = () => {
                 <div className="knowledge-sync-target-meta">
                   <span>{peerStatus.display_name || peerStatus.hostname || "Remote device"}</span>
                   {typeof peerStatus.visible_on_lan === "boolean" ? (
-                    <span>{peerStatus.visible_on_lan ? "LAN visible" : "LAN hidden"}</span>
+                    <span
+                      title={
+                        peerStatus.visible_on_lan
+                          ? "The remote device advertises a private-network address."
+                          : "The remote device is not advertising a private-network address."
+                      }
+                    >
+                      {peerStatus.visible_on_lan ? "LAN visible" : "LAN hidden"}
+                    </span>
                   ) : null}
                   {selectedPeer?.remote_device_id && !remoteAddressDirty ? (
                     <span>{selectedPeerConnected ? "Connected to this saved pair" : "Saved pair is reachable"}</span>
                   ) : null}
+                  {describePeerIdentityStatus(peerStatus) ? (
+                    <span title={peerStatus.identity_warning || "Stable device identity check."}>
+                      {describePeerIdentityStatus(peerStatus)}
+                    </span>
+                  ) : null}
+                  {shortFingerprint(peerStatus?.identity?.public_key) ? (
+                    <span>fingerprint {shortFingerprint(peerStatus.identity.public_key)}</span>
+                  ) : null}
                   {peerStatus.advertised_lan_url ? <span>{peerStatus.advertised_lan_url}</span> : null}
+                  {peerStatus.identity_warning ? (
+                    <span title={peerStatus.identity_warning}>{peerStatus.identity_warning}</span>
+                  ) : null}
                 </div>
               ) : peerStatus?.error ? (
                 <div className="status-note">{peerStatus.error}</div>
@@ -2052,11 +2513,11 @@ const KnowledgeSyncTab = () => {
             </div>
           ) : null}
           <div className="knowledge-sync-card-subtle">
-            <strong title="Choose which local and remote workspaces participate in preview/apply, and whether incoming data should merge into the destination or land as a nested imported workspace.">
+            <strong title={WORKSPACE_MAPPING_HELP}>
               Workspace mapping
             </strong>
             <div className="knowledge-sync-inline-mode-row">
-              <label className="knowledge-sync-inline-toggle">
+              <label className="knowledge-sync-inline-toggle" title="Merge writes into the selected destination workspace.">
                 <input
                   type="radio"
                   checked={workspaceMode === "merge"}
@@ -2064,7 +2525,7 @@ const KnowledgeSyncTab = () => {
                 />
                 <span>merge</span>
               </label>
-              <label className="knowledge-sync-inline-toggle">
+              <label className="knowledge-sync-inline-toggle" title="Import nested creates a new imported workspace under the selected destination.">
                 <input
                   type="radio"
                   checked={workspaceMode === "import"}
@@ -2077,46 +2538,66 @@ const KnowledgeSyncTab = () => {
               <div className="knowledge-sync-workspace-picker">
                 <span className="knowledge-sync-url-label">Local source workspaces</span>
                 <div className="knowledge-sync-workspace-chip-row">
-                  {localWorkspaceProfiles.map((profile) => (
-                    <label key={`local-source-${profile.id}`} className="knowledge-sync-scope-toggle">
-                      <input
-                        type="checkbox"
-                        checked={selectedWorkspaceIds.includes(profile.id)}
-                        onChange={(event) =>
-                          setSelectedWorkspaceIds((prev) => {
-                            const next = event.target.checked
-                              ? normalizeWorkspaceIdList([...prev, profile.id])
-                              : prev.filter((workspaceId) => workspaceId !== profile.id);
-                            return next.length ? next : [activeWorkspaceId || "root"];
-                          })
-                        }
-                      />
-                      <span>{profile.name}</span>
-                    </label>
-                  ))}
+                  {localWorkspaceProfiles.map((profile) => {
+                    const privacyMode = workspacePrivacyLabel(profile);
+                    return (
+                      <label
+                        key={`local-source-${profile.id}`}
+                        className="knowledge-sync-scope-toggle"
+                        title={getWorkspacePrivacyTooltip(privacyMode)}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selectedWorkspaceIds.includes(profile.id)}
+                          onChange={(event) =>
+                            setSelectedWorkspaceIds((prev) => {
+                              const next = event.target.checked
+                                ? normalizeWorkspaceIdList([...prev, profile.id])
+                                : prev.filter((workspaceId) => workspaceId !== profile.id);
+                              return next.length ? next : [activeWorkspaceId || "root"];
+                            })
+                          }
+                        />
+                        <span>{profile.name}</span>
+                        <span className={`knowledge-sync-target-status is-${privacyMode}`}>
+                          {privacyMode}
+                        </span>
+                      </label>
+                    );
+                  })}
                 </div>
               </div>
               <div className="knowledge-sync-workspace-picker">
                 <span className="knowledge-sync-url-label">Remote source workspaces</span>
                 {remoteWorkspaceProfiles.length ? (
                   <div className="knowledge-sync-workspace-chip-row">
-                    {remoteWorkspaceProfiles.map((profile) => (
-                      <label key={`remote-source-${profile.id}`} className="knowledge-sync-scope-toggle">
-                        <input
-                          type="checkbox"
-                          checked={remoteWorkspaceIds.includes(profile.id)}
-                          onChange={(event) =>
-                            setRemoteWorkspaceIds((prev) => {
-                              const next = event.target.checked
-                                ? normalizeWorkspaceIdList([...prev, profile.id])
-                                : prev.filter((workspaceId) => workspaceId !== profile.id);
-                              return next.length ? next : [profile.id];
-                            })
-                          }
-                        />
-                        <span>{profile.name}</span>
-                      </label>
-                    ))}
+                    {remoteWorkspaceProfiles.map((profile) => {
+                      const privacyMode = workspacePrivacyLabel(profile);
+                      return (
+                        <label
+                          key={`remote-source-${profile.id}`}
+                          className="knowledge-sync-scope-toggle"
+                          title={getWorkspacePrivacyTooltip(privacyMode)}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={remoteWorkspaceIds.includes(profile.id)}
+                            onChange={(event) =>
+                              setRemoteWorkspaceIds((prev) => {
+                                const next = event.target.checked
+                                  ? normalizeWorkspaceIdList([...prev, profile.id])
+                                  : prev.filter((workspaceId) => workspaceId !== profile.id);
+                                return next.length ? next : [profile.id];
+                              })
+                            }
+                          />
+                          <span>{profile.name}</span>
+                          <span className={`knowledge-sync-target-status is-${privacyMode}`}>
+                            {privacyMode}
+                          </span>
+                        </label>
+                      );
+                    })}
                   </div>
                 ) : (
                   <span className="status-note">Remote workspaces appear after the URL resolves.</span>
@@ -2162,8 +2643,9 @@ const KnowledgeSyncTab = () => {
             ) : null}
           </div>
           <div className="knowledge-sync-scope-row">
+            <strong title={SCOPE_ROW_HELP}>Allowed scopes</strong>
             {DEVICE_SCOPE_OPTIONS.map((scope) => (
-              <label key={scope} className="knowledge-sync-scope-toggle">
+              <label key={scope} className="knowledge-sync-scope-toggle" title={DEVICE_SCOPE_HELP[scope]}>
                 <input
                   type="checkbox"
                   checked={targetScopes.includes(scope)}
@@ -2182,7 +2664,7 @@ const KnowledgeSyncTab = () => {
           <label className="field-label" htmlFor="sync-target-code">
             <SyncLabelText
               text="Pairing code"
-              tooltip="Paste the one-time code shown on the other device. Pairing establishes trust; preview and apply decide what actually syncs."
+              tooltip={PAIRING_CODE_HELP}
             />
           </label>
           <input
@@ -2220,10 +2702,10 @@ const KnowledgeSyncTab = () => {
           <h4>
             <SyncLabelText
               text="Paired devices"
-              tooltip="Saved trusted targets. Each pair remembers the remote base URL, device id, and allowed scopes."
+              tooltip="Saved trusted targets. Each pair remembers the remote base URL, device id, allowed scopes, and workspace mapping."
             />
           </h4>
-          <p className="status-note">Named targets with stable device ids, scopes, and last-used details.</p>
+          <p className="status-note">Named targets with stable fingerprints, scopes, workspace mapping, and last-used details.</p>
         </div>
         {savedPeers.length ? (
           <div className="knowledge-sync-target-list">
@@ -2271,7 +2753,11 @@ const KnowledgeSyncTab = () => {
                     <span>{peer.remote_url}</span>
                     <div className="knowledge-sync-preview-chip-row">
                       {normalizePeerScopes(peer.scopes).map((scope) => (
-                        <span key={`${peer.id}-${scope}`} className="knowledge-sync-preview-chip">
+                        <span
+                          key={`${peer.id}-${scope}`}
+                          className="knowledge-sync-preview-chip"
+                          title={DEVICE_SCOPE_HELP[scope]}
+                        >
                           <strong>scope</strong>
                           <span>{scope}</span>
                         </span>
@@ -2290,6 +2776,11 @@ const KnowledgeSyncTab = () => {
                     <div className="knowledge-sync-target-meta">
                       <span>{peerReachable ? "Connected now" : `Last used ${formatDateTime(peer.last_used_at)}`}</span>
                       {peer.remote_device_id ? <span>remote id {peer.remote_device_id.slice(0, 8)}</span> : null}
+                      {shortFingerprint(peer.remote_public_key) ? (
+                        <span>fingerprint {shortFingerprint(peer.remote_public_key)}</span>
+                      ) : (
+                        <span>fingerprint not saved</span>
+                      )}
                       {peer.local_workspace_ids?.length ? (
                         <span>
                           local {peer.local_workspace_ids.map((id) => workspaceLabel(localWorkspaceProfiles, id)).join(", ")}
@@ -2301,10 +2792,20 @@ const KnowledgeSyncTab = () => {
                     </div>
                   </button>
                   <div className="knowledge-sync-target-actions">
-                    <button type="button" className="knowledge-sync-target-remove" onClick={() => syncPairTrust(peer)}>
+                    <button
+                      type="button"
+                      className="knowledge-sync-target-remove"
+                      onClick={() => syncPairTrust(peer)}
+                      title={REFRESH_TRUST_HELP}
+                    >
                       {pairSyncBusy && selectedPeerId === peer.id ? "Updating..." : "Refresh trust"}
                     </button>
-                    <button type="button" className="knowledge-sync-target-remove" onClick={() => revokeRemotePair(peer)}>
+                    <button
+                      type="button"
+                      className="knowledge-sync-target-remove"
+                      onClick={() => revokeRemotePair(peer)}
+                      title={REVOKE_REMOTE_HELP}
+                    >
                       Revoke remote
                     </button>
                     <button type="button" className="knowledge-sync-target-remove" onClick={() => removeSavedPeer(peer)}>
@@ -2353,6 +2854,24 @@ const KnowledgeSyncTab = () => {
               Ignored local workspaces to avoid recursive sync:{" "}
               {syncPreview.workspaces.local.ignored_workspace_ids
                 .map((workspaceId) => workspaceLabel(localWorkspaceProfiles, workspaceId))
+                .join(", ")}
+            </div>
+          ) : null}
+          {Array.isArray(syncPreview?.workspaces?.local?.privacy_ignored_workspace_ids) &&
+          syncPreview.workspaces.local.privacy_ignored_workspace_ids.length ? (
+            <div className="status-note">
+              Local workspaces kept private by policy:{" "}
+              {syncPreview.workspaces.local.privacy_ignored_workspace_ids
+                .map((workspaceId) => workspaceLabel(localWorkspaceProfiles, workspaceId))
+                .join(", ")}
+            </div>
+          ) : null}
+          {Array.isArray(syncPreview?.workspaces?.remote?.privacy_ignored_workspace_ids) &&
+          syncPreview.workspaces.remote.privacy_ignored_workspace_ids.length ? (
+            <div className="status-note">
+              Remote workspaces kept private by policy:{" "}
+              {syncPreview.workspaces.remote.privacy_ignored_workspace_ids
+                .map((workspaceId) => workspaceLabel(remoteWorkspaceProfiles, workspaceId))
                 .join(", ")}
             </div>
           ) : null}
@@ -2718,9 +3237,9 @@ const KnowledgeSyncTab = () => {
           </h4>
           <p className="status-note">These are device records registered here. Revoke them to remove local trust.</p>
         </div>
-        {inboundDevices.length ? (
+        {trustedInboundDevices.length ? (
           <div className="knowledge-sync-device-list">
-            {inboundDevices.map((device) => (
+            {trustedInboundDevices.map((device) => (
               <article key={device.id} className="knowledge-sync-device-card">
                 <div className="knowledge-sync-section-head">
                   <div className="knowledge-sync-section-stack">
@@ -2759,13 +3278,13 @@ const KnowledgeSyncTab = () => {
         ) : (
           <p className="status-note">No inbound trusted devices recorded yet.</p>
         )}
-        {legacyInboundDevices.length ? (
+        {visibleLegacyInboundDevices.length ? (
           <div className="knowledge-sync-card-subtle">
             <div className="knowledge-sync-section-head">
               <div className="knowledge-sync-section-stack">
                 <strong>Legacy browser records</strong>
                 <span className="status-note">
-                  Older browser-origin entries without sync scopes. These are usually stale local test records.
+                  Browser-origin or user-agent-shaped entries usually created by older local tests. Keep them out of the trusted-device list and prune them when they are no longer needed.
                 </span>
               </div>
               <button
@@ -2774,11 +3293,11 @@ const KnowledgeSyncTab = () => {
                 onClick={pruneLegacyDevices}
                 disabled={pruneLegacyBusy}
               >
-                {pruneLegacyBusy ? "Cleaning..." : `Prune ${legacyInboundDevices.length}`}
+                {pruneLegacyBusy ? "Cleaning..." : `Prune ${visibleLegacyInboundDevices.length}`}
               </button>
             </div>
             <div className="knowledge-sync-device-list compact">
-              {legacyInboundDevices.slice(0, 6).map((device) => (
+              {visibleLegacyInboundDevices.slice(0, 6).map((device) => (
                 <article key={`legacy-${device.id}`} className="knowledge-sync-device-card compact">
                   <div className="knowledge-sync-target-title-row">
                     <strong>{device.name}</strong>

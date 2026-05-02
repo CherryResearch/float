@@ -16,18 +16,20 @@ import {
   resolveConcreteModelSelection,
   resolveLocalCatalogModelId,
   resolveModelForMode,
-  resolveRequestModelForMode,
+  SUGGESTED_SERVER_MODELS,
   SUGGESTED_LOCAL_MODELS,
 } from "../utils/modelUtils";
 import { providerRuntimeHasChatModel } from "../utils/providerRuntime";
 import "../styles/TopBar.css";
 
 const suggestedLangModels = SUGGESTED_LOCAL_MODELS;
+const suggestedServerModels = SUGGESTED_SERVER_MODELS;
 const mobileTopbarQuery =
   "(max-width: 600px), (orientation: portrait) and (max-width: 900px)";
 const EMPTY_GLOBAL_STATE = Object.freeze({});
 const NOOP_SET_STATE = () => {};
 const LOCAL_PROVIDER_STATUS_POLL_MS = 60000;
+const MODEL_AVAILABLE_PIP = "\u25cf";
 
 const fireAndForget = (request) => {
   if (request && typeof request.catch === "function") {
@@ -45,40 +47,6 @@ const buildLocalSettingsPayload = (selection) => {
   }
   return { transformer_model: value };
 };
-
-const buildServerProbeTargets = (serverUrl) => {
-  const value = typeof serverUrl === "string" ? serverUrl.trim() : "";
-  if (!value) {
-    return [];
-  }
-  try {
-    const url = new URL(value, window.location.href);
-    const origin = `${url.protocol}//${url.host}`;
-    const path = url.pathname.replace(/\/+$/, "");
-    const candidates = new Set();
-    const addTarget = (pathname) => {
-      candidates.add(`${origin}${pathname}`);
-    };
-    if (/\/models$/i.test(path)) {
-      addTarget(path || "/models");
-    } else if (/\/v\d+$/i.test(path)) {
-      addTarget(`${path}/models`);
-    } else {
-      addTarget(`${path || ""}/v1/models`);
-      addTarget(`${path || ""}/models`);
-    }
-    if (path) {
-      addTarget("/v1/models");
-      addTarget("/models");
-    }
-    return Array.from(candidates);
-  } catch {
-    return [];
-  }
-};
-
-const serverProbeReached = (response) =>
-  Boolean(response) && (response.ok || response.status === 401 || response.status === 403);
 
 const formatRelativeTime = (timestamp) => {
   if (timestamp == null) return null;
@@ -151,7 +119,10 @@ const TopBar = () => {
       : "/";
 
   const [serverStatus, setServerStatus] = useState("offline"); // offline | loading | online
+  const [serverInventoryModels, setServerInventoryModels] = useState([]);
+  const [serverLoadedModel, setServerLoadedModel] = useState("");
   const [localStatus, setLocalStatus] = useState("offline"); // offline | loading | online | degraded
+  const [availableLocalModels, setAvailableLocalModels] = useState([]);
   const [isMobileTopbar, setIsMobileTopbar] = useState(() => {
     if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
       return false;
@@ -160,7 +131,10 @@ const TopBar = () => {
   });
   const [isMobileControlsOpen, setIsMobileControlsOpen] = useState(false);
 
-  const apiModelsAvailable = Array.isArray(state.apiModels) ? state.apiModels : [];
+  const apiModelsAvailable = useMemo(
+    () => (Array.isArray(state.apiModels) ? state.apiModels : []),
+    [state.apiModels],
+  );
   const apiModelsAvailableSet = useMemo(
     () => new Set(apiModelsAvailable),
     [apiModelsAvailable],
@@ -190,9 +164,29 @@ const TopBar = () => {
       .filter(Boolean);
     return Array.from(new Set(aliases));
   }, [state.registeredLocalModels]);
+  const availableLocalModelSet = useMemo(
+    () =>
+      new Set(
+        [
+          ...availableLocalModels,
+          ...registeredTransformerAliases,
+        ].filter((model) => typeof model === "string" && model.trim()),
+      ),
+    [availableLocalModels, registeredTransformerAliases],
+  );
+  const serverInventoryModelSet = useMemo(
+    () =>
+      new Set(
+        serverInventoryModels.filter(
+          (model) => typeof model === "string" && model.trim(),
+        ),
+      ),
+    [serverInventoryModels],
+  );
   const localModelOptions = useMemo(() => {
     const base = [
       ...registeredTransformerAliases,
+      ...availableLocalModels,
       ...(Array.isArray(suggestedLangModels) ? suggestedLangModels : []),
       ...(Array.isArray(LOCAL_RUNTIME_ENTRIES) ? LOCAL_RUNTIME_ENTRIES : []),
     ];
@@ -202,27 +196,28 @@ const TopBar = () => {
       return [current, ...deduped];
     }
     return deduped;
-  }, [state.localModel, registeredTransformerAliases]);
+  }, [state.localModel, registeredTransformerAliases, availableLocalModels]);
   const serverModelOptions = useMemo(() => {
     const base = [
+      ...serverInventoryModels,
       ...registeredTransformerAliases,
-      ...(Array.isArray(suggestedLangModels) ? suggestedLangModels : []),
+      ...(Array.isArray(suggestedServerModels) ? suggestedServerModels : []),
     ];
     const deduped = Array.from(new Set(base));
-    const current =
-      resolveConcreteModelSelection(state.transformerModel) ||
-      resolveConcreteModelSelection(state.localModel);
+    const current = resolveConcreteModelSelection(state.transformerModel);
     if (current && !deduped.includes(current)) {
       return [current, ...deduped];
     }
     return deduped;
-  }, [state.localModel, state.transformerModel, registeredTransformerAliases]);
+  }, [
+    state.transformerModel,
+    registeredTransformerAliases,
+    serverInventoryModels,
+  ]);
   const configuredLocalSelection =
     (typeof state.localModel === "string" ? state.localModel.trim() : "") ||
     resolveConcreteModelSelection(state.transformerModel);
-  const currentServerModel =
-    resolveConcreteModelSelection(state.transformerModel) ||
-    resolveConcreteModelSelection(state.localModel);
+  const currentServerModel = resolveConcreteModelSelection(state.transformerModel);
   const selectedModelValue =
     state.backendMode === "server"
       ? currentServerModel
@@ -243,15 +238,6 @@ const TopBar = () => {
     } else if (mode === "local") {
       Object.assign(payload, buildLocalSettingsPayload(configuredLocalSelection));
     } else if (mode === "server") {
-      const serverSelection = resolveRequestModelForMode({
-        backendMode: "server",
-        apiModel: state.apiModel,
-        transformerModel: state.transformerModel,
-        localModel: state.localModel,
-      });
-      if (serverSelection) {
-        payload.transformer_model = serverSelection;
-      }
       if (typeof state.serverUrl === "string") {
         payload.server_url = state.serverUrl;
       }
@@ -390,7 +376,7 @@ const TopBar = () => {
       >
         {state.backendMode === "api" ? (
           <>
-            <optgroup label="defaults">
+            <optgroup label={apiModelGroups.source === "discovered" ? "available" : "defaults"}>
               {apiModelGroups.defaults.map((m) => {
                 const disabled =
                   apiModelsAvailableSet.size > 0 && !apiModelsAvailableSet.has(m);
@@ -404,7 +390,7 @@ const TopBar = () => {
             </optgroup>
             {apiModelGroups.extras.length > 0 && (
               <optgroup
-                label={`available${apiModelsAvailable.length ? ` (${apiModelsAvailable.length})` : ""}`}
+                label="current selection"
               >
                 {apiModelGroups.extras.map((m) => (
                   <option key={m} value={m}>
@@ -416,17 +402,25 @@ const TopBar = () => {
           </>
         ) : (
           <>
-            {state.backendMode === "server" && !selectedModelValue && (
-              <option value="">select server model</option>
+            {state.backendMode === "server" && (
+              <option value="">server default</option>
             )}
             {(state.backendMode === "server" ? serverModelOptions : localModelOptions).map(
-              (m) => (
-                <option key={m} value={m}>
-                  {state.backendMode === "local" && isLocalRuntimeEntry(m)
+              (m) => {
+                const displayLabel =
+                  state.backendMode === "local" && isLocalRuntimeEntry(m)
                     ? formatLocalRuntimeLabel(m)
-                    : m}
-                </option>
-              ),
+                    : m;
+                const available =
+                  state.backendMode === "server"
+                    ? serverInventoryModelSet.has(m)
+                    : availableLocalModelSet.has(m) && !isLocalRuntimeEntry(m);
+                return (
+                  <option key={m} value={m}>
+                    {available ? `${MODEL_AVAILABLE_PIP} ${displayLabel}` : displayLabel}
+                  </option>
+                );
+              },
             )}
           </>
         )}
@@ -449,6 +443,8 @@ const TopBar = () => {
     setState((prev) => ({
       ...prev,
       conversation: [],
+      conversationTrimMeta: null,
+      history: [],
       sessionId: newId,
       sessionName: generateDefaultSessionName(timestamp),
     }));
@@ -634,38 +630,103 @@ const TopBar = () => {
     };
   }, [setState]);
 
-  // Ping server health when in server mode or when URL changes
+  // Load local transformer inventory once so downloaded/registered models surface in the picker.
+  useEffect(() => {
+    let canceled = false;
+    const fetchAvailableLocalModels = async () => {
+      try {
+        const response = await axios.get("/api/transformers/models");
+        if (canceled) return;
+        const models = Array.isArray(response?.data?.models)
+          ? response.data.models
+          : [];
+        setAvailableLocalModels(models);
+      } catch {
+        if (!canceled) {
+          setAvailableLocalModels([]);
+        }
+      }
+    };
+    fetchAvailableLocalModels();
+    return () => {
+      canceled = true;
+    };
+  }, []);
+
+  // Probe server/LAN model inventory through the backend to avoid browser CORS gaps.
   useEffect(() => {
     let aborted = false;
     const check = async () => {
       if (!state.serverUrl) {
         setServerStatus("offline");
+        setServerInventoryModels([]);
+        setServerLoadedModel("");
         return;
       }
       try {
         setServerStatus("loading");
-        const probeTargets = buildServerProbeTargets(state.serverUrl);
-        let reachable = false;
-        for (const target of probeTargets) {
-          const res = await fetch(target, { method: "GET" }).catch(() => null);
-          if (serverProbeReached(res)) {
-            reachable = true;
-            break;
-          }
-        }
+        const response = await axios.get("/api/llm/server/models", {
+          params: { server_url: state.serverUrl },
+        });
         if (aborted) return;
-        setServerStatus(reachable ? "online" : "offline");
+        const models = Array.isArray(response?.data?.models)
+          ? response.data.models
+          : [];
+        const loadedModel =
+          typeof response?.data?.loaded_model === "string"
+            ? response.data.loaded_model.trim()
+            : "";
+        setServerInventoryModels(models);
+        setServerLoadedModel(loadedModel);
+        setServerStatus(response?.data?.reachable || models.length ? "online" : "offline");
       } catch {
-        if (!aborted) setServerStatus("offline");
+        if (!aborted) {
+          setServerStatus("offline");
+          setServerInventoryModels([]);
+          setServerLoadedModel("");
+        }
       }
     };
     if (state.backendMode === "server") {
       check();
+    } else {
+      setServerInventoryModels([]);
+      setServerLoadedModel("");
     }
     return () => {
       aborted = true;
     };
   }, [state.backendMode, state.serverUrl]);
+
+  useEffect(() => {
+    if (state.backendMode !== "server" || !serverInventoryModels.length) {
+      return;
+    }
+    const current = resolveConcreteModelSelection(state.transformerModel);
+    if (current && serverInventoryModelSet.has(current)) {
+      return;
+    }
+    const nextModel =
+      serverLoadedModel && serverInventoryModelSet.has(serverLoadedModel)
+        ? serverLoadedModel
+        : "";
+    if (nextModel === current) {
+      return;
+    }
+    setState((prev) => {
+      if (prev.backendMode !== "server") return prev;
+      const prevCurrent = resolveConcreteModelSelection(prev.transformerModel);
+      if (prevCurrent && serverInventoryModelSet.has(prevCurrent)) return prev;
+      return { ...prev, transformerModel: nextModel };
+    });
+  }, [
+    state.backendMode,
+    state.transformerModel,
+    serverInventoryModels,
+    serverInventoryModelSet,
+    serverLoadedModel,
+    setState,
+  ]);
 
   // Resolve local model readiness by checking backend for model presence
   useEffect(() => {

@@ -10,7 +10,11 @@ from typing import Any, Dict, Iterator, List, Optional
 
 import requests
 
-from .base import LocalProviderAdapter, normalize_base_url
+from .base import (
+    LocalProviderAdapter,
+    infer_openai_compatible_auth_token,
+    normalize_base_url,
+)
 
 
 def _coerce_int(value: Any, fallback: int) -> int:
@@ -45,7 +49,10 @@ class LMStudioAdapter(LocalProviderAdapter):
         )
 
     def _headers(self, cfg: Dict[str, Any]) -> Optional[Dict[str, str]]:
-        token = str(cfg.get("local_provider_api_token") or "").strip()
+        token = infer_openai_compatible_auth_token(
+            cfg,
+            self.resolve_base_url(cfg, with_v1=True),
+        )
         if not token:
             return None
         return {"Authorization": f"Bearer {token}"}
@@ -159,11 +166,14 @@ class LMStudioAdapter(LocalProviderAdapter):
         headers = self._headers(cfg)
         api_base = self.resolve_base_url(cfg, with_v1=False)
         base_v1 = self.resolve_base_url(cfg, with_v1=True)
-        candidates = [
-            f"{api_base}/api/v0/models",
-            f"{api_base}/api/v1/models",
-            f"{base_v1}/models",
-        ]
+        if self._provider(cfg) == "custom-openai-compatible":
+            candidates = [f"{base_v1}/models"]
+        else:
+            candidates = [
+                f"{api_base}/api/v0/models",
+                f"{api_base}/api/v1/models",
+                f"{base_v1}/models",
+            ]
         reachable = False
         for endpoint in candidates:
             payload = self._http_get_json(endpoint, timeout=timeout, headers=headers)
@@ -377,8 +387,13 @@ class LMStudioAdapter(LocalProviderAdapter):
                 "error": "Remote unmanaged mode does not support start.",
             }
         current = self.poll_status(cfg, quick=True)
+        base = self.resolve_base_url(cfg, with_v1=False)
         if current.get("server_running"):
-            return {"ok": True, "note": "LM Studio server already running."}
+            return {
+                "ok": True,
+                "note": "LM Studio server already running.",
+                "base_url": base,
+            }
         install = self.detect_installation(cfg)
         if not install.get("installed"):
             return {"ok": False, "error": "LM Studio CLI (lms) was not found."}
@@ -392,7 +407,6 @@ class LMStudioAdapter(LocalProviderAdapter):
         if not result.get("ok"):
             return result
         if not self._wait_until_running(cfg):
-            base = self.resolve_base_url(cfg, with_v1=False)
             return {
                 "ok": False,
                 "error": (
@@ -402,7 +416,7 @@ class LMStudioAdapter(LocalProviderAdapter):
                     "running LM Studio endpoint."
                 ),
             }
-        return {"ok": True}
+        return {**result, "ok": True, "base_url": base, "binary": binary}
 
     def stop_server(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
         if self._mode(cfg) == "remote-unmanaged":
@@ -414,7 +428,15 @@ class LMStudioAdapter(LocalProviderAdapter):
         if not install.get("installed"):
             return {"ok": False, "error": "LM Studio CLI (lms) was not found."}
         binary = str(install.get("binary") or "")
-        return self._run_cmd([binary, "server", "stop"])
+        result = self._run_cmd([binary, "server", "stop"])
+        if not result.get("ok"):
+            return result
+        return {
+            **result,
+            "ok": True,
+            "base_url": self.resolve_base_url(cfg, with_v1=False),
+            "binary": binary,
+        }
 
     def load_model(
         self,
@@ -443,7 +465,12 @@ class LMStudioAdapter(LocalProviderAdapter):
                     headers=self._headers(cfg),
                 )
                 if isinstance(response, dict):
-                    return {"ok": True, "endpoint": endpoint, "response": response}
+                    return {
+                        "ok": True,
+                        "endpoint": endpoint,
+                        "response": response,
+                        "targets": [chosen],
+                    }
             return {
                 "ok": False,
                 "error": "LM Studio remote load endpoint is unavailable.",
@@ -454,7 +481,10 @@ class LMStudioAdapter(LocalProviderAdapter):
         args = [str(install.get("binary") or ""), "load", chosen]
         if isinstance(context_length, int) and context_length > 0:
             args.extend(["--context-length", str(context_length)])
-        return self._run_cmd(args, timeout=120)
+        result = self._run_cmd(args, timeout=120)
+        if not result.get("ok"):
+            return result
+        return {**result, "ok": True, "targets": [chosen]}
 
     def unload_model(
         self,
@@ -478,7 +508,12 @@ class LMStudioAdapter(LocalProviderAdapter):
                     headers=self._headers(cfg),
                 )
                 if isinstance(response, dict):
-                    return {"ok": True, "endpoint": endpoint, "response": response}
+                    return {
+                        "ok": True,
+                        "endpoint": endpoint,
+                        "response": response,
+                        "targets": [chosen] if chosen else ["*"],
+                    }
             return {
                 "ok": False,
                 "error": "LM Studio remote unload endpoint is unavailable.",
@@ -490,11 +525,14 @@ class LMStudioAdapter(LocalProviderAdapter):
         if chosen:
             primary = self._run_cmd([binary, "unload", chosen], timeout=60)
             if primary.get("ok"):
-                return primary
+                return {**primary, "ok": True, "targets": [chosen]}
         fallback = self._run_cmd([binary, "unload", "--all"], timeout=60)
         if fallback.get("ok"):
-            return fallback
-        return self._run_cmd([binary, "unload"], timeout=60)
+            return {**fallback, "ok": True, "targets": [chosen] if chosen else ["*"]}
+        final = self._run_cmd([binary, "unload"], timeout=60)
+        if not final.get("ok"):
+            return final
+        return {**final, "ok": True, "targets": [chosen] if chosen else ["*"]}
 
     def stream_logs(self, cfg: Dict[str, Any], stop_event) -> Iterator[Dict[str, Any]]:
         install = self.detect_installation(cfg)

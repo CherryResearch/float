@@ -7,6 +7,7 @@ import time
 from datetime import datetime
 from typing import Any, Dict, Optional
 
+from app.agent_workflows import build_agent_provenance, build_handoff_artifact
 from app.utils import calendar_store
 from app.utils.security import generate_signature, sanitize_args
 from fastapi import FastAPI
@@ -81,9 +82,9 @@ def _normalize_conversation_mode(value: Any) -> Optional[str]:
 def _normalize_action(action: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     normalized = dict(action)
     try:
-        raw_kind = str(
-            normalized.get("kind") or normalized.get("type") or ""
-        ).strip().lower()
+        raw_kind = (
+            str(normalized.get("kind") or normalized.get("type") or "").strip().lower()
+        )
     except Exception:
         raw_kind = ""
     kind = _ACTION_KIND_ALIASES.get(
@@ -100,9 +101,7 @@ def _normalize_action(action: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     normalized["kind"] = kind
     normalized.pop("type", None)
     if kind == "prompt" and "prompt" not in normalized:
-        prompt = _normalize_prompt(
-            normalized.get("text") or normalized.get("message")
-        )
+        prompt = _normalize_prompt(normalized.get("text") or normalized.get("message"))
         if prompt:
             normalized["prompt"] = prompt
     mode = _normalize_conversation_mode(
@@ -182,6 +181,8 @@ def _ensure_task_conversation(
     session_id: Optional[str],
     event: Dict[str, Any],
     event_id: str,
+    parent_session_id: Optional[str] = None,
+    parent_message_id: Optional[str] = None,
 ) -> str:
     """Ensure prompt-only scheduled work is readable as its own conversation thread."""
     if session_id:
@@ -199,6 +200,22 @@ def _ensure_task_conversation(
             conversation_store.set_display_name(
                 conv_name, title, auto_generated=True, manual=False
             )
+        conversation_store.merge_metadata(
+            conv_name,
+            {
+                "provenance": build_agent_provenance(
+                    kind="subchat",
+                    parent_session_id=parent_session_id,
+                    parent_message_id=parent_message_id,
+                    source_event_id=event_id,
+                    branch_session_id=conv_name,
+                    label=title or f"Task conversation {event_id}",
+                ),
+                "handoff": build_handoff_artifact(
+                    summary=title or "Scheduled follow-up conversation."
+                ),
+            },
+        )
     except Exception:
         pass
     return conv_name
@@ -389,9 +406,15 @@ async def _run_prompt_followup(
     event_id: str,
     event: Dict[str, Any],
     action_id: str,
+    parent_session_id: Optional[str] = None,
+    parent_message_id: Optional[str] = None,
 ) -> None:
     session_id = _ensure_task_conversation(
-        session_id=session_id, event=event, event_id=event_id
+        session_id=session_id,
+        event=event,
+        event_id=event_id,
+        parent_session_id=parent_session_id,
+        parent_message_id=parent_message_id,
     )
     chain_id = chain_id or session_id
 
@@ -539,10 +562,16 @@ async def _run_prompt_action(
     prompt: str,
     event_id: str,
     action_id: str,
+    parent_session_id: Optional[str] = None,
+    parent_message_id: Optional[str] = None,
 ) -> Optional[str]:
     """Execute a scheduled prompt-only action by asking the model."""
     session_id = _ensure_task_conversation(
-        session_id=session_id, event=event, event_id=event_id
+        session_id=session_id,
+        event=event,
+        event_id=event_id,
+        parent_session_id=parent_session_id,
+        parent_message_id=parent_message_id,
     )
     chain_id = chain_id or session_id
 
@@ -714,7 +743,11 @@ async def _run_tool_action(
     prompt = _normalize_prompt(action.get("prompt"))
     if prompt and not session_id:
         session_id = _ensure_task_conversation(
-            session_id=session_id, event=event, event_id=event_id
+            session_id=session_id,
+            event=event,
+            event_id=event_id,
+            parent_session_id=action.get("session_id"),
+            parent_message_id=action.get("message_id"),
         )
         chain_id = chain_id or session_id
         message_id = message_id or chain_id
@@ -903,6 +936,8 @@ async def _run_tool_action(
             event_id=event_id,
             event=event,
             action_id=action_id,
+            parent_session_id=action.get("session_id"),
+            parent_message_id=action.get("message_id"),
         )
     return {
         "status": "invoked",
@@ -992,11 +1027,17 @@ async def run_scheduled_tools_for_event(
                             action["started_at"] = time.time()
                             event["status"] = "running"
                             await _persist_event(app, event_id, event)
-                            session_id, message_id, chain_id = _resolve_action_conversation(
-                                action
-                            )
+                            (
+                                session_id,
+                                message_id,
+                                chain_id,
+                            ) = _resolve_action_conversation(action)
                             session_id = _ensure_task_conversation(
-                                session_id=session_id, event=event, event_id=event_id
+                                session_id=session_id,
+                                event=event,
+                                event_id=event_id,
+                                parent_session_id=action.get("session_id"),
+                                parent_message_id=action.get("message_id"),
                             )
                             chain_id = chain_id or session_id
                             action["session_id"] = session_id
@@ -1011,6 +1052,8 @@ async def run_scheduled_tools_for_event(
                                     prompt=prompt,
                                     event_id=event_id,
                                     action_id=resolved_id,
+                                    parent_session_id=action.get("session_id"),
+                                    parent_message_id=action.get("message_id"),
                                 )
                                 action["status"] = "prompted"
                                 action["result"] = response_text

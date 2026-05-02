@@ -10,9 +10,15 @@ def test_tool_specs_endpoint_returns_schemas(tmp_path, monkeypatch):
         sys.path.insert(0, str(backend_dir))
 
     from app.main import app
-    from app.utils import calendar_store, conversation_store
+    from app.utils import calendar_store, conversation_store, user_settings
 
     monkeypatch.setattr(conversation_store, "CONV_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(
+        user_settings,
+        "USER_SETTINGS_PATH",
+        tmp_path / "user_settings.json",
+        raising=False,
+    )
     monkeypatch.setattr(
         calendar_store, "EVENTS_DIR", tmp_path / "calendar", raising=False
     )
@@ -26,11 +32,18 @@ def test_tool_specs_endpoint_returns_schemas(tmp_path, monkeypatch):
         "list_actions",
         "read_action_diff",
         "revert_actions",
+        "subchat",
+        "reflect",
+        "list_reflections",
         "create_event",
         "create_task",
         "list_tasks",
         "list_dir",
         "read_file",
+        "write_file",
+        "compact_conversation_plan",
+        "compact_conversation_preview",
+        "compact_conversation_write",
         "computer.observe",
         "computer.act",
         "shell.exec",
@@ -50,6 +63,8 @@ def test_tool_specs_endpoint_returns_schemas(tmp_path, monkeypatch):
     assert isinstance(tools, list)
     remember = next((t for t in tools if t.get("name") == "remember"), None)
     assert remember is not None
+    assert remember["policy"]["workflow"] == "both"
+    assert remember["policy"]["approval"] == "low"
     assert "parameters" in remember
     assert remember["parameters"].get("type") == "object"
     props = remember["parameters"].get("properties") or {}
@@ -61,6 +76,9 @@ def test_tool_specs_endpoint_returns_schemas(tmp_path, monkeypatch):
     assert "occurs_at" in props
     assert "review_at" in props
     assert "decay_at" in props
+    assert "reflect_after_save" in props
+    assert "reflection_prompt" in props
+    assert "reflection_run_now" in props
     recall = next((t for t in tools if t.get("name") == "recall"), None)
     assert recall is not None
     recall_props = recall["parameters"].get("properties") or {}
@@ -70,19 +88,30 @@ def test_tool_specs_endpoint_returns_schemas(tmp_path, monkeypatch):
     assert "image_top_k" in recall_props
     help_tool = next((t for t in tools if t.get("name") == "help"), None)
     assert help_tool is not None
+    assert "{}" in help_tool.get("description", "")
     help_props = help_tool["parameters"].get("properties") or {}
     assert "tool_name" in help_props
     assert "detail" in help_props
+    assert "failed_tool_name" in help_props
+    assert "failed_args" in help_props
+    assert "failed_error" in help_props
     tool_help = next((t for t in tools if t.get("name") == "tool_help"), None)
     assert tool_help is not None
+    assert "{}" in tool_help.get("description", "")
     tool_help_props = tool_help["parameters"].get("properties") or {}
     assert "tool_name" in tool_help_props
     assert "detail" in tool_help_props
+    assert "failed_tool_name" in tool_help_props
+    assert "failed_args" in tool_help_props
+    assert "failed_error" in tool_help_props
     tool_info = next((t for t in tools if t.get("name") == "tool_info"), None)
     assert tool_info is not None
     tool_info_props = tool_info["parameters"].get("properties") or {}
     assert "tool_name" in tool_info_props
     assert "include_schema" in tool_info_props
+    assert "failed_tool_name" in tool_info_props
+    assert "failed_args" in tool_info_props
+    assert "failed_error" in tool_info_props
     list_actions = next((t for t in tools if t.get("name") == "list_actions"), None)
     assert list_actions is not None
     list_actions_props = list_actions["parameters"].get("properties") or {}
@@ -101,6 +130,24 @@ def test_tool_specs_endpoint_returns_schemas(tmp_path, monkeypatch):
     assert "response_id" in revert_actions_props
     assert "conversation_id" in revert_actions_props
     assert "force" in revert_actions_props
+    subchat = next((t for t in tools if t.get("name") == "subchat"), None)
+    assert subchat is not None
+    subchat_props = subchat["parameters"].get("properties") or {}
+    assert subchat_props["action"]["default"] == "return"
+    assert "continue" in subchat_props["action"]["enum"]
+    reflect = next((t for t in tools if t.get("name") == "reflect"), None)
+    assert reflect is not None
+    reflect_props = reflect["parameters"].get("properties") or {}
+    assert "question" in reflect_props
+    assert "patience" in reflect_props
+    assert "run_now" in reflect_props
+    list_reflections = next(
+        (t for t in tools if t.get("name") == "list_reflections"), None
+    )
+    assert list_reflections is not None
+    assert list_reflections["policy"]["approval"] == "low"
+    list_reflection_props = list_reflections["parameters"].get("properties") or {}
+    assert "include_runs" in list_reflection_props
     create_event = next((t for t in tools if t.get("name") == "create_event"), None)
     assert create_event is not None
     create_event_props = create_event["parameters"].get("properties") or {}
@@ -130,6 +177,7 @@ def test_tool_specs_endpoint_returns_schemas(tmp_path, monkeypatch):
     assert list_dir_props["max_entries"]["maximum"] == 200
     read_file = next((t for t in tools if t.get("name") == "read_file"), None)
     assert read_file is not None
+    assert read_file["policy"]["live_auto"] is True
     read_file_props = read_file["parameters"].get("properties") or {}
     assert "start_line" in read_file_props
     assert "line_count" in read_file_props
@@ -139,6 +187,30 @@ def test_tool_specs_endpoint_returns_schemas(tmp_path, monkeypatch):
     assert read_file_props["line_count"]["maximum"] == 1000
     assert read_file_props["max_chars"]["default"] == 12000
     assert read_file_props["max_chars"]["maximum"] == 20000
+    compact_plan = next(
+        (t for t in tools if t.get("name") == "compact_conversation_plan"),
+        None,
+    )
+    assert compact_plan is not None
+    assert compact_plan["policy"]["approval"] == "low"
+    compact_plan_props = compact_plan["parameters"].get("properties") or {}
+    assert "context_window_tokens" in compact_plan_props
+    assert compact_plan_props["context_window_tokens"]["default"] == 24000
+    assert "soft_trigger_ratio" in compact_plan_props
+    compact_preview = next(
+        (t for t in tools if t.get("name") == "compact_conversation_preview"),
+        None,
+    )
+    assert compact_preview is not None
+    compact_preview_props = compact_preview["parameters"].get("properties") or {}
+    assert "summary_workflow" in compact_preview_props
+    compact_write = next(
+        (t for t in tools if t.get("name") == "compact_conversation_write"),
+        None,
+    )
+    assert compact_write is not None
+    compact_write_props = compact_write["parameters"].get("properties") or {}
+    assert "target_conversation_id" in compact_write_props
     computer_observe = next(
         (t for t in tools if t.get("name") == "computer.observe"),
         None,
@@ -158,3 +230,27 @@ def test_tool_specs_endpoint_returns_schemas(tmp_path, monkeypatch):
     assert patch_apply is not None
     assert patch_apply["parameters"].get("required") == ["path", "content"]
     assert all(tool.get("name") != "decay_memories" for tool in tools)
+
+    live_resp = client.get("/api/tools/specs?workflow=live")
+    assert live_resp.status_code == 200
+    live_names = {tool.get("name") for tool in live_resp.json().get("tools", [])}
+    assert {"help", "tool_help", "tool_info", "read_file", "list_dir"} <= live_names
+    assert "remember" in live_names
+    assert "write_file" not in live_names
+    assert "computer.act" not in live_names
+
+    user_settings.save_settings(
+        {
+            "tool_policies": {
+                "write_file": {"workflow": "both", "approval": "low"},
+                "read_file": {"workflow": "disabled", "approval": "low"},
+            }
+        }
+    )
+    overridden_resp = client.get("/api/tools/specs?workflow=live")
+    assert overridden_resp.status_code == 200
+    overridden_names = {
+        tool.get("name") for tool in overridden_resp.json().get("tools", [])
+    }
+    assert "write_file" in overridden_names
+    assert "read_file" not in overridden_names

@@ -181,7 +181,7 @@ body.dark-mode {
   --glass-tint: color-mix(in oklab, var(--theme-very-dark) 88%, var(--theme-c1-dark) 12%);
   --glass-tint-strong: color-mix(in oklab, var(--theme-very-dark) 92%, var(--theme-c1-dark) 8%);
   --glass-border: color-mix(in oklab, var(--theme-c1-light) 22%, var(--theme-very-dark) 78%);
-  --glass-shadow: 0 24px 60px color-mix(in oklab, var(--theme-warm-black) 88%, transparent), 0 12px 28px color-mix(in oklab, var(--theme-c1-shadow) 20%, transparent);
+  --glass-shadow: 0 16px 42px color-mix(in oklab, var(--theme-warm-black) 72%, transparent), 0 8px 20px color-mix(in oklab, var(--theme-c1-shadow) 10%, transparent);
   --scrollbar-thumb-color: color-mix(in oklab, var(--theme-c1-light) 60%, var(--theme-c1-med) 40%);
   --scrollbar-thumb-hover-color: color-mix(in oklab, var(--theme-c1-med) 68%, var(--theme-c2-light) 32%);
   --scrollbar-track-color: color-mix(in oklab, var(--theme-very-dark) 84%, var(--theme-c1-dark) 16%);

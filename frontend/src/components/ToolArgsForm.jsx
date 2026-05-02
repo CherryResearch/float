@@ -18,6 +18,37 @@ const normalizeArrayInput = (raw) => {
     .filter(Boolean);
 };
 
+export const schemaTypeOptions = (rawType) => {
+  const values = Array.isArray(rawType) ? rawType : [rawType];
+  return values
+    .map((item) => (typeof item === "string" ? item.trim() : ""))
+    .filter(Boolean);
+};
+
+const valueTypeOption = (value) => {
+  if (Array.isArray(value)) return "array";
+  if (value && typeof value === "object") return "object";
+  if (typeof value === "number" && Number.isFinite(value)) return "number";
+  if (typeof value === "boolean") return "boolean";
+  if (typeof value === "string") return "string";
+  return "";
+};
+
+export const preferredSchemaInputType = (rawType, current) => {
+  const options = schemaTypeOptions(rawType);
+  const currentType = valueTypeOption(current);
+  if (currentType && options.includes(currentType)) return currentType;
+  if (
+    currentType === "number" &&
+    Number.isInteger(current) &&
+    options.includes("integer")
+  ) {
+    return "integer";
+  }
+  if (options.includes("string")) return "string";
+  return options[0] || "";
+};
+
 const fieldOrder = (schema) => {
   const props = schema?.properties && typeof schema.properties === "object" ? schema.properties : {};
   const required = Array.isArray(schema?.required) ? schema.required : [];
@@ -114,10 +145,10 @@ const ToolArgsForm = ({ schema, ui = {}, value, onChange, disabled = false }) =>
         const isRequired = required.includes(key);
         const isAdvanced = Boolean(uiConfig?.advanced || uiConfig?.secret);
         const rawType = propSchema?.type;
-        const type = Array.isArray(rawType) ? rawType[0] : rawType;
+        const current = args[key];
+        const type = preferredSchemaInputType(rawType, current);
         const description = propSchema?.description;
         const hasEnum = Array.isArray(propSchema?.enum) && propSchema.enum.length > 0;
-        const current = args[key];
         const hasValue =
           current !== null &&
           current !== undefined &&

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import abc
+import os
 from typing import Any, Dict, Iterator, Optional
+from urllib.parse import urlparse
 
 
 def normalize_base_url(url: str, *, with_v1: bool) -> str:
@@ -18,6 +20,43 @@ def normalize_base_url(url: str, *, with_v1: bool) -> str:
     return value
 
 
+def infer_openai_compatible_auth_token(cfg: Dict[str, Any], base_url: str = "") -> str:
+    """Choose the bearer token for a configured OpenAI-compatible endpoint."""
+    explicit = str(cfg.get("local_provider_api_token") or "").strip()
+    if explicit:
+        return explicit
+
+    value = str(
+        base_url or cfg.get("local_provider_base_url") or cfg.get("server_url") or ""
+    ).strip()
+    if not value:
+        return ""
+    candidate = value if "://" in value else f"https://{value}"
+    try:
+        parsed = urlparse(candidate)
+    except Exception:
+        return ""
+    host = (parsed.netloc or parsed.path or "").split("@")[-1].split(":")[0].lower()
+    if not host:
+        return ""
+
+    if host.endswith("huggingface.co") or host == "hf.co" or host.endswith(".hf.co"):
+        return str(
+            cfg.get("hf_token")
+            or os.getenv("HUGGINGFACE_HUB_TOKEN")
+            or os.getenv("HF_TOKEN")
+            or ""
+        ).strip()
+    if host == "api.openai.com" or host.endswith(".api.openai.com"):
+        return str(
+            cfg.get("api_key")
+            or os.getenv("OPENAI_API_KEY")
+            or os.getenv("API_KEY")
+            or ""
+        ).strip()
+    return ""
+
+
 class LocalProviderAdapter(abc.ABC):
     provider_name: str
 
@@ -30,7 +69,9 @@ class LocalProviderAdapter(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def poll_status(self, cfg: Dict[str, Any], *, quick: bool = False) -> Dict[str, Any]:
+    def poll_status(
+        self, cfg: Dict[str, Any], *, quick: bool = False
+    ) -> Dict[str, Any]:
         raise NotImplementedError
 
     @abc.abstractmethod

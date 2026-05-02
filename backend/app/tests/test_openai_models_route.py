@@ -40,8 +40,20 @@ def test_openai_models_route_uses_ttl_cache(monkeypatch):
             return {
                 "data": [
                     {"id": "gpt-5.4"},
+                    {"id": "gpt-5.4-pro"},
                     {"id": "gpt-4.1-mini"},
                     {"id": "gpt-5.4"},
+                    {"id": "deepseek-chat"},
+                    {"id": "text-embedding-3-large"},
+                    {"id": "gpt-3.5-turbo-instruct"},
+                    {"id": "gpt-image-1"},
+                    {"id": "gpt-4o-mini-tts"},
+                    {"id": "gpt-4o-mini-transcribe"},
+                    {"id": "omni-moderation-latest"},
+                    {"id": "computer-use-preview"},
+                    {"id": "sora-2"},
+                    {"id": "davinci-002"},
+                    {"id": "text-davinci-003"},
                 ]
             }
 
@@ -57,11 +69,35 @@ def test_openai_models_route_uses_ttl_cache(monkeypatch):
 
     first = client.get("/api/openai/models")
     second = client.get("/api/openai/models")
+    full = client.get("/api/openai/models", params={"include_non_chat": True})
 
     assert first.status_code == 200
     assert second.status_code == 200
-    assert first.json() == {"models": ["gpt-4.1-mini", "gpt-5.4"]}
-    assert second.json() == {"models": ["gpt-4.1-mini", "gpt-5.4"]}
+    assert full.status_code == 200
+    assert first.json() == {
+        "models": ["gpt-5.4", "gpt-5.4-pro", "gpt-4.1-mini", "deepseek-chat"]
+    }
+    assert second.json() == {
+        "models": ["gpt-5.4", "gpt-5.4-pro", "gpt-4.1-mini", "deepseek-chat"]
+    }
+    assert full.json() == {
+        "models": [
+            "gpt-5.4",
+            "gpt-5.4-pro",
+            "gpt-4.1-mini",
+            "gpt-4o-mini-transcribe",
+            "gpt-4o-mini-tts",
+            "gpt-3.5-turbo-instruct",
+            "computer-use-preview",
+            "davinci-002",
+            "deepseek-chat",
+            "gpt-image-1",
+            "omni-moderation-latest",
+            "sora-2",
+            "text-davinci-003",
+            "text-embedding-3-large",
+        ]
+    }
     assert call_urls == ["https://api.openai.com/v1/models"]
 
 

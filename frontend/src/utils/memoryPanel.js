@@ -1,3 +1,10 @@
+export const normalizeMemorySearchText = (value) =>
+  String(value ?? "")
+    .toLowerCase()
+    .replace(/[_/\\-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
 export const serializeMemoryValue = (row) => {
   if (!row) return "";
   if (row.sensitivity === "secret" && (row.encrypted || row.decrypt_error)) {
@@ -12,10 +19,9 @@ export const serializeMemoryValue = (row) => {
 };
 
 export const buildMemorySearchText = (row) =>
-  [row?.key, row?.hint, serializeMemoryValue(row)]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
+  normalizeMemorySearchText(
+    [row?.key, row?.hint, serializeMemoryValue(row)].filter(Boolean).join(" "),
+  );
 
 export const getMemoryFilterTimestamp = (row, field) => {
   if (!row) return null;

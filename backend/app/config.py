@@ -111,6 +111,7 @@ DEFAULT_DATA_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_DATABASES_DIR = (DEFAULT_DATA_DIR / "databases").resolve()
 DEFAULT_DATABASES_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_MEMORY_FILE = (DEFAULT_DATABASES_DIR / "memory.sqlite3").resolve()
+DEFAULT_REFLECTION_STORE = (DEFAULT_DATABASES_DIR / "reflections.sqlite3").resolve()
 DEFAULT_FILES_DIR = (DEFAULT_DATA_DIR / "files").resolve()
 DEFAULT_FILES_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_WORKSPACE_DIR = (DEFAULT_DATA_DIR / "workspace").resolve()
@@ -269,6 +270,10 @@ def load_config():
     else:
         default_memory_file = databases_dir / "memory.sqlite3"
     memory_store_path = os.getenv("FLOAT_MEMORY_FILE", str(default_memory_file))
+    reflection_store_path = os.getenv(
+        "FLOAT_REFLECTION_STORE",
+        str(databases_dir / "reflections.sqlite3"),
+    )
     conv_folder = os.getenv("FLOAT_CONV_DIR", str(default_conv))
     models_folder = os.getenv("FLOAT_MODELS_DIR", str(DEFAULT_MODELS_DIR))
     try:
@@ -382,10 +387,36 @@ def load_config():
         "voice_model": os.getenv("VOICE_MODEL", "alloy"),
         "stream_backend": os.getenv("FLOAT_STREAM_BACKEND", "api"),
         "realtime_model": os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime"),
+        "openai_provider_transport": os.getenv(
+            "FLOAT_OPENAI_PROVIDER_TRANSPORT", "http"
+        )
+        .strip()
+        .lower()
+        or "http",
+        "openai_responses_ws_enabled": _env_bool(
+            "FLOAT_OPENAI_RESPONSES_WS_EXPERIMENTAL", False
+        ),
+        "openai_responses_ws_url": os.getenv("OPENAI_RESPONSES_WS_URL", "").strip(),
+        "openai_responses_ws_fallback_to_http": _env_bool(
+            "FLOAT_OPENAI_RESPONSES_WS_FALLBACK_TO_HTTP", True
+        ),
+        "openai_responses_ws_max_tool_rounds": _env_int(
+            "FLOAT_OPENAI_RESPONSES_WS_MAX_TOOL_ROUNDS", 4
+        ),
+        "openai_responses_ws_connect_timeout": _env_int(
+            "FLOAT_OPENAI_RESPONSES_WS_CONNECT_TIMEOUT", 15
+        ),
+        "openai_responses_ws_max_age_seconds": _env_int(
+            "FLOAT_OPENAI_RESPONSES_WS_MAX_AGE_SECONDS", 3300
+        ),
         "realtime_voice": os.getenv(
             "OPENAI_REALTIME_VOICE",
             os.getenv("VOICE_MODEL", "alloy"),
         ),
+        "live_agent_mode": os.getenv("FLOAT_LIVE_AGENT_MODE", "local").strip().lower()
+        or "local",
+        "live_agent_model": os.getenv("FLOAT_LIVE_AGENT_MODEL", "").strip(),
+        "live_multimodal_model": os.getenv("FLOAT_LIVE_MULTIMODAL_MODEL", "").strip(),
         "realtime_base_url": os.getenv(
             "OPENAI_REALTIME_URL", "https://api.openai.com/v1/realtime/client_secrets"
         ),
@@ -472,6 +503,10 @@ def load_config():
         "models_folder": models_folder,
         "data_dir": str(data_dir),
         "memory_store_path": memory_store_path,
+        "reflection_store_path": reflection_store_path,
+        "reflection_scheduler_enabled": _env_bool(
+            "FLOAT_REFLECTION_SCHEDULER_ENABLED", False
+        ),
         # Default system prompt describing Float's current tool/runtime behavior.
         "system_prompt": os.getenv(
             "SYSTEM_PROMPT",

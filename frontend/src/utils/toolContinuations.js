@@ -1,4 +1,4 @@
-const stableValue = (value) => {
+export const stableValue = (value) => {
   if (
     value === null ||
     typeof value === "string" ||

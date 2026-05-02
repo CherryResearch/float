@@ -5,11 +5,18 @@ import { useNavigate } from "react-router-dom";
 import SwapVertIcon from "@mui/icons-material/SwapVert";
 import CallSplitIcon from "@mui/icons-material/CallSplit";
 import { GlobalContext } from "../main";
+import { getConversationTrimMeta } from "../utils/proxy";
+import { buildHistoryFromConversation } from "../utils/conversationHistory";
 import "../styles/Sidebar.css";
 import {
   handleUnifiedPress,
   supportsHoverInteractions,
 } from "../utils/pointerInteractions";
+import {
+  CONVERSATION_PRIVACY_OPTIONS,
+  getConversationPrivacyTooltip,
+  normalizeConversationPrivacyMode,
+} from "../utils/privacyLevels";
 
 const EMPTY_GLOBAL_STATE = Object.freeze({});
 const NOOP_SET_STATE = () => {};
@@ -96,8 +103,8 @@ const DEFAULT_FOLDER_COLORS = [
   "#7B5CD6",
 ];
 const SIDEBAR_MIN_WIDTH = 220;
-const SIDEBAR_MAX_WIDTH = 520;
-const SIDEBAR_VIEWPORT_GUTTER = 160;
+const SIDEBAR_MAX_WIDTH = 760;
+const SIDEBAR_VIEWPORT_GUTTER = 96;
 const SIDEBAR_KEYBOARD_STEP = 20;
 const SIDEBAR_KEYBOARD_STEP_FAST = 40;
 const HISTORY_SORT_MODE_STORAGE_KEY = "historySortMode";
@@ -289,6 +296,7 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
   const [moveFolderValue, setMoveFolderValue] = React.useState("");
   const [renameTarget, setRenameTarget] = React.useState(null);
   const [renameValue, setRenameValue] = React.useState("");
+  const [renamePrivacyMode, setRenamePrivacyMode] = React.useState("default");
   const [renameSuggestBusy, setRenameSuggestBusy] = React.useState(false);
   const [folderRenameTarget, setFolderRenameTarget] = React.useState(null);
   const [folderRenameValue, setFolderRenameValue] = React.useState("");
@@ -638,10 +646,13 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
     return () => document.removeEventListener("mousedown", handleClick);
   }, [activeMenuKey, folderMenuKey]);
 
-  const loadConversation = async (id) => {
+  const loadConversation = async (id, displayName = "") => {
     try {
       const res = await axios.get(`/api/conversations/${encodeURIComponent(id)}`);
       const loadedMessages = res.data.messages || [];
+      const conversationTrimMeta = getConversationTrimMeta(res.data);
+      const nextSessionName = ensureString(displayName) || displayNameFromId(id);
+      const history = buildHistoryFromConversation(loadedMessages);
       if (typeof sessionStorage !== "undefined") {
         try {
           sessionStorage.setItem(
@@ -653,8 +664,10 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
       setState((prev) => ({
         ...prev,
         conversation: loadedMessages,
+        conversationTrimMeta,
+        history,
         sessionId: id,
-        sessionName: displayNameFromId(id),
+        sessionName: nextSessionName,
       }));
       navigate("/");
     } catch (err) {
@@ -667,6 +680,8 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
     setState((prev) => ({
       ...prev,
       conversation: [],
+      conversationTrimMeta: null,
+      history: [],
       sessionId: newId,
       sessionName: displayNameFromId(newId),
     }));
@@ -814,8 +829,13 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
           storageKey: trimmed,
           displayName: displayNameFromId(base),
           folderPath,
+          privacyMode: "default",
           threadId: null,
           threadTags: getThreadTagsForConversation(trimmed),
+          provenance: null,
+          parentSessionId: "",
+          parentMessageId: "",
+          subchatKind: "",
           createdSortKey,
           updatedSortKey,
           createdAt,
@@ -865,12 +885,31 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
         const fallbackSort = parseSessionTimestamp(storageKey) || 0;
         const createdSortKey = createdAt || updatedAt || fallbackSort;
         const updatedSortKey = updatedAt || createdAt || fallbackSort;
+        const provenance =
+          entry.provenance && typeof entry.provenance === "object"
+            ? entry.provenance
+            : null;
+        const subchatKind = ensureString(provenance?.kind).trim().toLowerCase();
+        const parentSessionId = ensureString(provenance?.parent_session_id).trim();
+        const parentMessageId = ensureString(provenance?.parent_message_id).trim();
+        const privacyMode = normalizeConversationPrivacyMode(
+          entry.privacy_mode || entry.privacyMode,
+        );
         entries.push({
           storageKey,
           displayName: displaySource || displayNameFromId(storageKey),
           folderPath,
+          privacyMode,
           threadId: normalizedThreadId || null,
           threadTags,
+          provenance,
+          parentSessionId:
+            (subchatKind === "subchat" || subchatKind === "fork")
+              ? parentSessionId
+              : "",
+          parentMessageId,
+          subchatKind:
+            subchatKind === "subchat" || subchatKind === "fork" ? subchatKind : "",
           createdSortKey,
           updatedSortKey,
           createdAt,
@@ -899,8 +938,13 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
         displayName:
           ensureString(state.sessionName) || displayNameFromId(currentSessionId),
         folderPath: getFolderPathFromName(currentSessionId),
+        privacyMode: "default",
         threadId: null,
         threadTags: getThreadTagsForConversation(currentSessionId),
+        provenance: null,
+        parentSessionId: "",
+        parentMessageId: "",
+        subchatKind: "",
         createdSortKey: createdSortKey || 0,
         updatedSortKey: updatedSortKey || 0,
         createdAt,
@@ -918,6 +962,37 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
     state.sessionId,
     state.sessionName,
   ]);
+
+  const conversationByKey = React.useMemo(() => {
+    const map = new Map();
+    normalizedConversations.forEach((conv) => {
+      if (conv?.storageKey) map.set(conv.storageKey, conv);
+    });
+    return map;
+  }, [normalizedConversations]);
+
+  const subchatChildrenByParent = React.useMemo(() => {
+    const map = new Map();
+    normalizedConversations.forEach((conv) => {
+      const parentKey = ensureString(conv?.parentSessionId).trim();
+      if (!parentKey || !conversationByKey.has(parentKey)) return;
+      if (!map.has(parentKey)) map.set(parentKey, []);
+      map.get(parentKey).push(conv);
+    });
+    map.forEach((items) => {
+      items.sort(compareConversations);
+    });
+    return map;
+  }, [compareConversations, conversationByKey, normalizedConversations]);
+
+  const rootConversations = React.useMemo(
+    () =>
+      normalizedConversations.filter((conv) => {
+        const parentKey = ensureString(conv?.parentSessionId).trim();
+        return !(parentKey && conversationByKey.has(parentKey));
+      }),
+    [conversationByKey, normalizedConversations],
+  );
 
   const folderOptions = React.useMemo(() => {
     const set = new Set();
@@ -965,7 +1040,7 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
       return node;
     };
     const root = createNode("", "");
-    normalizedConversations.forEach((conv) => {
+    rootConversations.forEach((conv) => {
       const segments = splitFolderPath(conv.folderPath);
       if (!segments.length) {
         root.conversations.push(conv);
@@ -1000,11 +1075,11 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
     };
 
     return finalize(root);
-  }, [compareConversations, compareFolderNodes, folderSettings, normalizedConversations]);
+  }, [compareConversations, compareFolderNodes, folderSettings, rootConversations]);
 
   const threadGroups = React.useMemo(() => {
     const groups = new Map();
-    normalizedConversations.forEach((conv) => {
+    rootConversations.forEach((conv) => {
       const key = resolveThreadGroupId(conv);
       if (!groups.has(key)) {
         groups.set(key, []);
@@ -1031,7 +1106,7 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
         }
         return (b.sortKey || 0) - (a.sortKey || 0);
       });
-  }, [compareConversations, normalizedConversations, resolveThreadGroupId, sortMode]);
+  }, [compareConversations, resolveThreadGroupId, rootConversations, sortMode]);
 
   const visibleConversations = React.useMemo(() => {
     if (!activeThreadFilter) return normalizedConversations;
@@ -1039,6 +1114,24 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
       (conv.threadTags || []).includes(activeThreadFilter),
     );
   }, [normalizedConversations, activeThreadFilter]);
+
+  const visibleRootConversations = React.useMemo(() => {
+    if (!activeThreadFilter) return rootConversations;
+    return rootConversations.filter((conv) =>
+      (conv.threadTags || []).includes(activeThreadFilter),
+    );
+  }, [activeThreadFilter, rootConversations]);
+
+  const visibleSubchatChildrenByParent = React.useMemo(() => {
+    if (!activeThreadFilter) return subchatChildrenByParent;
+    const visibleKeys = new Set(visibleConversations.map((conv) => conv.storageKey));
+    const map = new Map();
+    subchatChildrenByParent.forEach((items, parentKey) => {
+      const nextItems = items.filter((conv) => visibleKeys.has(conv.storageKey));
+      if (nextItems.length) map.set(parentKey, nextItems);
+    });
+    return map;
+  }, [activeThreadFilter, subchatChildrenByParent, visibleConversations]);
 
   const visibleFolderTree = React.useMemo(() => {
     if (!activeThreadFilter) return folderTree;
@@ -1063,7 +1156,7 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
       return node;
     };
     const root = createNode("", "");
-    visibleConversations.forEach((conv) => {
+    visibleRootConversations.forEach((conv) => {
       const segments = splitFolderPath(conv.folderPath);
       if (!segments.length) {
         root.conversations.push(conv);
@@ -1105,13 +1198,13 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
     compareFolderNodes,
     folderSettings,
     folderTree,
-    visibleConversations,
+    visibleRootConversations,
   ]);
 
   const visibleThreadGroups = React.useMemo(() => {
     if (!activeThreadFilter) return threadGroups;
     const groups = new Map();
-    visibleConversations.forEach((conv) => {
+    visibleRootConversations.forEach((conv) => {
       const key = resolveThreadGroupId(conv);
       if (!groups.has(key)) {
         groups.set(key, []);
@@ -1144,7 +1237,7 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
     resolveThreadGroupId,
     sortMode,
     threadGroups,
-    visibleConversations,
+    visibleRootConversations,
   ]);
 
   React.useEffect(() => {
@@ -1303,6 +1396,7 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
     setRenameTarget(conv);
     const base = extractSessionBasename(conv.storageKey) || conv.displayName || "";
     setRenameValue(base);
+    setRenamePrivacyMode(normalizeConversationPrivacyMode(conv.privacyMode));
   };
 
   const openMoveModal = (conv) => {
@@ -1337,6 +1431,7 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
   const closeRenameModal = () => {
     setRenameTarget(null);
     setRenameValue("");
+    setRenamePrivacyMode("default");
     setRenameSuggestBusy(false);
   };
 
@@ -1375,27 +1470,32 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
     }
   };
 
-  const renameConversationStorage = async (conv, nextBaseName) => {
+  const renameConversationStorage = async (conv, nextBaseName, nextPrivacyMode) => {
     if (!conv || apiUnavailable) return;
     const baseName = sanitizeBaseName(nextBaseName);
     if (!baseName) return;
     const folderPath = getFolderPathFromName(conv.storageKey);
     const newName = folderPath ? `${folderPath}/${baseName}` : baseName;
-    if (!newName || newName === conv.storageKey) return;
+    const privacyMode = normalizeConversationPrivacyMode(nextPrivacyMode);
+    const currentPrivacyMode = normalizeConversationPrivacyMode(conv.privacyMode);
+    const nameChanged = Boolean(newName && newName !== conv.storageKey);
+    const privacyChanged = privacyMode !== currentPrivacyMode;
+    if (!nameChanged && !privacyChanged) return;
     try {
       await axios.post(`/api/conversations/${encodeURIComponent(conv.storageKey)}/rename`, {
-        new_name: newName,
+        new_name: nameChanged ? newName : conv.storageKey,
+        privacy_mode: privacyMode,
       });
       setCustomOrder((prev) => {
         const current = Number(prev?.[conv.storageKey]);
         if (!Number.isFinite(current)) return prev;
         const next = { ...(prev || {}) };
         delete next[conv.storageKey];
-        next[newName] = current;
+        next[nameChanged ? newName : conv.storageKey] = current;
         return next;
       });
       await fetchConversations();
-      if (state.sessionId === conv.storageKey) {
+      if (nameChanged && state.sessionId === conv.storageKey) {
         setState((prev) => ({
           ...prev,
           sessionId: newName,
@@ -1617,7 +1717,7 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
 
   const submitRename = async () => {
     if (!renameTarget) return;
-    await renameConversationStorage(renameTarget, renameValue);
+    await renameConversationStorage(renameTarget, renameValue, renamePrivacyMode);
     closeRenameModal();
   };
 
@@ -2168,6 +2268,8 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
         setState((prev) => ({
           ...prev,
           conversation: [],
+          conversationTrimMeta: null,
+          history: [],
           sessionId: "",
           sessionName: "",
         }));
@@ -2190,10 +2292,20 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
     setActiveMenuKey(null);
   };
 
-  const renderConversationRow = (conv, depth = 0) => {
+  const renderConversationRow = (conv, depth = 0, options = {}) => {
+    const isSubchatChild = options.isSubchatChild === true;
     const indent = depth > 0 ? depth * 14 : 0;
     const threadColor = getThreadColor(conv.threadId || conv.storageKey);
+    const privacyMode = normalizeConversationPrivacyMode(conv.privacyMode);
+    const privacyTooltip = getConversationPrivacyTooltip(privacyMode);
     const isActive = state.sessionId === conv.storageKey;
+    const childConversations = isSubchatChild
+      ? []
+      : visibleSubchatChildrenByParent.get(conv.storageKey) || [];
+    const hasActiveChild = childConversations.some(
+      (child) => state.sessionId === child.storageKey,
+    );
+    const isBranchExpanded = childConversations.length > 0 && (isActive || hasActiveChild);
     const isDragging = draggingConversation?.storageKey === conv.storageKey;
     const isDropTarget = dragOverConversation === conv.storageKey;
     const isMenuOpen = activeMenuKey === conv.storageKey;
@@ -2215,25 +2327,31 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
             : "U";
     return (
       <div
-        key={`conv-${conv.storageKey}`}
-        className={`conversation-item folder-conversation${
-          isActive ? " is-active" : ""
-        }${isDragging ? " is-dragging" : ""}${isDropTarget ? " is-drop-target" : ""}${
-          isMenuOpen ? " menu-open" : ""
-        }`}
-        style={indent ? { paddingLeft: indent } : undefined}
-        draggable={!apiUnavailable}
-        onDragStart={(event) => handleConversationDragStart(event, conv)}
-        onDragEnd={handleConversationDragEnd}
-        onDragOver={(event) => handleConversationDragOver(event, conv)}
-        onDragLeave={(event) => handleConversationDragLeave(event, conv.storageKey)}
-        onDrop={(event) => handleConversationDrop(event, conv)}
+        key={`conv-branch-${conv.storageKey}`}
+        className={`conversation-branch${
+          isBranchExpanded ? " is-expanded" : ""
+        }${isSubchatChild ? " is-subchat-child" : ""}`}
+        style={{ "--conversation-thread-color": threadColor }}
       >
+        <div
+          className={`conversation-item folder-conversation${
+            isActive ? " is-active" : ""
+          }${isDragging ? " is-dragging" : ""}${isDropTarget ? " is-drop-target" : ""}${
+            isMenuOpen ? " menu-open" : ""
+          }${isSubchatChild ? " is-subchat-child" : ""}`}
+          style={indent ? { paddingLeft: indent } : undefined}
+          draggable={!apiUnavailable}
+          onDragStart={(event) => handleConversationDragStart(event, conv)}
+          onDragEnd={handleConversationDragEnd}
+          onDragOver={(event) => handleConversationDragOver(event, conv)}
+          onDragLeave={(event) => handleConversationDragLeave(event, conv.storageKey)}
+          onDrop={(event) => handleConversationDrop(event, conv)}
+        >
         <div className="conversation-main">
           <span className="thread-dot" style={{ backgroundColor: threadColor }} aria-hidden="true" />
           <button
             className="conversation-link"
-            onClick={() => loadConversation(conv.storageKey)}
+            onClick={() => loadConversation(conv.storageKey, conv.displayName)}
             title={conv.displayName}
             onDoubleClick={(event) => {
               event.preventDefault();
@@ -2243,6 +2361,19 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
           >
             {conv.displayName}
           </button>
+          {isSubchatChild && (
+            <span className="conversation-subchat-chip">
+              {conv.subchatKind || "subchat"}
+            </span>
+          )}
+          {privacyMode !== "default" && (
+            <span
+              className={`conversation-privacy-badge is-${privacyMode}`}
+              title={privacyTooltip}
+            >
+              {privacyMode}
+            </span>
+          )}
         </div>
         <div className="conv-actions">
           <button
@@ -2298,7 +2429,7 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
                     <button
                       type="button"
                       className="history-prop-link"
-                      title="Double click to rename"
+                      title="Double click to edit"
                       onDoubleClick={(event) => {
                         event.preventDefault();
                         event.stopPropagation();
@@ -2319,6 +2450,20 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
                     >
                       {conv.storageKey}
                     </button>
+                  </div>
+                  <div className="history-prop-row">
+                    <span
+                      className="history-prop-label"
+                      title={privacyTooltip}
+                    >
+                      Privacy
+                    </span>
+                    <span
+                      className={`conversation-privacy-badge is-${privacyMode}`}
+                      title={privacyTooltip}
+                    >
+                      {privacyMode}
+                    </span>
                   </div>
                   {conv.threadTags && conv.threadTags.length ? (
                     <div className="history-prop-row history-prop-row--stack">
@@ -2390,7 +2535,7 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
                     onClick={() => handleRename(conv)}
                     disabled={apiUnavailable}
                   >
-                    Rename
+                    Edit
                   </button>
                   <button type="button" onClick={() => handleMove(conv)} disabled={apiUnavailable}>
                     Move
@@ -2417,6 +2562,14 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
             )}
           </div>
         </div>
+        </div>
+        {isBranchExpanded && (
+          <div className="conversation-subchat-children">
+            {childConversations.map((child) =>
+              renderConversationRow(child, depth + 1, { isSubchatChild: true }),
+            )}
+          </div>
+        )}
       </div>
     );
   };
@@ -3081,7 +3234,7 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
         renderInBodyPortal(
         <div className="history-modal-overlay" onClick={closeRenameModal}>
           <div className="history-modal" onClick={(event) => event.stopPropagation()}>
-            <h3>Rename conversation</h3>
+            <h3>Edit conversation</h3>
             <div className="history-modal-body">
               <div className="history-modal-field">
                 <span>Folder</span>
@@ -3103,6 +3256,26 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
                   }}
                 />
               </label>
+              <label className="history-modal-field">
+                <span title={getConversationPrivacyTooltip(renamePrivacyMode)}>
+                  Privacy
+                </span>
+                <select
+                  value={renamePrivacyMode}
+                  title={getConversationPrivacyTooltip(renamePrivacyMode)}
+                  onChange={(event) =>
+                    setRenamePrivacyMode(
+                      normalizeConversationPrivacyMode(event.target.value),
+                    )
+                  }
+                >
+                  {CONVERSATION_PRIVACY_OPTIONS.map((option) => (
+                    <option key={`conversation-privacy-${option.value}`} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
               <div className="history-channel-row">
                 <button
                   type="button"
@@ -3111,6 +3284,9 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
                 >
                   {renameSuggestBusy ? "Suggesting..." : "Suggest name"}
                 </button>
+              </div>
+              <div className="history-modal-note">
+                {getConversationPrivacyTooltip(renamePrivacyMode)}
               </div>
               <div className="history-modal-note">
                 Folder path stays the same. Use Move to change folders.

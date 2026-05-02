@@ -30,12 +30,19 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "conversation_folders": {},
     "tool_display_mode": "console",
     "tool_link_behavior": "console",
+    "tool_policies": {},
     "live_transcript_enabled": True,
     "live_camera_default_enabled": False,
     "capture_retention_days": 7,
     "capture_default_sensitivity": "personal",
     "capture_allow_model_raw_image_access": True,
     "capture_allow_summary_fallback": True,
+    "privacy_filter_mode": "off",
+    "privacy_filter_model": "openai/privacy-filter",
+    "privacy_filter_min_score": 0.5,
+    "privacy_filter_max_chars": 60000,
+    "privacy_filter_route_private_mode": "off",
+    "privacy_filter_route_min_sensitivity": "protected",
     "default_workflow": "default",
     "enabled_workflow_modules": [],
     "device_display_name": "",
@@ -77,6 +84,13 @@ def save_settings(data: Dict[str, Any]) -> None:
     except Exception:
         current = {}
     settings = {**current, **data}
+    if isinstance(current.get("tool_policies"), dict) and isinstance(
+        data.get("tool_policies"), dict
+    ):
+        settings["tool_policies"] = {
+            **current.get("tool_policies", {}),
+            **data.get("tool_policies", {}),
+        }
     if "updated_at" not in data:
         from datetime import datetime, timezone
 

@@ -222,7 +222,7 @@ body.dark-mode .topbar-theme-toggle:hover {
 }
 
 .topbar-mobile-controls-wrap {
-  width: min(var(--center-rail-max), 100%);
+  width: min(var(--center-rail-width, var(--center-rail-max)), 100%);
   margin: 6px auto 0;
   padding: 0 12px;
   pointer-events: auto;

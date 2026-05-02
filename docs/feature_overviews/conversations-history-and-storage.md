@@ -3,3 +3,5 @@ conversations, history, and storage are the parts of float that make chats durab
 From a user's point of view, this shows up as conversation history, drafts, export and import options, and a predictable place for related files to live. The reason it matters is simple: if storage feels messy or fragile, the rest of the assistant becomes harder to trust, especially once conversations, uploads, and follow-up work start to accumulate.
 
 This part of the product is more practical than flashy, but it underpins almost everything else. The public storage references for the current shipped surface are `docs/data_directory.md` and `docs/architecture_map.md`.
+
+For long chats, Float keeps the full saved transcript even when the interface only renders the latest slice for performance. When a conversation needs to be shortened for continued work, that should happen as an explicit compaction step rather than by silently overwriting the original history.

@@ -62,7 +62,11 @@ export const buildAttachmentViewerItems = (items = []) =>
     uploadedAt: att.uploaded_at || null,
     contentHash: att.content_hash || null,
     caption: att.caption || "",
+    captionModel: att.caption_model || "",
     captionStatus: att.caption_status || "",
+    captionGeneratedAt: att.caption_generated_at || "",
+    captionUpdatedAt: att.caption_updated_at || "",
+    captionRecordedAt: att.caption_recorded_at || "",
     placeholderCaption: att.placeholder_caption === true,
     origin: att.origin || "",
     sourceSyncLabel: att.source_sync_label || "",
@@ -70,6 +74,14 @@ export const buildAttachmentViewerItems = (items = []) =>
     relativePath: att.relative_path || "",
     captureSource: att.capture_source || "",
     indexStatus: att.index_status || "",
+    indexWarning: att.index_warning || "",
+    indexedAt: att.indexed_at || "",
+    embeddingModel: att.embedding_model || "",
+    embeddingDim:
+      typeof att.embedding_dim === "number" && Number.isFinite(att.embedding_dim)
+        ? att.embedding_dim
+        : null,
+    clipIndexedAt: att.clip_indexed_at || "",
   }));
 
 export const describeAttachmentCard = (attachment, folderLabel) => {
@@ -114,9 +126,12 @@ export const describeAttachmentCard = (attachment, folderLabel) => {
       ? {
           key: "index",
           label: att.index_status,
-          title: att.index_warning
-            ? `index: ${att.index_status} (${att.index_warning})`
-            : `index: ${att.index_status}`,
+          title: [
+            `index: ${att.index_status}`,
+            att.embedding_model ? `model: ${att.embedding_model}` : "",
+            att.indexed_at ? `indexed: ${formatTimestamp(att.indexed_at)}` : "",
+            att.index_warning ? `warning: ${att.index_warning}` : "",
+          ].filter(Boolean).join(" | "),
           className: "attachment-badge attachment-badge--status",
         }
       : null,
@@ -124,7 +139,11 @@ export const describeAttachmentCard = (attachment, folderLabel) => {
       ? {
           key: "caption",
           label: att.caption_status,
-          title: `caption: ${att.caption_status}`,
+          title: [
+            `caption: ${att.caption_status}`,
+            att.caption_model ? `model: ${att.caption_model}` : "",
+            att.caption_recorded_at ? `date: ${formatTimestamp(att.caption_recorded_at)}` : "",
+          ].filter(Boolean).join(" | "),
           className: "attachment-badge attachment-badge--status",
         }
       : null,

@@ -11,6 +11,12 @@ import "./styles/theme.css";
 import "@livekit/components-styles";
 import axios from "axios";
 import { ensureServiceWorker } from "./utils/push";
+import {
+  CONVERSATION_WINDOW_STORAGE_KEY,
+  debugLog,
+  trimConversationMessagesForDom,
+} from "./utils/proxy";
+import { buildHistoryFromConversation } from "./utils/conversationHistory";
 import { shouldRefreshProviderModels } from "./utils/providerProbe";
 import { ensureDeviceAndToken } from "./utils/sync";
 import { isGptOssModel, isLocalRuntimeEntry } from "./utils/modelUtils";
@@ -54,13 +60,28 @@ const parseStoredInt = (value) => {
   return Number.isNaN(parsed) ? null : parsed;
 };
 
-const parseStoredConversation = (value) => {
-  if (!value) return [];
+const parseStoredConversationWindow = (value) => {
+  if (!value) return null;
   try {
     const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed : [];
+    return parsed && typeof parsed === "object" && parsed.truncated ? parsed : null;
   } catch {
-    return [];
+    return null;
+  }
+};
+
+const parseStoredConversation = (value, storedWindow = null) => {
+  if (!value) return { messages: [], trimMeta: null };
+  try {
+    const parsed = JSON.parse(value);
+    if (!Array.isArray(parsed)) return { messages: [], trimMeta: null };
+    const trimmed = trimConversationMessagesForDom(parsed, { source: "localStorage" });
+    return {
+      messages: trimmed.messages,
+      trimMeta: storedWindow || trimmed.meta,
+    };
+  } catch {
+    return { messages: [], trimMeta: null };
   }
 };
 
@@ -143,8 +164,14 @@ export const GlobalContext = createContext();
 const GlobalProvider = ({ children }) => {
   const [state, setState] = useState(() => {
     const storedConversation = localStorage.getItem("conversation");
+    const storedConversationWindow = parseStoredConversationWindow(
+      localStorage.getItem(CONVERSATION_WINDOW_STORAGE_KEY),
+    );
+    const storedConversationSnapshot = parseStoredConversation(
+      storedConversation,
+      storedConversationWindow,
+    );
     const storedSessionId = localStorage.getItem("sessionId");
-    const storedHistory = localStorage.getItem("history");
     const storedLevel = localStorage.getItem("approvalLevel") || "all";
     const storedTheme = localStorage.getItem("theme") || "light";
     const storedCustomThemes = parseStoredThemes(localStorage.getItem("customThemes"));
@@ -159,7 +186,7 @@ const GlobalProvider = ({ children }) => {
     const storedLocalModel =
       localStorage.getItem("localModel") || "mistral:7b";
     const storedTransformerModel =
-      localStorage.getItem("transformerModel") || "gpt-oss-20b";
+      localStorage.getItem("transformerModel") || "";
     const storedStaticModel =
       localStorage.getItem("staticModel") || "gpt-5.4-mini";
     const storedHarmonyFormatRaw = localStorage.getItem("harmonyFormat");
@@ -253,6 +280,7 @@ const GlobalProvider = ({ children }) => {
           "gpt-5",
           "gpt-5.1",
           "gpt-5.2",
+          "gpt-5.4",
         ];
         return models
           .filter(Boolean)
@@ -268,26 +296,14 @@ const GlobalProvider = ({ children }) => {
         ? isHarmonyPreferred(storedTransformerModel, storedApiModel)
         : storedHarmonyFormat;
 
-    // Ensure local history shape matches backend expectations: [{role, text}]
-    let initialHistory = [];
-    try {
-      const parsed = storedHistory ? JSON.parse(storedHistory) : [];
-      if (Array.isArray(parsed)) {
-        initialHistory = parsed.filter(
-          (h) =>
-            h &&
-            typeof h === "object" &&
-            (h.role === "user" || h.role === "ai") &&
-            typeof h.text === "string",
-        );
-      }
-    } catch {
-      initialHistory = [];
-    }
+    const initialHistory = buildHistoryFromConversation(
+      storedConversationSnapshot.messages,
+    );
 
     return {
       context: null, // Initial state for model context
-      conversation: parseStoredConversation(storedConversation),
+      conversation: storedConversationSnapshot.messages,
+      conversationTrimMeta: storedConversationSnapshot.trimMeta,
       history: initialHistory,
       sessionId: initialSessionId,
       sessionName: storedSessionName || defaultNameFromId(initialSessionId),
@@ -437,7 +453,7 @@ const GlobalProvider = ({ children }) => {
       } catch (err) {
         attempts += 1;
         if (err && err.code === "ECONNREFUSED") {
-          console.debug("API connection refused");
+          debugLog("API connection refused");
         }
         const delay = Math.min(1000 * 2 ** Math.max(attempts - 1, 0), 30000);
         if (attempts >= maxAttempts) {
@@ -592,7 +608,15 @@ const GlobalProvider = ({ children }) => {
 
   useEffect(() => {
     localStorage.setItem("conversation", JSON.stringify(state.conversation));
-  }, [state.conversation]);
+    if (state.conversationTrimMeta?.truncated) {
+      localStorage.setItem(
+        CONVERSATION_WINDOW_STORAGE_KEY,
+        JSON.stringify(state.conversationTrimMeta),
+      );
+    } else {
+      localStorage.removeItem(CONVERSATION_WINDOW_STORAGE_KEY);
+    }
+  }, [state.conversation, state.conversationTrimMeta]);
 
   // Persist conversation to server storage
   useEffect(() => {
@@ -613,11 +637,15 @@ const GlobalProvider = ({ children }) => {
           }
         } catch {}
       }
+      const clientWindow = state.conversationTrimMeta?.truncated
+        ? state.conversationTrimMeta
+        : null;
       axios
         .post(`/api/conversations/${state.sessionId}`, {
           name: state.sessionName,
           session_id: state.sessionId,
           messages: state.conversation,
+          ...(clientWindow ? { client_window: clientWindow } : {}),
         })
         .catch((err) => console.error("Failed to save conversation", err));
     }
@@ -626,6 +654,7 @@ const GlobalProvider = ({ children }) => {
     state.sessionId,
     state.sessionName,
     state.apiStatus,
+    state.conversationTrimMeta,
   ]);
 
   useEffect(() => {
@@ -708,6 +737,7 @@ const GlobalProvider = ({ children }) => {
           "gpt-5",
           "gpt-5.1",
           "gpt-5.2",
+          "gpt-5.4",
         ];
         return models
           .filter(Boolean)
@@ -1091,7 +1121,15 @@ const GlobalProvider = ({ children }) => {
 const rootElement = document.getElementById("root");
 
 if (rootElement) {
-  ReactDOM.createRoot(rootElement).render(
+  const rootState =
+    window.__FLOAT_REACT_ROOT__?.element === rootElement
+      ? window.__FLOAT_REACT_ROOT__
+      : {
+          element: rootElement,
+          root: ReactDOM.createRoot(rootElement),
+        };
+  window.__FLOAT_REACT_ROOT__ = rootState;
+  rootState.root.render(
     <React.StrictMode>
       <GlobalProvider>
         <App />

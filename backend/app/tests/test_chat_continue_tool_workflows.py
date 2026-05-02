@@ -1154,13 +1154,156 @@ def test_chat_continue_includes_structured_tool_outcome_prompt(monkeypatch, tmp_
     assert tool_messages
     tool_prompt = tool_messages[-1]
     assert tool_prompt.startswith("Use these tool results to continue your response.")
+    assert "Discovery-only note" in tool_prompt
+    assert "do not change durable state" in tool_prompt
     assert "Summary:" in tool_prompt
     assert "Tool result data:" in tool_prompt
-    assert '"write_file"' in tool_prompt
     assert '"total_count": 34' in tool_prompt
+    assert '"more_tools": 12' in tool_prompt
+    assert '"write_file"' not in tool_prompt
+    assert '"required_args"' not in tool_prompt
     assert "picture-in-picture" not in tool_prompt.lower()
     assert "[[tool_call:" not in " ".join(
         str(msg.get("content") or "") for msg in ctx.messages if isinstance(msg, dict)
+    )
+
+
+def test_tool_events_prompt_text_uses_named_budget_policy():
+    from app import routes
+
+    payload = [
+        {
+            "name": "tool_info",
+            "status": "invoked",
+            "args": {"tool_name": "create_task"},
+            "result": {
+                "status": "invoked",
+                "data": {
+                    "schema": {
+                        f"field_{index}": {
+                            "type": "string",
+                            "description": "verbose schema detail " * 20,
+                        }
+                        for index in range(80)
+                    }
+                },
+            },
+        }
+    ]
+
+    text = routes._tool_events_prompt_text(payload, result_char_budget=1200)
+
+    assert routes.DEFAULT_TOOL_RESULT_PROMPT_CHAR_BUDGET == 4000
+    assert "Tool result data:" in text
+    assert len(text) < 1800
+    assert text.rstrip().endswith("```")
+    assert "..." in text
+
+
+def test_chat_continue_retries_discovery_only_persistence_claim(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLOAT_CONV_DIR", str(tmp_path))
+    conv_store = importlib.import_module("app.utils.conversation_store")
+    importlib.reload(conv_store)
+
+    conv_store.save_conversation(
+        "sess",
+        [
+            {
+                "id": "m1:user",
+                "role": "user",
+                "text": "save this for my food diary",
+            },
+            {"id": "m1", "role": "ai", "text": "[[tool_call:0]]"},
+        ],
+    )
+
+    from app import routes
+    from app.base_services import ModelContext
+
+    routes.llm_service.contexts = {"default": ModelContext(system_prompt="")}
+    calls = []
+
+    def fake_generate(
+        prompt,
+        session_id=None,
+        model=None,
+        attachments=None,
+        context=None,
+        **kwargs,
+    ):
+        calls.append(context)
+        if len(calls) == 1:
+            return {
+                "text": "Logged for the food diary.",
+                "thought": "",
+                "tools_used": [
+                    {
+                        "name": "tool_help",
+                        "status": "invoked",
+                        "args": {"tool_name": "remember"},
+                        "result": {"status": "invoked", "ok": True},
+                    }
+                ],
+                "metadata": {},
+            }
+        return {
+            "text": "Saved to memory.",
+            "thought": "",
+            "tools_used": [
+                {
+                    "name": "remember",
+                    "status": "invoked",
+                    "args": {
+                        "key": "food_diary",
+                        "value": "User asked to save this for the food diary.",
+                    },
+                    "result": {"status": "invoked", "ok": True},
+                }
+            ],
+            "metadata": {},
+        }
+
+    monkeypatch.setattr(routes.llm_service, "generate", fake_generate)
+
+    app = importlib.import_module("app.main").app
+    app.state.pending_tools = {}
+    client = TestClient(app)
+    resp = client.post(
+        "/chat/continue",
+        json={
+            "session_id": "sess",
+            "message_id": "m1",
+            "model": None,
+            "tools": [
+                {
+                    "id": "tool-1",
+                    "name": "tool_help",
+                    "args": {"tool_name": "remember"},
+                    "result": {
+                        "status": "invoked",
+                        "ok": True,
+                        "data": {"tools": [{"name": "remember"}]},
+                    },
+                    "status": "invoked",
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["message"] == "Saved to memory."
+    assert payload["metadata"]["post_discovery_persistence_retry"] is True
+    assert [tool["name"] for tool in payload["tools_used"]] == ["remember"]
+    assert len(calls) == 2
+    retry_messages = calls[1].messages
+    assert any(
+        isinstance(message, dict)
+        and (message.get("metadata") or {}).get("turn_message_key")
+        == "post_discovery_action"
+        for message in retry_messages
     )
 
 
@@ -1617,10 +1760,13 @@ def test_effective_system_prompt_appends_json_tool_call_hint():
         response_format=None,
     )
 
+    assert "call help or tool_help with `{}`" in prompt
+    assert "do not invent `tool_name` or `failed_*` fields" in prompt
     assert (
-        'Tool call syntax for this turn: emit direct JSON only in the form {"tool":"tool_help","args":{}}.'
+        'Tool call syntax for this turn: emit direct JSON only in the form {"tool":"<exact_tool_name>","args":{...}}'
         in prompt
     )
+    assert '{"tool":"list_dir","args":{"path":"."}}' in prompt
     assert "<|channel|>commentary to=tool_help" not in prompt
 
 
@@ -1632,11 +1778,24 @@ def test_effective_system_prompt_appends_harmony_tool_call_hint():
         response_format="harmony",
     )
 
+    assert "call help or tool_help with `{}`" in prompt
     assert (
         "Tool call syntax for this turn: emit Harmony tool calls only in the form "
-        "<|channel|>commentary to=tool_help <|constrain|>json <|message|>{}."
+        "<|channel|>commentary to=<exact_tool_name> <|constrain|>json <|message|>{...}; "
+        "for example, <|channel|>commentary to=tool_help <|constrain|>json <|message|>{}."
     ) in prompt
     assert '{"tool":"tool_help","args":{}}' not in prompt
+
+
+def test_effective_system_prompt_keeps_empty_menu_guidance_when_base_mentions_tool_help():
+    from app import routes
+
+    prompt = routes._effective_system_prompt(
+        "Use tool_help and tool_info before guessing.",
+        response_format=None,
+    )
+
+    assert "call help or tool_help with `{}`" in prompt
 
 
 def test_effective_system_prompt_dedupes_existing_tool_call_hints():
@@ -1644,11 +1803,12 @@ def test_effective_system_prompt_dedupes_existing_tool_call_hints():
 
     base = (
         "Base prompt.\n\n"
-        'Tool call syntax for this turn: emit direct JSON only in the form {"tool":"tool_help","args":{}}. '
+        'Tool call syntax for this turn: emit direct JSON only in the form {"tool":"<exact_tool_name>","args":{...}}; for example, {"tool":"tool_help","args":{}} or {"tool":"list_dir","args":{"path":"."}}. '
         "Use exact tool identifiers and valid JSON only. "
         "Do not wrap JSON calls in Harmony markers.\n\n"
         "Tool call syntax for this turn: emit Harmony tool calls only in the form "
-        "<|channel|>commentary to=tool_help <|constrain|>json <|message|>{}. "
+        "<|channel|>commentary to=<exact_tool_name> <|constrain|>json <|message|>{...}; "
+        "for example, <|channel|>commentary to=tool_help <|constrain|>json <|message|>{}. "
         "Use exact tool identifiers and valid JSON in the message body only. "
         "Do not prepend standalone JSON tool calls outside the Harmony wrapper."
     )
@@ -1660,6 +1820,7 @@ def test_effective_system_prompt_dedupes_existing_tool_call_hints():
 
     assert prompt.count("Tool call syntax for this turn:") == 1
     assert '{"tool":"tool_help","args":{}}' in prompt
+    assert '{"tool":"list_dir","args":{"path":"."}}' in prompt
     assert "<|channel|>commentary to=tool_help" not in prompt
 
 

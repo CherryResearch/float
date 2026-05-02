@@ -287,15 +287,40 @@ body.dark-mode .sidebar-header {
 
 /* Right header: keep the controls grouped on the right, with title to the right of the button */
 .right-header {
-  justify-content: flex-end;
-  flex-wrap: wrap;
-  gap: 8px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
 }
-.right-header .stream-toggle { order: 1; }
-.right-header h2 { order: 2; }
-.right-header .console-permission-control { order: 3; }
-.right-header .console-hidden-btn { order: 4; }
-.right-header .refresh-btn { order: 5; }
+
+.right-header-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+  width: 100%;
+}
+
+.right-header-controls-scroll {
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+  width: 100%;
+}
+
+.right-header-controls-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+.right-header-controls-scroll-content {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: max-content;
+  width: max-content;
+  justify-content: flex-end;
+}
 
 .console-permission-control {
   display: inline-flex;
@@ -305,6 +330,8 @@ body.dark-mode .sidebar-header {
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--color-text-muted);
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .console-permission-control label {
@@ -312,7 +339,7 @@ body.dark-mode .sidebar-header {
 }
 
 .console-permission-select {
-  border-radius: 999px;
+  border-radius: 8px;
   border: 1px solid color-mix(in oklab, var(--glass-border) 70%, transparent);
   background: color-mix(in oklab, var(--glass-tint) 85%, transparent);
   color: var(--color-text);
@@ -335,7 +362,7 @@ body.dark-mode .sidebar-header {
 /* Styled pause/resume button to match app hover affordances */
 .stream-toggle {
   padding: 4px 10px;
-  border-radius: 999px;
+  border-radius: 8px;
   border: 1px solid var(--glass-border);
   background: var(--glass-tint);
   color: var(--color-text);
@@ -1018,6 +1045,35 @@ body.dark-mode .folder-row:hover {
   gap: 4px;
 }
 
+.conversation-branch {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.conversation-subchat-children {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 0 0 2px 10px;
+  padding-left: 12px;
+}
+
+.conversation-subchat-children::before {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 0;
+  bottom: 2px;
+  width: 3px;
+  border-radius: 999px;
+  background: var(--conversation-thread-color, var(--color-lavender));
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--glass-border) 54%, transparent);
+  opacity: 0.88;
+}
+
 .conversation-item {
   display: flex;
   align-items: flex-start;
@@ -1066,6 +1122,18 @@ body.dark-mode .conversation-item.is-active {
     color-mix(in oklab, var(--theme-warm-black) 18%, var(--glass-tint) 82%);
 }
 
+.conversation-item.is-subchat-child {
+  padding-top: 5px;
+  padding-bottom: 5px;
+  background:
+    linear-gradient(
+      120deg,
+      color-mix(in oklab, var(--color-lavender) 10%, transparent),
+      transparent 62%
+    ),
+    color-mix(in oklab, var(--glass-tint) 58%, transparent);
+}
+
 .conversation-item.is-dragging {
   opacity: 0.6;
   cursor: grabbing;
@@ -1085,6 +1153,8 @@ body.dark-mode .conversation-item.is-active {
   align-items: center;
   gap: 6px;
   flex: 1 1 auto;
+  min-width: 0;
+  flex-wrap: wrap;
 }
 
 .thread-dot {
@@ -1287,6 +1357,48 @@ body.dark-mode .conversation-item.is-active {
 }
 .conversation-link:hover {
   text-decoration: underline;
+}
+
+.conversation-subchat-chip {
+  flex: 0 0 auto;
+  max-width: 56px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border: 1px solid color-mix(in oklab, var(--color-lavender) 30%, transparent);
+  border-radius: 999px;
+  padding: 1px 5px;
+  color: var(--color-text-muted);
+  font-size: 0.62rem;
+  font-style: italic;
+  line-height: 1.2;
+}
+
+.conversation-privacy-badge {
+  flex: 0 0 auto;
+  max-width: 84px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 82%, transparent);
+  border-radius: 999px;
+  padding: 1px 6px;
+  font-size: 0.62rem;
+  line-height: 1.25;
+  letter-spacing: 0.03em;
+  text-transform: lowercase;
+  color: var(--color-text-muted);
+  background: color-mix(in oklab, var(--glass-tint) 90%, transparent);
+}
+
+.conversation-privacy-badge.is-protected {
+  border-color: color-mix(in oklab, #f2c36d 42%, var(--glass-border) 58%);
+  color: color-mix(in oklab, #f2c36d 76%, var(--color-text) 24%);
+}
+
+.conversation-privacy-badge.is-secret {
+  border-color: color-mix(in oklab, #f28482 40%, var(--glass-border) 60%);
+  color: color-mix(in oklab, #f6a6a4 78%, var(--color-text) 22%);
 }
 
 .rename-btn:disabled,
@@ -1644,6 +1756,13 @@ body.dark-mode .conversation-item.is-active {
   color: var(--color-text-muted);
 }
 
+.agent-tool-body-title {
+  font-size: 0.82rem;
+  font-weight: 700;
+  letter-spacing: 0.015em;
+  color: var(--color-text);
+}
+
 .thought-item {
   background: transparent;
   border: none;
@@ -1791,7 +1910,7 @@ body.dark-mode .conversation-item.is-active {
 
 .console-hidden-btn {
   padding: 4px 10px;
-  border-radius: 999px;
+  border-radius: 8px;
   border: 1px solid var(--glass-border);
   background: color-mix(in oklab, var(--glass-tint) 85%, transparent);
   color: var(--color-text);
@@ -1818,12 +1937,418 @@ body.dark-mode .conversation-item.is-active {
   font-size: 0.82rem;
 }
 
+.agent-console-note--system {
+  border-color: color-mix(in oklab, var(--color-mint-green) 28%, var(--glass-border) 72%);
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in oklab, var(--color-mint-green) 12%, transparent),
+      color-mix(in oklab, var(--color-lavender) 10%, transparent)
+    ),
+    color-mix(in oklab, var(--glass-tint) 90%, transparent);
+  color: var(--color-text);
+}
+
+.agent-console-system-rail {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid color-mix(in oklab, var(--color-lavender) 28%, var(--glass-border) 72%);
+  border-radius: var(--radius-sm);
+  background:
+    linear-gradient(
+      145deg,
+      color-mix(in oklab, var(--color-mint-green) 10%, transparent),
+      transparent 58%
+    ),
+    color-mix(in oklab, var(--glass-tint) 90%, transparent);
+}
+
+.agent-console-system-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+.agent-console-system-card {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in oklab, var(--glass-border) 82%, transparent);
+  background: color-mix(in oklab, var(--glass-tint) 94%, transparent);
+  min-width: 0;
+}
+
+.agent-console-system-card[data-tone="online"],
+.agent-console-system-card[data-tone="connected"],
+.agent-console-system-card[data-tone="runtime"],
+.agent-console-system-card[data-tone="provider"] {
+  border-color: color-mix(in oklab, var(--color-lavender) 28%, var(--glass-border) 72%);
+}
+
+.agent-console-system-card[data-tone="loading"],
+.agent-console-system-card[data-tone="degraded"],
+.agent-console-system-card[data-tone="task"] {
+  border-color: color-mix(in oklab, #fbbf24 26%, var(--glass-border) 74%);
+}
+
+.agent-console-system-label {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-text-muted);
+}
+
+.agent-console-system-value {
+  font-size: 0.92rem;
+  font-weight: 700;
+  color: var(--color-text);
+  overflow-wrap: anywhere;
+}
+
+.agent-console-system-note {
+  font-size: 0.78rem;
+  line-height: 1.35;
+  color: var(--color-text-muted);
+  overflow-wrap: anywhere;
+}
+
+.agent-console-object-card {
+  position: relative;
+  min-width: 0;
+}
+
+.agent-console-object-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+  width: 100%;
+}
+
+.agent-console-object-title {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.agent-console-object-title h3 {
+  margin: 0;
+  font-size: 1rem;
+  text-transform: lowercase;
+  white-space: nowrap;
+  overflow: hidden;
+  overflow-wrap: normal;
+  text-overflow: ellipsis;
+}
+
+.agent-console-object-subtitle {
+  min-width: 0;
+  font-size: 0.72rem;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  overflow: hidden;
+  overflow-wrap: normal;
+  text-overflow: ellipsis;
+}
+
+.agent-console-object-actions {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 6px;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  justify-self: end;
+  min-width: 0;
+  max-width: min(100%, 22rem);
+  overflow: visible;
+  scrollbar-width: none;
+}
+
+.agent-console-object-actions::-webkit-scrollbar {
+  display: none;
+}
+
+.agent-console-object-body {
+  display: flex;
+  flex-direction: column;
+  gap: inherit;
+  min-width: 0;
+}
+
+.agent-console-object-card[data-click-toggle="true"] {
+  cursor: pointer;
+}
+
+.agent-console-object-card[data-click-toggle="true"]:focus-visible {
+  outline: 2px solid color-mix(in oklab, var(--color-accent) 50%, transparent);
+  outline-offset: 2px;
+}
+
+.agent-console-object-hover-preview {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  top: calc(100% + 4px);
+  z-index: 8;
+  display: none;
+  max-height: 4.5rem;
+  padding: 7px 9px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 82%, transparent);
+  background: color-mix(in oklab, var(--glass-tint-strong, var(--glass-tint)) 94%, transparent);
+  color: var(--color-text-muted);
+  box-shadow: var(--shadow-md);
+  font-size: 0.78rem;
+  font-style: italic;
+  line-height: 1.35;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.agent-console-object-card.is-collapsed:hover .agent-console-object-hover-preview,
+.agent-console-object-card.is-collapsed:focus-within .agent-console-object-hover-preview {
+  display: block;
+}
+
+.agent-background-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 86%, transparent);
+  background:
+    linear-gradient(
+      145deg,
+      color-mix(in oklab, var(--color-mint-green) 6%, transparent),
+      transparent 58%
+    ),
+    color-mix(in oklab, var(--glass-tint) 94%, transparent);
+}
+
+.agent-background-panel.agent-console-object-card,
+.agent-runtime-panel.agent-console-object-card,
+.agent-sync-panel.agent-console-object-card,
+.action-history-panel.agent-console-object-card {
+  overflow: visible;
+}
+
+.agent-background-panel[data-collapsed="true"] {
+  gap: 4px;
+  padding: 10px 12px 8px;
+}
+
+.agent-background-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+  width: 100%;
+}
+
+.agent-background-panel-title {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.agent-background-panel-title h3 {
+  margin: 0;
+  text-transform: lowercase;
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+
+.agent-background-panel-subtitle {
+  font-size: 0.72rem;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agent-background-panel-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: nowrap;
+  justify-content: flex-end;
+  flex: 0 0 auto;
+}
+
+.agent-console-pip-row {
+  display: flex;
+  align-items: stretch;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.agent-console-pip-row--compact {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 4px;
+  overflow-x: auto;
+  padding-bottom: 1px;
+  scrollbar-width: none;
+}
+
+.agent-console-pip-row--compact::-webkit-scrollbar {
+  display: none;
+}
+
+.agent-console-pip {
+  display: inline-flex;
+  flex: 1 1 140px;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 82%, transparent);
+  background: color-mix(in oklab, var(--glass-tint) 92%, transparent);
+}
+
+.agent-console-pip-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.agent-console-pip-light {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: currentColor;
+  box-shadow: 0 0 0 1px color-mix(in oklab, currentColor 55%, transparent);
+}
+
+.agent-console-pip--compact {
+  flex: 0 0 auto;
+  flex-direction: row;
+  align-items: center;
+  gap: 3px;
+  width: auto;
+  max-width: 52px;
+  min-width: 0;
+  min-height: 18px;
+  padding: 2px 4px;
+  line-height: 1.1;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+
+.agent-console-pip--compact .agent-console-pip-label {
+  font-size: 0.52rem;
+  flex: 0 0 auto;
+  max-width: 18px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-console-pip--compact .agent-console-pip-value {
+  font-size: 0.62rem;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  overflow-wrap: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-console-pip--compact .agent-console-pip-copy {
+  flex-direction: row;
+  align-items: baseline;
+  gap: 2px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.agent-console-pip--compact .agent-console-pip-light {
+  width: 6px;
+  height: 6px;
+}
+
+.agent-console-pip[data-tone="task"] {
+  border-color: color-mix(in oklab, #fbbf24 26%, var(--glass-border) 74%);
+  color: color-mix(in oklab, #fbbf24 76%, var(--color-text) 24%);
+}
+
+.agent-console-pip[data-tone="runtime"],
+.agent-console-pip[data-tone="provider"] {
+  border-color: color-mix(in oklab, var(--color-lavender) 28%, var(--glass-border) 72%);
+  color: color-mix(in oklab, var(--color-lavender) 76%, var(--color-text) 24%);
+}
+
+.agent-console-pip[data-tone="online"],
+.agent-console-pip[data-tone="connected"] {
+  border-color: color-mix(in oklab, var(--color-mint-green) 28%, var(--glass-border) 72%);
+  color: color-mix(in oklab, var(--color-mint-green) 80%, var(--color-text) 20%);
+}
+
+.agent-console-pip[data-tone="degraded"],
+.agent-console-pip[data-tone="loading"] {
+  border-color: color-mix(in oklab, #fbbf24 24%, var(--glass-border) 76%);
+  color: color-mix(in oklab, #fbbf24 76%, var(--color-text) 24%);
+}
+
+.agent-console-pip[data-tone="idle"] {
+  border-color: color-mix(in oklab, var(--glass-border) 82%, transparent);
+  color: var(--color-text-muted);
+}
+
+.agent-console-pip[data-tone="error"] {
+  border-color: color-mix(in oklab, var(--color-error) 45%, var(--glass-border) 55%);
+  color: var(--color-error);
+}
+
+.agent-console-pip-label {
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-text-muted);
+}
+
+.agent-console-pip-value {
+  font-size: 0.78rem;
+  line-height: 1.25;
+  font-weight: 600;
+  color: var(--color-text);
+  overflow-wrap: anywhere;
+}
+
+.agent-console-pip--compact .agent-console-pip-label,
+.agent-console-pip--compact .agent-console-pip-value {
+  color: inherit;
+}
+
+.agent-console-pip--compact .agent-console-pip-label {
+  opacity: 0.78;
+}
+
 .agent-sync-panel {
   display: flex;
   flex-direction: column;
   gap: 8px;
   padding: 12px;
-  border-radius: var(--radius-md);
+  border-radius: 8px;
   border: 1px solid color-mix(in oklab, var(--color-mint-green) 34%, var(--glass-border) 66%);
   background:
     linear-gradient(
@@ -1834,7 +2359,14 @@ body.dark-mode .conversation-item.is-active {
     color-mix(in oklab, var(--glass-tint) 90%, transparent);
 }
 
-.agent-sync-panel-header,
+.agent-sync-panel-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 6px;
+  min-width: 0;
+}
+
 .agent-sync-review-top {
   display: flex;
   justify-content: space-between;
@@ -1853,6 +2385,8 @@ body.dark-mode .conversation-item.is-active {
 .agent-sync-panel-title h3 {
   margin: 0;
   text-transform: lowercase;
+  white-space: nowrap;
+  overflow-wrap: normal;
 }
 
 .agent-sync-panel-subtitle,
@@ -1864,13 +2398,69 @@ body.dark-mode .conversation-item.is-active {
   letter-spacing: 0.04em;
 }
 
+.agent-sync-panel-subtitle {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  overflow-wrap: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .agent-sync-panel-actions,
 .agent-sync-review-actions {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   justify-content: flex-end;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.agent-sync-panel-actions {
+  max-width: 100%;
+}
+
+.agent-sync-panel[data-collapsed="true"] .agent-sync-panel-header {
+  grid-template-columns: minmax(0, 1fr);
+  align-items: center;
+}
+
+.agent-sync-panel[data-collapsed="true"] .agent-sync-panel-title {
+  flex-direction: row;
+  align-items: baseline;
+  gap: 8px;
+  overflow: hidden;
+  scrollbar-width: none;
+}
+
+.agent-sync-panel[data-collapsed="true"] .agent-sync-panel-title::-webkit-scrollbar {
+  display: none;
+}
+
+.agent-sync-panel[data-collapsed="true"] .agent-sync-panel-title h3 {
+  flex: 0 0 auto;
+}
+
+.agent-sync-panel[data-collapsed="true"] .agent-sync-panel-subtitle {
+  flex: 1 1 auto;
+}
+
+.agent-sync-panel[data-collapsed="true"] .agent-sync-panel-actions {
+  justify-self: end;
+  max-width: 100%;
+}
+
+.agent-sync-panel[data-collapsed="true"] .agent-sync-review-list,
+.agent-sync-panel[data-collapsed="true"] .agent-sync-review-history,
+.agent-sync-panel[data-collapsed="true"] .agent-sync-review-card {
+  display: none;
+}
+
+.agent-sync-panel-actions::-webkit-scrollbar,
+.agent-sync-review-actions::-webkit-scrollbar {
+  display: none;
 }
 
 .agent-sync-review-history,
@@ -1956,7 +2546,7 @@ body.dark-mode .conversation-item.is-active {
   flex-direction: column;
   gap: 8px;
   padding: 12px;
-  border-radius: var(--radius-md);
+  border-radius: 8px;
   border: 1px solid color-mix(in oklab, var(--color-lavender) 36%, var(--glass-border) 64%);
   background:
     linear-gradient(
@@ -1982,15 +2572,23 @@ body.dark-mode .action-history-panel {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  gap: 12px;
+  gap: 8px;
+  min-width: 0;
 }
 
 .action-history-header-actions {
   display: inline-flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 8px;
-  flex-wrap: wrap;
+  gap: 6px;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  scrollbar-width: none;
+  flex: 0 0 auto;
+}
+
+.action-history-header-actions::-webkit-scrollbar {
+  display: none;
 }
 
 .action-history-title {
@@ -2002,24 +2600,76 @@ body.dark-mode .action-history-panel {
 }
 
 .action-history-title-row {
-  display: inline-flex;
+  display: flex;
   align-items: center;
   gap: 8px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  width: 100%;
+  min-width: 0;
 }
 
 .action-history-panel.compact {
-  gap: 6px;
+  gap: 4px;
+  padding-bottom: 8px;
 }
 
 .action-history-panel.compact .action-history-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
   align-items: center;
+}
+
+.action-history-panel.compact .action-history-title {
+  flex: 1 1 auto;
+}
+
+.action-history-panel.compact .action-history-title-row {
+  flex-wrap: nowrap;
+  overflow: hidden;
+  scrollbar-width: none;
+}
+
+.action-history-panel.compact .action-history-title-row::-webkit-scrollbar {
+  display: none;
+}
+
+.action-history-inline-meta {
+  flex: 1 1 auto;
+  font-size: 0.72rem;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  min-width: 0;
+  overflow: hidden;
+  overflow-wrap: normal;
+  text-overflow: ellipsis;
+}
+
+.action-history-panel.compact .action-history-groups {
+  display: none;
+}
+
+.action-history-panel.compact .status-note {
+  display: none;
+}
+
+.action-history-panel.compact .agent-console-note {
+  display: none;
 }
 
 .action-history-header h3,
 .action-group-header h4 {
+  flex: 0 0 auto;
   margin: 0;
   text-transform: lowercase;
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+
+.action-history-panel.compact .action-history-header-actions {
+  justify-self: end;
+  max-width: 100%;
 }
 
 .action-history-groups {
@@ -2237,53 +2887,77 @@ body.dark-mode .agent-card {
 }
 
 .agent-card-header {
-  display: flex;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: flex-start;
   gap: 12px;
+  min-width: 0;
+  width: 100%;
 }
 
 .agent-card-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
+  display: grid;
+  justify-items: end;
+  gap: 6px;
+  flex: 0 1 auto;
+  min-width: 0;
   justify-content: flex-end;
+  max-width: 100%;
 }
 
 .agent-card-controls {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   justify-content: flex-end;
+  max-width: 100%;
+  overflow-x: visible;
+  scrollbar-width: none;
+}
+
+.agent-card-controls::-webkit-scrollbar,
+.agent-card-submeta::-webkit-scrollbar {
+  display: none;
 }
 
 .agent-card-control-btn {
-  border-radius: 999px;
+  border-radius: 8px;
   border: 1px solid color-mix(in oklab, var(--glass-border) 80%, transparent);
   background: color-mix(in oklab, var(--glass-tint) 90%, transparent);
   color: var(--color-text);
-  font-size: 0.7rem;
+  font-size: 0.64rem;
   letter-spacing: 0.04em;
   text-transform: uppercase;
-  padding: 2px 8px;
+  min-height: 22px;
+  padding: 1px 6px;
   cursor: pointer;
   white-space: nowrap;
   transition: transform 120ms ease, box-shadow 120ms ease, background-color 120ms ease;
 }
 
 .agent-card-control-symbol {
-  min-width: 1.95rem;
-  padding-inline: 0;
-  font-size: 0.85rem;
+  width: 1.65rem;
+  height: 1.65rem;
+  min-width: 1.65rem;
+  min-height: 1.65rem;
+  padding: 0;
+  border-radius: 999px;
+  font-size: 0.78rem;
   font-weight: 600;
   letter-spacing: 0;
   text-transform: none;
+  flex: 0 0 auto;
+}
+
+.agent-open-chat-btn {
+  max-width: 6.5rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .agent-card-control-btn:hover {
-  transform: translateY(-1px);
+  transform: none;
   box-shadow: var(--shadow-sm);
 }
 
@@ -2311,22 +2985,100 @@ body.dark-mode .agent-card {
 .agent-card.compact {
   padding: 10px 12px;
   gap: 6px;
+  overflow: visible;
 }
 
 .agent-card.compact .agent-card-header {
-  align-items: center;
+  align-items: flex-start;
+}
+
+.agent-card.compact .agent-card-actions {
+  flex: 0 1 auto;
+  max-width: 100%;
 }
 
 .agent-card-meta {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.agent-card-title-stack {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
 }
 
 .agent-card-meta h3 {
   margin: 0;
   font-size: 1rem;
   text-transform: lowercase;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-card-title-button {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  max-width: 100%;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  text-transform: inherit;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-card-title-button:hover {
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+.agent-card-title-button:focus-visible {
+  outline: 2px solid color-mix(in oklab, var(--color-accent) 55%, transparent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.agent-card-title-note {
+  font-size: 0.72rem;
+  line-height: 1.25;
+  color: var(--color-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-card.compact .agent-card-title-note {
+  position: absolute;
+  left: 0;
+  right: -7rem;
+  top: calc(100% + 5px);
+  z-index: 8;
+  display: none;
+  max-height: 2.2rem;
+  padding: 6px 8px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 80%, transparent);
+  background: color-mix(in oklab, var(--glass-tint-strong, var(--glass-tint)) 94%, transparent);
+  box-shadow: var(--shadow-sm);
+  pointer-events: none;
+}
+
+.agent-card.compact:hover .agent-card-title-note,
+.agent-card.compact:focus-within .agent-card-title-note {
+  display: block;
 }
 
 .agent-status-dot {
@@ -2339,27 +3091,95 @@ body.dark-mode .agent-card {
 .agent-card-submeta {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 8px;
+  flex-wrap: nowrap;
   font-size: 0.75rem;
   color: var(--color-text-muted);
   text-transform: uppercase;
   letter-spacing: 0.04em;
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: auto;
 }
 
 .agent-status-label {
   padding: 2px 6px;
   border-radius: 999px;
   border: 1px solid color-mix(in oklab, var(--glass-border) 85%, transparent);
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .agent-updated-at {
+  flex: 0 0 auto;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .agent-card-summary {
   margin: 0;
   font-size: 0.85rem;
   color: var(--color-text-muted);
+  overflow-wrap: anywhere;
+}
+
+.agent-card[role="button"] {
+  cursor: pointer;
+}
+
+.agent-card[role="button"]:focus-visible {
+  outline: 2px solid color-mix(in oklab, var(--color-accent) 55%, transparent);
+  outline-offset: 2px;
+}
+
+.agent-card-detail-stack {
+  display: grid;
+  gap: 6px;
+}
+
+.agent-card-detail-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 0.78rem;
+  color: var(--color-text-muted);
+}
+
+.agent-card-detail-note {
+  margin: 0;
+  font-size: 0.78rem;
+  color: var(--color-text-muted);
+}
+
+.agent-card-detail-label {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-text-muted);
+}
+
+.agent-card-redirect-form {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 78%, transparent);
+  border-radius: 8px;
+  background: color-mix(in oklab, var(--glass-tint) 90%, transparent);
+}
+
+.agent-card-redirect-form textarea,
+.agent-card-redirect-form input {
+  width: 100%;
+}
+
+.agent-card-redirect-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .agent-card-resources {
@@ -2397,10 +3217,12 @@ body.dark-mode .agent-card {
 }
 
 .agent-activity {
-  border: 1px solid color-mix(in oklab, var(--color-border) 70%, transparent);
+  position: relative;
+  border: 1px solid color-mix(in oklab, var(--color-border) 76%, transparent);
+  border-left: 3px solid color-mix(in oklab, var(--color-border) 80%, transparent);
   border-radius: var(--radius-sm);
   padding: 8px 10px;
-  background: color-mix(in oklab, var(--color-surface) 88%, var(--color-lavender) 12%);
+  background: color-mix(in oklab, var(--glass-tint) 92%, transparent);
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -2414,12 +3236,14 @@ body.dark-mode .agent-card {
 
 .agent-activity.proposed {
   border-color: color-mix(in oklab, var(--color-accent) 55%, var(--color-border) 45%);
-  background: color-mix(in oklab, var(--color-lavender) 32%, var(--color-surface) 68%);
+  border-left-color: color-mix(in oklab, var(--color-accent) 76%, var(--color-lavender) 24%);
+  background: color-mix(in oklab, var(--color-accent) 8%, var(--glass-tint) 92%);
 }
 
 .agent-activity.resolved {
   border-color: color-mix(in oklab, var(--color-border) 50%, transparent);
-  background: color-mix(in oklab, var(--color-surface) 94%, transparent 6%);
+  border-left-color: color-mix(in oklab, var(--color-border) 62%, transparent);
+  background: color-mix(in oklab, var(--glass-tint) 88%, transparent);
   opacity: 0.88;
 }
 
@@ -2430,45 +3254,86 @@ body.dark-mode .agent-card {
 }
 
 .agent-activity.focused {
-  background: color-mix(in oklab, var(--color-lavender) 38%, var(--color-surface) 62%);
+  background: color-mix(in oklab, var(--color-accent) 10%, var(--glass-tint) 90%);
   box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--color-accent) 45%, transparent);
   opacity: 1;
 }
 
 .agent-activity.agent-activity-tool {
-  background: color-mix(in oklab, var(--color-surface) 92%, var(--color-lavender) 8%);
-  border-color: color-mix(in oklab, var(--color-lavender) 45%, var(--color-border) 55%);
+  background: color-mix(in oklab, var(--glass-tint) 92%, transparent);
+  border-color: color-mix(in oklab, var(--glass-border) 82%, transparent);
+  border-left-color: color-mix(in oklab, var(--color-lavender) 55%, var(--glass-border) 45%);
+}
+
+.agent-activity.agent-activity-tool[data-tool-status="proposed"],
+.agent-activity.agent-activity-tool[data-tool-status="pending"] {
+  border-left-color: color-mix(in oklab, var(--color-lavender) 74%, var(--glass-border) 26%);
+  background: color-mix(in oklab, var(--color-lavender) 9%, var(--glass-tint) 91%);
+}
+
+.agent-activity.agent-activity-tool[data-tool-status="running"],
+.agent-activity.agent-activity-tool[data-tool-status="queued"] {
+  border-left-color: color-mix(in oklab, var(--color-primary) 68%, var(--glass-border) 32%);
+}
+
+.agent-activity.agent-activity-tool[data-tool-status="invoked"],
+.agent-activity.agent-activity-tool[data-tool-status="ok"],
+.agent-activity.agent-activity-tool[data-tool-status="success"],
+.agent-activity.agent-activity-tool[data-tool-status="complete"] {
+  border-left-color: color-mix(in oklab, var(--color-mint-green) 72%, var(--glass-border) 28%);
+  background: color-mix(in oklab, var(--color-mint-green) 7%, var(--glass-tint) 93%);
+}
+
+.agent-activity.agent-activity-tool[data-tool-status="error"],
+.agent-activity.agent-activity-tool[data-tool-status="failed"],
+.agent-activity.agent-activity-tool[data-tool-status="denied"],
+.agent-activity.agent-activity-tool[data-tool-status="timeout"] {
+  border-left-color: color-mix(in oklab, var(--color-error) 76%, var(--glass-border) 24%);
+  background: color-mix(in oklab, var(--color-error) 7%, var(--glass-tint) 93%);
 }
 
 .agent-activity.agent-activity-thought {
-  background: color-mix(in oklab, var(--color-mint-green) 26%, var(--glass-tint) 74%);
-  border-color: color-mix(in oklab, var(--color-mint-green) 60%, var(--glass-border) 40%);
+  background: color-mix(in oklab, var(--color-mint-green) 7%, var(--glass-tint) 93%);
+  border-color: color-mix(in oklab, var(--glass-border) 82%, transparent);
+  border-left-color: color-mix(in oklab, var(--color-mint-green) 68%, var(--glass-border) 32%);
 }
 
 .agent-activity.agent-activity-task {
-  background: color-mix(in oklab, var(--color-pear-green) 24%, var(--glass-tint) 76%);
-  border-color: color-mix(in oklab, var(--color-pear-green) 55%, var(--glass-border) 45%);
+  background: color-mix(in oklab, var(--color-pear-green) 7%, var(--glass-tint) 93%);
+  border-color: color-mix(in oklab, var(--glass-border) 82%, transparent);
+  border-left-color: color-mix(in oklab, var(--color-pear-green) 66%, var(--glass-border) 34%);
 }
 
 .agent-activity.agent-activity-message,
 .agent-activity.agent-activity-notification {
-  background: color-mix(in oklab, var(--color-lavender) 24%, var(--glass-tint) 76%);
-  border-color: color-mix(in oklab, var(--color-lavender) 60%, var(--glass-border) 40%);
+  background: color-mix(in oklab, var(--color-lavender) 7%, var(--glass-tint) 93%);
+  border-color: color-mix(in oklab, var(--glass-border) 82%, transparent);
+  border-left-color: color-mix(in oklab, var(--color-lavender) 62%, var(--glass-border) 38%);
 }
 
 .agent-activity.agent-activity-stream {
-  background: color-mix(in oklab, var(--color-lavender) 16%, var(--glass-tint) 84%);
-  border-color: color-mix(in oklab, var(--color-lavender) 40%, var(--glass-border) 60%);
+  background: color-mix(in oklab, var(--color-lavender) 6%, var(--glass-tint) 94%);
+  border-color: color-mix(in oklab, var(--glass-border) 82%, transparent);
+  border-left-color: color-mix(in oklab, var(--color-lavender) 48%, var(--glass-border) 52%);
 }
 
 .agent-activity-meta {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: nowrap;
   font-size: 0.75rem;
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: var(--color-text-muted);
+  min-width: 0;
+  line-height: 1.2;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.agent-activity-meta::-webkit-scrollbar {
+  display: none;
 }
 
 .agent-activity.resolved .agent-activity-meta {
@@ -2491,6 +3356,26 @@ body.dark-mode .agent-card {
   text-transform: none;
   letter-spacing: 0.01em;
   font-weight: 600;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agent-activity-name-button {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.agent-activity-name-button:hover {
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
 }
 
 .agent-activity-status {
@@ -2498,6 +3383,74 @@ body.dark-mode .agent-card {
   padding: 2px 6px;
   border-radius: 999px;
   color: var(--color-text);
+  white-space: nowrap;
+}
+
+.agent-tool-status-code {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 72%, transparent);
+  background: color-mix(in oklab, var(--glass-tint) 82%, transparent);
+  color: var(--color-text);
+  font-size: 0.68rem;
+  letter-spacing: 0.035em;
+  white-space: nowrap;
+}
+
+.agent-tool-status-code[data-tool-status="proposed"],
+.agent-tool-status-code[data-tool-status="pending"] {
+  background: color-mix(in oklab, var(--color-lavender) 26%, var(--glass-tint) 74%);
+}
+
+.agent-tool-status-code[data-tool-status="invoked"],
+.agent-tool-status-code[data-tool-status="ok"],
+.agent-tool-status-code[data-tool-status="success"],
+.agent-tool-status-code[data-tool-status="complete"] {
+  background: color-mix(in oklab, var(--color-mint-green) 28%, var(--glass-tint) 72%);
+}
+
+.agent-tool-status-code[data-tool-status="error"],
+.agent-tool-status-code[data-tool-status="failed"],
+.agent-tool-status-code[data-tool-status="denied"],
+.agent-tool-status-code[data-tool-status="timeout"] {
+  padding: 2px;
+  border-color: transparent;
+  background: transparent;
+}
+
+.agent-tool-status-code[data-tool-status="error"] .agent-tool-status-text,
+.agent-tool-status-code[data-tool-status="failed"] .agent-tool-status-text,
+.agent-tool-status-code[data-tool-status="denied"] .agent-tool-status-text,
+.agent-tool-status-code[data-tool-status="timeout"] .agent-tool-status-text {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.agent-tool-status-code[data-tool-status="error"] .agent-tool-status-pip,
+.agent-tool-status-code[data-tool-status="failed"] .agent-tool-status-pip,
+.agent-tool-status-code[data-tool-status="denied"] .agent-tool-status-pip,
+.agent-tool-status-code[data-tool-status="timeout"] .agent-tool-status-pip {
+  width: 0.62rem;
+  height: 0.62rem;
+  background: var(--color-error) !important;
+}
+
+.agent-tool-status-pip {
+  width: 0.48rem;
+  height: 0.48rem;
+  border-radius: 999px;
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--glass-border) 70%, transparent);
+  flex: 0 0 auto;
 }
 
 .agent-activity-toggle {
@@ -2518,7 +3471,7 @@ body.dark-mode .agent-card {
 }
 
 .agent-activity-toggle:hover {
-  transform: translateY(-1px);
+  transform: none;
   box-shadow: var(--shadow-sm);
 }
 
@@ -2535,12 +3488,86 @@ body.dark-mode .agent-card {
 .agent-activity-preview {
   font-size: 0.82rem;
   color: var(--color-text-muted);
+  font-style: italic;
   text-transform: none;
   letter-spacing: 0;
   display: -webkit-box;
-  -webkit-line-clamp: 2;
+  -webkit-line-clamp: 1;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+
+.agent-chat-group-line {
+  position: absolute;
+  left: 7px;
+  top: 7px;
+  bottom: 7px;
+  width: 4px;
+  border: 0;
+  border-radius: 999px;
+  padding: 0;
+  background: var(--agent-chat-color, var(--color-lavender));
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--glass-border) 64%, transparent);
+  cursor: pointer;
+}
+
+.agent-chat-group-line:hover,
+.agent-chat-group-line:focus-visible {
+  box-shadow:
+    0 0 0 1px color-mix(in oklab, var(--agent-chat-color, var(--color-lavender)) 55%, transparent),
+    0 0 12px color-mix(in oklab, var(--agent-chat-color, var(--color-lavender)) 35%, transparent);
+}
+
+.agent-tool-chat-group {
+  position: relative;
+  padding-left: 20px;
+}
+
+.agent-tool-chat-group > .agent-chat-group-line {
+  left: 6px;
+  top: 2px;
+  bottom: 2px;
+}
+
+.agent-tool-chat-group-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.agent-tool-chat-summary-card {
+  position: relative;
+  min-height: 58px;
+  padding-left: 22px;
+  border-color: color-mix(in oklab, var(--agent-chat-color, var(--color-lavender)) 42%, var(--glass-border) 58%);
+}
+
+.agent-tool-chat-summary-card .agent-chat-group-line {
+  left: 10px;
+  top: 10px;
+  bottom: 10px;
+}
+
+.agent-tool-chat-summary-copy {
+  min-width: 0;
+}
+
+.agent-tool-chat-summary-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.agent-tool-chat-summary-header strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-tool-chat-summary-preview {
+  margin: 5px 0 0;
 }
 
 .agent-activity-body {
@@ -2612,6 +3639,8 @@ body.dark-mode .agent-card {
   display: flex;
   gap: 6px;
   flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-start;
 }
 
 .agent-history-toggle {
@@ -2717,7 +3746,7 @@ body.dark-mode .agent-card {
   flex-direction: column;
   gap: 10px;
   padding: var(--space-md);
-  border-radius: var(--radius-md);
+  border-radius: 8px;
   border: 1px solid color-mix(in oklab, var(--glass-border) 80%, transparent);
   background:
     radial-gradient(
@@ -2736,9 +3765,26 @@ body.dark-mode .agent-card {
   -webkit-backdrop-filter: blur(18px) saturate(150%);
   position: relative;
   overflow: hidden;
-  position: sticky;
-  top: 0;
-  z-index: 2;
+  z-index: 1;
+}
+
+.agent-runtime-panel[data-collapsed="true"] {
+  gap: 6px;
+  padding: 12px;
+}
+
+.agent-runtime-panel[data-collapsed="true"] .runtime-panel-summary,
+.agent-runtime-panel[data-collapsed="true"] .runtime-panel-note,
+.agent-runtime-panel[data-collapsed="true"] .runtime-panel-warning,
+.agent-runtime-panel[data-collapsed="true"] .runtime-panel-error,
+.agent-runtime-panel[data-collapsed="true"] .runtime-model-row:not(.runtime-model-row--compact),
+.agent-runtime-panel[data-collapsed="true"] .runtime-provider-actions,
+.agent-runtime-panel[data-collapsed="true"] .runtime-context-row,
+.agent-runtime-panel[data-collapsed="true"] .runtime-context-estimate,
+.agent-runtime-panel[data-collapsed="true"] .runtime-stepper,
+.agent-runtime-panel[data-collapsed="true"] .runtime-meters,
+.agent-runtime-panel[data-collapsed="true"] .runtime-provider-logs-wrap {
+  display: none;
 }
 
 .agent-runtime-panel::after {
@@ -2747,10 +3793,8 @@ body.dark-mode .agent-card {
   inset: 0;
   border-radius: inherit;
   pointer-events: none;
-  background-image: var(--card-noise-texture);
-  background-size: 120px 120px;
-  mix-blend-mode: soft-light;
-  opacity: 0.05;
+  background: none;
+  opacity: 0;
 }
 
 .agent-runtime-panel > * {
@@ -2763,15 +3807,34 @@ body.dark-mode .agent-card {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+
+.runtime-model-row--compact {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 4px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.runtime-model-row--compact::-webkit-scrollbar {
+  display: none;
+}
+
+.runtime-model-row--compact .runtime-model-name {
+  flex: 0 0 auto;
 }
 
 .runtime-panel-actions {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
+  gap: 6px;
+  flex-wrap: nowrap;
   justify-content: flex-end;
+  flex: 0 0 auto;
+  min-width: 0;
 }
 
 .runtime-action-wrap {
@@ -2785,28 +3848,32 @@ body.dark-mode .agent-card {
   border: 1px solid var(--glass-border);
   background: color-mix(in oklab, var(--glass-tint) 92%, transparent);
   color: var(--color-text);
-  font-size: 0.7rem;
+  font-size: 0.64rem;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  padding: 4px 8px;
-  min-height: 30px;
+  padding: 2px 6px;
+  min-height: 24px;
   line-height: 1.2;
-  border-radius: 999px;
+  border-radius: 8px;
   cursor: pointer;
   transition: transform 120ms ease, box-shadow 120ms ease;
 }
 
 .runtime-action-symbol {
-  min-width: 1.95rem;
-  padding-inline: 0;
-  font-size: 0.9rem;
+  width: 1.65rem;
+  height: 1.65rem;
+  min-width: 1.65rem;
+  min-height: 1.65rem;
+  padding: 0;
+  border-radius: 999px;
+  font-size: 0.8rem;
   font-weight: 600;
   letter-spacing: 0;
   text-transform: none;
 }
 
 .runtime-action-btn:hover:enabled {
-  transform: translateY(-1px);
+  transform: none;
   box-shadow: 0 6px 16px rgba(0,0,0,0.15);
 }
 
@@ -2817,14 +3884,20 @@ body.dark-mode .agent-card {
 
 .runtime-panel-title {
   display: flex;
+  flex: 1 1 auto;
   flex-direction: column;
   gap: 2px;
+  min-width: 0;
 }
 
 .runtime-panel-title h3 {
   margin: 0;
   font-size: 1rem;
   text-transform: lowercase;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .runtime-panel-subtitle {
@@ -2832,6 +3905,11 @@ body.dark-mode .agent-card {
   letter-spacing: 0.04em;
   text-transform: uppercase;
   color: var(--color-text-muted);
+  min-width: 0;
+  overflow: hidden;
+  overflow-wrap: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .runtime-panel-status {
@@ -2839,6 +3917,12 @@ body.dark-mode .agent-card {
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--color-text-muted);
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  overflow-wrap: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .runtime-freshness-indicator {
@@ -3214,6 +4298,10 @@ body.dark-mode .agent-card {
   border: 1px solid color-mix(in oklab, var(--color-pear-green) 35%, transparent);
 }
 
+.runtime-panel-summary {
+  padding: 8px;
+}
+
 .runtime-meters {
   display: flex;
   flex-direction: column;
@@ -3296,10 +4384,8 @@ body.dark-mode .agent-card {
   inset: 0;
   border-radius: inherit;
   pointer-events: none;
-  background-image: var(--card-noise-texture);
-  background-size: 120px 120px;
-  mix-blend-mode: soft-light;
-  opacity: 0.05;
+  background: none;
+  opacity: 0;
 }
 
 .agent-tasks-panel > * {
@@ -3868,11 +4954,18 @@ body.dark-mode .task-composer-nudges button {
 
 .sidebar-header,
 .right-header,
+.right-header-title-row,
+.right-header-controls-scroll,
+.right-header-controls-scroll-content,
 .right-header h2,
 .console-permission-control,
 .console-permission-select,
 .agent-console-body,
 .agent-console-body > *,
+.agent-background-panel,
+.agent-background-panel *,
+.agent-console-pip-row,
+.agent-console-pip,
 .agent-runtime-panel,
 .agent-sync-panel,
 .agent-card,
@@ -3890,19 +4983,23 @@ body.dark-mode .task-composer-nudges button {
   padding-right: 4px;
 }
 
-.right-header {
-  align-items: flex-start;
+.agent-console-body > * {
+  flex: 0 0 auto;
 }
 
 .right-header h2 {
   flex: 1 1 auto;
-  overflow-wrap: anywhere;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: right;
 }
 
 .console-permission-control {
-  flex: 0 1 100%;
-  flex-wrap: wrap;
-  justify-content: flex-end;
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+  justify-content: flex-start;
 }
 
 .console-permission-select {
@@ -3929,7 +5026,8 @@ body.dark-mode .task-composer-nudges button {
     gap: 6px;
   }
 
-  .right-header h2,
+  .right-header-title-row,
+  .right-header-controls-scroll,
   .console-permission-control,
   .console-hidden-btn {
     width: 100%;
@@ -3942,4 +5040,174 @@ body.dark-mode .task-composer-nudges button {
   .console-hidden-btn {
     text-align: center;
   }
+}
+
+.agent-background-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid color-mix(in oklab, var(--glass-border) 70%, transparent);
+}
+
+.agent-background-reflection-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.agent-background-reflection-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 78%, transparent);
+  border-left: 3px solid color-mix(in oklab, var(--color-mint-green) 68%, var(--glass-border) 32%);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  background: color-mix(in oklab, var(--color-mint-green) 6%, var(--glass-tint) 94%);
+}
+
+.agent-background-reflection-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--color-text);
+}
+
+.agent-background-reflection-header strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-background-reflection-header time,
+.agent-background-reflection-event time {
+  color: var(--color-text-muted);
+  font-size: 0.75rem;
+  margin-left: auto;
+}
+
+.agent-background-reflection-preview {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: 0.84rem;
+  line-height: 1.35;
+  font-style: italic;
+}
+
+.agent-background-reflection-events {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.agent-background-reflection-event {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--color-text-muted);
+  font-size: 0.78rem;
+}
+
+.agent-background-reflection-event > span:not(.agent-resource-pill) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-background-composer-note {
+  margin: 0;
+  font-size: 0.78rem;
+  line-height: 1.35;
+  color: var(--color-text-muted);
+}
+
+.agent-background-composer-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.agent-background-composer-label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-text-muted);
+}
+
+.agent-background-composer-input {
+  width: 100%;
+  min-height: 78px;
+  resize: vertical;
+  border-radius: 8px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 76%, transparent);
+  background: color-mix(in oklab, var(--glass-tint) 88%, transparent);
+  color: var(--color-text);
+  padding: 8px 10px;
+  font: inherit;
+}
+
+.agent-background-composer-input:is(input, select) {
+  min-height: 34px;
+  resize: none;
+}
+
+.agent-background-composer-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(110px, 0.55fr);
+  gap: 8px;
+}
+
+.agent-background-composer-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: nowrap;
+}
+
+.agent-background-compose-buttons {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.agent-background-compose-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 30px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  font: inherit;
+}
+
+.agent-background-compose-trigger:hover {
+  color: var(--color-text);
+}
+
+.agent-background-compose-rule {
+  flex: 1 1 auto;
+  line-height: 1;
+  opacity: 0.7;
+  letter-spacing: 0;
+}
+
+.agent-background-compose-plus {
+  flex: 0 0 auto;
+  min-width: 1ch;
+  font-weight: 700;
+  color: var(--color-text);
 }

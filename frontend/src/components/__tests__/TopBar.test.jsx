@@ -75,6 +75,18 @@ describe("TopBar local runtime entries", () => {
       if (url === "/api/models/registered") {
         return Promise.resolve({ data: { models: [] } });
       }
+      if (url === "/api/transformers/models") {
+        return Promise.resolve({ data: { models: ["gemma-4-26B-A4B-it"] } });
+      }
+      if (url === "/api/llm/server/models") {
+        return Promise.resolve({
+          data: {
+            models: ["gpt-oss-20b"],
+            loaded_model: "gpt-oss-20b",
+            reachable: true,
+          },
+        });
+      }
       if (url === "/api/llm/provider/models") {
         return Promise.resolve({
           data: {
@@ -135,6 +147,42 @@ describe("TopBar local runtime entries", () => {
     ).toBeInTheDocument();
   });
 
+  it("clears carried-over history when starting a new chat session", async () => {
+    const { setState } = renderTopBar({
+      history: [{ role: "user", text: "stale question" }],
+      conversation: [{ role: "user", text: "stale question" }],
+      conversationTrimMeta: { truncated: true },
+    });
+
+    await act(async () => {
+      fireEvent.doubleClick(screen.getByRole("tab", { name: "chat" }));
+    });
+
+    const previousState = {
+      ...baseState,
+      history: [{ role: "user", text: "stale question" }],
+      conversation: [{ role: "user", text: "stale question" }],
+      conversationTrimMeta: { truncated: true },
+    };
+    const nextState = setState.mock.calls
+      .map(([updater]) =>
+        typeof updater === "function" ? updater(previousState) : updater,
+      )
+      .find(
+        (candidate) =>
+          candidate &&
+          Array.isArray(candidate.conversation) &&
+          candidate.conversation.length === 0 &&
+          Array.isArray(candidate.history) &&
+          candidate.history.length === 0 &&
+          /^sess-\d+$/.test(String(candidate.sessionId || "")),
+      );
+    expect(nextState).toBeTruthy();
+    expect(nextState.conversation).toEqual([]);
+    expect(nextState.history).toEqual([]);
+    expect(nextState.sessionId).toMatch(/^sess-\d+$/);
+  });
+
   it("checks provider runtime status endpoint when local runtime marker is selected", async () => {
     renderTopBar({ localModel: "lmstudio" });
 
@@ -162,6 +210,9 @@ describe("TopBar local runtime entries", () => {
       }
       if (url === "/api/models/registered") {
         return Promise.resolve({ data: { models: [] } });
+      }
+      if (url === "/api/transformers/models") {
+        return Promise.resolve({ data: { models: ["gemma4:e4b"] } });
       }
       if (url === "/api/llm/provider/models") {
         providerModelPolls += 1;
@@ -260,7 +311,6 @@ describe("TopBar local runtime entries", () => {
   });
 
   it("keeps server model selection visible and probes model inventory endpoints", async () => {
-    global.fetch = vi.fn().mockResolvedValue({ ok: true, status: 200 });
     renderTopBar({
       backendMode: "server",
       localModel: "lmstudio",
@@ -272,7 +322,7 @@ describe("TopBar local runtime entries", () => {
       "http://127.0.0.1:1234",
     );
     const select = await screen.findByRole("combobox");
-    expect(select).toHaveDisplayValue("gpt-oss-20b");
+    expect(select).toHaveDisplayValue("\u25cf gpt-oss-20b");
 
     fireEvent.change(select, { target: { value: "Llama-3.1-8B" } });
 
@@ -282,13 +332,52 @@ describe("TopBar local runtime entries", () => {
       });
     });
     await waitFor(() => {
-      expect(global.fetch).toHaveBeenCalledWith(
-        "http://127.0.0.1:1234/v1/models",
-        { method: "GET" },
-      );
+      expect(axiosMocks.get).toHaveBeenCalledWith("/api/llm/server/models", {
+        params: { server_url: "http://127.0.0.1:1234" },
+      });
     });
-    const calledUrls = global.fetch.mock.calls.map(([url]) => url);
-    expect(calledUrls).not.toContain("http://127.0.0.1:1234/health");
-    expect(calledUrls).not.toContain("http://127.0.0.1:1234");
+    expect(
+      screen.getByRole("option", { name: "gemma-4-26B-A4B-it" }),
+    ).toBeInTheDocument();
+  });
+
+  it("offers the loaded server model and clears stale static selections", async () => {
+    axiosMocks.get.mockImplementation((url) => {
+      if (url === "/api/settings") {
+        return Promise.resolve({ data: { devices: [], default_device: null } });
+      }
+      if (url === "/api/models/registered") {
+        return Promise.resolve({ data: { models: [] } });
+      }
+      if (url === "/api/transformers/models") {
+        return Promise.resolve({ data: { models: [] } });
+      }
+      if (url === "/api/llm/server/models") {
+        return Promise.resolve({
+          data: {
+            models: ["gemma-4-26B-A4B-it"],
+            loaded_model: "gemma-4-26B-A4B-it",
+            reachable: true,
+          },
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    const { setState, state } = renderTopBar({
+      backendMode: "server",
+      transformerModel: "gpt-oss-20b",
+      serverUrl: "http://127.0.0.1:1234",
+    });
+
+    expect(
+      await screen.findByRole("option", { name: "\u25cf gemma-4-26B-A4B-it" }),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      const updaterCall = setState.mock.calls.find(([arg]) => {
+        if (typeof arg !== "function") return false;
+        return arg(state).transformerModel === "gemma-4-26B-A4B-it";
+      });
+      expect(updaterCall).toBeTruthy();
+    });
   });
 });

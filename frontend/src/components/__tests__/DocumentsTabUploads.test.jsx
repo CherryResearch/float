@@ -43,6 +43,30 @@ describe("DocumentsTab upload helpers", () => {
     expect(card.secondaryMeta.join(" | ")).toContain("uploads/hash-1/bails.jpg");
   });
 
+  it("passes caption and index provenance into viewer items", () => {
+    const attachment = {
+      content_hash: "hash-2",
+      filename: "desk.png",
+      url: "/api/attachments/hash-2/desk.png",
+      caption: "A desk with a notebook.",
+      caption_model: "local-captioner",
+      caption_status: "generated",
+      caption_generated_at: "2026-04-23T17:20:00Z",
+      index_status: "indexed",
+      indexed_at: "2026-04-23T17:21:00Z",
+      embedding_model: "clip:ViT-B-32",
+      embedding_dim: 512,
+    };
+
+    expect(buildAttachmentViewerItems([attachment])[0]).toMatchObject({
+      captionModel: "local-captioner",
+      captionGeneratedAt: "2026-04-23T17:20:00Z",
+      indexedAt: "2026-04-23T17:21:00Z",
+      embeddingModel: "clip:ViT-B-32",
+      embeddingDim: 512,
+    });
+  });
+
   it("matches focused docs by absolute file path when opening from work history links", () => {
     const docs = [
       {

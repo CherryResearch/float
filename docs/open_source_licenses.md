@@ -2,6 +2,8 @@
 
 Purpose: track every open source license used by Float (runtime, dev, and bundled services). This is a living document; complete before launch.
 
+Status note (2026-04-13): dependency versions below are aligned with the direct dependency pins in `pyproject.toml` and `frontend/package.json`, but most licenses are still marked `TBD` until the audit workflow at the bottom is run.
+
 ## Project license
 - Float repository: GNU Affero General Public License v3.0 only (see `LICENSE`).
 - External contribution ownership is governed separately by `CLA.md` and
@@ -38,8 +40,8 @@ Purpose: track every open source license used by Float (runtime, dev, and bundle
 | soundfile | ^0.12.1 | TBD | runtime |
 | mcp | ^1.12.2 | TBD | runtime (fastmcp extra) |
 | langextract | ^1.0.2 | TBD | runtime |
-| transformers | ^4.55.0 | TBD | runtime |
-| huggingface-hub | ^0.34.3 | TBD | runtime (hf-xet, hf-transfer extras) |
+| transformers | ^5.5.0 | TBD | runtime |
+| huggingface-hub | ^1.5.0 | TBD | runtime |
 | openai-harmony | 0.0.3 | TBD | runtime |
 | icalendar | ^5.0.11 | TBD | runtime |
 | python-dateutil | ^2.9.0 | TBD | runtime |
@@ -57,6 +59,9 @@ Purpose: track every open source license used by Float (runtime, dev, and bundle
 | chromadb | ^1.1.0 | TBD | runtime |
 | mcp-server | ^0.1.4 | TBD | runtime |
 | accelerate | ^1.10.1 | TBD | runtime |
+| ipykernel | ^6.30.1 | TBD | dev/notebooks |
+| playwright | ^1.58.0 | TBD | runtime/dev computer-use |
+| pywinauto | ^0.6.9 | TBD | optional Windows desktop runtime |
 
 ## Python dev dependencies
 | Package | Version | License | Notes |
@@ -104,8 +109,8 @@ Purpose: track every open source license used by Float (runtime, dev, and bundle
 ## Runtime services and external components (verify licenses)
 - LiveKit server and SDKs
 - Pipecat (and any plugins used for turn detection)
-- Chroma
-- Weaviate
+- Chroma (default local vector mirror)
+- Weaviate (optional vector backend)
 - Celery + Redis
 - Hugging Face model artifacts downloaded into `data/models/` (legacy `models/` folders may still appear during migration)
 - espeak-ng (system dependency for Kokoro TTS on some platforms)

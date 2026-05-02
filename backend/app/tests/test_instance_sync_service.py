@@ -11,6 +11,7 @@ def _load_modules():
     import app.services.instance_sync_service as sync_module
     from app.services.instance_sync_service import (
         InstanceSyncService,
+        RemoteFloatClient,
         _write_conversation_snapshot,
     )
     from app.utils import (
@@ -18,6 +19,7 @@ def _load_modules():
         calendar_store,
         conversation_store,
         memory_store,
+        theme_store,
         user_settings,
     )
     from app.utils.graph_store import GraphStore
@@ -25,10 +27,12 @@ def _load_modules():
 
     return {
         "InstanceSyncService": InstanceSyncService,
+        "RemoteFloatClient": RemoteFloatClient,
         "_write_conversation_snapshot": _write_conversation_snapshot,
         "calendar_store": calendar_store,
         "conversation_store": conversation_store,
         "memory_store": memory_store,
+        "theme_store": theme_store,
         "user_settings": user_settings,
         "blob_store": blob_store,
         "GraphStore": GraphStore,
@@ -45,6 +49,8 @@ def _configure_paths(tmp_path, monkeypatch):
     calendar_dir.mkdir(parents=True, exist_ok=True)
     blobs_dir = tmp_path / "blobs"
     blobs_dir.mkdir(parents=True, exist_ok=True)
+    themes_dir = tmp_path / "themes"
+    themes_dir.mkdir(parents=True, exist_ok=True)
     files_dir = tmp_path / "data" / "files"
     files_dir.mkdir(parents=True, exist_ok=True)
     for dirname in ("uploads", "captured", "screenshots", "downloaded", "workspace"):
@@ -57,6 +63,7 @@ def _configure_paths(tmp_path, monkeypatch):
         "USER_SETTINGS_PATH",
         tmp_path / "user_settings.json",
     )
+    monkeypatch.setattr(modules["theme_store"], "THEMES_DIR", themes_dir)
     monkeypatch.setattr(modules["blob_store"], "BLOBS_DIR", blobs_dir)
     monkeypatch.setattr(modules["sync_module"], "BLOBS_DIR", blobs_dir)
     monkeypatch.setattr(
@@ -159,6 +166,301 @@ def test_merge_snapshot_renames_conversation_and_updates_portable_state(
     assert user_settings.load_settings()["theme"] == "dark"
     assert user_settings.load_settings()["tool_display_mode"] == "inline"
     assert calendar_store.load_event("evt-1")["title"] == "Review"
+
+
+def test_settings_sync_includes_and_merges_custom_visual_themes(tmp_path, monkeypatch):
+    modules = _configure_paths(tmp_path, monkeypatch)
+    service = modules["InstanceSyncService"]()
+    theme_store = modules["theme_store"]
+    user_settings = modules["user_settings"]
+    slots = {
+        "c1Light": "#d6f5dd",
+        "c1Med": "#3c8f5a",
+        "c1Dark": "#173927",
+        "c2Light": "#f4efc7",
+        "c2Med": "#c6a93e",
+        "c2Dark": "#5e4b12",
+        "veryLight": "#fcfff8",
+        "veryDark": "#08110a",
+    }
+    user_settings.save_settings(
+        {
+            "theme": "dark",
+            "visual_theme": "forest-glass",
+            "updated_at": "2026-04-01T00:00:00+00:00",
+        }
+    )
+    theme_store.save_theme(
+        theme_id="forest-glass",
+        label="Forest Glass",
+        slots=slots,
+    )
+
+    manifest = service.build_manifest(["settings"])
+    snapshot = service.build_snapshot(["settings"])
+
+    settings_item = manifest["sections"]["settings"]["items"][0]
+    assert settings_item["sync_id"] == "settings"
+    assert settings_item["themes"] == 1
+    settings_snapshot = snapshot["sections"]["settings"]
+    assert settings_snapshot["data"]["visual_theme"] == "forest-glass"
+    assert settings_snapshot["themes"][0]["id"] == "forest-glass"
+
+    theme_store.delete_theme("forest-glass")
+    user_settings.save_settings(
+        {
+            "theme": "light",
+            "visual_theme": "spring",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        }
+    )
+
+    result = service.merge_snapshot(snapshot)
+
+    assert result["sections"]["settings"]["applied"] == 2
+    assert user_settings.load_settings()["visual_theme"] == "forest-glass"
+    assert theme_store.list_themes() == [
+        {
+            "id": "forest-glass",
+            "label": "Forest Glass",
+            "slots": slots,
+        }
+    ]
+
+
+def test_settings_sync_selects_imported_custom_theme_when_settings_are_newer(
+    tmp_path, monkeypatch
+):
+    modules = _configure_paths(tmp_path, monkeypatch)
+    service = modules["InstanceSyncService"]()
+    theme_store = modules["theme_store"]
+    user_settings = modules["user_settings"]
+    slots = {
+        "c1Light": "#d6f5dd",
+        "c1Med": "#3c8f5a",
+        "c1Dark": "#173927",
+        "c2Light": "#f4efc7",
+        "c2Med": "#c6a93e",
+        "c2Dark": "#5e4b12",
+        "veryLight": "#fcfff8",
+        "veryDark": "#08110a",
+    }
+    user_settings.save_settings(
+        {
+            "theme": "light",
+            "visual_theme": "spring",
+            "updated_at": "2027-01-01T00:00:00+00:00",
+        }
+    )
+    snapshot = {
+        "sections": {
+            "settings": {
+                "sync_id": "settings",
+                "updated_at": "2026-04-01T00:00:00+00:00",
+                "data": {
+                    "theme": "dark",
+                    "visual_theme": "forest-glass",
+                },
+                "themes": [
+                    {
+                        "sync_id": "theme:forest-glass",
+                        "id": "forest-glass",
+                        "label": "Forest Glass",
+                        "slots": slots,
+                        "updated_at": "2026-04-01T00:00:00+00:00",
+                    }
+                ],
+            }
+        }
+    }
+
+    result = service.merge_snapshot(snapshot)
+
+    assert result["sections"]["settings"]["applied"] == 2
+    assert result["sections"]["settings"]["skipped"] == 1
+    assert user_settings.load_settings()["theme"] == "light"
+    assert user_settings.load_settings()["visual_theme"] == "forest-glass"
+    assert theme_store.list_themes()[0]["id"] == "forest-glass"
+
+
+def test_remote_client_repairs_saved_pair_when_device_proof_is_required():
+    modules = _load_modules()
+    sync_module = modules["sync_module"]
+    RemoteFloatClient = modules["RemoteFloatClient"]
+
+    class FakeResponse:
+        def __init__(self, payload=None, *, status_code=200, text=""):
+            self._payload = payload or {}
+            self.status_code = status_code
+            self.text = text
+
+        def raise_for_status(self):
+            if self.status_code < 400:
+                return None
+            exc = sync_module.requests.HTTPError(f"{self.status_code} error")
+            exc.response = self
+            raise exc
+
+        def json(self):
+            return self._payload
+
+    class FakeSession:
+        def __init__(self):
+            self.calls = []
+
+        def request(self, method, url, json=None, headers=None, timeout=None):
+            self.calls.append(
+                {
+                    "method": method,
+                    "path": url.rsplit("/api/", 1)[-1],
+                    "json": json or {},
+                    "headers": headers or {},
+                    "timeout": timeout,
+                }
+            )
+            path = self.calls[-1]["path"]
+            token_calls = [
+                call for call in self.calls if call["path"] == "devices/token"
+            ]
+            if path == "devices/token" and len(token_calls) == 1:
+                return FakeResponse(
+                    status_code=403,
+                    text='{"detail":"Device proof required for token issuance"}',
+                )
+            if path == "devices/register":
+                return FakeResponse({"device": {"id": "fresh-device"}})
+            if path == "devices/token":
+                return FakeResponse({"token": "fresh-token"})
+            if path == "sync/manifest":
+                return FakeResponse({"sections": {}})
+            raise AssertionError(f"unexpected request path: {path}")
+
+    session = FakeSession()
+    client = RemoteFloatClient(
+        "http://pear.local:54089",
+        session=session,
+        paired_device={
+            "id": "peer-1",
+            "remote_device_id": "stale-device",
+            "public_key": "",
+            "scopes": ["sync", "files"],
+        },
+        device_name="Cherry",
+    )
+
+    assert client.get_manifest(["settings"]) == {"sections": {}}
+
+    paths = [call["path"] for call in session.calls]
+    assert paths == [
+        "devices/token",
+        "devices/register",
+        "devices/token",
+        "sync/manifest",
+    ]
+    assert session.calls[0]["json"]["public_key"] == ""
+    assert session.calls[1]["json"]["public_key"]
+    assert session.calls[2]["json"]["device_id"] == "fresh-device"
+    assert (
+        session.calls[2]["json"]["public_key"] == session.calls[1]["json"]["public_key"]
+    )
+    assert session.calls[3]["headers"]["Authorization"] == "Bearer fresh-token"
+    assert client.get_pairing_state()["remote_device_id"] == "fresh-device"
+
+
+def test_remote_client_enriches_legacy_settings_snapshot_with_themes():
+    modules = _load_modules()
+    sync_module = modules["sync_module"]
+    RemoteFloatClient = modules["RemoteFloatClient"]
+    slots = {
+        "c1Light": "#a8f5ab",
+        "c1Med": "#4aed1d",
+        "c1Dark": "#05420f",
+        "c2Light": "#f8f7f7",
+        "c2Med": "#f7bff3",
+        "c2Dark": "#d24ba1",
+        "veryLight": "#e8f5f7",
+        "veryDark": "#1e3038",
+    }
+
+    class FakeResponse:
+        def __init__(self, payload=None, *, status_code=200, text=""):
+            self._payload = payload or {}
+            self.status_code = status_code
+            self.text = text
+
+        def raise_for_status(self):
+            if self.status_code < 400:
+                return None
+            exc = sync_module.requests.HTTPError(f"{self.status_code} error")
+            exc.response = self
+            raise exc
+
+        def json(self):
+            return self._payload
+
+    class FakeSession:
+        def __init__(self):
+            self.calls = []
+
+        def request(self, method, url, json=None, headers=None, timeout=None):
+            path = url.rsplit("/api/", 1)[-1]
+            self.calls.append({"method": method, "path": path, "json": json or {}})
+            if path == "devices/token":
+                return FakeResponse({"token": "sync-token"})
+            if path == "devices/remote-device":
+                return FakeResponse({"device": {"id": "remote-device"}})
+            if path == "sync/export":
+                return FakeResponse(
+                    {
+                        "sections": {
+                            "settings": {
+                                "sync_id": "settings",
+                                "updated_at": "2026-04-15T04:43:39+00:00",
+                                "data": {"theme": "light"},
+                            }
+                        }
+                    }
+                )
+            if path == "user-settings":
+                return FakeResponse({"visual_theme": "blossom", "theme": "light"})
+            if path == "themes":
+                return FakeResponse(
+                    {
+                        "themes": [
+                            {
+                                "id": "blossom",
+                                "label": "Blossom",
+                                "slots": slots,
+                            }
+                        ]
+                    }
+                )
+            raise AssertionError(f"unexpected request path: {path}")
+
+    client = RemoteFloatClient(
+        "http://pear.local:54089",
+        session=FakeSession(),
+        paired_device={
+            "remote_device_id": "remote-device",
+            "public_key": "pk-local",
+            "scopes": ["sync"],
+        },
+        device_name="Cherry",
+    )
+
+    snapshot = client.export_snapshot(["settings"])
+
+    settings = snapshot["sections"]["settings"]
+    assert settings["data"]["visual_theme"] == "blossom"
+    assert settings["themes"] == [
+        {
+            "sync_id": "theme:blossom",
+            "id": "blossom",
+            "label": "Blossom",
+            "slots": slots,
+            "updated_at": "2026-04-15T04:43:39+00:00",
+        }
+    ]
 
 
 def test_merge_snapshot_links_synced_state_to_source_namespace(tmp_path, monkeypatch):
@@ -441,6 +743,7 @@ def test_merge_snapshot_writes_attachment_knowledge_and_graph(tmp_path, monkeypa
     result = service.merge_snapshot(snapshot)
 
     assert result["sections"]["attachments"]["applied"] == 1
+    assert result["sections"]["attachments"]["applied_ids"] == [content_hash]
     attachment_meta = modules["sync_module"]._load_attachment_meta(content_hash)
     assert attachment_meta["source_sync_label"] == "remote"
     assert (
@@ -892,3 +1195,123 @@ def test_build_snapshot_filters_by_workspace_selection(tmp_path, monkeypatch):
     conversations = snapshot["sections"]["conversations"]
     assert len(conversations) == 1
     assert conversations[0]["metadata"]["id"] == "personal__conv-2"
+
+
+def test_build_manifest_applies_workspace_privacy_rules(tmp_path, monkeypatch):
+    modules = _configure_paths(tmp_path, monkeypatch)
+    service = modules["InstanceSyncService"]()
+    write_conversation = modules["_write_conversation_snapshot"]
+    user_settings = modules["user_settings"]
+
+    user_settings.save_settings(
+        {
+            "workspace_profiles": [
+                {
+                    "id": "root",
+                    "name": "Main workspace",
+                    "privacy_mode": "default",
+                    "private_patterns": ["notes/private/*"],
+                },
+                {
+                    "id": "vault",
+                    "name": "Vault",
+                    "slug": "vault",
+                    "namespace": "vault",
+                    "root_path": "data/files/workspace/vault",
+                    "privacy_mode": "protected",
+                },
+            ],
+            "active_workspace_id": "root",
+            "sync_selected_workspace_ids": ["root", "vault"],
+        }
+    )
+    write_conversation(
+        name="notes/shared/alpha",
+        messages=[{"role": "user", "content": "share me"}],
+        metadata={
+            "id": "conv-root-visible",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-02T00:00:00+00:00",
+            "display_name": "Visible conversation",
+        },
+    )
+    write_conversation(
+        name="notes/private/alpha",
+        messages=[{"role": "user", "content": "keep local"}],
+        metadata={
+            "id": "conv-root-private",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-03T00:00:00+00:00",
+            "display_name": "Private conversation",
+        },
+    )
+    write_conversation(
+        name="vault/ledger",
+        messages=[{"role": "user", "content": "blocked workspace"}],
+        metadata={
+            "id": "conv-vault",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-04T00:00:00+00:00",
+            "display_name": "Vault conversation",
+        },
+    )
+
+    manifest = service.build_manifest(
+        ["conversations"], workspace_ids=["root", "vault"]
+    )
+
+    assert manifest["workspace_selection"]["workspace_ids"] == ["root"]
+    assert manifest["workspace_selection"]["privacy_ignored_workspace_ids"] == ["vault"]
+    assert [
+        item["sync_id"] for item in manifest["sections"]["conversations"]["items"]
+    ] == ["conv-root-visible"]
+
+
+def test_build_snapshot_excludes_sensitive_memory_items_from_sync(
+    tmp_path, monkeypatch
+):
+    modules = _configure_paths(tmp_path, monkeypatch)
+    service = modules["InstanceSyncService"]()
+    memory_store = modules["memory_store"]
+    user_settings = modules["user_settings"]
+
+    user_settings.save_settings(
+        {
+            "workspace_profiles": [
+                {
+                    "id": "root",
+                    "name": "Main workspace",
+                    "privacy_mode": "default",
+                }
+            ],
+            "active_workspace_id": "root",
+            "sync_selected_workspace_ids": ["root"],
+        }
+    )
+    memory_store.save(
+        {
+            "visible": {
+                "value": "allowed",
+                "updated_at": 10.0,
+                "sensitivity": "personal",
+            },
+            "protected-note": {
+                "value": "blocked",
+                "updated_at": 11.0,
+                "sensitivity": "protected",
+            },
+            "secret-note": {
+                "value": "blocked",
+                "updated_at": 12.0,
+                "sensitivity": "secret",
+            },
+        }
+    )
+
+    manifest = service.build_manifest(["memories"], workspace_ids=["root"])
+    snapshot = service.build_snapshot(["memories"], workspace_ids=["root"])
+
+    assert [item["key"] for item in manifest["sections"]["memories"]["items"]] == [
+        "visible"
+    ]
+    assert [record["key"] for record in snapshot["sections"]["memories"]] == ["visible"]

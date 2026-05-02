@@ -17,12 +17,18 @@ def add_backend_to_sys_path():
 def use_temp_dotenv(monkeypatch, tmp_path):
     # Prevent accidental writes to the repo-root `.env` during tests.
     monkeypatch.setenv("FLOAT_ENV_FILE", str(tmp_path / ".env"))
+    # Keep tests deterministic even when the developer's repo `.env` uses server mode.
+    monkeypatch.setenv("MODE", "api")
 
 
 @pytest.fixture
 def client(add_backend_to_sys_path):
+    from app import routes
     from app.main import app
 
+    app.state.config["mode"] = "api"
+    routes.llm_service.mode = "api"
+    routes.llm_service.config = app.state.config
     return TestClient(app)
 
 
@@ -141,6 +147,9 @@ def test_realtime_voice_settings_refresh_service(client, tmp_path):
             "stream_backend": "api",
             "realtime_model": "gpt-realtime",
             "realtime_voice": "marin",
+            "live_agent_mode": "server",
+            "live_agent_model": "gemma-4-E4B-it",
+            "live_multimodal_model": "gemma-4-26B-A4B-it",
             "realtime_base_url": "https://api.openai.com/v1/realtime/client_secrets",
             "realtime_connect_url": "https://api.openai.com/v1/realtime/calls",
         },
@@ -150,6 +159,9 @@ def test_realtime_voice_settings_refresh_service(client, tmp_path):
     assert settings.get("stream_backend") == "api"
     assert settings.get("realtime_model") == "gpt-realtime"
     assert settings.get("realtime_voice") == "marin"
+    assert settings.get("live_agent_mode") == "server"
+    assert settings.get("live_agent_model") == "gemma-4-E4B-it"
+    assert settings.get("live_multimodal_model") == "gemma-4-26B-A4B-it"
     assert (
         settings.get("realtime_base_url")
         == "https://api.openai.com/v1/realtime/client_secrets"
@@ -162,10 +174,45 @@ def test_realtime_voice_settings_refresh_service(client, tmp_path):
     assert "FLOAT_STREAM_BACKEND" in content and "api" in content
     assert "OPENAI_REALTIME_MODEL" in content and "gpt-realtime" in content
     assert "OPENAI_REALTIME_VOICE" in content and "marin" in content
+    assert "FLOAT_LIVE_AGENT_MODE" in content and "server" in content
+    assert "FLOAT_LIVE_AGENT_MODEL" in content and "gemma-4-E4B-it" in content
+    assert "FLOAT_LIVE_MULTIMODAL_MODEL" in content and "gemma-4-26B-A4B-it" in content
     livekit_service = client.app.state.livekit_service
     assert livekit_service.mode == "api"
     assert livekit_service.realtime_model == "gpt-realtime"
     assert livekit_service.realtime_voice == "marin"
+    assert livekit_service.live_agent_mode == "server"
+    assert livekit_service.live_agent_model == "gemma-4-E4B-it"
+    assert livekit_service.live_multimodal_model == "gemma-4-26B-A4B-it"
+
+
+def test_local_live_settings_refresh_service(client, tmp_path):
+    env_path = tmp_path / ".env"
+    resp = client.post(
+        "/settings",
+        json={
+            "stream_backend": "local",
+            "live_agent_mode": "local",
+            "live_agent_model": "gemma-4-E2B-it",
+            "live_multimodal_model": "gemma-4-E4B-it",
+        },
+    )
+    assert resp.status_code == 200
+    settings = resp.json().get("settings") or {}
+    assert settings.get("stream_backend") == "local"
+    assert settings.get("live_agent_mode") == "local"
+    assert settings.get("live_agent_model") == "gemma-4-E2B-it"
+    assert settings.get("live_multimodal_model") == "gemma-4-E4B-it"
+    content = env_path.read_text()
+    assert "FLOAT_STREAM_BACKEND" in content and "local" in content
+    assert "FLOAT_LIVE_AGENT_MODE" in content and "local" in content
+    assert "FLOAT_LIVE_AGENT_MODEL" in content and "gemma-4-E2B-it" in content
+    assert "FLOAT_LIVE_MULTIMODAL_MODEL" in content and "gemma-4-E4B-it" in content
+    livekit_service = client.app.state.livekit_service
+    assert livekit_service.mode == "local"
+    assert livekit_service.live_agent_mode == "local"
+    assert livekit_service.live_agent_model == "gemma-4-E2B-it"
+    assert livekit_service.live_multimodal_model == "gemma-4-E4B-it"
 
 
 def test_model_search_dirs_includes_custom(tmp_path, monkeypatch):

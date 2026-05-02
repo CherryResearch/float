@@ -52,7 +52,7 @@ def _entry(
 _BUILTIN_TOOL_CATALOG: Dict[str, Dict[str, Any]] = {
     "help": _entry(
         category="help",
-        summary="List tools or inspect one tool with compact defaults.",
+        summary="List tool names or inspect one tool with compact defaults.",
         description=(
             "Returns lean built-in tool guidance so the model can verify a capability "
             "without pulling full schemas unless requested."
@@ -65,7 +65,7 @@ _BUILTIN_TOOL_CATALOG: Dict[str, Dict[str, Any]] = {
         can_access=["built-in tool metadata and argument schemas"],
         cannot_access=["network, files, browser state, or user secrets"],
         limit_hints=[
-            "Defaults are brief, schema-free, and capped for lower token usage."
+            "Default list mode returns a curated menu; use detail=brief for summaries or rich for full guidance."
         ],
     ),
     "tool_help": _entry(
@@ -86,7 +86,7 @@ _BUILTIN_TOOL_CATALOG: Dict[str, Dict[str, Any]] = {
     ),
     "tool_info": _entry(
         category="help",
-        summary="Return one built-in tool capability record.",
+        summary="Return one exact tool capability record or a family-menu hint.",
         description=(
             "Returns the same structured capability metadata exposed via the "
             "tool catalog API for a single tool."
@@ -98,6 +98,64 @@ _BUILTIN_TOOL_CATALOG: Dict[str, Dict[str, Any]] = {
         safety={"risk_level": "low", "default_approval": "auto"},
         can_access=["built-in tool capability metadata and schemas"],
         cannot_access=["network, files, browser state, or user secrets"],
+    ),
+    "subchat": _entry(
+        category="workflow",
+        summary="Signal subchat return or request more time.",
+        description=(
+            "Lets a child subchat mark itself complete and return control to the "
+            "parent/main chat, or explicitly ask to continue for more time."
+        ),
+        runtime={"executor": "backend_python", "network": False, "filesystem": False},
+        freshness={"type": "current_conversation_state"},
+        persistence={"writes_state": False},
+        safety={"risk_level": "low", "default_approval": "auto"},
+        can_access=["the current tool call arguments and subchat control intent"],
+        cannot_access=["files, network, browser state, or conversation contents"],
+        limit_hints=[
+            "No arguments means return to the parent chat.",
+            "Use action=continue with requested_minutes to ask for more time.",
+        ],
+    ),
+    "reflect": _entry(
+        category="reflection",
+        summary="Create and optionally run a bounded background thought task.",
+        description=(
+            "Queues a ThoughtTask in the reflection store, links any explicit "
+            "conversation, memory, or calendar source metadata, and can run one "
+            "strict reflection/evaluation pass immediately."
+        ),
+        runtime={"executor": "backend_python", "network": False, "filesystem": True},
+        limits={"default_patience": 1, "max_patience": 3, "manual_only_v0": True},
+        freshness={"type": "live_local_state"},
+        persistence={"writes_state": True, "stores_output": True},
+        safety={"risk_level": "medium", "default_approval": "confirm"},
+        can_access=[
+            "reflection task/run state",
+            "explicit conversation summaries",
+            "linked safe memories",
+            "bounded RAG snippets",
+        ],
+        cannot_access=[
+            "protected or secret memories by default",
+            "broad calendar scans",
+            "unrestricted autonomous loops",
+        ],
+        limit_hints=[
+            "Patience controls depth budget, not priority.",
+            "Only surfaced runs create a reflection conversation.",
+        ],
+    ),
+    "list_reflections": _entry(
+        category="reflection",
+        summary="List recent/open reflection tasks and optional runs.",
+        runtime={"executor": "backend_python", "network": False, "filesystem": True},
+        limits={"default_limit": 20, "max_limit": 200},
+        freshness={"type": "live_local_state"},
+        persistence={"writes_state": False},
+        safety={"risk_level": "low", "default_approval": "auto"},
+        can_access=["reflection task/run metadata"],
+        cannot_access=["memory text unless included in saved reflection output"],
     ),
     "list_actions": _entry(
         category="history",
@@ -500,6 +558,118 @@ _BUILTIN_TOOL_CATALOG: Dict[str, Dict[str, Any]] = {
         can_access=["the latest persisted thread summary file"],
         cannot_access=["live recomputation or arbitrary files"],
     ),
+    "compact_conversation_plan": _entry(
+        category="conversation",
+        summary="Plan context compaction from a target context budget.",
+        description=(
+            "Estimates usable history budget for a saved conversation, classifies "
+            "the context window, and returns recommended preview/write payloads "
+            "without changing any saved state."
+        ),
+        runtime={"executor": "backend_python", "network": False, "filesystem": True},
+        sandbox={
+            "read_roots": ["data/conversations/"],
+            "write_roots": [],
+        },
+        limits={
+            "default_context_window_tokens": 24000,
+            "max_context_window_tokens": 1000000,
+            "default_reserve_output_tokens": 2048,
+            "default_reserve_tool_tokens": 2500,
+            "default_reserve_retrieval_tokens": 2500,
+            "default_reserve_system_tokens": 1500,
+            "soft_trigger_ratio": 0.75,
+            "hard_trigger_ratio": 0.9,
+            "context_profiles": ["short", "medium", "long"],
+            "summary_modes": ["deterministic", "llm"],
+            "summary_workflows": [
+                "conversation_handoff",
+                "decision_focus",
+                "task_state",
+            ],
+        },
+        freshness={"type": "live_local_state"},
+        persistence={"writes_state": False, "stores_output": False},
+        safety={"risk_level": "low", "default_approval": "auto"},
+        can_access=["stored conversation transcripts and conversation metadata"],
+        cannot_access=["files outside the conversation store"],
+        limit_hints=[
+            "This is a planner, not a writer; it returns recommended preview and write payloads.",
+            "Token estimates are approximate rather than model-native tokenizer counts.",
+            "Use compact_conversation_preview or compact_conversation_write after reviewing the plan.",
+        ],
+    ),
+    "compact_conversation_preview": _entry(
+        category="conversation",
+        summary="Preview context compaction for a long saved conversation.",
+        description=(
+            "Builds a transparent summary preview plus recent-turn retention plan "
+            "without writing any conversation state. Deterministic and LLM summary "
+            "modes are explicit choices."
+        ),
+        runtime={"executor": "backend_python", "network": False, "filesystem": True},
+        sandbox={
+            "read_roots": ["data/conversations/"],
+            "write_roots": [],
+        },
+        limits={
+            "default_keep_last": 40,
+            "max_keep_last": 200,
+            "default_summary_chars": 6000,
+            "max_summary_chars": 20000,
+            "summary_modes": ["deterministic", "llm"],
+            "summary_workflows": [
+                "conversation_handoff",
+                "decision_focus",
+                "task_state",
+            ],
+        },
+        freshness={"type": "live_local_state"},
+        persistence={"writes_state": False, "stores_output": False},
+        safety={"risk_level": "low", "default_approval": "auto"},
+        can_access=["stored conversation transcripts and conversation metadata"],
+        cannot_access=["files outside the conversation store"],
+        limit_hints=[
+            "LLM summary mode falls back to deterministic compaction when no provider is available.",
+            "Use summary_workflow plus optional format notes to request a specific handoff shape.",
+            "Use compact_conversation_write to create a saved compacted copy.",
+        ],
+    ),
+    "compact_conversation_write": _entry(
+        category="conversation",
+        summary="Write a compacted conversation copy.",
+        description=(
+            "Creates a compacted conversation from a summary plus recent turns. "
+            "It writes a copy by default; replacing the source requires an explicit flag."
+        ),
+        runtime={"executor": "backend_python", "network": False, "filesystem": True},
+        sandbox={
+            "read_roots": ["data/conversations/"],
+            "write_roots": ["data/conversations/"],
+        },
+        limits={
+            "default_keep_last": 40,
+            "max_keep_last": 200,
+            "default_summary_chars": 6000,
+            "max_summary_chars": 20000,
+            "summary_modes": ["deterministic", "llm"],
+            "summary_workflows": [
+                "conversation_handoff",
+                "decision_focus",
+                "task_state",
+            ],
+        },
+        freshness={"type": "live_local_state"},
+        persistence={"writes_state": True, "stores_output": True},
+        safety={"risk_level": "high", "default_approval": "confirm"},
+        can_access=["stored conversation transcripts and conversation metadata"],
+        cannot_access=["files outside the conversation store"],
+        limit_hints=[
+            "Leave replace=false to preserve the source chat.",
+            "LLM summary mode falls back to deterministic compaction when no provider is available.",
+            "Use summary_workflow plus optional format notes to request a specific handoff shape.",
+        ],
+    ),
     "create_event": _entry(
         category="calendar",
         summary="Compatibility alias for creating or updating an upcoming event.",
@@ -626,6 +796,12 @@ def _display_name(tool_name: str) -> str:
         "write_file": "Write File",
         "generate_threads": "Generate Threads",
         "read_threads_summary": "Read Threads Summary",
+        "compact_conversation_plan": "Compact Conversation Plan",
+        "compact_conversation_preview": "Compact Conversation Preview",
+        "compact_conversation_write": "Compact Conversation Write",
+        "subchat": "Subchat",
+        "reflect": "Reflect",
+        "list_reflections": "List Reflections",
         "create_event": "Create Event",
         "create_task": "Create Task",
         "list_tasks": "List Tasks",

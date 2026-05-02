@@ -17,13 +17,16 @@ import requests
 from app.utils import blob_store, calendar_store, conversation_store
 from app.utils import graph_store as graph_store_module
 from app.utils import knowledge_store as knowledge_store_module
-from app.utils import memory_store, user_settings
+from app.utils import memory_store, theme_store, user_settings
 from app.utils.attachment_media import build_attachment_media_descriptor
 from app.utils.blob_store import BLOBS_DIR, find_asset_path
 from app.utils.blob_store import iter_attachment_hashes as iter_stored_attachment_hashes
 from app.utils.blob_store import managed_relative_path, resolve_managed_path
 from app.utils.sync_paths import sync_attachment_relative_path
-from app.utils.workspace_registry import resolve_workspace_selection
+from app.utils.workspace_registry import (
+    resolve_workspace_selection,
+    workspace_item_exclusion_reason,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +60,7 @@ SYNCABLE_USER_SETTING_KEYS = (
     "history",
     "approval_level",
     "theme",
+    "visual_theme",
     "push_enabled",
     "calendar_notify_minutes",
     "tool_resolution_notifications",
@@ -336,7 +340,7 @@ def _portable_settings_snapshot() -> Dict[str, Any]:
     }
 
 
-def _settings_updated_at() -> float:
+def _settings_data_updated_at() -> float:
     settings = user_settings.load_settings()
     ts = _coerce_timestamp(settings.get("updated_at"))
     if ts > 0:
@@ -345,6 +349,71 @@ def _settings_updated_at() -> float:
         return float(user_settings.USER_SETTINGS_PATH.stat().st_mtime)
     except Exception:
         return 0.0
+
+
+def _iter_theme_files() -> List[Path]:
+    try:
+        return sorted(theme_store.themes_dir().glob("*.json"))
+    except Exception:
+        return []
+
+
+def _theme_file_updated_at(theme_id: str) -> float:
+    clean_id = str(theme_id or "").strip()
+    if not clean_id:
+        return 0.0
+    for path in _iter_theme_files():
+        if path.stem == clean_id:
+            try:
+                return float(path.stat().st_mtime)
+            except Exception:
+                return 0.0
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if (
+            isinstance(payload, dict)
+            and str(payload.get("id") or "").strip() == clean_id
+        ):
+            try:
+                return float(path.stat().st_mtime)
+            except Exception:
+                return 0.0
+    return 0.0
+
+
+def _themes_updated_at() -> float:
+    updated_at = 0.0
+    for path in _iter_theme_files():
+        try:
+            updated_at = max(updated_at, float(path.stat().st_mtime))
+        except Exception:
+            continue
+    return updated_at
+
+
+def _theme_snapshot() -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for theme in theme_store.list_themes():
+        if not isinstance(theme, dict):
+            continue
+        theme_id = str(theme.get("id") or "").strip()
+        if not theme_id:
+            continue
+        record = {
+            "sync_id": f"theme:{theme_id}",
+            "id": theme_id,
+            "label": str(theme.get("label") or theme_id).strip() or theme_id,
+            "slots": dict(theme.get("slots") or {}),
+            "updated_at": _theme_file_updated_at(theme_id),
+        }
+        records.append(record)
+    return records
+
+
+def _settings_updated_at() -> float:
+    return max(_settings_data_updated_at(), _themes_updated_at())
 
 
 def _write_settings_snapshot(payload: Dict[str, Any], updated_at: Any) -> None:
@@ -358,6 +427,58 @@ def _write_settings_snapshot(payload: Dict[str, Any], updated_at: Any) -> None:
     user_settings.USER_SETTINGS_PATH.write_text(
         json.dumps(next_settings, indent=2, ensure_ascii=False),
         encoding="utf-8",
+    )
+
+
+def _merge_theme_snapshot(payload: Any) -> Dict[str, int]:
+    if not isinstance(payload, list):
+        return {"applied": 0, "skipped": 0}
+    local_by_id = {
+        str(theme.get("id") or "").strip(): theme
+        for theme in theme_store.list_themes()
+        if isinstance(theme, dict) and str(theme.get("id") or "").strip()
+    }
+    applied = 0
+    skipped = 0
+    for record in payload:
+        if not isinstance(record, dict):
+            continue
+        theme_id = str(record.get("id") or "").strip()
+        slots = record.get("slots")
+        if not theme_id or not isinstance(slots, dict):
+            skipped += 1
+            continue
+        label = str(record.get("label") or theme_id).strip() or theme_id
+        incoming_ts = _coerce_timestamp(record.get("updated_at"))
+        current_ts = _theme_file_updated_at(theme_id)
+        existing = local_by_id.get(theme_id)
+        theme_changed = (
+            not existing
+            or existing.get("label") != label
+            or existing.get("slots") != slots
+        )
+        if existing and current_ts > incoming_ts and incoming_ts > 0 and theme_changed:
+            skipped += 1
+            continue
+        if not theme_changed:
+            continue
+        try:
+            theme_store.save_theme(theme_id=theme_id, label=label, slots=slots)
+        except ValueError:
+            skipped += 1
+            continue
+        applied += 1
+    return {"applied": applied, "skipped": skipped}
+
+
+def _theme_exists(theme_id: str) -> bool:
+    clean_id = str(theme_id or "").strip()
+    if not clean_id:
+        return False
+    return any(
+        str(theme.get("id") or "").strip() == clean_id
+        for theme in theme_store.list_themes()
+        if isinstance(theme, dict)
     )
 
 
@@ -597,6 +718,9 @@ class RemoteFloatClient:
                         "device_id": device_id,
                         "scopes": scopes,
                         "ttl_seconds": 3600,
+                        "public_key": str(
+                            self._paired_device.get("public_key") or ""
+                        ).strip(),
                     },
                 )
                 token = str(issued.get("token") or "").strip()
@@ -620,7 +744,13 @@ class RemoteFloatClient:
                 status_code = (
                     exc.response.status_code if exc.response is not None else None
                 )
-                if status_code not in {400, 404}:
+                response_excerpt = self._response_excerpt(exc.response)
+                if (
+                    status_code == 403
+                    and "Device proof required" not in response_excerpt
+                ):
+                    raise
+                if status_code not in {400, 403, 404}:
                     raise
         public_key = str(self._paired_device.get("public_key") or "").strip() or str(
             uuid.uuid4()
@@ -656,6 +786,7 @@ class RemoteFloatClient:
                 "device_id": device_id,
                 "scopes": scopes,
                 "ttl_seconds": 3600,
+                "public_key": public_key,
             },
         )
         token = str(issued.get("token") or "").strip()
@@ -679,13 +810,88 @@ class RemoteFloatClient:
             with_auth=True,
         )
 
+    def _sections_include_settings(self, sections: Optional[List[str]]) -> bool:
+        if not sections:
+            return True
+        return any(
+            str(section or "").strip().lower() == "settings" for section in sections
+        )
+
+    def _fetch_remote_settings_extras(self) -> Dict[str, Any]:
+        extras: Dict[str, Any] = {}
+        try:
+            settings = self._request("get", "user-settings", with_auth=True)
+        except requests.RequestException:
+            settings = {}
+        if isinstance(settings, dict):
+            extras["settings"] = settings
+        try:
+            themes_payload = self._request("get", "themes", with_auth=True)
+        except requests.RequestException:
+            themes_payload = {}
+        themes = (
+            themes_payload.get("themes") if isinstance(themes_payload, dict) else None
+        )
+        if isinstance(themes, list):
+            extras["themes"] = themes
+        return extras
+
+    def _enrich_settings_snapshot(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        sections = snapshot.get("sections") if isinstance(snapshot, dict) else {}
+        if not isinstance(sections, dict):
+            return snapshot
+        settings_section = sections.get("settings")
+        if not isinstance(settings_section, dict):
+            return snapshot
+        needs_user_settings = not isinstance(settings_section.get("data"), dict) or any(
+            key not in settings_section.get("data", {}) for key in ("visual_theme",)
+        )
+        needs_themes = not isinstance(settings_section.get("themes"), list)
+        if not needs_user_settings and not needs_themes:
+            return snapshot
+        extras = self._fetch_remote_settings_extras()
+        data = (
+            settings_section.get("data")
+            if isinstance(settings_section.get("data"), dict)
+            else {}
+        )
+        data = dict(data)
+        remote_settings = extras.get("settings")
+        if isinstance(remote_settings, dict):
+            for key in SYNCABLE_USER_SETTING_KEYS:
+                if key not in data and key in remote_settings:
+                    data[key] = remote_settings.get(key)
+        settings_section["data"] = data
+        if needs_themes:
+            fallback_updated_at = settings_section.get("updated_at") or _now_iso()
+            theme_records: List[Dict[str, Any]] = []
+            for theme in extras.get("themes") or []:
+                if not isinstance(theme, dict):
+                    continue
+                theme_id = str(theme.get("id") or "").strip()
+                slots = theme.get("slots")
+                if not theme_id or not isinstance(slots, dict):
+                    continue
+                theme_records.append(
+                    {
+                        "sync_id": f"theme:{theme_id}",
+                        "id": theme_id,
+                        "label": str(theme.get("label") or theme_id).strip()
+                        or theme_id,
+                        "slots": dict(slots),
+                        "updated_at": theme.get("updated_at") or fallback_updated_at,
+                    }
+                )
+            settings_section["themes"] = theme_records
+        return snapshot
+
     def export_snapshot(
         self,
         sections: Optional[List[str]] = None,
         *,
         workspace_ids: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        return self._request(
+        snapshot = self._request(
             "post",
             "sync/export",
             json_body={
@@ -694,6 +900,9 @@ class RemoteFloatClient:
             },
             with_auth=True,
         )
+        if self._sections_include_settings(sections):
+            return self._enrich_settings_snapshot(snapshot)
+        return snapshot
 
     def ingest_snapshot(
         self,
@@ -873,6 +1082,250 @@ class InstanceSyncService:
             ) or _coerce_relative_files_path(payload.get("source_sync_namespace"))
         return ""
 
+    def _match_values(self, *values: Any) -> List[str]:
+        normalized: List[str] = []
+        seen: set[str] = set()
+        for value in values:
+            candidates: Iterable[Any]
+            if isinstance(value, (list, tuple, set)):
+                candidates = value
+            else:
+                candidates = [value]
+            for candidate in candidates:
+                if candidate is None or isinstance(candidate, dict):
+                    continue
+                text = str(candidate or "").strip().replace("\\", "/")
+                if not text:
+                    continue
+                lowered = text.lower()
+                if lowered in seen:
+                    continue
+                seen.add(lowered)
+                normalized.append(text)
+        return normalized
+
+    def _namespace_from_profile_values(
+        self,
+        values: Optional[Iterable[Any]],
+        profiles: Optional[List[Dict[str, Any]]],
+    ) -> str:
+        best_match = ""
+        for value in values or []:
+            cleaned_value = _coerce_relative_files_path(value)
+            if not cleaned_value:
+                continue
+            for profile in profiles or []:
+                namespace = _coerce_relative_files_path(profile.get("namespace"))
+                if not namespace:
+                    continue
+                if cleaned_value == namespace or cleaned_value.startswith(
+                    f"{namespace}/"
+                ):
+                    if len(namespace) > len(best_match):
+                        best_match = namespace
+        return best_match
+
+    def _manifest_item_match_values(
+        self, section: str, item: Dict[str, Any]
+    ) -> List[str]:
+        if not isinstance(item, dict):
+            return []
+        if section == "conversations":
+            return self._match_values(
+                item.get("name"),
+                item.get("path"),
+                item.get("display_name"),
+                item.get("sync_id"),
+                item.get("original_sync_id"),
+            )
+        if section == "memories":
+            return self._match_values(
+                item.get("key"),
+                item.get("source_sync_relative_path"),
+                item.get("source_path"),
+                item.get("root_source"),
+                item.get("sync_id"),
+            )
+        if section == "knowledge":
+            return self._match_values(
+                item.get("knowledge_id"),
+                item.get("source"),
+                item.get("root_source"),
+                item.get("relative_path"),
+                item.get("source_path"),
+                item.get("title"),
+            )
+        if section == "graph":
+            return self._match_values(
+                item.get("sync_id"),
+                item.get("node_id"),
+                item.get("claim_id"),
+                item.get("source_ref"),
+                item.get("source_path"),
+                item.get("label"),
+            )
+        if section == "attachments":
+            return self._match_values(
+                item.get("filename"),
+                item.get("relative_path"),
+                item.get("source_path"),
+                item.get("content_hash"),
+            )
+        if section == "calendar":
+            return self._match_values(
+                item.get("event_id"),
+                item.get("title"),
+                item.get("source_path"),
+                item.get("source"),
+            )
+        return []
+
+    def _manifest_item_sensitivity(self, item: Dict[str, Any]) -> str:
+        if not isinstance(item, dict):
+            return ""
+        return str(item.get("sensitivity") or "").strip().lower()
+
+    def _snapshot_record_match_values(
+        self, section: str, record: Dict[str, Any]
+    ) -> List[str]:
+        if not isinstance(record, dict):
+            return []
+        if section == "conversations":
+            metadata = (
+                record.get("metadata")
+                if isinstance(record.get("metadata"), dict)
+                else {}
+            )
+            return self._match_values(
+                record.get("name"),
+                metadata.get("id"),
+                metadata.get("display_name"),
+                metadata.get("source_sync_original_name"),
+            )
+        if section == "memories":
+            payload = (
+                record.get("payload") if isinstance(record.get("payload"), dict) else {}
+            )
+            return self._match_values(
+                record.get("key"),
+                payload.get("source_sync_relative_path"),
+                payload.get("source_path"),
+                payload.get("root_source"),
+                payload.get("hint"),
+            )
+        if section == "knowledge":
+            metadata = (
+                record.get("metadata")
+                if isinstance(record.get("metadata"), dict)
+                else {}
+            )
+            return self._match_values(
+                record.get("knowledge_id"),
+                record.get("source"),
+                metadata.get("source"),
+                metadata.get("root_source"),
+                metadata.get("relative_path"),
+                metadata.get("source_path"),
+                record.get("title"),
+            )
+        if section == "graph":
+            if "node_id" in record:
+                attributes = (
+                    record.get("attributes")
+                    if isinstance(record.get("attributes"), dict)
+                    else {}
+                )
+                return self._match_values(
+                    record.get("node_id"),
+                    record.get("canonical_name"),
+                    attributes.get("source_ref"),
+                    attributes.get("source"),
+                    attributes.get("root_source"),
+                    attributes.get("source_path"),
+                )
+            metadata = (
+                record.get("metadata")
+                if isinstance(record.get("metadata"), dict)
+                else {}
+            )
+            return self._match_values(
+                record.get("claim_id"),
+                record.get("predicate"),
+                record.get("source_ref"),
+                metadata.get("source"),
+                metadata.get("root_source"),
+                metadata.get("source_path"),
+            )
+        if section == "attachments":
+            metadata = (
+                record.get("metadata")
+                if isinstance(record.get("metadata"), dict)
+                else {}
+            )
+            return self._match_values(
+                record.get("content_hash"),
+                record.get("filename"),
+                metadata.get("relative_path"),
+                metadata.get("source_path"),
+                metadata.get("path"),
+            )
+        if section == "calendar":
+            payload = (
+                record.get("payload") if isinstance(record.get("payload"), dict) else {}
+            )
+            return self._match_values(
+                record.get("event_id"),
+                payload.get("title"),
+                payload.get("summary"),
+                payload.get("source"),
+                payload.get("source_path"),
+            )
+        return []
+
+    def _snapshot_record_sensitivity(self, section: str, record: Dict[str, Any]) -> str:
+        if not isinstance(record, dict):
+            return ""
+        if section == "conversations":
+            metadata = (
+                record.get("metadata")
+                if isinstance(record.get("metadata"), dict)
+                else {}
+            )
+            return str(metadata.get("sensitivity") or "").strip().lower()
+        if section == "memories":
+            payload = (
+                record.get("payload") if isinstance(record.get("payload"), dict) else {}
+            )
+            return str(payload.get("sensitivity") or "").strip().lower()
+        if section == "knowledge":
+            metadata = (
+                record.get("metadata")
+                if isinstance(record.get("metadata"), dict)
+                else {}
+            )
+            return str(metadata.get("sensitivity") or "").strip().lower()
+        if section == "graph":
+            metadata_key = "attributes" if "node_id" in record else "metadata"
+            metadata = (
+                record.get(metadata_key)
+                if isinstance(record.get(metadata_key), dict)
+                else {}
+            )
+            return str(metadata.get("sensitivity") or "").strip().lower()
+        if section == "attachments":
+            metadata = (
+                record.get("metadata")
+                if isinstance(record.get("metadata"), dict)
+                else {}
+            )
+            return str(metadata.get("sensitivity") or "").strip().lower()
+        if section == "calendar":
+            payload = (
+                record.get("payload") if isinstance(record.get("payload"), dict) else {}
+            )
+            return str(payload.get("sensitivity") or "").strip().lower()
+        return ""
+
     def _filter_manifest_by_workspaces(
         self, manifest: Dict[str, Any], workspace_ids: Optional[Iterable[str]]
     ) -> Dict[str, Any]:
@@ -882,6 +1335,33 @@ class InstanceSyncService:
             return manifest
         filtered = copy.deepcopy(manifest)
         filtered_sections = filtered.get("sections") or {}
+
+        def _allowed(section: str, item: Dict[str, Any]) -> bool:
+            values = self._manifest_item_match_values(section, item)
+            namespace = self._manifest_item_namespace(section, item)
+            if not namespace:
+                namespace = self._namespace_from_profile_values(
+                    values,
+                    selection["profiles"],
+                )
+            if not _namespace_matches_selection(
+                namespace,
+                include_root=selection["include_root"],
+                namespaces=selection["namespaces"],
+            ):
+                return False
+            if self._manifest_item_sensitivity(item) in {"protected", "secret"}:
+                return False
+            return (
+                workspace_item_exclusion_reason(
+                    namespace=namespace,
+                    values=values,
+                    profiles=selection["profiles"],
+                    purpose="sync",
+                )
+                is None
+            )
+
         for section in self.normalize_sections(filtered_sections.keys()):
             if section == "settings":
                 continue
@@ -889,19 +1369,12 @@ class InstanceSyncService:
             items = payload.get("items") if isinstance(payload, dict) else None
             if not isinstance(items, list):
                 continue
-            payload["items"] = [
-                item
-                for item in items
-                if _namespace_matches_selection(
-                    self._manifest_item_namespace(section, item),
-                    include_root=selection["include_root"],
-                    namespaces=selection["namespaces"],
-                )
-            ]
+            payload["items"] = [item for item in items if _allowed(section, item)]
             payload["count"] = len(payload["items"])
         filtered["workspace_selection"] = {
             "workspace_ids": selection["selected_workspace_ids"],
             "include_root": selection["include_root"],
+            "privacy_ignored_workspace_ids": selection["privacy_ignored_workspace_ids"],
         }
         return filtered
 
@@ -914,6 +1387,36 @@ class InstanceSyncService:
             return snapshot
         filtered = copy.deepcopy(snapshot)
         filtered_sections = filtered.get("sections") or {}
+
+        def _allowed(section: str, record: Dict[str, Any]) -> bool:
+            values = self._snapshot_record_match_values(section, record)
+            namespace = self._snapshot_record_namespace(section, record)
+            if not namespace:
+                namespace = self._namespace_from_profile_values(
+                    values,
+                    selection["profiles"],
+                )
+            if not _namespace_matches_selection(
+                namespace,
+                include_root=selection["include_root"],
+                namespaces=selection["namespaces"],
+            ):
+                return False
+            if self._snapshot_record_sensitivity(section, record) in {
+                "protected",
+                "secret",
+            }:
+                return False
+            return (
+                workspace_item_exclusion_reason(
+                    namespace=namespace,
+                    values=values,
+                    profiles=selection["profiles"],
+                    purpose="sync",
+                )
+                is None
+            )
+
         for section in self.normalize_sections(filtered_sections.keys()):
             if section == "settings":
                 continue
@@ -922,36 +1425,34 @@ class InstanceSyncService:
                 payload["nodes"] = [
                     node
                     for node in payload.get("nodes") or []
-                    if _namespace_matches_selection(
-                        self._snapshot_record_namespace("graph", node),
-                        include_root=selection["include_root"],
-                        namespaces=selection["namespaces"],
-                    )
+                    if _allowed("graph", node)
                 ]
+                allowed_node_ids = {
+                    str(node.get("node_id") or "").strip()
+                    for node in payload["nodes"]
+                    if isinstance(node, dict) and str(node.get("node_id") or "").strip()
+                }
                 payload["claims"] = [
                     claim
                     for claim in payload.get("claims") or []
-                    if _namespace_matches_selection(
-                        self._snapshot_record_namespace("graph", claim),
-                        include_root=selection["include_root"],
-                        namespaces=selection["namespaces"],
+                    if _allowed("graph", claim)
+                    and all(
+                        not str((role or {}).get("node_id") or "").strip()
+                        or str((role or {}).get("node_id") or "").strip()
+                        in allowed_node_ids
+                        for role in claim.get("roles") or []
                     )
                 ]
                 continue
             if not isinstance(payload, list):
                 continue
             filtered_sections[section] = [
-                record
-                for record in payload
-                if _namespace_matches_selection(
-                    self._snapshot_record_namespace(section, record),
-                    include_root=selection["include_root"],
-                    namespaces=selection["namespaces"],
-                )
+                record for record in payload if _allowed(section, record)
             ]
         filtered["workspace_selection"] = {
             "workspace_ids": selection["selected_workspace_ids"],
             "include_root": selection["include_root"],
+            "privacy_ignored_workspace_ids": selection["privacy_ignored_workspace_ids"],
         }
         return filtered
 
@@ -2219,6 +2720,14 @@ class InstanceSyncService:
                     "source_sync_namespace": entry.get("source_sync_namespace") or "",
                     "updated_at": _coerce_timestamp(entry.get("updated_at")),
                     "message_count": int(entry.get("message_count") or 0),
+                    "sensitivity": str(
+                        entry.get("sensitivity")
+                        or conversation_store.conversation_privacy_to_sensitivity(
+                            entry.get("privacy_mode")
+                        )
+                    )
+                    .strip()
+                    .lower(),
                 }
             )
         return items
@@ -2335,8 +2844,15 @@ class InstanceSyncService:
                     "sync_id": str(key),
                     "key": str(key),
                     "source_sync_namespace": item.get("source_sync_namespace") or "",
+                    "source_sync_relative_path": str(
+                        item.get("source_sync_relative_path")
+                        or item.get("source_path")
+                        or item.get("root_source")
+                        or ""
+                    ).strip(),
                     "updated_at": _coerce_timestamp(item.get("updated_at")),
                     "archived": bool(item.get("archived")),
+                    "sensitivity": str(item.get("sensitivity") or "").strip().lower(),
                 }
             )
         return items
@@ -2383,19 +2899,44 @@ class InstanceSyncService:
 
     def _knowledge_manifest(self) -> List[Dict[str, Any]]:
         records = self._knowledge_records()
-        return [
-            {
-                "sync_id": item["knowledge_id"],
-                "knowledge_id": item["knowledge_id"],
-                "source": item["source"],
-                "kind": item["kind"],
-                "source_sync_namespace": str(
-                    (item.get("metadata") or {}).get("source_sync_namespace") or ""
-                ).strip(),
-                "updated_at": _safe_float(item["updated_at"]),
-            }
-            for item in records
-        ]
+        items: List[Dict[str, Any]] = []
+        for item in records:
+            metadata = (
+                item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            )
+            items.append(
+                {
+                    "sync_id": item["knowledge_id"],
+                    "knowledge_id": item["knowledge_id"],
+                    "source": item["source"],
+                    "root_source": str(
+                        metadata.get("root_source") or item.get("source") or ""
+                    ).strip(),
+                    "relative_path": str(
+                        metadata.get("relative_path")
+                        or metadata.get("source_path")
+                        or metadata.get("source")
+                        or item.get("source")
+                        or ""
+                    ).strip(),
+                    "source_path": str(
+                        metadata.get("source_path")
+                        or metadata.get("source")
+                        or item.get("source")
+                        or ""
+                    ).strip(),
+                    "kind": item["kind"],
+                    "title": item.get("title"),
+                    "source_sync_namespace": str(
+                        metadata.get("source_sync_namespace") or ""
+                    ).strip(),
+                    "updated_at": _safe_float(item["updated_at"]),
+                    "sensitivity": str(metadata.get("sensitivity") or "")
+                    .strip()
+                    .lower(),
+                }
+            )
+        return items
 
     def _knowledge_snapshot(self) -> List[Dict[str, Any]]:
         return self._knowledge_records()
@@ -2586,15 +3127,30 @@ class InstanceSyncService:
         for node in snapshot.get("nodes", []):
             if not isinstance(node, dict):
                 continue
+            attributes = (
+                node.get("attributes")
+                if isinstance(node.get("attributes"), dict)
+                else {}
+            )
             items.append(
                 {
                     "sync_id": f"node:{node.get('node_id')}",
                     "kind": "node",
                     "source_sync_namespace": str(
-                        (node.get("attributes") or {}).get("source_sync_namespace")
-                        or ""
+                        attributes.get("source_sync_namespace") or ""
                     ).strip(),
                     "updated_at": _safe_float(node.get("updated_at")),
+                    "node_id": str(node.get("node_id") or "").strip(),
+                    "source_ref": str(
+                        attributes.get("source_ref")
+                        or attributes.get("source")
+                        or attributes.get("root_source")
+                        or ""
+                    ).strip(),
+                    "source_path": str(attributes.get("source_path") or "").strip(),
+                    "sensitivity": str(attributes.get("sensitivity") or "")
+                    .strip()
+                    .lower(),
                     "label": node.get("canonical_name")
                     or node.get("node_type")
                     or node.get("node_id"),
@@ -2603,14 +3159,28 @@ class InstanceSyncService:
         for claim in snapshot.get("claims", []):
             if not isinstance(claim, dict):
                 continue
+            metadata = (
+                claim.get("metadata") if isinstance(claim.get("metadata"), dict) else {}
+            )
             items.append(
                 {
                     "sync_id": f"claim:{claim.get('claim_id')}",
                     "kind": "claim",
                     "source_sync_namespace": str(
-                        (claim.get("metadata") or {}).get("source_sync_namespace") or ""
+                        metadata.get("source_sync_namespace") or ""
                     ).strip(),
                     "updated_at": _safe_float(claim.get("updated_at")),
+                    "claim_id": str(claim.get("claim_id") or "").strip(),
+                    "source_ref": str(
+                        claim.get("source_ref")
+                        or metadata.get("source")
+                        or metadata.get("root_source")
+                        or ""
+                    ).strip(),
+                    "source_path": str(metadata.get("source_path") or "").strip(),
+                    "sensitivity": str(metadata.get("sensitivity") or "")
+                    .strip()
+                    .lower(),
                     "label": claim.get("predicate") or claim.get("claim_id"),
                 }
             )
@@ -2872,6 +3442,7 @@ class InstanceSyncService:
                         meta, fallback_path=target
                     ),
                     "size": int(meta.get("size") or target.stat().st_size),
+                    "sensitivity": str(meta.get("sensitivity") or "").strip().lower(),
                 }
             )
         return items
@@ -2969,6 +3540,7 @@ class InstanceSyncService:
             if isinstance(item, dict) and item.get("sync_id")
         }
         applied = 0
+        applied_ids: List[str] = []
         skipped = 0
         for record in payload:
             if not isinstance(record, dict):
@@ -3008,10 +3580,16 @@ class InstanceSyncService:
                 "updated_at": incoming_ts,
             }
             applied += 1
+            applied_ids.append(content_hash)
         notes: List[str] = []
         if applied:
             notes.append("Attachment files and captions were synced.")
-        return {"applied": applied, "skipped": skipped, "notes": notes}
+        return {
+            "applied": applied,
+            "skipped": skipped,
+            "notes": notes,
+            "applied_ids": applied_ids,
+        }
 
     def _calendar_manifest(self) -> List[Dict[str, Any]]:
         items: List[Dict[str, Any]] = []
@@ -3034,6 +3612,11 @@ class InstanceSyncService:
                     ).strip(),
                     "updated_at": ts,
                     "title": event.get("title") or event.get("summary") or event_id,
+                    "source_path": str(
+                        event.get("source_path") or event.get("source") or ""
+                    ).strip(),
+                    "source": str(event.get("source") or "").strip(),
+                    "sensitivity": str(event.get("sensitivity") or "").strip().lower(),
                 }
             )
         return items
@@ -3093,33 +3676,60 @@ class InstanceSyncService:
         return {"applied": applied, "skipped": skipped, "notes": notes}
 
     def _settings_manifest(self) -> List[Dict[str, Any]]:
+        themes = _theme_snapshot()
         return [
             {
                 "sync_id": "settings",
                 "updated_at": _settings_updated_at(),
                 "keys": len(_portable_settings_snapshot()),
+                "themes": len(themes),
             }
         ]
 
     def _settings_snapshot(self) -> Dict[str, Any]:
+        updated_at = _settings_updated_at()
         return {
             "sync_id": "settings",
-            "updated_at": user_settings.load_settings().get("updated_at") or _now_iso(),
+            "updated_at": updated_at if updated_at > 0 else _now_iso(),
             "data": _portable_settings_snapshot(),
+            "themes": _theme_snapshot(),
         }
 
     def _merge_settings(self, payload: Any) -> Dict[str, Any]:
         if not isinstance(payload, dict):
             return {"applied": 0, "skipped": 0}
         incoming_data = payload.get("data")
-        if not isinstance(incoming_data, dict):
-            return {"applied": 0, "skipped": 0}
-        current_ts = _settings_updated_at()
+        applied = 0
+        skipped = 0
+        notes: List[str] = []
         incoming_ts = _coerce_timestamp(payload.get("updated_at"))
-        if current_ts > incoming_ts and incoming_ts > 0:
-            return {"applied": 0, "skipped": 1}
-        _write_settings_snapshot(incoming_data, payload.get("updated_at"))
-        return {"applied": 1, "skipped": 0}
+        if isinstance(incoming_data, dict):
+            current_ts = _settings_data_updated_at()
+            if current_ts > incoming_ts and incoming_ts > 0:
+                skipped += 1
+            else:
+                _write_settings_snapshot(incoming_data, payload.get("updated_at"))
+                applied += 1
+        themes_result = _merge_theme_snapshot(payload.get("themes"))
+        applied += themes_result["applied"]
+        skipped += themes_result["skipped"]
+        incoming_visual_theme = (
+            str((incoming_data or {}).get("visual_theme") or "").strip()
+            if isinstance(incoming_data, dict)
+            else ""
+        )
+        if (
+            themes_result["applied"]
+            and incoming_visual_theme
+            and _theme_exists(incoming_visual_theme)
+        ):
+            current_settings = user_settings.load_settings()
+            if current_settings.get("visual_theme") != incoming_visual_theme:
+                user_settings.save_settings({"visual_theme": incoming_visual_theme})
+                applied += 1
+        if themes_result["applied"]:
+            notes.append("Custom visual themes were synced.")
+        return {"applied": applied, "skipped": skipped, "notes": notes}
 
 
 __all__ = [

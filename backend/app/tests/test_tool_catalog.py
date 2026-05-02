@@ -10,9 +10,15 @@ def test_tool_catalog_endpoint_returns_builtin_metadata(tmp_path, monkeypatch):
         sys.path.insert(0, str(backend_dir))
 
     from app.main import app
-    from app.utils import calendar_store, conversation_store
+    from app.utils import calendar_store, conversation_store, user_settings
 
     monkeypatch.setattr(conversation_store, "CONV_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(
+        user_settings,
+        "USER_SETTINGS_PATH",
+        tmp_path / "user_settings.json",
+        raising=False,
+    )
     monkeypatch.setattr(
         calendar_store, "EVENTS_DIR", tmp_path / "calendar", raising=False
     )
@@ -49,6 +55,8 @@ def test_tool_catalog_endpoint_returns_builtin_metadata(tmp_path, monkeypatch):
 
     list_dir = next((tool for tool in tools if tool.get("id") == "list_dir"), None)
     assert list_dir is not None
+    assert list_dir["policy"]["workflow"] == "both"
+    assert list_dir["policy"]["live_auto"] is True
     assert list_dir["sandbox"]["read_roots"] == ["data/"]
     assert list_dir["limits"]["default_max_entries"] == 100
     assert list_dir["limits"]["max_entries"] == 200
@@ -72,6 +80,7 @@ def test_tool_catalog_endpoint_returns_builtin_metadata(tmp_path, monkeypatch):
         (tool for tool in tools if tool.get("id") == "revert_actions"), None
     )
     assert revert_actions is not None
+    assert revert_actions["policy"]["approval"] == "high"
     assert revert_actions["category"] == "history"
     assert revert_actions["persistence"]["writes_state"] is True
     assert revert_actions["safety"]["default_approval"] == "confirm"
@@ -79,6 +88,55 @@ def test_tool_catalog_endpoint_returns_builtin_metadata(tmp_path, monkeypatch):
     assert list_tasks is not None
     assert list_tasks["category"] == "calendar"
     assert list_tasks["persistence"]["writes_state"] is False
+    compact_preview = next(
+        (tool for tool in tools if tool.get("id") == "compact_conversation_preview"),
+        None,
+    )
+    compact_plan = next(
+        (tool for tool in tools if tool.get("id") == "compact_conversation_plan"),
+        None,
+    )
+    assert compact_plan is not None
+    assert compact_plan["category"] == "conversation"
+    assert compact_plan["limits"]["default_context_window_tokens"] == 24000
+    assert compact_plan["limits"]["context_profiles"] == ["short", "medium", "long"]
+    assert compact_plan["persistence"]["writes_state"] is False
+    assert compact_plan["policy"]["approval"] == "low"
+    assert compact_preview is not None
+    assert compact_preview["category"] == "conversation"
+    assert compact_preview["limits"]["max_keep_last"] == 200
+    assert compact_preview["limits"]["summary_workflows"] == [
+        "conversation_handoff",
+        "decision_focus",
+        "task_state",
+    ]
+    assert compact_preview["persistence"]["writes_state"] is False
+    assert compact_preview["policy"]["approval"] == "low"
+    compact_write = next(
+        (tool for tool in tools if tool.get("id") == "compact_conversation_write"),
+        None,
+    )
+    assert compact_write is not None
+    assert compact_write["category"] == "conversation"
+    assert compact_write["limits"]["summary_modes"] == ["deterministic", "llm"]
+    assert compact_write["limits"]["summary_workflows"][0] == ("conversation_handoff")
+    assert compact_write["persistence"]["writes_state"] is True
+    assert compact_write["policy"]["approval"] == "high"
+    subchat = next((tool for tool in tools if tool.get("id") == "subchat"), None)
+    assert subchat is not None
+    assert subchat["category"] == "workflow"
+    assert subchat["safety"]["default_approval"] == "auto"
+    reflect = next((tool for tool in tools if tool.get("id") == "reflect"), None)
+    assert reflect is not None
+    assert reflect["category"] == "reflection"
+    assert reflect["persistence"]["writes_state"] is True
+    assert reflect["limits"]["manual_only_v0"] is True
+    list_reflections = next(
+        (tool for tool in tools if tool.get("id") == "list_reflections"), None
+    )
+    assert list_reflections is not None
+    assert list_reflections["policy"]["approval"] == "low"
+    assert list_reflections["persistence"]["writes_state"] is False
     assert all(tool.get("id") != "decay_memories" for tool in tools)
 
 
@@ -88,9 +146,15 @@ def test_tool_catalog_single_entry_endpoint(tmp_path, monkeypatch):
         sys.path.insert(0, str(backend_dir))
 
     from app.main import app
-    from app.utils import calendar_store, conversation_store
+    from app.utils import calendar_store, conversation_store, user_settings
 
     monkeypatch.setattr(conversation_store, "CONV_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(
+        user_settings,
+        "USER_SETTINGS_PATH",
+        tmp_path / "user_settings.json",
+        raising=False,
+    )
     monkeypatch.setattr(
         calendar_store, "EVENTS_DIR", tmp_path / "calendar", raising=False
     )
@@ -102,6 +166,7 @@ def test_tool_catalog_single_entry_endpoint(tmp_path, monkeypatch):
     tool = resp.json().get("tool")
     assert isinstance(tool, dict)
     assert tool["id"] == "search_web"
+    assert tool["policy"]["workflow"] == "both"
     assert tool["runtime"]["network"] is True
     assert tool["limits"]["max_results"] == 10
 

@@ -83,4 +83,37 @@ describe("MemoryTab", () => {
       screen.getByText(new Date(archivedItem.last_accessed_at * 1000).toLocaleString()),
     ).toBeInTheDocument();
   });
+
+  it("matches search terms across underscore and dash separated keys", async () => {
+    vi.spyOn(axios, "get").mockImplementation((url) => {
+      if (url === "/api/memory") {
+        return Promise.resolve({
+          data: {
+            items: [
+              {
+                key: "tea_party-story",
+                value: "Stories and menu ideas",
+                importance: 1,
+                created_at: 1710000000,
+                updated_at: 1710001800,
+                sensitivity: "mundane",
+                vectorize: false,
+              },
+            ],
+          },
+        });
+      }
+      return Promise.reject(new Error(`Unexpected GET ${url}`));
+    });
+
+    render(<MemoryTab />);
+
+    expect(await screen.findByText("tea_party-story")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Filter memory"), {
+      target: { value: "tea party story" },
+    });
+
+    expect(screen.getByText("tea_party-story")).toBeInTheDocument();
+  });
 });

@@ -13,9 +13,14 @@ BUILTIN_WORKFLOWS: Dict[str, Dict[str, Any]] = {
         "id": "default",
         "label": "Default",
         "description": "Balanced reasoning with normal tool access and moderate latency.",
+        "role": "general",
+        "latency_tier": "interactive",
+        "delegation_mode": "direct",
         "thinking_default": "auto",
         "preferred_continue": "mini_execution",
         "allow_continue_to": ["default", "mini_execution"],
+        "supports_background": False,
+        "supports_live": False,
         "enabled_modules": [
             "computer_use",
             "camera_capture",
@@ -26,9 +31,14 @@ BUILTIN_WORKFLOWS: Dict[str, Dict[str, Any]] = {
         "id": "architect_planner",
         "label": "Architect / Planner",
         "description": "Higher-reasoning planning workflow that prefers decomposition and explicit handoff.",
+        "role": "architect",
+        "latency_tier": "deliberate",
+        "delegation_mode": "delegate",
         "thinking_default": "high",
         "preferred_continue": "mini_execution",
         "allow_continue_to": ["architect_planner", "default", "mini_execution"],
+        "supports_background": False,
+        "supports_live": False,
         "enabled_modules": [
             "computer_use",
             "camera_capture",
@@ -40,12 +50,33 @@ BUILTIN_WORKFLOWS: Dict[str, Dict[str, Any]] = {
         "id": "mini_execution",
         "label": "Mini Execution",
         "description": "Short, low-latency execution bursts for in-between tool steps and recursive continue loops.",
+        "role": "worker",
+        "latency_tier": "fast",
+        "delegation_mode": "execute",
         "thinking_default": "low",
         "preferred_continue": "mini_execution",
         "allow_continue_to": ["mini_execution"],
+        "supports_background": False,
+        "supports_live": False,
         "enabled_modules": [
             "computer_use",
             "camera_capture",
+        ],
+    },
+    "background_reflection": {
+        "id": "background_reflection",
+        "label": "Background Reflection",
+        "description": "Bounded background thinking over memories, recent conversations, and unresolved questions.",
+        "role": "background",
+        "latency_tier": "deliberate",
+        "delegation_mode": "introspection",
+        "thinking_default": "low",
+        "preferred_continue": "mini_execution",
+        "allow_continue_to": ["background_reflection", "mini_execution", "default"],
+        "supports_background": True,
+        "supports_live": False,
+        "enabled_modules": [
+            "memory_promotion",
         ],
     },
 }
@@ -77,11 +108,12 @@ BUILTIN_MODULES: Dict[str, Dict[str, Any]] = {
     },
 }
 
-CLIENT_RESOLUTION_TOOLS = {"camera.capture"}
+CLIENT_RESOLUTION_TOOLS = {"camera.capture", "route_to_local_model"}
 
 TRUST_TIER_MAP: Dict[str, int] = {
     "computer.observe": 1,
     "camera.capture": 1,
+    "route_to_local_model": 1,
     "capture.list": 1,
     "computer.session.start": 2,
     "computer.session.stop": 2,

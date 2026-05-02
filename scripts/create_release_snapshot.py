@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import shutil
 import sys
 from pathlib import Path
@@ -17,6 +18,7 @@ INCLUDE_PATHS = [
     ".github",
     ".gitignore",
     ".pre-commit-config.yaml",
+    "CHANGELOG.md",
     "CLA.md",
     "CONTRIBUTOR_ASSIGNMENT_AGREEMENT.md",
     "LICENSE",
@@ -31,6 +33,8 @@ INCLUDE_PATHS = [
     "docs/environment setup.md",
     "docs/feature_overviews",
     "docs/open_source_licenses.md",
+    "docs/resources/floatlogo.png",
+    "docs/ui-snapshot-2026-04-12.png",
     "frontend",
     "jwt.py",
     "main.py",
@@ -67,10 +71,12 @@ EXCLUDED_PREFIXES = (
     ".env.example",
     "backend/.env",
     "backend/.env.example",
+    "backend/app/sae/train.py",
     "backend/conversations/",
     "backend/logs/",
     "backend/models/",
     "backend/venv/",
+    "backend/app/tests/conversations/",
     "blobs/",
     "conversations/",
     "data/",
@@ -85,6 +91,10 @@ EXCLUDED_PREFIXES = (
     "test_conversations/",
     "test_logs.json",
     "user_settings.json",
+)
+
+EXCLUDED_GLOBS = (
+    "scripts/*_eval.py",
 )
 
 TEXT_SUFFIXES = {
@@ -112,6 +122,7 @@ REFERENCE_SCAN_SUFFIXES = {
 FORBIDDEN_TEXT_SNIPPETS = (
     "docs/function descriptions/",
     "docs/internal/",
+    "notebooks/",
 )
 
 
@@ -151,6 +162,8 @@ def is_excluded(path: Path) -> bool:
         relative == prefix.rstrip("/") or relative.startswith(prefix)
         for prefix in EXCLUDED_PREFIXES
     ):
+        return True
+    if any(fnmatch.fnmatchcase(relative, pattern) for pattern in EXCLUDED_GLOBS):
         return True
     return any(part in EXCLUDED_PARTS for part in path.parts)
 

@@ -7,7 +7,17 @@ from typing import TYPE_CHECKING, Any, Callable, Dict
 from . import actions as action_tools
 from . import browser
 from . import calendar as calendar_tools
-from . import computer_tools, crawler, local_files, memory, threads
+from . import (
+    computer_tools,
+    conversations,
+    crawler,
+    local_files,
+    memory,
+    reflections,
+    routing,
+)
+from . import subchat as subchat_tools
+from . import threads
 from . import tool_help as help_tools
 
 if TYPE_CHECKING:  # pragma: no cover - circular import safe guard
@@ -40,12 +50,19 @@ BUILTIN_TOOLS: Dict[str, Callable[..., Any]] = {
     "list_tasks": calendar_tools.list_tasks,
     "generate_threads": threads.generate_threads_tool,
     "read_threads_summary": threads.read_threads_summary_tool,
+    "compact_conversation_plan": conversations.compact_conversation_plan,
+    "compact_conversation_preview": conversations.compact_conversation_preview,
+    "compact_conversation_write": conversations.compact_conversation_write,
     "memory.save": memory.legacy_memory_save,
     "remember": memory.remember,
     "recall": memory.recall,
+    "reflect": reflections.reflect,
+    "list_reflections": reflections.list_reflections,
     "list_actions": action_tools.list_actions,
     "read_action_diff": action_tools.read_action_diff,
     "revert_actions": action_tools.revert_actions,
+    "subchat": subchat_tools.subchat,
+    "route_to_local_model": routing.route_to_local_model,
     "help": help_tools.help_tool,
     "tool_help": help_tools.tool_help,
     "tool_info": help_tools.tool_info,
@@ -65,8 +82,12 @@ __all__ = [
     "calendar_tools",
     "local_files",
     "threads",
+    "conversations",
     "memory",
+    "reflections",
     "action_tools",
+    "subchat_tools",
+    "routing",
     "help_tools",
     "BUILTIN_TOOLS",
     "register_builtin_tools",

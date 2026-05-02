@@ -56,7 +56,7 @@ describe("RagContextPanel", () => {
       </MemoryRouter>,
     );
     expect(
-      screen.getByRole("button", { name: /Retrieved context/i }),
+      screen.getByRole("button", { name: /^Retrieved context/i }),
     ).toBeInTheDocument();
     expect(screen.getByText("Alpha entry")).toBeInTheDocument();
     const score = screen.getByText(/sim 0.52/i);
@@ -64,7 +64,7 @@ describe("RagContextPanel", () => {
       "title",
       expect.stringContaining("Embedding: local:all-MiniLM-L6-v2"),
     );
-    const toggle = screen.getByRole("button", { name: /Retrieved context/i });
+    const toggle = screen.getByRole("button", { name: /^Retrieved context/i });
     fireEvent.click(toggle);
     expect(screen.queryByText("Alpha entry")).not.toBeInTheDocument();
     fireEvent.click(toggle);

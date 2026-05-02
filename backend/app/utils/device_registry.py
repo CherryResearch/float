@@ -1,5 +1,6 @@
 import json
 import os
+import secrets
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -7,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from app import config as app_config
+from app.utils import user_settings
 
 import jwt
 
@@ -172,10 +174,23 @@ def list_devices() -> Dict[str, Any]:
     return _load_all()
 
 
+def get_device_jwt_secret() -> str:
+    env_secret = str(os.getenv("DEVICE_JWT_SECRET") or "").strip()
+    if env_secret:
+        return env_secret
+    settings = user_settings.load_settings()
+    existing = str(settings.get("device_jwt_secret") or "").strip()
+    if existing:
+        return existing
+    generated = secrets.token_urlsafe(48)
+    user_settings.save_settings({"device_jwt_secret": generated})
+    return generated
+
+
 def issue_device_token(
     device_id: str, scopes: Optional[list[str]] = None, ttl_seconds: int = 3600
 ) -> str:
-    secret = os.getenv("DEVICE_JWT_SECRET", "dev-secret-change-me")
+    secret = get_device_jwt_secret()
     now = int(time.time())
     payload = {
         "iss": "float-backend",
@@ -188,3 +203,7 @@ def issue_device_token(
         "jti": str(uuid.uuid4()),
     }
     return jwt.encode(payload, secret, algorithm="HS256")
+
+
+def decode_device_token(token: str) -> Dict[str, Any]:
+    return jwt.decode(token, get_device_jwt_secret(), algorithms=["HS256"])

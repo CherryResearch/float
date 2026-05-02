@@ -130,7 +130,9 @@ def test_lmstudio_start_server_reports_existing_server(monkeypatch):
 
     result = adapter.start_server(_base_cfg())
 
-    assert result == {"ok": True, "note": "LM Studio server already running."}
+    assert result["ok"] is True
+    assert result["note"] == "LM Studio server already running."
+    assert result["base_url"] == "http://127.0.0.1:1234"
 
 
 def test_lmstudio_start_server_reports_unreachable_api_after_cli_wakeup(monkeypatch):
@@ -204,6 +206,31 @@ def test_lmstudio_list_models_passes_api_token(monkeypatch):
     assert result["ok"] is True
     assert result["models"] == ["gemma-4-E2B-it"]
     assert captured["headers"] == {"Authorization": "Bearer secret-token"}
+
+
+def test_custom_provider_huggingface_url_uses_stored_hf_token(monkeypatch):
+    adapter = LMStudioAdapter()
+    captured = {}
+
+    def fake_get(url, timeout, headers=None):
+        captured["url"] = url
+        captured["headers"] = headers
+        return _FakeResponse({"data": [{"id": "openai/gpt-oss-120b"}]})
+
+    monkeypatch.setattr("app.local_providers.lmstudio.requests.get", fake_get)
+
+    result = adapter.list_models(
+        _base_cfg(
+            local_provider="custom-openai-compatible",
+            local_provider_base_url="https://router.huggingface.co/v1",
+            hf_token="hf-secret-token",
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["models"] == ["openai/gpt-oss-120b"]
+    assert captured["url"] == "https://router.huggingface.co/v1/models"
+    assert captured["headers"] == {"Authorization": "Bearer hf-secret-token"}
 
 
 def test_lmstudio_custom_provider_uses_remote_unmanaged_capabilities():

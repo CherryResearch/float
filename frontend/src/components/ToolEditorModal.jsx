@@ -1,7 +1,7 @@
-import React, { useContext, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import axios from "axios";
-import ToolArgsForm from "./ToolArgsForm";
+import ToolArgsForm, { schemaTypeOptions } from "./ToolArgsForm";
 import ActionListEditor from "./ActionListEditor";
 import "../styles/ToolEditor.css";
 import { GlobalContext } from "../main";
@@ -11,6 +11,8 @@ import {
   formatLocalRuntimeLabel,
   isLocalRuntimeEntry,
   LOCAL_RUNTIME_ENTRIES,
+  resolveRequestModelForMode,
+  SUGGESTED_SERVER_MODELS,
   SUGGESTED_LOCAL_MODELS,
 } from "../utils/modelUtils";
 
@@ -187,7 +189,33 @@ const timezones = (() => {
   }
 })();
 
-const validateArgsAgainstSchema = (schema, args) => {
+const matchesSchemaType = (type, value) => {
+  if (type === "string") return typeof value === "string";
+  if (type === "number") return typeof value === "number" && Number.isFinite(value);
+  if (type === "integer") return typeof value === "number" && Number.isInteger(value);
+  if (type === "boolean") return typeof value === "boolean";
+  if (type === "array") return Array.isArray(value);
+  if (type === "object") {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+  }
+  return true;
+};
+
+const describeSchemaTypes = (types) => {
+  const labels = types.map((type) => {
+    if (type === "boolean") return "true/false";
+    if (type === "array") return "a list";
+    if (type === "object") return "an object";
+    if (type === "integer") return "an integer";
+    if (type === "number") return "a number";
+    return `a ${type}`;
+  });
+  if (labels.length <= 1) return labels[0] || "the expected type";
+  if (labels.length === 2) return `${labels[0]} or ${labels[1]}`;
+  return `${labels.slice(0, -1).join(", ")}, or ${labels[labels.length - 1]}`;
+};
+
+export const validateArgsAgainstSchema = (schema, args) => {
   if (!schema || schema.type !== "object") return { ok: true };
   const props =
     schema.properties && typeof schema.properties === "object"
@@ -210,29 +238,13 @@ const validateArgsAgainstSchema = (schema, args) => {
     if (!propSchema || typeof propSchema !== "object") continue;
     const value = args?.[key];
     if (value === null || value === undefined) continue;
-    const rawType = propSchema.type;
-    const expected = Array.isArray(rawType) ? rawType[0] : rawType;
-    if (!expected) continue;
-    if (expected === "string" && typeof value !== "string") {
-      return { ok: false, message: `Argument '${key}' must be a string.` };
-    }
-    if (
-      (expected === "number" || expected === "integer") &&
-      (typeof value !== "number" || !Number.isFinite(value))
-    ) {
-      return { ok: false, message: `Argument '${key}' must be a number.` };
-    }
-    if (expected === "boolean" && typeof value !== "boolean") {
-      return { ok: false, message: `Argument '${key}' must be true/false.` };
-    }
-    if (expected === "array" && !Array.isArray(value)) {
-      return { ok: false, message: `Argument '${key}' must be a list.` };
-    }
-    if (
-      expected === "object" &&
-      (typeof value !== "object" || value === null || Array.isArray(value))
-    ) {
-      return { ok: false, message: `Argument '${key}' must be an object.` };
+    const expectedTypes = schemaTypeOptions(propSchema.type);
+    if (!expectedTypes.length) continue;
+    if (!expectedTypes.some((expected) => matchesSchemaType(expected, value))) {
+      return {
+        ok: false,
+        message: `Argument '${key}' must be ${describeSchemaTypes(expectedTypes)}.`,
+      };
     }
   }
   return { ok: true };
@@ -274,7 +286,10 @@ const ToolEditorModal = ({
   const [catalogError, setCatalogError] = useState("");
   const [loadingSpecs, setLoadingSpecs] = useState(false);
   const { state } = useContext(GlobalContext);
-  const apiModelsAvailable = Array.isArray(state.apiModels) ? state.apiModels : [];
+  const apiModelsAvailable = useMemo(
+    () => (Array.isArray(state.apiModels) ? state.apiModels : []),
+    [state.apiModels],
+  );
   const apiModelsAvailableSet = useMemo(
     () => new Set(apiModelsAvailable),
     [apiModelsAvailable],
@@ -302,8 +317,8 @@ const ToolEditorModal = ({
     return base;
   }, [state.localModel]);
   const serverModelOptions = useMemo(() => {
-    const base = Array.isArray(SUGGESTED_LOCAL_MODELS)
-      ? [...SUGGESTED_LOCAL_MODELS]
+    const base = Array.isArray(SUGGESTED_SERVER_MODELS)
+      ? [...SUGGESTED_SERVER_MODELS]
       : [];
     const current = state.transformerModel;
     if (current && !base.includes(current)) {
@@ -311,19 +326,29 @@ const ToolEditorModal = ({
     }
     return base;
   }, [state.transformerModel]);
-  const resolveContinueTarget = (modeValue) => {
+  const resolveContinueTarget = useCallback((modeValue) => {
     const currentMode = (modeValue || state.backendMode || "").toLowerCase();
     if (currentMode === "local") {
       return {
         mode: currentMode,
-        model: state.localModel || state.transformerModel || state.apiModel || "",
+        model: resolveRequestModelForMode({
+          backendMode: currentMode,
+          apiModel: state.apiModel,
+          transformerModel: state.transformerModel,
+          localModel: state.localModel,
+        }),
         workflow: state.workflowProfile || "default",
       };
     }
     if (currentMode === "server") {
       return {
         mode: currentMode,
-        model: state.transformerModel || state.apiModel || "",
+        model: resolveRequestModelForMode({
+          backendMode: currentMode,
+          apiModel: state.apiModel,
+          transformerModel: state.transformerModel,
+          localModel: state.localModel,
+        }),
         workflow: state.workflowProfile || "default",
       };
     }
@@ -343,10 +368,22 @@ const ToolEditorModal = ({
         "",
       workflow: state.workflowProfile || "default",
     };
-  };
-  const initialContinue = resolveContinueTarget(state.backendMode);
+  }, [
+    state.apiModel,
+    state.backendMode,
+    state.localModel,
+    state.transformerModel,
+    state.workflowProfile,
+  ]);
+  const routeContinueMode =
+    tool?.name === "route_to_local_model" ? tool?.args?.target_mode : "";
+  const routeContinueModel =
+    tool?.name === "route_to_local_model" ? tool?.args?.target_model : "";
+  const initialContinue = resolveContinueTarget(routeContinueMode || state.backendMode);
   const [continueMode, setContinueMode] = useState(initialContinue.mode);
-  const [continueModel, setContinueModel] = useState(initialContinue.model);
+  const [continueModel, setContinueModel] = useState(
+    routeContinueModel || initialContinue.model,
+  );
   const [continueWorkflow] = useState(
     initialContinue.workflow || state.workflowProfile || "default",
   );
@@ -370,6 +407,13 @@ const ToolEditorModal = ({
     normalizedContinueMode,
     serverModelOptions,
   ]);
+  useEffect(() => {
+    const target = resolveContinueTarget(normalizedContinueMode);
+    if (continueModel === target.model) return;
+    if (!continueModel || !continueModelOptions.includes(continueModel)) {
+      setContinueModel(target.model);
+    }
+  }, [continueModel, continueModelOptions, normalizedContinueMode, resolveContinueTarget]);
   const inlineConversationContext = useMemo(
     () =>
       buildInlineConversationContext(taskPrefill) ||
@@ -493,6 +537,13 @@ const ToolEditorModal = ({
     setArgs(normalized);
     setArgsText(JSON.stringify(normalized, null, 2));
     setViewMode("form");
+    const nextRouteMode =
+      tool?.name === "route_to_local_model" ? normalized.target_mode : "";
+    const nextRouteModel =
+      tool?.name === "route_to_local_model" ? normalized.target_model : "";
+    const nextContinue = resolveContinueTarget(nextRouteMode || state.backendMode);
+    setContinueMode(nextContinue.mode);
+    setContinueModel(nextRouteModel || nextContinue.model);
 
     const schedule =
       schedulePrefill && typeof schedulePrefill === "object"
@@ -546,6 +597,8 @@ const ToolEditorModal = ({
     schedulePrefill,
     defaultTz,
     defaultScheduleConversationMode,
+    resolveContinueTarget,
+    state.backendMode,
   ]);
 
   useEffect(() => {
@@ -1493,11 +1546,9 @@ const ToolEditorModal = ({
                     className="chip backend-chip"
                     onClick={cycleContinueMode}
                     aria-label="Continue mode"
-                    title="Continue mode: click to cycle api -> local -> cloud"
+                    title="Continue mode: click to cycle api -> local -> server"
                   >
-                    {normalizedContinueMode === "server"
-                      ? "cloud"
-                      : normalizedContinueMode}
+                    {normalizedContinueMode}
                   </button>
                   <select
                     className="model-select"
@@ -1507,7 +1558,7 @@ const ToolEditorModal = ({
                   >
                     {normalizedContinueMode === "api" ? (
                       <>
-                        <optgroup label="defaults">
+                        <optgroup label={apiModelGroups.source === "discovered" ? "available" : "defaults"}>
                           {apiModelGroups.defaults.map((model) => {
                             const disabled =
                               apiModelsAvailableSet.size > 0 &&
@@ -1522,7 +1573,7 @@ const ToolEditorModal = ({
                         </optgroup>
                         {apiModelGroups.extras.length > 0 && (
                           <optgroup
-                            label={`available${apiModelsAvailable.length ? ` (${apiModelsAvailable.length})` : ""}`}
+                            label="current selection"
                           >
                             {apiModelGroups.extras.map((model) => (
                               <option key={model} value={model}>
@@ -1533,14 +1584,19 @@ const ToolEditorModal = ({
                         )}
                       </>
                     ) : (
-                      continueModelOptions.map((model) => (
-                        <option key={model} value={model}>
-                          {normalizedContinueMode === "local" &&
-                          isLocalRuntimeEntry(model)
-                            ? formatLocalRuntimeLabel(model)
-                            : model}
-                        </option>
-                      ))
+                      <>
+                        {normalizedContinueMode === "server" && (
+                          <option value="">server default</option>
+                        )}
+                        {continueModelOptions.map((model) => (
+                          <option key={model} value={model}>
+                            {normalizedContinueMode === "local" &&
+                            isLocalRuntimeEntry(model)
+                              ? formatLocalRuntimeLabel(model)
+                              : model}
+                          </option>
+                        ))}
+                      </>
                     )}
                   </select>
                 </div>

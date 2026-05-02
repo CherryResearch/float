@@ -131,6 +131,44 @@ def test_generate_forwards_text_response_format_in_server_mode(monkeypatch):
     assert captured["payload"]["response_format"] == {"type": "text"}
 
 
+def test_generate_omits_blank_server_model(monkeypatch):
+    import app.base_services as base_services
+
+    captured = {}
+
+    class DummyResp:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {
+                "choices": [{"message": {"content": "ok"}}],
+                "model": "gemma-loaded",
+            }
+
+        def raise_for_status(self):
+            pass
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured["payload"] = kwargs.get("json") or {}
+        return DummyResp()
+
+    monkeypatch.setattr(base_services.http_session, "post", fake_post)
+
+    cfg = {
+        "server_url": "http://example.invalid/v1/chat/completions",
+        "api_model": "gpt-5.4",
+    }
+    svc = LLMService(config=cfg)
+    svc.mode = "server"
+    res = svc.generate("hi", model="")
+
+    assert res["text"] == "ok"
+    assert "model" not in captured["payload"]
+    assert res["metadata"]["model_received"] == "gemma-loaded"
+
+
 def test_normalize_chat_role_maps_persisted_aliases():
     import app.base_services as base_services
 

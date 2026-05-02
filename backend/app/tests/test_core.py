@@ -172,12 +172,18 @@ def test_context_endpoints(client):
 
 
 def test_context_branching(client):
+    from app.utils import conversation_store
+
     base = {"system_prompt": "Base"}
     client.post("/context/original", json=base)
     r = client.post("/context/original/branch", json={"new_id": "child"})
     assert r.status_code == 200
     child_ctx = r.json()["context"]
     assert child_ctx["system_prompt"] == "Base"
+    child_meta = conversation_store.get_metadata("child")
+    assert child_meta["workflow_profile"] == "default"
+    assert child_meta["provenance"]["kind"] == "fork"
+    assert child_meta["provenance"]["parent_session_id"] == "original"
     client.post(
         "/context/child/message",
         params={"role": "user", "content": "hi"},

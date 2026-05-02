@@ -1,232 +1,208 @@
-# Float Stack – OpenAI Responses API × MCP SDK Cheat‑Sheet
-_A human- & machine-readable reference for the **Float** AI assistant._
+# Float API Reference
 
-> Dependencies are managed with Poetry. Run `poetry install` to set up all core and optional dependencies (see `pyproject.toml` and `poetry.lock`).
-<small>Last updated 2025‑07‑21 (PDT)</small>
+Updated: 2026-04-13
 
----
-## 1 OpenAI Responses API (streaming‑first)
-> Modern alternative to `chat/completions`; chunked streaming, deltas, and built‑in function‑call signals.
-```bash
-pip install openai
-```
-```python
-import openai, time
-openai.api_key = "<OPENAI_KEY>"
+This is a curated reference for the current local FastAPI surface. Most routes are mounted under `/api`; root health probes also exist at `/` and `/health`.
 
-def stream_chat(messages):
-    resp = openai.Responses.create(model="gpt-4o", stream=True, messages=messages)
-    for chunk in resp:                        # iterable JSON payloads
-        delta = chunk["choices"][0]["delta"]
-        if "content" in delta:
-            yield delta["content"]
-```
-Robust retry wrapper:
-```python
-from openai.error import RateLimitError, OpenAIError
+The implementation source of truth is `backend/app/routes.py` plus the app setup in `backend/app/main.py`. Keep this file high-level enough to stay readable, and check route definitions before adding exact request/response schemas.
 
-def robust_stream(msgs, tries=3):
-    for i in range(tries):
-        try: yield from stream_chat(msgs); return
-        except RateLimitError: time.sleep(2**i)
-        except OpenAIError as e: raise RuntimeError(e)
-```
+## Health And Status
 
----
-## 2 Model Context Protocol (MCP) Python‑SDK
-> Declarative agent protocol—manage *contexts*, stream events, and tool calls.
-```bash
-pip install mcp-client
-```
-```python
-from mcp.client import MCPClient, Context
-client = MCPClient()            # env: MCP_SERVER_URL / API_TOKEN
-ctx = Context(system_prompt="You are Float AI.",
-              tools=[{"name":"search","description":"web search",
-                      "parameters":{"q":str}}])
-ctx.add_message("user", "Weather in Paris?")
-for ev in client.chat(ctx, stream=True):
-    if ev.type == "message": print(ev.content,end="")
-    elif ev.type == "tool_call":
-        res = my_search(ev.parameters["q"])
-        client.send_tool_result(ctx.id, ev.name, res)
-```
-`ev.type ∈ {message, tool_call, function_result}`.
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/health`, `/api/health` | `GET` | Basic backend readiness. |
+| `/api/mcp/status` | `GET` | MCP bridge status. |
+| `/api/celery/status` | `GET` | Worker/broker status summary. |
+| `/api/celery/tasks` | `GET` | Current Celery task view for diagnostics. |
+| `/api/rag/status` | `GET` | Vector-store and embedding-runtime status. |
 
----
-## 3 Integration Skeleton (FloatService)
-```python
-class FloatService:
-    def __init__(self, api_key, mcp_url, mode="api"):
-        import openai
-        from transformers import pipeline
-        openai.api_key = api_key
-        self.client = MCPClient(base_url=mcp_url)
-        self.mode = mode                # 'api' | 'local' | 'dynamic'
-        self.local_pipe = pipeline(
-            "text-generation",
-            model="mistralai/Mistral-7B-Instruct-v0.2",
-            device_map="auto",
-            max_new_tokens=256,
-        )
+## Chat And Continuation
 
-    def _llm_stream(self, messages):
-        if self.mode == "api":
-            yield from robust_stream(messages)
-        elif self.mode == "local":
-            prompt = messages[0]["content"]
-            for chunk in self.local_pipe(prompt, stream=True, return_full_text=False):
-                yield chunk["generated_text"]
-        else:
-            raise NotImplementedError
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/chat` | `POST` | Main chat entrypoint. Accepts mode, model/runtime hints, prompt text, attachments, and workflow context. |
+| `/api/chat/continue` | `POST` | Continue after tool decisions/results or regenerate from saved assistant state. |
+| `/api/llm/generate` | `POST` | Lower-level generation endpoint used by tests and internal callers. |
+| `/api/stream/thoughts` | `GET` | SSE stream for thought/tool/agent-console events. |
+| `/api/history` | `POST` | Store one timeline/history payload. |
+| `/api/history/{session_id}` | `GET` | Read a stored timeline/history payload. |
 
-    def chat(self, prompt):
-        msgs = [{"role":"user","content":prompt}]
-        yield from self._llm_stream(msgs)
-```
+Chat modes are `api`, `local`, and `server`.
 
----
-## 4 Datastores & Embeddings
-> **Weaviate** for vector search + **SQLite** for relational / graph tables.
-```python
-import weaviate
-client = weaviate.connect_to_local()
-emb = EmbeddingService("mixedbread-ai/bert-base-sentence")
-vec = emb.embed("Paris weather")
-client.data_object.create({"text": "Paris weather"}, "Memory", vector=vec)
-```
-Minimal extraction and embedding:
-```python
-from app.services import LangExtractService
-from app.utils.embedding import EmbeddingService
+- `api` uses the configured OpenAI-compatible API URL, defaulting to OpenAI Responses.
+- `local` uses direct local Transformers or a managed local provider marker such as LM Studio/Ollama.
+- `server` uses a user-supplied OpenAI-compatible `server_url` and does not manage that server process.
 
-lx = LangExtractService("Key facts", [])
-items = lx.from_text("Alice met Bob in Paris.")
-vec = EmbeddingService().embed_text(items[0]["text"])
-```
-Schema snapshot:
-| Table | Purpose |
-|---|---|
-| `messages` | raw chat (id, role, content, ts, session) |
-| `memory_vectors` | id, embedding (pgvector), json metadata |
-| `graph_edges` | subject → predicate → object |
+## Voice And Live Streaming
 
----
-## 5 Tool Definition Schema
-```python
-{
-  "name": "search",
-  "description": "web search",
-  "parameters": {"q": "string"},
-  "requires_approval": false
-}
-```
-*When MCP emits a* `tool_call`, *match by `name`, execute, then return with* `client.send_tool_result()`.
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/voice/connect` | `POST` | Current cloud-default live voice bootstrap. In Realtime API mode, returns browser-facing Realtime connection details. |
+| `/api/voice/stream` | `POST` | Older worker-backed voice stream path; not used when the browser streams directly to OpenAI Realtime. |
+| `/api/voice/tts` | `POST` | Text-to-speech generation. |
+| `/api/stream/sessions` | `POST` | Experimental device streaming/session sketch. |
+| `/api/stream/candidates` | `POST` | Experimental ICE/signaling candidate route. |
+| `/api/stream/sessions/{session_id}` | `GET` / `DELETE` | Experimental streaming session status/end routes. |
 
----
-## 6 Tool Endpoints
-Register a built‑in tool then invoke it:
-```bash
-curl -X POST /tools/register -d '{"name":"read_file"}'
-curl -X POST /tools/invoke -d '{"name":"read_file","args":{"path":"notes.txt"}}'
-```
-Both endpoints return JSON results; `/tools/invoke` responds with `{"result": {"status": "invoked", "ok": true, "message": null, "data": "<tool output>"}}`.
+OpenAI Realtime is the current cloud-default live voice path. Gemma 4 is not a supported live voice transport in this pass; use Gemma 4 through the language-model lanes. LiveKit remains a fallback transport and Pipecat remains an explored pipeline option.
 
----
-## 7 Background Jobs (Celery)
-```python
-from tasks import celery_app
+## Tools, Actions, And Agent Console
 
-@celery_app.task
-def long_search(query):
-    return my_search(query)
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/tools/` | `GET` | List registered tools. |
+| `/api/tools/specs` | `GET` | JSON-schema tool specs for UI forms and model/tool guidance. |
+| `/api/tools/register` | `POST` | Register a tool with the runtime manager. |
+| `/api/tools/invoke` | `POST` | Invoke a registered tool. |
+| `/api/tools/propose` | `POST` | Store a proposed tool call for user decision. |
+| `/api/tools/decision` | `POST` | Approve, deny, or edit a proposed tool call. |
+| `/api/tools/client-resolve` | `POST` | Resolve client-side tool work such as camera capture. |
+| `/api/tools/schedule` | `POST` | Schedule a tool/action follow-up. |
+| `/api/actions` | `GET` | List tracked write actions. |
+| `/api/actions/{action_id}` | `GET` | Inspect a tracked action/diff. |
+| `/api/actions/revert` | `POST` | Revert tracked write actions when conflict checks allow it. |
+| `/api/agents/console` | `GET` | Hydrate Agent Console cards after refresh/reconnect. |
 
-# in tool handler
-job = long_search.delay(ev.parameters["q"])
-client.send_tool_result(ctx.id, ev.name, job.get())
-```
-Celery broker = Redis, results backend = PostgreSQL.
+Current built-in tool metadata lives in `backend/app/tool_catalog.py`; current callable registration lives in `backend/app/tools/__init__.py`.
 
----
-## 8 Operational Security
-*   AES‑256‑GCM encrypts serialized memories at rest (`crypto.py`).
-*   Keys stored in Google KMS; loaded at process start via Vault‑agent.
-*   API keys masked before logging; PII redaction helper in `utils.sec`.
+## Computer Use And Captures
 
----
-## 9 UI Integration Hooks
-| Endpoint | Emits | Used in React UI |
-|---|---|---|
-| `/stream/responses` | SSE chunks from OpenAI | chat pane |
-| `/stream/thoughts` | SSE of LLM thoughts & tool logs | agent console |
-| `/agents/console` | JSON snapshot of active agents/tasks | agent console |
-| `/events/mcp` | WebSocket of MCP events | tool sidebar |
-All streams send `{event:"delta", data:"…"}` objects for progressive rendering.
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/computer/capabilities` | `GET` | Report available browser/desktop computer-use runtimes. |
+| `/api/computer/sessions` | `POST` | Start a browser or Windows desktop session. |
+| `/api/computer/sessions/{session_id}` | `GET` / `DELETE` | Inspect or stop a computer-use session. |
+| `/api/computer/screenshots/{filename}` | `GET` | Serve a captured computer-use screenshot. |
+| `/api/captures` | `GET` | List transient captures from camera/computer/screen sources. |
+| `/api/captures/upload` | `POST` | Upload a capture into transient capture storage. |
+| `/api/captures/{capture_id}` | `GET` / `DELETE` | Inspect or delete a capture. |
+| `/api/captures/{capture_id}/content` | `GET` | Serve capture content. |
+| `/api/captures/{capture_id}/promote` | `POST` | Promote a transient capture into durable attachment/knowledge storage. |
 
----
-## 10 Transformer Model API
-| Endpoint | Purpose |
-|---|---|
-| `GET /api/transformers/models` | list available GPT-OSS/transformers models |
-| `POST /api/transformers/generate` | generate text with a selected transformer model |
-Example request:
-```bash
-curl -X POST /api/transformers/generate \
-     -H 'Content-Type: application/json' \
-     -d '{"model":"mistralai/Mistral-7B-Instruct-v0.2","prompt":"hi"}'
-```
+## Memory, Knowledge, RAG, And Attachments
 
----
-## 11  Reference Links
-- OpenAI Responses announcement: <https://community.openai.com/t/introducing-the-responses-api/1140929>
-- Responses API docs: <https://platform.openai.com/docs/api-reference/responses>
-- MCP tutorial: <https://modelcontextprotocol.io/tutorials/building-mcp-with-llms>
-- MCP Python SDK: <https://github.com/modelcontextprotocol/python-sdk>
-- Example agents: <https://github.com/evalstate/fast-agent>, <https://github.com/Abiorh001/mcp_omni_connect>
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/memory` | `GET` | List memory entries, optionally detailed. |
+| `/api/memory/{key}` | `GET` / `POST` / `DELETE` | Read, upsert, or delete one memory. |
+| `/api/memory/{key}/rename` | `POST` | Rename a memory key. |
+| `/api/memory/{key}/memorize` | `POST` | Include a memory in retrieval. |
+| `/api/memory/{key}/exclude` | `POST` | Exclude a memory from default retrieval. |
+| `/api/memory/{key}/archive` | `POST` | Archive/unarchive a memory. |
+| `/api/memory/search` | `POST` | Deterministic memory text search. |
+| `/api/memory/rag/rehydrate` | `POST` | Reindex memory rows into RAG. |
+| `/api/memory/graph` | `GET` | Current memory/provenance graph projection. |
+| `/api/knowledge/upload` | `POST` | Upload a document into knowledge. |
+| `/api/knowledge/add` | `POST` | Add an existing allowed path or URL-like source. |
+| `/api/knowledge/text` | `POST` | Add freeform text. |
+| `/api/knowledge/ingest-folder` | `POST` | Ingest a folder under allowed workspace roots. |
+| `/api/knowledge/query` | `GET` | Query text/CLIP/hybrid knowledge indexes. |
+| `/api/knowledge/list` | `GET` | List indexed knowledge rows. |
+| `/api/knowledge/{doc_id}` | `GET` / `PUT` / `DELETE` | Inspect, update, or delete a knowledge row. |
+| `/api/knowledge/trace/{doc_id}` | `GET` | Fetch full normalized text/metadata for auditing a retrieved match. |
+| `/api/knowledge/file/{doc_id}` | `GET` | Serve a local file only when it resolves inside the managed data/files area. |
+| `/api/knowledge/reveal/{doc_id}` | `GET` | Reveal/open a safe local knowledge source location. |
+| `/api/attachments/upload` | `POST` | Upload an attachment. |
+| `/api/attachments` | `GET` | List attachments. |
+| `/api/attachments/rag/rehydrate` | `POST` | Caption/reindex image attachments. |
+| `/api/attachments/caption/{content_hash}` | `GET` / `PUT` / `DELETE` | Read, set, or clear an attachment caption. |
+| `/api/attachments/reveal/{content_hash}` | `GET` | Reveal/open a safe local attachment location. |
+| `/api/attachments/{content_hash}/{filename}` | `GET` | Serve attachment content. |
+| `/api/attachments/{content_hash}` | `DELETE` | Delete an attachment. |
 
----
+SQLite is the canonical knowledge/memory store. Chroma is the default retrieval mirror. Weaviate is optional and exposed through `/api/weaviate/status`, `/api/weaviate/start`, and `/api/knowledge/import/weaviate`.
 
-## 12 Harmony Message Format
-Float adopts the [Harmony envelope](https://github.com/openai/harmony) for structured
-messages.  Each message's ``content`` is a list of typed parts.  Use the
-`openai-harmony` utilities to render and parse Harmony tokens:
+## Conversations And Threads
 
-```python
-from openai_harmony import (
-    Conversation,
-    HarmonyEncodingName,
-    Message,
-    Role,
-    load_harmony_encoding,
-)
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/conversations` | `GET` | List saved conversations; `detailed=true` returns richer metadata. |
+| `/api/conversations/{name:path}` | `GET` / `POST` / `DELETE` | Read, save, or delete a conversation by nested path. |
+| `/api/conversations/{name:path}/rename` | `POST` | Rename/move a conversation. |
+| `/api/conversations/{name:path}/export` | `GET` | Export one conversation. |
+| `/api/conversations/export-all` | `GET` | Export all conversations. |
+| `/api/conversations/import/preview` | `POST` | Preview import payloads. |
+| `/api/conversations/import` | `POST` | Import Markdown/JSON/text/OpenAI-style export content. |
+| `/api/conversations/reveal/{name:path}` | `GET` | Reveal a saved conversation location. |
+| `/api/conversations/{name:path}/suggest-name` | `GET` | Suggest a better display name. |
+| `/api/threads/generate` | `POST` | Generate/update semantic thread summaries. |
+| `/api/threads/summary` | `GET` | Read latest thread summary. |
+| `/api/threads/search` | `POST` | Search generated thread data. |
+| `/api/threads/rename` | `POST` | Rename a generated thread. |
 
-# Build a conversation and render it to tokens
-conv = Conversation(messages=[
-    Message.from_role_and_content(Role.USER, "Ping?")
-])
-enc = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
-request_tokens = enc.render_conversation_for_completion(conv, Role.ASSISTANT)
+Conversation sidecar metadata can exist without a matching conversation JSON file. UI/API counts should distinguish real conversation JSON files from metadata-only sidecars.
 
-# ...send request_tokens to a model and obtain response_tokens...
-response_tokens = enc.render(
-    Message.from_role_and_content(Role.ASSISTANT, "Pong!")
-)
-msgs = enc.parse_messages_from_completion_tokens(response_tokens)
-print(msgs[-1].content[0].text)
-```
+## Calendar, Tasks, Push, And Notifications
 
-Serialized HTTP payloads look like:
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/calendar/events` | `GET` | List calendar events/tasks. |
+| `/api/calendar/events/{event_id}` | `GET` / `POST` / `DELETE` | Read, update, or delete one event/task. |
+| `/api/calendar/events/{event_id}/prompt` | `POST` | Prompt/review one event. |
+| `/api/calendar/events/{event_id}/run` | `POST` | Manually run an event action. |
+| `/api/calendar/import/google` | `POST` | Import Google Calendar payloads. |
+| `/api/calendar/import/ics` | `POST` | Import ICS calendar payloads. |
+| `/api/calendar/reminders/flush` | `POST` | Flush due reminder prompts after launch/reconnect. |
+| `/api/calendar/rag/rehydrate` | `POST` | Reindex calendar events into RAG. |
+| `/api/tasks/` | `POST` | Create a task through the shared task surface. |
+| `/api/tasks/{task_id}` | `GET` | Read task state. |
+| `/api/notify` | `POST` | Add a local notification. |
+| `/api/notifications/recent` | `GET` | List recent notifications. |
+| `/api/stream/notifications` | `GET` | SSE notifications stream. |
+| `/api/push/public-key` | `GET` | Web-push public key. |
+| `/api/push/subscribe`, `/api/push/unsubscribe`, `/api/push/test` | `POST` | Web-push subscription management and test. |
 
-```json
-{
-  "role": "user",
-  "content": [{"type": "text", "text": "Ping?"}]
-}
-```
+## Settings, Themes, Models, And Providers
 
-When calling ``LLMService.generate`` set ``response_format="harmony"`` to request
-Harmony-formatted responses.
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/settings` | `GET` / `POST` | Read/update runtime settings and persisted `.env` values. |
+| `/api/user-settings` | `GET` / `POST` | Read/update UI/user preferences. |
+| `/api/themes` | `GET` / `POST` | List or save user-created themes. |
+| `/api/themes/{theme_id}` | `DELETE` | Delete a user theme. |
+| `/api/workflows/catalog` | `GET` | Read built-in workflow profile metadata. |
+| `/api/openai/models` | `GET` | Cached model inventory for the configured OpenAI-compatible API provider. |
+| `/api/llm/provider/status` | `GET` | Managed local provider runtime status. |
+| `/api/llm/provider/models` | `GET` | Managed local provider model inventory. |
+| `/api/llm/provider/start`, `/api/llm/provider/stop` | `POST` | Start/stop local-managed provider server when supported. |
+| `/api/llm/provider/load`, `/api/llm/provider/unload` | `POST` | Load/unload a provider-managed model when supported. |
+| `/api/llm/server/models` | `GET` | Probe a Server/LAN OpenAI-compatible endpoint for models. |
+| `/api/llm/local-status`, `/api/llm/load-local`, `/api/llm/unload-local` | `GET` / `POST` | Direct local Transformers runtime status/load/unload. |
+| `/api/models/supported` | `GET` | Current built-in supported model ids. |
+| `/api/models/downloadable` | `GET` | Downloadable model catalog entries. |
+| `/api/models/registered` | `GET` / `POST` | Local registered model aliases. |
+| `/api/models/registered/{alias}` | `DELETE` | Remove a local registered model alias. |
+| `/api/models/jobs` | `GET` / `POST` | List/create model download jobs. |
+| `/api/models/jobs/{job_id}` | `GET` | Read one model job. |
+| `/api/models/jobs/{job_id}/pause`, `/resume`, `/cancel` | `POST` | Control a model job. |
+| `/api/models/info/{model_name}` | `GET` | Model metadata. |
+| `/api/models/summary/{model_name}` | `GET` | Short model summary. |
+| `/api/models/verify/{model_name}` | `GET` | Verify installed local model files. |
+| `/api/models/reveal/{model_name}` | `GET` | Reveal local model path. |
+| `/api/models/{model_name}` | `DELETE` | Delete a local model payload. |
 
----
+Current API defaults focus on `gpt-5.4`; direct-local Gemma 4 targets `gemma-4-E2B-it`; larger Gemma 4 checkpoints are provider/server-first.
 
-*Last updated 2025‑07‑21 (PDT).*&nbsp;
+## Trusted Devices And Sync
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/devices/register` | `POST` | Register a trusted device. |
+| `/api/devices/token` | `POST` | Issue a scoped device token. |
+| `/api/devices` | `GET` | List device records. |
+| `/api/devices/{device_id}` | `PATCH` / `DELETE` | Update or revoke a device. |
+| `/api/devices/prune-legacy` | `POST` | Prune legacy device records. |
+| `/api/pairing/offers` | `POST` | Create a pairing offer. |
+| `/api/pairing/offers/accept` | `POST` | Accept a pairing offer. |
+| `/api/sync/overview` | `GET` | Sync visibility, pairings, workspace profiles, and review state. |
+| `/api/sync/pair` | `POST` | Pair with another Float instance. |
+| `/api/sync/peer/status` | `POST` | Probe paired peer reachability. |
+| `/api/sync/pair/update`, `/api/sync/pair/revoke` | `POST` | Update/revoke saved pairings. |
+| `/api/sync/manifest` | `POST` | Remote manifest endpoint for authenticated sync. |
+| `/api/sync/export` | `POST` | Remote export endpoint for authenticated sync. |
+| `/api/sync/ingest` | `POST` | Remote ingest endpoint, reviewable unless auto-accept is enabled. |
+| `/api/sync/plan` | `POST` | Local preview of pull/push changes. |
+| `/api/sync/apply` | `POST` | Apply selected sync changes. |
+| `/api/sync/reviews/{review_id}/approve`, `/reject` | `POST` | Approve or reject inbound push review items. |
+
+Sync covers conversations, memories, knowledge, graph rows, attachments, calendar files, and workspace preferences. It is an alpha trusted-device flow, not a public gateway or background-sync system.

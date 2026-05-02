@@ -28,6 +28,7 @@ vi.mock("../../main", () => {
 import AgentConsole from "../AgentConsole";
 import ActionHistoryPanel from "../ActionHistoryPanel";
 import { GlobalContext } from "../../main";
+import { TOOL_REVIEW_ACTION_EVENT } from "../../utils/toolReviewActions";
 
 const slugify = (input) =>
   (input || "")
@@ -60,6 +61,12 @@ const renderWithGlobalState = (
         {ui}
       </GlobalContext.Provider>
     </MemoryRouter>,
+  );
+};
+
+const expandRuntimeDetails = async () => {
+  fireEvent.click(
+    await screen.findByRole("button", { name: /expand runtime details/i }),
   );
 };
 
@@ -139,7 +146,7 @@ describe("AgentConsole", () => {
       },
     ];
 
-    render(
+    const { container } = render(
       <MemoryRouter>
         <AgentConsole
           collapsed={false}
@@ -154,11 +161,240 @@ describe("AgentConsole", () => {
       </MemoryRouter>,
     );
 
-    expect(await screen.findByText(/calendar-sync/i)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /background/i })).toBeInTheDocument();
+    expect(container.querySelector(".right-header-title-row")).toBeInTheDocument();
+    expect(container.querySelector(".right-header-controls-scroll")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /expand background/i })).toHaveTextContent("+");
+    const backgroundRegion = screen.getByRole("region", { name: /background/i });
+    expect(within(backgroundRegion).getByTitle(/0 active, 0 queue updates/i)).toBeInTheDocument();
+    expect(backgroundRegion.querySelector(".agent-console-pip-row")).not.toBeInTheDocument();
+    const runtimePanel = screen.getByRole("heading", { name: /runtime/i }).closest("section");
+    expect(runtimePanel?.querySelectorAll(".agent-console-pip")).toHaveLength(4);
+    expect(within(runtimePanel).getByTitle(/API: test-model/i)).toBeInTheDocument();
+    expect(within(runtimePanel).getByTitle(/WebSocket: offline/i)).toBeInTheDocument();
+    expect(within(runtimePanel).queryByTitle(/Background work/i)).not.toBeInTheDocument();
+    expect(within(backgroundRegion).queryByRole("button", { name: /start background agent/i })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /expand background/i }));
+    expect(screen.getByRole("button", { name: /collapse background/i })).toHaveTextContent("-");
+    expect(within(backgroundRegion).getByRole("button", { name: /start background agent/i })).toBeInTheDocument();
+    fireEvent.click(within(backgroundRegion).getByRole("button", { name: /start background agent/i }));
+    const promptBox = within(backgroundRegion).getByLabelText(/prompt/i);
+    expect(promptBox).toBeInTheDocument();
+    fireEvent.change(promptBox, { target: { value: "Review the latest background queue" } });
+    fireEvent.click(within(backgroundRegion).getByRole("button", { name: /^start$/i }));
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith(
+        expect.stringMatching(
+          /\/api\/calendar\/events\/background-[^/]+$/i,
+        ),
+        expect.objectContaining({
+          title: "Background: Review the latest background queue",
+          description: "Review the latest background queue",
+          status: "pending",
+          actions: [
+            expect.objectContaining({
+              kind: "prompt",
+              prompt: "Review the latest background queue",
+              conversation_mode: "new_chat",
+            }),
+          ],
+        }),
+      );
+    });
+    await waitFor(() => {
+      expect(
+        axios.post.mock.calls.some(
+          ([url, payload]) =>
+            /\/api\/calendar\/events\/background-.*\/run\?force=true$/i.test(String(url)) &&
+            payload === null,
+        ),
+      ).toBe(true);
+    });
+    expect(await within(backgroundRegion).findByText(/Started background agent\./i)).toBeInTheDocument();
+    expect(within(backgroundRegion).queryByLabelText(/prompt/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /calendar-sync/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /expand agent card/i })).toHaveTextContent("+");
+    fireEvent.click(screen.getByRole("button", { name: /expand agent card/i }));
     expect(screen.getAllByText(/calendar.lookup/i)[0]).toBeInTheDocument();
 
     expect(screen.getByRole("heading", { name: /calendar-sync/i })).toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: /accept/i })[0]).toBeInTheDocument();
+  });
+
+  it("creates a bounded reflection task from the background panel", async () => {
+    const onRefreshAgents = vi.fn();
+    axios.post.mockResolvedValue({ data: { status: "ran" } });
+
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled
+        onStreamToggle={() => {}}
+        agents={[]}
+        backendReady
+        onRefreshAgents={onRefreshAgents}
+      />,
+    );
+
+    const backgroundRegion = screen.getByRole("region", { name: /background/i });
+    fireEvent.click(screen.getByRole("button", { name: /expand background/i }));
+    fireEvent.click(
+      within(backgroundRegion).getByRole("button", {
+        name: /start background agent/i,
+      }),
+    );
+    fireEvent.change(within(backgroundRegion).getByLabelText(/^mode$/i), {
+      target: { value: "reflect" },
+    });
+    const questionBox = within(backgroundRegion).getByLabelText(/reflection question/i);
+    fireEvent.change(questionBox, {
+      target: { value: "Find one useful follow-up from this thread" },
+    });
+    fireEvent.click(within(backgroundRegion).getByRole("button", { name: /run now/i }));
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith(
+        "/api/reflections/tasks",
+        expect.objectContaining({
+          question: "Find one useful follow-up from this thread",
+          source_thread_id: "sess-123",
+          patience: 1,
+          run_now: true,
+          metadata: { source_mode: "current" },
+        }),
+      );
+    });
+    expect(onRefreshAgents).toHaveBeenCalled();
+    expect(
+      await within(backgroundRegion).findByText(/Reflection started\./i),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps the background composer open while typing spaces", () => {
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled
+        onStreamToggle={() => {}}
+        agents={[]}
+        backendReady
+      />,
+    );
+
+    const backgroundRegion = screen.getByRole("region", { name: /background/i });
+    fireEvent.click(screen.getByRole("button", { name: /expand background/i }));
+    fireEvent.click(
+      within(backgroundRegion).getByRole("button", {
+        name: /start background agent/i,
+      }),
+    );
+    const promptBox = within(backgroundRegion).getByLabelText(/prompt/i);
+    fireEvent.change(promptBox, { target: { value: "hello" } });
+    fireEvent.keyDown(promptBox, { key: " " });
+    fireEvent.change(promptBox, { target: { value: "hello world" } });
+
+    expect(within(backgroundRegion).getByLabelText(/prompt/i)).toHaveValue("hello world");
+  });
+
+  it("nests reflection workers inside the background panel", () => {
+    const now = Date.now() / 1000;
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled
+        onStreamToggle={() => {}}
+        agents={[
+          {
+            id: "reflection:task-1",
+            label: "reflection worker",
+            status: "complete",
+            updatedAt: now,
+            summary: "Reflection saved: one useful next step",
+            provenance: { kind: "background_reflection" },
+            events: [
+              {
+                type: "thought",
+                content: "Reflection saved: one useful next step",
+                timestamp: now,
+              },
+            ],
+          },
+        ]}
+        backendReady
+      />,
+    );
+
+    const backgroundRegion = screen.getByRole("region", { name: /background/i });
+    fireEvent.click(screen.getByRole("button", { name: /expand background/i }));
+
+    expect(within(backgroundRegion).getByText(/reflection worker/i)).toBeInTheDocument();
+    expect(
+      within(backgroundRegion).getAllByText(/Reflection saved: one useful next step/i).length,
+    ).toBeGreaterThan(0);
+    expect(screen.queryByRole("heading", { name: /reflection worker/i })).not.toBeInTheDocument();
+  });
+
+  it("renders chat grouping rail outside tool activity rows", () => {
+    const now = Date.now() / 1000;
+    const agents = [
+      {
+        id: "tool-agent-1",
+        label: "remember",
+        status: "complete",
+        updatedAt: now,
+        session_id: "sess-chat-rail",
+        events: [
+          {
+            type: "tool",
+            name: "remember",
+            status: "invoked",
+            result: { status: "ok" },
+            timestamp: now,
+            id: "tool-rail-1",
+            chain_id: "msg-rail-1",
+            message_id: "msg-rail-1",
+            session_id: "sess-chat-rail",
+          },
+        ],
+      },
+      {
+        id: "tool-agent-2",
+        label: "tool_help",
+        status: "complete",
+        updatedAt: now - 1,
+        session_id: "sess-chat-rail",
+        events: [
+          {
+            type: "tool",
+            name: "tool_help",
+            status: "invoked",
+            result: { status: "ok" },
+            timestamp: now - 1,
+            id: "tool-rail-2",
+            chain_id: "msg-rail-2",
+            message_id: "msg-rail-2",
+            session_id: "sess-chat-rail",
+          },
+        ],
+      },
+    ];
+    const { container } = renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled
+        onStreamToggle={() => {}}
+        agents={agents}
+        backendReady
+      />,
+    );
+
+    expect(container.querySelector(".agent-tool-chat-group > .agent-chat-group-line")).not.toBeNull();
+    fireEvent.click(screen.getAllByRole("button", { name: /expand agent card/i })[0]);
+    expect(container.querySelector(".agent-activity .agent-chat-group-line")).toBeNull();
   });
 
   it("surfaces sync reviews in the console and approves them from there", async () => {
@@ -206,6 +442,8 @@ describe("AgentConsole", () => {
     );
 
     expect(await screen.findByRole("heading", { name: /sync inbox/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /expand sync inbox/i })).toHaveTextContent("+");
+    fireEvent.click(screen.getByRole("button", { name: /expand sync inbox/i }));
     expect(screen.getByText("Pear", { selector: "strong" })).toBeInTheDocument();
     expect(screen.getByText(/Sections: Knowledge \+ Files/i)).toBeInTheDocument();
     expect(screen.getByText(/recent decisions/i)).toBeInTheDocument();
@@ -261,6 +499,7 @@ describe("AgentConsole", () => {
     );
 
     expect(await screen.findByRole("heading", { name: /sync inbox/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /expand sync inbox/i })).toHaveTextContent("+");
     expect(screen.queryByText("Pear", { selector: "strong" })).not.toBeInTheDocument();
 
     const expandButton = screen.getByRole("button", { name: /expand sync inbox/i });
@@ -269,9 +508,7 @@ describe("AgentConsole", () => {
     fireEvent.click(expandButton);
 
     expect(await screen.findByText("Pear", { selector: "strong" })).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: /collapse sync inbox/i }),
-    ).toHaveTextContent("-");
+    expect(screen.getByRole("button", { name: /collapse sync inbox/i })).toHaveTextContent("-");
   });
 
   it("lets the user hide and restore the sync inbox", async () => {
@@ -302,6 +539,10 @@ describe("AgentConsole", () => {
     );
 
     expect(await screen.findByRole("heading", { name: /sync inbox/i })).toBeInTheDocument();
+    const syncInboxRegion = screen.getByRole("region", { name: /sync inbox/i });
+    expect(within(syncInboxRegion).queryByText(/recent decisions/i)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /expand sync inbox/i }));
+    expect(within(syncInboxRegion).getByText(/recent decisions/i)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /hide sync inbox/i }));
 
     expect(screen.queryByRole("heading", { name: /sync inbox/i })).not.toBeInTheDocument();
@@ -309,12 +550,95 @@ describe("AgentConsole", () => {
     const showHiddenButton = screen.getByRole("button", {
       name: /show hidden console cards/i,
     });
-    expect(showHiddenButton).toHaveTextContent("show hidden (1)");
+    expect(showHiddenButton).toHaveTextContent("hidden (1)");
 
     fireEvent.click(showHiddenButton);
 
     expect(await screen.findByRole("heading", { name: /sync inbox/i })).toBeInTheDocument();
     expect(screen.getByText(/recent decisions/i)).toBeInTheDocument();
+  });
+
+  it("resets session-scoped console expansion state when the session changes", async () => {
+    const now = Date.now() / 1000;
+    const agents = [
+      {
+        id: "agent-reset",
+        label: "calendar-sync",
+        status: "pending",
+        updatedAt: now,
+        events: [
+          {
+            type: "thought",
+            content: "Still working",
+            timestamp: now,
+          },
+        ],
+      },
+    ];
+
+    const syncReviews = {
+      pending: [],
+      recent: [
+        {
+          id: "review-reset",
+          status: "approved",
+          source_label: "Desk",
+          updated_at: now - 60,
+          requested_section_labels: ["Knowledge"],
+        },
+      ],
+    };
+
+    const view = renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled
+        onStreamToggle={() => {}}
+        agents={agents}
+        syncReviews={syncReviews}
+        onSelectMessage={() => {}}
+        backendReady
+        onRefreshAgents={() => {}}
+      />,
+      {
+        stateOverrides: {
+          sessionId: "sess-a",
+        },
+      },
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: /expand sync inbox/i }));
+    expect(screen.getByText(/recent decisions/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /expand agent card/i }));
+    expect(screen.getByRole("button", { name: /compact agent card/i })).toBeInTheDocument();
+
+    view.rerender(
+      <MemoryRouter>
+        <GlobalContext.Provider
+          value={{
+            state: { ...baseGlobalState, sessionId: "sess-b" },
+            setState: vi.fn(),
+          }}
+        >
+          <AgentConsole
+            collapsed={false}
+            onToggle={() => {}}
+            streamEnabled
+            onStreamToggle={() => {}}
+            agents={agents}
+            syncReviews={syncReviews}
+            onSelectMessage={() => {}}
+            backendReady
+            onRefreshAgents={() => {}}
+          />
+        </GlobalContext.Provider>
+      </MemoryRouter>,
+    );
+
+    expect(screen.queryByText(/recent decisions/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /expand sync inbox/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /expand agent card/i })).toBeInTheDocument();
   });
 
   it("uses symbol toggles for runtime details", async () => {
@@ -339,13 +663,102 @@ describe("AgentConsole", () => {
     );
 
     const collapseButton = await screen.findByRole("button", {
-      name: /collapse runtime details/i,
+      name: /expand runtime details/i,
     });
-    expect(collapseButton).toHaveTextContent("-");
+    expect(collapseButton).toHaveTextContent("+");
 
     fireEvent.click(collapseButton);
 
-    expect(screen.getByRole("button", { name: /expand runtime details/i })).toHaveTextContent("+");
+    expect(screen.getByRole("button", { name: /collapse runtime details/i })).toHaveTextContent("-");
+  });
+
+  it("flags provider runtimes that are running outside Float", async () => {
+    const defaultGet = axios.get.getMockImplementation();
+    axios.get.mockImplementation((url, ...rest) => {
+      if (url === "/api/llm/provider/models") {
+        return Promise.resolve({
+          data: {
+            models: ["gpt-oss-20b"],
+            runtime: {
+              provider: "lmstudio",
+              installed: false,
+              server_running: true,
+              server_owned_by_float: false,
+              model_loaded: true,
+              loaded_model: "gpt-oss-20b",
+              loaded_model_owned_by_float: false,
+              effective_model_id: "gpt-oss-20b",
+              base_url: "http://127.0.0.1:1234/v1",
+              capabilities: {
+                start_stop: true,
+                load_unload: true,
+                context_length: true,
+              },
+              checked_at: Math.floor(Date.now() / 1000) - 3,
+            },
+          },
+        });
+      }
+      if (url === "/api/llm/provider/status") {
+        return Promise.resolve({
+          data: {
+            runtime: {
+              provider: "lmstudio",
+              installed: false,
+              server_running: true,
+              server_owned_by_float: false,
+              model_loaded: true,
+              loaded_model: "gpt-oss-20b",
+              loaded_model_owned_by_float: false,
+              effective_model_id: "gpt-oss-20b",
+              base_url: "http://127.0.0.1:1234/v1",
+              capabilities: {
+                start_stop: true,
+                load_unload: true,
+                context_length: true,
+              },
+              checked_at: Math.floor(Date.now() / 1000) - 3,
+            },
+          },
+        });
+      }
+      return defaultGet ? defaultGet(url, ...rest) : Promise.resolve({ data: {} });
+    });
+
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled
+        onStreamToggle={() => {}}
+        agents={[]}
+        onSelectMessage={() => {}}
+        backendReady
+        onRefreshAgents={() => {}}
+      />,
+      {
+        stateOverrides: {
+          backendMode: "local",
+          localModel: "lmstudio",
+          transformerModel: "lmstudio",
+        },
+      },
+    );
+
+    await expandRuntimeDetails();
+
+    expect(
+      await screen.findByTitle(/runtime status: external model loaded/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/switch this lane to External HTTP only before using start, stop, load, or unload here\./i),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("Explain provider runtime state"));
+    const inspector = screen.getByRole("dialog", {
+      name: "Why this runtime state is shown",
+    });
+    expect(within(inspector).getByText("Owner")).toBeInTheDocument();
+    expect(within(inspector).getByText("outside Float")).toBeInTheDocument();
   });
 
   it("does not auto-scroll the console when the user has moved away from the bottom", async () => {
@@ -553,6 +966,7 @@ describe("AgentConsole", () => {
     );
 
     expect(await screen.findByText(/writer/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /expand agent card/i }));
     expect(screen.getAllByText(/write_file/i)[0]).toBeInTheDocument();
 
     await act(async () => {
@@ -665,7 +1079,7 @@ describe("AgentConsole", () => {
     const showHiddenButton = screen.getByRole("button", {
       name: /show hidden write items/i,
     });
-    expect(showHiddenButton).toHaveTextContent("show hidden (1)");
+    expect(showHiddenButton).toHaveTextContent("hidden (1)");
 
     fireEvent.click(showHiddenButton);
     expect(screen.getByText(/draft reply/i)).toBeInTheDocument();
@@ -727,6 +1141,7 @@ describe("AgentConsole", () => {
       </MemoryRouter>,
     );
 
+    fireEvent.click(screen.getByRole("button", { name: /expand agent card/i }));
     fireEvent.click(screen.getByText("Accept", { selector: "button" }));
 
     await waitFor(() => {
@@ -744,6 +1159,169 @@ describe("AgentConsole", () => {
           message_id: "msg-1",
         }),
       );
+    });
+  });
+
+  it("handles tool review notification actions through the console controls", async () => {
+    const now = Date.now() / 1000;
+    const agents = [
+      {
+        id: "agent-1",
+        label: "calendar-sync",
+        status: "pending",
+        updatedAt: now,
+        events: [
+          {
+            type: "tool",
+            name: "calendar.lookup",
+            args: { query: "today" },
+            status: "proposed",
+            timestamp: now,
+            id: "proposal-1",
+            chain_id: "msg-1",
+            message_id: "msg-1",
+            session_id: "sess-123",
+          },
+        ],
+      },
+    ];
+
+    axios.post.mockImplementation((url) => {
+      if (url === "/api/tools/decision") {
+        return Promise.resolve({
+          data: {
+            status: "invoked",
+            result: { status: "invoked", ok: true, data: { ok: true } },
+          },
+        });
+      }
+      if (url === "/api/chat/continue") {
+        return Promise.resolve({
+          data: { message: "continued", metadata: {} },
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    render(
+      <MemoryRouter>
+        <AgentConsole
+          collapsed={false}
+          onToggle={() => {}}
+          streamEnabled
+          onStreamToggle={() => {}}
+          agents={agents}
+          onSelectMessage={() => {}}
+          backendReady
+          onRefreshAgents={() => {}}
+        />
+      </MemoryRouter>,
+    );
+
+    await screen.findByRole("button", { name: /expand agent card/i });
+
+    fireEvent(
+      window,
+      new CustomEvent(TOOL_REVIEW_ACTION_EVENT, {
+        detail: { action: "accept", toolIds: ["proposal-1"] },
+      }),
+    );
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith(
+        "/api/tools/decision",
+        expect.objectContaining({ request_id: "proposal-1", decision: "accept" }),
+      );
+    });
+  });
+
+  it("clears stale pending metadata after a continuation resolves", async () => {
+    const currentState = {
+      ...baseGlobalState,
+      conversation: [
+        {
+          role: "user",
+          id: "msg-1:user",
+          text: "Use a tool.",
+        },
+        {
+          role: "ai",
+          id: "msg-1",
+          text: "Requested tool tool_info. Awaiting approval.",
+          metadata: {
+            tool_response_pending: true,
+          },
+          tools: [
+            {
+              id: "proposal-1",
+              name: "tool_info",
+              status: "error",
+              args: { tool: "read_file", include_schema: true },
+              result: {
+                status: "error",
+                ok: false,
+                message: "Missing required argument(s): tool_name",
+              },
+            },
+          ],
+        },
+      ],
+      history: [
+        { role: "user", text: "Use a tool." },
+        { role: "ai", text: "Requested tool tool_info. Awaiting approval." },
+      ],
+    };
+    let nextState = currentState;
+    const setState = vi.fn((update) => {
+      nextState = typeof update === "function" ? update(nextState) : update;
+    });
+
+    axios.post.mockImplementation((url) => {
+      if (url === "/api/chat/continue") {
+        return Promise.resolve({
+          data: {
+            message: "continued",
+            metadata: {},
+          },
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled
+        onStreamToggle={() => {}}
+        agents={[]}
+        onSelectMessage={() => {}}
+        backendReady
+        onRefreshAgents={() => {}}
+      />,
+      { stateOverrides: currentState, setState },
+    );
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith(
+        "/api/chat/continue",
+        expect.objectContaining({
+          session_id: "sess-123",
+          message_id: "msg-1",
+          tools: [
+            expect.objectContaining({
+              id: "proposal-1",
+              status: "error",
+            }),
+          ],
+        }),
+      );
+    });
+
+    await waitFor(() => {
+      expect(nextState.conversation[1].metadata.tool_response_pending).toBe(false);
+      expect(nextState.conversation[1].metadata.tool_continued).toBe(true);
+      expect(nextState.conversation[1].text).toBe("continued");
     });
   });
 
@@ -807,6 +1385,7 @@ describe("AgentConsole", () => {
       },
     );
 
+    fireEvent.click(screen.getByRole("button", { name: /expand agent card/i }));
     const acceptButton = await screen.findByText("Accept", { selector: "button" });
     const denyButton = screen.getByText("Deny", { selector: "button" });
 
@@ -1069,9 +1648,8 @@ describe("AgentConsole", () => {
       },
     );
 
-    fireEvent.click(
-      await screen.findByRole("button", { name: /expand activity details/i }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: /expand agent card/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /expand activity details/i }));
     fireEvent.click(await screen.findByText("Continue", { selector: "button" }));
 
     await waitFor(() => {
@@ -1166,9 +1744,8 @@ describe("AgentConsole", () => {
       />,
     );
 
-    fireEvent.click(
-      await screen.findByRole("button", { name: /expand activity details/i }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: /expand agent card/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /expand activity details/i }));
     fireEvent.click(screen.getAllByRole("button", { name: /expand browser/i }).at(-1));
 
     const dialog = await screen.findByRole("dialog", {
@@ -1364,6 +1941,7 @@ describe("AgentConsole", () => {
 
     axios.get.mockResolvedValue({ data: { tools: [] } });
 
+    fireEvent.click(screen.getByRole("button", { name: /expand agent card/i }));
     fireEvent.click(screen.getByRole("button", { name: /^edit$/i }));
     expect(screen.getByText(/tool editor/i)).toBeInTheDocument();
     await waitFor(() => expect(axios.get).toHaveBeenCalled());
@@ -1439,7 +2017,10 @@ describe("AgentConsole", () => {
       },
     );
 
-    expect(await screen.findByText("installed")).toBeInTheDocument();
+    expect(
+      await screen.findByText("installed", { selector: ".runtime-panel-status" }),
+    ).toBeInTheDocument();
+    await expandRuntimeDetails();
     expect(screen.getByRole("button", { name: "start" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "load" })).toBeInTheDocument();
 
@@ -1532,7 +2113,10 @@ describe("AgentConsole", () => {
       },
     );
 
-    expect(await screen.findByText("endpoint reachable")).toBeInTheDocument();
+    expect(
+      await screen.findByText("endpoint reachable", { selector: ".runtime-panel-status" }),
+    ).toBeInTheDocument();
+    await expandRuntimeDetails();
     expect(screen.getByText("remote endpoint")).toBeInTheDocument();
     expect(screen.getByText(/2 models/i)).toBeInTheDocument();
     const providerSelect = screen.getByTitle(/provider target model/i);
@@ -1622,13 +2206,84 @@ describe("AgentConsole", () => {
       },
     );
 
-    expect(await screen.findByText("not installed")).toBeInTheDocument();
+    expect(
+      await screen.findByText("not installed", { selector: ".runtime-panel-status" }),
+    ).toBeInTheDocument();
+    await expandRuntimeDetails();
     expect(await screen.findByDisplayValue("gemma-4-a")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /refresh provider runtime status/i }));
     await waitFor(() => {
       expect(providerSnapshotCalls).toBeGreaterThanOrEqual(2);
     });
     expect(await screen.findByDisplayValue("gemma-4-b")).toBeInTheDocument();
+  });
+
+  it("surfaces the last provider action without opening provider logs", async () => {
+    const defaultGet = axios.get.getMockImplementation();
+    axios.get.mockImplementation((url, ...rest) => {
+      if (url === "/api/llm/provider/models") {
+        return Promise.resolve({
+          data: {
+            models: ["gpt-oss-20b"],
+            runtime: {
+              provider: "lmstudio",
+              installed: true,
+              server_running: true,
+              model_loaded: true,
+              loaded_model: "gpt-oss-20b",
+              effective_model_id: "gpt-oss-20b",
+              capabilities: { start_stop: true, context_length: true },
+              checked_at: Math.floor(Date.now() / 1000) - 3,
+              last_operation: {
+                id: "load#7",
+                action: "load",
+                status: "error",
+                model: "gpt-oss-20b",
+                started_at: Math.floor(Date.now() / 1000) - 9,
+                finished_at: Math.floor(Date.now() / 1000) - 8,
+                duration_ms: 842,
+                result: {
+                  error: "Remote load endpoint unavailable",
+                  endpoint: "http://127.0.0.1:1234/v1/responses",
+                },
+              },
+            },
+          },
+        });
+      }
+      return defaultGet ? defaultGet(url, ...rest) : Promise.resolve({ data: {} });
+    });
+
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled={false}
+        onStreamToggle={() => {}}
+        agents={[]}
+        onSelectMessage={() => {}}
+        backendReady
+        onRefreshAgents={() => {}}
+      />,
+      {
+        stateOverrides: {
+          backendMode: "local",
+          localModel: "lmstudio",
+          transformerModel: "lmstudio",
+        },
+      },
+    );
+
+    expect(
+      await screen.findByText("model loaded", { selector: ".runtime-panel-status" }),
+    ).toBeInTheDocument();
+    await expandRuntimeDetails();
+    expect(
+      screen.getByText(/Last action: load#7 failed for gpt-oss-20b/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Last action: load#7 failed for gpt-oss-20b/i),
+    ).toHaveAttribute("title", expect.stringContaining("endpoint http://127.0.0.1:1234/v1/responses"));
   });
 
   it("polls provider runtime less often and only loads provider logs on demand", async () => {
@@ -1712,12 +2367,15 @@ describe("AgentConsole", () => {
       },
     );
 
-    expect(await screen.findByText("model loaded")).toBeInTheDocument();
+    expect(
+      await screen.findByText("model loaded", { selector: ".runtime-panel-status" }),
+    ).toBeInTheDocument();
     expect(intervalDelays).toContain(60000);
     expect(providerLogCalls).toHaveLength(0);
     expect(providerModelCalls).toBe(1);
     expect(screen.queryByText(/Inventory checked/i)).not.toBeInTheDocument();
     expect(screen.getByLabelText("Provider inventory freshness")).toBeInTheDocument();
+    await expandRuntimeDetails();
 
     fireEvent.click(screen.getByRole("button", { name: /show logs/i }));
 
@@ -1782,7 +2440,10 @@ describe("AgentConsole", () => {
       },
     );
 
-    expect(await screen.findByText("model loaded")).toBeInTheDocument();
+    expect(
+      await screen.findByText("model loaded", { selector: ".runtime-panel-status" }),
+    ).toBeInTheDocument();
+    await expandRuntimeDetails();
     expect(screen.getByText("http://127.0.0.1:11434/v1")).toBeInTheDocument();
     expect(screen.getByDisplayValue("gemma-4-E2B-it-Q4_K_M")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^load$/i })).toBeInTheDocument();
@@ -1851,6 +2512,10 @@ describe("AgentConsole", () => {
       },
     );
 
+    fireEvent.click(
+      screen.getByRole("button", { name: /expand runtime details/i }),
+    );
+
     expect(await screen.findByText(/loading started/i)).toBeInTheDocument();
     expect(
       screen.getByText(/Backend Python: D:\/notebooks\/float_dev\/backend\/\.venv\/Scripts\/python\.exe/i),
@@ -1917,10 +2582,18 @@ describe("AgentConsole", () => {
     );
 
     expect(await screen.findByRole("heading", { name: /calendar-sync/i })).toBeInTheDocument();
-    expect(screen.getAllByText("Thought 7").length).toBeGreaterThan(0);
+    expect(screen.queryAllByText("Thought 7")).toHaveLength(0);
+    expect(screen.getByRole("button", { name: /expand agent card/i })).toHaveTextContent("+");
 
+    fireEvent.click(screen.getByRole("button", { name: /expand agent card/i }));
+    expect(screen.getAllByText("Thought 7").length).toBeGreaterThan(0);
     fireEvent.click(screen.getByRole("button", { name: /show full activity/i }));
     expect(screen.getByRole("button", { name: /show recent activity/i })).toBeInTheDocument();
+
+    const card = screen.getByRole("heading", { name: /calendar-sync/i }).closest(".agent-card");
+    fireEvent.click(card);
+    expect(screen.getByRole("button", { name: /expand agent card/i })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /expand agent card/i }));
 
     fireEvent.click(screen.getByRole("button", { name: /compact agent card/i }));
     expect(screen.queryAllByText("Thought 7")).toHaveLength(0);
@@ -1932,10 +2605,237 @@ describe("AgentConsole", () => {
     const showHiddenButton = screen.getByRole("button", {
       name: /show hidden console cards/i,
     });
-    expect(showHiddenButton).toHaveTextContent("show hidden (1)");
+    expect(showHiddenButton).toHaveTextContent("hidden (1)");
 
     fireEvent.click(showHiddenButton);
     expect(await screen.findByRole("heading", { name: /calendar-sync/i })).toBeInTheDocument();
+  });
+
+  it("shows delegated-run metadata and sends console control actions", async () => {
+    const now = Date.now() / 1000;
+    const onRefreshAgents = vi.fn().mockResolvedValue(undefined);
+    const agents = [
+      {
+        id: "task:agent-1",
+        label: "delegated worker",
+        status: "active",
+        updatedAt: now,
+        summary: "Working on the verification pass",
+        workflow: {
+          id: "architect_planner",
+          label: "Architect / Planner",
+          role: "architect",
+        },
+        provenance: {
+          kind: "fork",
+          parent_session_id: "sess-parent",
+          parent_message_id: "msg-parent",
+        },
+        handoff: {
+          summary: "Verify the search result before replying.",
+          open_goals: [{ id: "goal-1", title: "verify", status: "open" }],
+          pending_approvals: [{ id: "approval-1", label: "search tool" }],
+        },
+        controls: {
+          available: ["pause", "redirect", "stop"],
+          modes: {
+            pause: "soft",
+            redirect: "queued_request",
+            stop: "runtime_revoke",
+          },
+        },
+        events: [
+          {
+            type: "thought",
+            content: "Working on the verification pass",
+            timestamp: now,
+          },
+        ],
+      },
+    ];
+
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled={false}
+        onStreamToggle={() => {}}
+        agents={agents}
+        onSelectMessage={() => {}}
+        backendReady
+        onRefreshAgents={onRefreshAgents}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: /expand agent card/i })).toHaveTextContent("+");
+    fireEvent.click(screen.getByRole("button", { name: /expand agent card/i }));
+    expect(await screen.findByText(/Architect \/ Planner · architect/i)).toBeInTheDocument();
+    expect(screen.getByText(/fork of sess-parent from msg-parent/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/handoff: Verify the search result before replying\. \(1 goal, 1 approval\)/i),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /pause delegated run/i }));
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith("/api/agents/console/task%3Aagent-1/pause", {
+        note: "",
+        workflow: "",
+      });
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /redirect delegated run/i }));
+    fireEvent.change(screen.getByLabelText(/redirect note/i), {
+      target: { value: "Take the verifier pass next." },
+    });
+    fireEvent.change(screen.getByLabelText(/workflow target/i), {
+      target: { value: "mini_execution" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /send redirect/i }));
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith("/api/agents/console/task%3Aagent-1/redirect", {
+        note: "Take the verifier pass next.",
+        workflow: "mini_execution",
+      });
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /stop delegated run/i }));
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith("/api/agents/console/task%3Aagent-1/stop", {
+        note: "",
+        workflow: "",
+      });
+    });
+    expect(onRefreshAgents).toHaveBeenCalled();
+  });
+
+  it("labels subchat agents clearly and opens the subchat conversation", async () => {
+    const now = Date.now() / 1000;
+    const onOpenConversation = vi.fn();
+    const agents = [
+      {
+        id: "7d977fc1-f520-4ac9-9f58-017f67fddab3",
+        label: "7d977fc1-f520-4ac9-9f58-017f67fddab3",
+        status: "active",
+        updatedAt: now,
+        summary: "Checking layout and clickthrough state",
+        provenance: {
+          kind: "subchat",
+          parent_session_id: "sess-parent",
+          parent_message_id: "msg-parent",
+          branch_session_id: "sess-child",
+          label: "Investigate agent console",
+        },
+        events: [],
+      },
+    ];
+
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled={false}
+        onStreamToggle={() => {}}
+        agents={agents}
+        onSelectMessage={() => {}}
+        onOpenConversation={onOpenConversation}
+        backendReady
+        onRefreshAgents={() => {}}
+      />,
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: /investigate agent console/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/checking layout and clickthrough state/i)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /^investigate agent console$/i }));
+    expect(onOpenConversation).toHaveBeenCalledWith(
+      "sess-child",
+      "Investigate agent console",
+    );
+    onOpenConversation.mockClear();
+
+    fireEvent.click(screen.getByRole("button", { name: /open subchat investigate agent console/i }));
+
+    expect(onOpenConversation).toHaveBeenCalledWith(
+      "sess-child",
+      "Investigate agent console",
+    );
+  });
+
+  it("hides empty opaque agent records instead of showing active UUID cards", async () => {
+    const now = Date.now() / 1000;
+    const agents = [
+      {
+        id: "6d9a911c-98be-4084-8fdd-98b75bdec64e",
+        label: "6d9a911c-98be-4084-8fdd-98b75bdec64e",
+        status: "active",
+        updatedAt: now,
+        events: [],
+      },
+      {
+        id: "agent-1",
+        label: "reader",
+        status: "active",
+        updatedAt: now,
+        events: [{ type: "thought", content: "Reading files", timestamp: now }],
+      },
+    ];
+
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled={false}
+        onStreamToggle={() => {}}
+        agents={agents}
+        onSelectMessage={() => {}}
+        backendReady
+        onRefreshAgents={() => {}}
+      />,
+    );
+
+    expect(await screen.findByRole("heading", { name: /reader/i })).toBeInTheDocument();
+    expect(
+      screen.queryByText(/6d9a911c-98be-4084-8fdd-98b75bdec64e/i),
+    ).not.toBeInTheDocument();
+    const backgroundRegion = screen.getByRole("region", { name: /background/i });
+    expect(within(backgroundRegion).getByTitle(/0 active, 0 queue updates/i)).toBeInTheDocument();
+  });
+
+  it("shortens useful opaque agent records when no readable label is available", async () => {
+    const now = Date.now() / 1000;
+    const agents = [
+      {
+        id: "6d9a911c-98be-4084-8fdd-98b75bdec64e",
+        label: "6d9a911c-98be-4084-8fdd-98b75bdec64e",
+        status: "active",
+        updatedAt: now,
+        summary: "Background import is running",
+        events: [{ type: "thought", content: "Indexing", timestamp: now }],
+      },
+    ];
+
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled={false}
+        onStreamToggle={() => {}}
+        agents={agents}
+        onSelectMessage={() => {}}
+        backendReady
+        onRefreshAgents={() => {}}
+      />,
+    );
+
+    expect(await screen.findByRole("heading", { name: /agent 6d9a911c/i })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: /6d9a911c-98be-4084-8fdd-98b75bdec64e/i }),
+    ).not.toBeInTheDocument();
   });
 
   it("lets standalone write history minimize and restore from the hidden console button", async () => {
@@ -1970,12 +2870,12 @@ describe("AgentConsole", () => {
     );
 
     expect(await screen.findByRole("heading", { name: /write history/i })).toBeInTheDocument();
-    expect(screen.getByText(/draft reply/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /minimize write history/i })).toHaveTextContent("-");
-
-    fireEvent.click(screen.getByRole("button", { name: /minimize write history/i }));
-    expect(screen.getByRole("button", { name: /expand write history/i })).toHaveTextContent("+");
     expect(screen.queryByText(/draft reply/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /expand write history/i })).toHaveTextContent("+");
+
+    fireEvent.click(screen.getByRole("button", { name: /expand write history/i }));
+    expect(screen.getByRole("button", { name: /minimize write history/i })).toHaveTextContent("-");
+    expect(screen.getByText(/draft reply/i)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /hide write history/i }));
     expect(screen.queryByRole("heading", { name: /write history/i })).not.toBeInTheDocument();
@@ -1983,10 +2883,67 @@ describe("AgentConsole", () => {
     const showHiddenButton = screen.getByRole("button", {
       name: /show hidden console cards/i,
     });
-    expect(showHiddenButton).toHaveTextContent("show hidden (1)");
+    expect(showHiddenButton).toHaveTextContent("hidden (1)");
 
     fireEvent.click(showHiddenButton);
     expect(await screen.findByRole("heading", { name: /write history/i })).toBeInTheDocument();
+  });
+
+  it("keeps standalone write history visible even when tool cards expose contextual history", async () => {
+    const now = Date.now() / 1000;
+    const actions = [
+      {
+        id: "action-1",
+        conversation_id: "sess-123",
+        conversation_label: "Current chat",
+        response_id: "msg-1234",
+        response_label: "response 1234",
+        kind: "write",
+        name: "write_file",
+        summary: "Draft reply",
+        status: "applied",
+        created_at_ts: now,
+        revertible: true,
+      },
+    ];
+    const agents = [
+      {
+        id: "agent-1",
+        label: "writer",
+        status: "active",
+        updatedAt: now,
+        events: [
+          {
+            type: "tool",
+            name: "write_file",
+            args: { path: "note", content: "i miss you" },
+            result: { status: "invoked", message: "written" },
+            status: "invoked",
+            message_id: "msg-1234",
+            chain_id: "msg-1234",
+            timestamp: now,
+          },
+        ],
+      },
+    ];
+
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled={false}
+        onStreamToggle={() => {}}
+        agents={agents}
+        actions={actions}
+        onSelectMessage={() => {}}
+        backendReady
+        onRefreshAgents={() => {}}
+      />,
+    );
+
+    expect(await screen.findByRole("heading", { name: /write history/i })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /expand agent card/i }));
+    expect(screen.getAllByRole("button", { name: /work history \(1\)/i }).length).toBeGreaterThan(0);
   });
 
   it("explains when tool details move inline and hides duplicate tool rows", async () => {
@@ -2037,8 +2994,57 @@ describe("AgentConsole", () => {
         /Tool details are inline in chat\. The console is showing thoughts, messages, and tasks only\./i,
       ),
     ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /expand agent card/i }));
     expect(screen.getAllByText("Still working").length).toBeGreaterThan(0);
     expect(screen.queryByText("calendar.lookup")).not.toBeInTheDocument();
+  });
+
+  it("renders a synthetic console tool card when chat tool state exists without agent events", async () => {
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled={false}
+        onStreamToggle={() => {}}
+        agents={[]}
+        onSelectMessage={() => {}}
+        backendReady
+        onRefreshAgents={() => {}}
+      />,
+      {
+        stateOverrides: {
+          toolDisplayMode: "both",
+          conversation: [
+            {
+              role: "ai",
+              id: "ai-tool-error",
+              text: "",
+              timestamp: "2026-04-22T16:17:00Z",
+              tools: [
+                {
+                  name: "write_file",
+                  args: { path: "////w..5%7*/*{{} /", content: "i miss you" },
+                  status: "error",
+                  result: { status: "error", message: "Invalid signature" },
+                },
+              ],
+            },
+          ],
+        },
+      },
+    );
+
+    expect(await screen.findByRole("heading", { name: "write_file" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /expand activity details/i }));
+    expect(screen.getAllByText(/Invalid signature/i).length).toBeGreaterThan(0);
+    const failedToolRow = document.querySelector(
+      '.agent-activity-tool[data-tool-status="error"]',
+    );
+    expect(failedToolRow).toBeInTheDocument();
+    expect(within(failedToolRow).getByRole("button", { name: /^retry$/i })).toBeInTheDocument();
+    expect(
+      within(failedToolRow).getByRole("button", { name: /edit & retry/i }),
+    ).toBeInTheDocument();
   });
 
   it("keeps tool rows visible in auto mode", async () => {
@@ -2084,6 +3090,7 @@ describe("AgentConsole", () => {
       },
     );
 
+    fireEvent.click(screen.getByRole("button", { name: /expand agent card/i }));
     expect(await screen.findByText("calendar.lookup")).toBeInTheDocument();
     expect(
       screen.queryByText(

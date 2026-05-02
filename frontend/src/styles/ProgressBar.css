@@ -231,6 +231,63 @@
   color: rgba(255,255,255,0.8);
 }
 
+.operation-progress-toast {
+  align-items: flex-start;
+}
+
+.operation-progress-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 6px;
+}
+
+.operation-progress-detail {
+  font-size: 12px;
+  color: rgba(255,255,255,0.92);
+}
+
+.operation-progress-meta {
+  font-size: 11px;
+  color: rgba(255,255,255,0.72);
+}
+
+.operation-progress-status {
+  margin-top: 2px;
+  text-transform: lowercase;
+  white-space: nowrap;
+}
+
+.download-toast.operation-progress-toast.is-error {
+  border: 1px solid color-mix(in oklab, var(--color-error) 44%, transparent);
+}
+
+.download-toast.operation-progress-toast.is-complete {
+  border: 1px solid color-mix(in oklab, var(--color-mint-green) 34%, transparent);
+}
+
+.operation-progress-track {
+  min-width: 180px;
+}
+
+.download-progress-fill.is-indeterminate,
+.operation-progress-fill.is-indeterminate {
+  width: 38%;
+  animation: operation-progress-indeterminate 1.1s ease-in-out infinite;
+}
+
+@keyframes operation-progress-indeterminate {
+  0% {
+    transform: translateX(-110%);
+  }
+  50% {
+    transform: translateX(45%);
+  }
+  100% {
+    transform: translateX(170%);
+  }
+}
+
 /* Toasts */
 .download-toasts {
   display: flex;
@@ -249,11 +306,70 @@
   padding: 6px 8px;
 }
 
+.download-toast.tool-resolution-toast {
+  border: 1px solid color-mix(in oklab, var(--color-accent) 42%, transparent);
+  background: color-mix(in oklab, var(--color-mint-green) 12%, rgba(255,255,255,0.08));
+  align-items: flex-start;
+}
+
+.download-toast.tool-resolution-toast.selected-tool-review-toast {
+  border-color: color-mix(in oklab, var(--color-accent) 72%, var(--color-mint-green) 28%);
+}
+
+.download-toast.tool-resolution-toast:hover,
+.download-toast.tool-resolution-toast:focus-within {
+  border-color: color-mix(in oklab, var(--color-mint-green) 70%, var(--color-accent) 30%);
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--color-mint-green) 18%, transparent);
+}
+
 .download-toast-text {
   font-size: 14px;
+}
+
+.tool-review-stack {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+.tool-review-stack-item {
+  border: 1px solid color-mix(in oklab, var(--color-accent) 28%, transparent);
+  border-radius: 6px;
+  background: color-mix(in oklab, var(--glass-tint) 78%, transparent);
+  color: var(--color-text);
+  font-size: 12px;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+
+.tool-review-stack-item.selected {
+  background: color-mix(in oklab, var(--color-mint-green) 34%, var(--glass-tint) 66%);
+  border-color: color-mix(in oklab, var(--color-mint-green) 68%, transparent);
 }
 
 .download-toast-actions {
   display: flex;
   gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.download-toast-actions .notification-tool-action {
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+
+.download-toast-actions .notification-tool-action.batch {
+  border-style: solid;
+  border-width: 1px;
+  border-color: color-mix(in oklab, var(--color-mint-green) 55%, transparent);
+  font-weight: 700;
+}
+
+.download-toast-actions .notification-tool-action.shortcut-active {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--color-accent) 24%, transparent);
+  transform: translateY(-1px);
 }

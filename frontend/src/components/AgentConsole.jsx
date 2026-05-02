@@ -7,11 +7,13 @@ import "../styles/ToolActions.css";
 import "../styles/ToolPayload.css";
 import ActionHistoryPanel from "./ActionHistoryPanel";
 import BrowserSessionDialog from "./BrowserSessionDialog";
+import ConsoleObjectCard from "./ConsoleObjectCard";
 import ToolEditorModal from "./ToolEditorModal";
 import ToolPayloadView, {
   extractComputerPayload,
   summarizeToolPayload,
 } from "./ToolPayloadView";
+import StateInspector from "./StateInspector";
 import {
   formatLocalRuntimeLabel,
   isLocalRuntimeEntry,
@@ -22,8 +24,10 @@ import {
 } from "../utils/modelUtils";
 import {
   filterChatCapableProviderModels,
+  formatProviderLastOperation,
   isChatCapableProviderModelName,
 } from "../utils/providerRuntime";
+import { buildProviderRuntimeInspectorRows } from "../utils/stateExplanations";
 import {
   buildToolContinuationSignature,
   hasMatchingToolContinuationSignature,
@@ -36,11 +40,17 @@ import {
   normalizeToolDisplayMode,
   toolDisplayShowsConsole,
 } from "../utils/toolDisplayModes";
+import {
+  TOOL_REVIEW_ACTION_EVENT,
+  normalizeToolReviewAction,
+  normalizeToolReviewTarget,
+  toolReviewScopeSelectors,
+} from "../utils/toolReviewActions";
 import { mergeContinuationText } from "../utils/continuationText";
 
 const SIDEBAR_MIN_WIDTH = 220;
-const SIDEBAR_MAX_WIDTH = 520;
-const SIDEBAR_VIEWPORT_GUTTER = 160;
+const SIDEBAR_MAX_WIDTH = 760;
+const SIDEBAR_VIEWPORT_GUTTER = 96;
 const SIDEBAR_KEYBOARD_STEP = 20;
 const SIDEBAR_KEYBOARD_STEP_FAST = 40;
 const LOCAL_RUNTIME_POLL_MS = 8000;
@@ -48,6 +58,14 @@ const PROVIDER_RUNTIME_POLL_MS = 60000;
 const EMPTY_GLOBAL_STATE = Object.freeze({});
 const NOOP_SET_STATE = () => {};
 const CLIENT_RESOLUTION_TOOLS = new Set(["camera.capture"]);
+const RETRIABLE_TOOL_STATUSES = new Set([
+  "error",
+  "failed",
+  "denied",
+  "timeout",
+  "cancelled",
+  "canceled",
+]);
 const TOOL_TRUST_TIERS = {
   "computer.observe": 1,
   "camera.capture": 1,
@@ -102,16 +120,34 @@ const statusTone = (status) => {
   const key = (status || "idle").toLowerCase();
   switch (key) {
     case "active":
-    case "running":
-    case "streaming":
       return { label: "active", hue: "var(--color-mint-green)" };
+    case "running":
+      return { label: "running", hue: "var(--color-mint-green)" };
+    case "streaming":
+      return { label: "streaming", hue: "var(--color-mint-green)" };
+    case "proposed":
+      return { label: "proposed", hue: "var(--color-lavender)" };
     case "waiting":
     case "pending":
     case "queued":
       return { label: "pending", hue: "var(--color-lavender)" };
+    case "invoked":
+    case "ok":
+    case "success":
+    case "complete":
+      return {
+        label: key === "invoked" ? "invoked" : "complete",
+        hue: "var(--color-mint-green)",
+      };
+    case "scheduled":
+      return { label: "scheduled", hue: "var(--color-primary)" };
+    case "denied":
     case "error":
     case "failed":
-      return { label: "error", hue: "var(--color-accent)" };
+    case "timeout":
+      return { label: "error", hue: "var(--color-error)" };
+    case "cancelled":
+    case "canceled":
     case "paused":
     case "stopped":
       return { label: "paused", hue: "var(--color-text-muted)" };
@@ -152,6 +188,52 @@ const normalizeRuntimeTimestamp = (value) => {
   return Number.isNaN(ms) ? null : ms;
 };
 
+const COMPACT_CONSOLE_PIP_LABELS = {
+  API: "api",
+  Background: "bg",
+  Context: "ctx",
+  Device: "dev",
+  Model: "mdl",
+  Loaded: "loaded",
+  Provider: "prv",
+  Runtime: "run",
+  Status: "st",
+  Transformer: "tf",
+  WebSocket: "ws",
+  background: "bg",
+  model: "mdl",
+  provider: "prv",
+  runtime: "run",
+  status: "st",
+  websocket: "ws",
+};
+
+const compactConsolePipLabel = (label) => {
+  const normalized = typeof label === "string" ? label.trim() : "";
+  if (!normalized) return "";
+  return COMPACT_CONSOLE_PIP_LABELS[normalized] || normalized;
+};
+
+const compactConsolePipValue = (value) => {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  if (!normalized) return "";
+  const lower = normalized.toLowerCase();
+  if (lower === "connected") return "on";
+  if (lower === "disconnected" || lower === "offline") return "off";
+  if (lower === "stopped") return "off";
+  if (lower === "api runtime") return "api";
+  if (lower === "api mode") return "api";
+  if (lower === "local runtime") return "local";
+  if (lower === "transformer model not selected") return "none";
+  if (lower === "local model") return "local";
+  if (lower === "0 task updates") return "0";
+  const versionedOpenAiModel = normalized.match(
+    /^(gpt-\d+(?:\.\d+)?(?:-[a-z]+)?)-\d{4}-\d{2}-\d{2}$/i,
+  );
+  if (versionedOpenAiModel) return versionedOpenAiModel[1];
+  return normalized;
+};
+
 const formatRuntimeClockTime = (value) => {
   const normalized = normalizeRuntimeTimestamp(value);
   if (!normalized) return null;
@@ -184,6 +266,13 @@ const formatRuntimeRelativeTime = (value, now = Date.now()) => {
 const normalizePreviewText = (value) => {
   if (value === null || value === undefined) return "";
   return String(value).replace(/\s+/g, " ").trim();
+};
+
+const normalizeStatusValue = (value) => {
+  if (typeof value === "string" && value.trim()) return value.trim().toLowerCase();
+  if (value === true) return "online";
+  if (value === false) return "offline";
+  return "unknown";
 };
 
 const truncatePreviewText = (value, maxLength = 160) => {
@@ -259,6 +348,279 @@ const formatModelSourceLabel = (mode, model) => {
   return "";
 };
 
+const formatWorkflowMeta = (workflow) => {
+  if (!workflow || typeof workflow !== "object") return "";
+  const label =
+    typeof workflow.label === "string" && workflow.label.trim()
+      ? workflow.label.trim()
+      : typeof workflow.id === "string"
+        ? workflow.id.trim()
+        : "";
+  const role =
+    typeof workflow.role === "string" && workflow.role.trim()
+      ? workflow.role.trim()
+      : "";
+  if (label && role) return `${label} · ${role}`;
+  return label || role;
+};
+
+const formatProvenanceMeta = (provenance) => {
+  if (!provenance || typeof provenance !== "object") return "";
+  const kind =
+    typeof provenance.kind === "string" ? provenance.kind.trim().toLowerCase() : "";
+  const parentSession =
+    typeof provenance.parent_session_id === "string"
+      ? provenance.parent_session_id.trim()
+      : "";
+  const parentMessage =
+    typeof provenance.parent_message_id === "string"
+      ? provenance.parent_message_id.trim()
+      : "";
+  const taskId =
+    typeof provenance.task_id === "string" ? provenance.task_id.trim() : "";
+  if (kind === "fork" && parentSession) {
+    return `fork of ${parentSession}${parentMessage ? ` from ${parentMessage}` : ""}`;
+  }
+  if (kind === "subchat" && parentSession) {
+    return `subchat from ${parentSession}${parentMessage ? ` / ${parentMessage}` : ""}`;
+  }
+  if (kind === "task_chain" && taskId) {
+    return `task chain ${taskId}`;
+  }
+  if (kind && parentSession) {
+    return `${kind} from ${parentSession}`;
+  }
+  return kind || "";
+};
+
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+const looksLikeUuid = (value) => UUID_PATTERN.test(String(value || "").trim());
+
+const shortOpaqueId = (value, length = 8) => {
+  const normalized = String(value || "").trim();
+  return normalized ? normalized.slice(0, length) : "";
+};
+
+const AGENT_CARD_INTERACTIVE_SELECTOR =
+  'button, a, input, select, textarea, label, summary, [role="button"], [data-no-card-toggle="true"]';
+
+const getRenderableAgentActivity = (agent, { showToolEntries = true } = {}) => {
+  const activity = Array.isArray(agent?.events) ? agent.events : [];
+  return activity.filter(
+    (entry) =>
+      entry &&
+      entry.type !== "content" &&
+      (showToolEntries || entry.type !== "tool"),
+  );
+};
+
+const agentHasUsefulDetails = (agent) => {
+  if (!agent || typeof agent !== "object") return false;
+  if (normalizePreviewText(agent.summary)) return true;
+  if (agent.resources && Object.keys(agent.resources).length) return true;
+  if (agent.workflow && Object.keys(agent.workflow).length) return true;
+  if (agent.provenance && Object.keys(agent.provenance).length) return true;
+  if (agent.handoff && Object.keys(agent.handoff).length) return true;
+  if (agent.controls && Object.keys(agent.controls).length) return true;
+  return false;
+};
+
+const isOpaqueEmptyAgentRecord = (agent, { showToolEntries = true } = {}) => {
+  const id = String(agent?.id || agent?.agent_id || agent?.session_id || "").trim();
+  const label = String(agent?.label || agent?.agent_label || agent?.name || agent?.title || "").trim();
+  if (!looksLikeUuid(id) && !looksLikeUuid(label)) return false;
+  return !getRenderableAgentActivity(agent, { showToolEntries }).length && !agentHasUsefulDetails(agent);
+};
+
+const shouldShowAgentInConsole = (agent, { showToolEntries = true } = {}) => {
+  const id = String(agent?.id || "").trim();
+  if (!id || id === "system:celery") return false;
+  if (isOpaqueEmptyAgentRecord(agent, { showToolEntries })) return false;
+  return true;
+};
+
+const isBackgroundWorkAgent = (agent) => {
+  if (!agent || typeof agent !== "object") return false;
+  const id = String(agent.id || agent.agent_id || "").trim().toLowerCase();
+  if (id.startsWith("task:") || id.startsWith("background:") || id.startsWith("reflection:")) {
+    return true;
+  }
+  const provenance =
+    agent.provenance && typeof agent.provenance === "object" ? agent.provenance : null;
+  const kind = String(provenance?.kind || agent.kind || "").trim().toLowerCase();
+  return kind === "task_chain" || kind === "background" || kind === "background_reflection";
+};
+
+const isReflectionAgent = (agent) => {
+  if (!agent || typeof agent !== "object") return false;
+  const id = String(agent.id || agent.agent_id || "").trim().toLowerCase();
+  if (id.startsWith("reflection:")) return true;
+  const provenance =
+    agent.provenance && typeof agent.provenance === "object" ? agent.provenance : null;
+  const kind = String(provenance?.kind || agent.kind || "").trim().toLowerCase();
+  return kind === "background_reflection";
+};
+
+const THREAD_COLOR_PALETTE = ["#9B8CFF", "#B29ED9", "#6B7AD6", "#86EAA0", "#21B228"];
+
+const getThreadColor = (conversationId) => {
+  const normalized = String(conversationId || "").trim();
+  if (!normalized) return THREAD_COLOR_PALETTE[0];
+  const hash = normalized
+    .split("")
+    .reduce((acc, char) => acc + char.charCodeAt(0), 0);
+  return THREAD_COLOR_PALETTE[hash % THREAD_COLOR_PALETTE.length];
+};
+
+const activityEntryKey = (agent, entry) =>
+  `${agent?.id || agent?.agent_id || agent?.session_id || "agent"}-${
+    entry?.id || entry?.request_id || entry?.timestamp || "event"
+  }-${entry?.type || "log"}-${entry?.name || "entry"}`;
+
+const resolveToolChatKey = (entry, agent, fallbackSessionId = "") => {
+  const provenance =
+    agent?.provenance && typeof agent.provenance === "object" ? agent.provenance : null;
+  return String(
+    entry?.session_id ||
+      agent?.session_id ||
+      agent?.conversationId ||
+      agent?.conversation_id ||
+      provenance?.parent_session_id ||
+      provenance?.branch_session_id ||
+      fallbackSessionId ||
+      "",
+  ).trim();
+};
+
+const isToolOnlyAgent = (agent) => {
+  const events = getRenderableAgentActivity(agent, { showToolEntries: true });
+  return events.length > 0 && events.every((entry) => entry?.type === "tool");
+};
+
+const resolveAgentToolChatKey = (agent, fallbackSessionId = "") => {
+  if (!isToolOnlyAgent(agent)) return "";
+  const events = getRenderableAgentActivity(agent, { showToolEntries: true });
+  return resolveToolChatKey(events[0], agent, fallbackSessionId);
+};
+
+const resolveAgentDisplayLabel = (agent) => {
+  if (!agent || typeof agent !== "object") return "orchestrator";
+  const id = String(
+    agent.id || agent.agent_id || agent.sessionId || agent.session_id || agent.chain_id || "",
+  ).trim();
+  const explicit = String(
+    agent.label || agent.agent_label || agent.name || agent.title || "",
+  ).trim();
+  const provenance =
+    agent.provenance && typeof agent.provenance === "object" ? agent.provenance : null;
+  const provenanceLabel = String(provenance?.label || "").trim();
+  const kind = String(provenance?.kind || "").trim().toLowerCase();
+
+  if (explicit && !looksLikeUuid(explicit)) {
+    return explicit;
+  }
+  if (provenanceLabel) {
+    return provenanceLabel;
+  }
+  if (kind === "subchat" || kind === "fork") {
+    const shortId = shortOpaqueId(
+      provenance?.branch_session_id || agent.conversationId || agent.sessionId || id,
+    );
+    return shortId ? `${kind} ${shortId}` : kind || "subchat";
+  }
+  if (kind === "task_chain") {
+    const shortId = shortOpaqueId(provenance?.task_id || id);
+    return shortId ? `task ${shortId}` : "task chain";
+  }
+  if (explicit && !looksLikeUuid(explicit)) {
+    return explicit;
+  }
+  if (looksLikeUuid(id)) {
+    return `agent ${shortOpaqueId(id)}`;
+  }
+  return id || "orchestrator";
+};
+
+const resolveAgentConversationTarget = (agent, displayLabel = "") => {
+  if (!agent || typeof agent !== "object") return null;
+  const provenance =
+    agent.provenance && typeof agent.provenance === "object" ? agent.provenance : null;
+  const kind = String(provenance?.kind || "").trim().toLowerCase();
+  const branchSessionId = String(provenance?.branch_session_id || "").trim();
+  const directConversationId = String(
+    agent.conversationId ||
+      agent.conversation_id ||
+      agent.sessionId ||
+      agent.session_id ||
+      "",
+  ).trim();
+  const id = String(
+    agent.id || agent.agent_id || agent.sessionId || agent.session_id || agent.chain_id || "",
+  ).trim();
+  let conversationId = branchSessionId || directConversationId;
+  if (!conversationId && (kind === "subchat" || kind === "fork" || looksLikeUuid(id))) {
+    conversationId = id;
+  }
+  if (!conversationId) return null;
+  return {
+    conversationId,
+    label: String(displayLabel || agent.label || "").trim() || conversationId,
+    kind: kind || "conversation",
+    buttonLabel: kind === "subchat" || kind === "fork" ? "open subchat" : "open chat",
+  };
+};
+
+const renderConsolePip = ({ key, label, value, title, tone = "", compact = false }) => {
+  const pipTitle = [label, value]
+    .filter((part) => typeof part === "string" && part.trim())
+    .join(": ");
+  const fullTitle = [pipTitle, title].filter(Boolean).join(" - ");
+  const visibleLabel = compact ? compactConsolePipLabel(label) : label;
+  const visibleValue = compact ? compactConsolePipValue(value) : value;
+
+  return (
+    <span
+      key={key}
+      className={`agent-console-pip${compact ? " agent-console-pip--compact" : ""}`}
+      data-tone={tone || undefined}
+      title={fullTitle}
+    >
+      {compact ? <span className="agent-console-pip-light" aria-hidden="true" /> : null}
+      <span className="agent-console-pip-copy">
+        <span className="agent-console-pip-label">{visibleLabel}</span>
+        <span className="agent-console-pip-value">{visibleValue}</span>
+      </span>
+    </span>
+  );
+};
+
+const formatHandoffMeta = (handoff) => {
+  if (!handoff || typeof handoff !== "object") return "";
+  const summary =
+    typeof handoff.summary === "string" ? handoff.summary.trim() : "";
+  const goalCount = Array.isArray(handoff.open_goals) ? handoff.open_goals.length : 0;
+  const approvalCount = Array.isArray(handoff.pending_approvals)
+    ? handoff.pending_approvals.length
+    : 0;
+  const counts = [];
+  if (goalCount) counts.push(`${goalCount} goal${goalCount === 1 ? "" : "s"}`);
+  if (approvalCount) {
+    counts.push(`${approvalCount} approval${approvalCount === 1 ? "" : "s"}`);
+  }
+  if (!summary && !counts.length) return "";
+  return counts.length ? `${summary || "handoff"} (${counts.join(", ")})` : summary;
+};
+
+const controlModeTitle = (mode) => {
+  const key = typeof mode === "string" ? mode.trim().toLowerCase() : "";
+  if (key === "runtime_revoke") return "Sends a runtime stop request to the delegated task.";
+  if (key === "queued_request") return "Stores a redirect request for the delegated run.";
+  if (key === "soft") return "Updates delegated-run state in the console for now.";
+  return "";
+};
+
 const normalizeToolStatus = (status) =>
   typeof status === "string" ? status.trim().toLowerCase() : "";
 
@@ -283,6 +645,36 @@ const getEffectiveToolStatus = (tool) => {
     return status;
   }
   return getToolResultStatus(tool.result) || status;
+};
+
+const buildToolStateInspectorRows = (entry, context = {}) => {
+  if (!entry || entry.type !== "tool") return [];
+  const status = context.status || getEffectiveToolStatus(entry) || normalizeToolStatus(entry.status);
+  const requestId = String(entry.id || entry.request_id || "").trim();
+  const chainId = String(context.chainIdentifier || entry.chain_id || entry.message_id || "").trim();
+  const sessionId = String(entry.session_id || context.sessionId || "").trim();
+  const owner = String(context.agentId || entry.agent_id || entry.agent || "").trim();
+  const isPending = status === "proposed" || status === "pending" || !status;
+  return [
+    { label: "Source", value: context.sourceLabel || "tool event" },
+    { label: "Status", value: status || "pending" },
+    { label: "Owner", value: owner || sessionId || "current console" },
+    { label: "Request", value: requestId || chainId || "local fallback" },
+    {
+      label: "Evidence",
+      value: entry.synthetic
+        ? "saved conversation tool state"
+        : requestId
+          ? "backend Agent Console event"
+          : "live console activity",
+    },
+    {
+      label: "Next",
+      value: isPending
+        ? "Approve, edit, or deny this tool."
+        : "Open the activity to inspect arguments and result.",
+    },
+  ];
 };
 
 const getBrowserSessionToolContext = (entry) => {
@@ -356,6 +748,46 @@ const mergeToolUpdate = (tools, update) => {
   }
   return list;
 };
+
+
+const summarizeToolBatchLabel = (tools) => {
+  const names = (Array.isArray(tools) ? tools : [])
+    .map((tool) => (typeof tool?.name === "string" ? tool.name.trim() : ""))
+    .filter(Boolean);
+  if (!names.length) return "tool activity";
+  if (names.length === 1) return names[0];
+  if (names.length === 2) return `${names[0]} + ${names[1]}`;
+  return `${names[0]} +${names.length - 1}`;
+};
+
+
+const summarizeSyntheticAgentStatus = (events) => {
+  const statuses = (Array.isArray(events) ? events : [])
+    .map((entry) => getEffectiveToolStatus(entry) || normalizeToolStatus(entry?.status))
+    .filter(Boolean);
+  if (statuses.some((status) => status === "proposed" || status === "pending")) {
+    return "pending";
+  }
+  if (statuses.some((status) => status === "error" || status === "timeout")) {
+    return "error";
+  }
+  return "active";
+};
+
+
+const buildSyntheticToolEventTimestamp = (tool, message, fallbackSeconds, index = 0) => {
+  if (typeof tool?.timestamp === "number" && Number.isFinite(tool.timestamp)) {
+    return tool.timestamp + index * 0.001;
+  }
+  const resolved = resolveEventTimestamp(
+    tool?.updated_at || tool?.created_at || message?.timestamp || message?.updated_at,
+  );
+  if (resolved) {
+    return resolved / 1000 + index * 0.001;
+  }
+  return fallbackSeconds + index * 0.001;
+};
+
 
 const responseLabelForAction = (action) => {
   if (action?.response_label) return String(action.response_label);
@@ -450,6 +882,7 @@ const AgentConsole = ({
   onStreamToggle,
   agents = [],
   onSelectMessage,
+  onOpenConversation,
   isCalendar = false,
   events = [],
   backendReady = true,
@@ -480,15 +913,30 @@ const AgentConsole = ({
   const [taskQuery, setTaskQuery] = React.useState("");
   const [toolEditorState, setToolEditorState] = React.useState(null); // tool | task editor state
   const [collapsedChains, setCollapsedChains] = React.useState({});
+  const [collapsedToolChats, setCollapsedToolChats] = React.useState({});
   const [collapsedAgents, setCollapsedAgents] = React.useState({});
   const [expandedAgents, setExpandedAgents] = React.useState({});
   const [hiddenAgents, setHiddenAgents] = React.useState({});
-  const [actionHistoryCollapsed, setActionHistoryCollapsed] = React.useState(false);
+  const [actionHistoryCollapsed, setActionHistoryCollapsed] = React.useState(true);
   const [actionHistoryHidden, setActionHistoryHidden] = React.useState(false);
   const [runtimeStatus, setRuntimeStatus] = React.useState(null);
   const [runtimeLoading, setRuntimeLoading] = React.useState(false);
   const [runtimeError, setRuntimeError] = React.useState("");
-  const [runtimePanelCollapsed, setRuntimePanelCollapsed] = React.useState(false);
+  const [runtimePanelCollapsed, setRuntimePanelCollapsed] = React.useState(true);
+  const [runtimePanelHidden, setRuntimePanelHidden] = React.useState(false);
+  const [backgroundPanelCollapsed, setBackgroundPanelCollapsed] = React.useState(true);
+  const [backgroundPanelHidden, setBackgroundPanelHidden] = React.useState(false);
+  const [backgroundPromptOpen, setBackgroundPromptOpen] = React.useState(false);
+  const [backgroundComposerMode, setBackgroundComposerMode] = React.useState("prompt");
+  const [backgroundPromptDraft, setBackgroundPromptDraft] = React.useState("");
+  const [backgroundPromptFeedback, setBackgroundPromptFeedback] = React.useState("");
+  const [backgroundPromptPending, setBackgroundPromptPending] = React.useState(false);
+  const [reflectionQuestionDraft, setReflectionQuestionDraft] = React.useState("");
+  const [reflectionSourceMode, setReflectionSourceMode] = React.useState("current");
+  const [reflectionMemoryKey, setReflectionMemoryKey] = React.useState("");
+  const [reflectionPatience, setReflectionPatience] = React.useState("1");
+  const [reflectionFeedback, setReflectionFeedback] = React.useState("");
+  const [reflectionPending, setReflectionPending] = React.useState(false);
   const [providerStatus, setProviderStatus] = React.useState(null);
   const [providerModels, setProviderModels] = React.useState([]);
   const [providerLogs, setProviderLogs] = React.useState([]);
@@ -522,7 +970,7 @@ const AgentConsole = ({
   const [actionHistoryFeedback, setActionHistoryFeedback] = React.useState("");
   const [syncReviewPendingKey, setSyncReviewPendingKey] = React.useState("");
   const [syncReviewFeedback, setSyncReviewFeedback] = React.useState("");
-  const [syncInboxCollapsed, setSyncInboxCollapsed] = React.useState(false);
+  const [syncInboxCollapsed, setSyncInboxCollapsed] = React.useState(true);
   const [syncInboxHidden, setSyncInboxHidden] = React.useState(false);
   const [browserSessionPopup, setBrowserSessionPopup] = React.useState(null);
   const [browserPopupPendingAction, setBrowserPopupPendingAction] = React.useState("");
@@ -530,6 +978,11 @@ const AgentConsole = ({
   const [browserNavigateDraft, setBrowserNavigateDraft] = React.useState("");
   const [browserTypeDraft, setBrowserTypeDraft] = React.useState("");
   const [browserKeyDraft, setBrowserKeyDraft] = React.useState("Enter");
+  const [agentControlPendingKey, setAgentControlPendingKey] = React.useState("");
+  const [agentControlFeedback, setAgentControlFeedback] = React.useState("");
+  const [redirectEditorAgentId, setRedirectEditorAgentId] = React.useState("");
+  const [redirectNoteDraft, setRedirectNoteDraft] = React.useState("");
+  const [redirectWorkflowDraft, setRedirectWorkflowDraft] = React.useState("");
   const providerActionPending = Boolean(providerPendingAction);
   const sidebarRef = React.useRef(null);
   const focusTokenRef = React.useRef(null);
@@ -568,6 +1021,209 @@ const AgentConsole = ({
   const usingProviderRuntime =
     state.backendMode === "local" && Boolean(selectedLocalProvider);
   const isLocalMode = (state.backendMode || "").toLowerCase() === "local";
+  const backgroundAgent = React.useMemo(
+    () =>
+      (Array.isArray(agents) ? agents : []).find(
+        (agent) => String(agent?.id || "").trim() === "system:celery",
+      ) || null,
+    [agents],
+  );
+  const systemTaskCount = React.useMemo(
+    () =>
+      (Array.isArray(agents) ? agents : []).reduce((total, agent) => {
+        if (String(agent?.id || "").trim().startsWith("system:")) return total;
+        const events = Array.isArray(agent?.events) ? agent.events : [];
+        return (
+          total +
+          events.reduce(
+            (eventTotal, entry) => (entry?.type === "task" ? eventTotal + 1 : eventTotal),
+            0,
+          )
+        );
+      }, 0),
+    [agents],
+  );
+  const pendingSyncReviewCount = Array.isArray(syncReviews?.pending)
+    ? syncReviews.pending.length
+    : 0;
+  const activeAgentCount = React.useMemo(
+    () =>
+      (Array.isArray(agents) ? agents : []).filter(
+        (agent) =>
+          isBackgroundWorkAgent(agent) &&
+          String(agent?.status || "").trim().toLowerCase() === "active",
+      ).length,
+    [agents],
+  );
+  const persistCalendarTask = React.useCallback(
+    async (payload) => {
+      const eventId = String(payload?.id || "").trim();
+      if (!eventId) {
+        throw new Error("Task id is required.");
+      }
+      await axios.post(`/api/calendar/events/${encodeURIComponent(eventId)}`, payload);
+      onRefreshCalendar?.();
+      return eventId;
+    },
+    [onRefreshCalendar],
+  );
+  const openTaskEditor = React.useCallback(
+    ({ task = null, taskPrefill = null } = {}) => {
+      setToolEditorState({
+        mode: "task",
+        task,
+        taskPrefill,
+        onSaveTask: persistCalendarTask,
+      });
+    },
+    [persistCalendarTask],
+  );
+  const buildBackgroundTaskPayload = React.useCallback(
+    (promptText, startDate = new Date()) => {
+      const normalizedPrompt = normalizePreviewText(promptText);
+      const safeStart =
+        startDate instanceof Date && !Number.isNaN(startDate.getTime())
+          ? startDate
+          : new Date();
+      const startTime = Math.floor(safeStart.getTime() / 1000);
+      const promptSlug =
+        normalizedPrompt
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/(^-|-$)+/g, "")
+          .slice(0, 32) || "prompt";
+      return {
+        id: `background-${promptSlug}-${startTime}`,
+        title: `Background: ${truncatePreviewText(normalizedPrompt, 56)}`,
+        description: normalizedPrompt,
+        start_time: startTime,
+        end_time: startTime + 15 * 60,
+        timezone: preferredTimezone,
+        status: "pending",
+        actions: [
+          {
+            kind: "prompt",
+            prompt: normalizedPrompt,
+            conversation_mode: "new_chat",
+          },
+        ],
+      };
+    },
+    [preferredTimezone],
+  );
+  const scheduleBackgroundPrompt = React.useCallback(() => {
+    if (backgroundPromptPending) return;
+    const normalizedPrompt = normalizePreviewText(backgroundPromptDraft);
+    if (!normalizedPrompt) {
+      setBackgroundPromptFeedback("Write a prompt before scheduling it.");
+      return;
+    }
+    openTaskEditor({
+      taskPrefill: buildBackgroundTaskPayload(normalizedPrompt),
+    });
+    setBackgroundPromptFeedback("Opened the task scheduler for this background prompt.");
+    setBackgroundPromptDraft("");
+    setBackgroundPromptOpen(false);
+  }, [
+    backgroundPromptDraft,
+    backgroundPromptPending,
+    buildBackgroundTaskPayload,
+    openTaskEditor,
+  ]);
+  const startBackgroundPrompt = React.useCallback(async () => {
+    if (!backendReady || backgroundPromptPending) return;
+    const normalizedPrompt = normalizePreviewText(backgroundPromptDraft);
+    if (!normalizedPrompt) {
+      setBackgroundPromptFeedback("Write a prompt before starting a background agent.");
+      return;
+    }
+    const payload = buildBackgroundTaskPayload(normalizedPrompt, new Date(Date.now() - 1000));
+    setBackgroundPromptPending(true);
+    setBackgroundPromptFeedback("Starting background agent...");
+    try {
+      const eventId = await persistCalendarTask(payload);
+      await axios.post(`/api/calendar/events/${encodeURIComponent(eventId)}/run?force=true`, null);
+      onRefreshAgents?.();
+      onRefreshCalendar?.();
+      setBackgroundPromptFeedback("Started background agent.");
+      setBackgroundPromptDraft("");
+      setBackgroundPromptOpen(false);
+    } catch (err) {
+      const detail =
+        err?.response?.data?.detail ||
+        err?.response?.data?.message ||
+        err?.message ||
+        "Unable to start background prompt.";
+      setBackgroundPromptFeedback(String(detail));
+    } finally {
+      setBackgroundPromptPending(false);
+    }
+  }, [
+    backendReady,
+    backgroundPromptDraft,
+    backgroundPromptPending,
+    buildBackgroundTaskPayload,
+    onRefreshAgents,
+    onRefreshCalendar,
+    persistCalendarTask,
+  ]);
+  const submitReflectionTask = React.useCallback(
+    async (runNow) => {
+      if (!backendReady || reflectionPending) return;
+      const normalizedQuestion = normalizePreviewText(reflectionQuestionDraft);
+      if (!normalizedQuestion) {
+        setReflectionFeedback("Write a question before saving the reflection.");
+        return;
+      }
+      const sourceMode = String(reflectionSourceMode || "manual").toLowerCase();
+      const memoryKey = reflectionMemoryKey.trim();
+      if (sourceMode === "memory" && !memoryKey) {
+        setReflectionFeedback("Add a memory key or choose a different source.");
+        return;
+      }
+      const patienceValue = Math.max(0, Math.min(3, Number(reflectionPatience) || 0));
+      const payload = {
+        title: `Reflection: ${truncatePreviewText(normalizedQuestion, 64)}`,
+        question: normalizedQuestion,
+        source: "user",
+        source_thread_id:
+          sourceMode === "current" && state.sessionId ? String(state.sessionId) : "",
+        patience: patienceValue,
+        memory_keys: sourceMode === "memory" ? [memoryKey] : [],
+        metadata: { source_mode: sourceMode },
+        run_now: Boolean(runNow),
+      };
+      setReflectionPending(true);
+      setReflectionFeedback(runNow ? "Running reflection..." : "Saving reflection...");
+      try {
+        await axios.post("/api/reflections/tasks", payload);
+        onRefreshAgents?.();
+        setReflectionFeedback(runNow ? "Reflection started." : "Reflection saved.");
+        setReflectionQuestionDraft("");
+        setReflectionMemoryKey("");
+        setBackgroundPromptOpen(false);
+      } catch (err) {
+        const detail =
+          err?.response?.data?.detail ||
+          err?.response?.data?.message ||
+          err?.message ||
+          "Unable to save reflection.";
+        setReflectionFeedback(String(detail));
+      } finally {
+        setReflectionPending(false);
+      }
+    },
+    [
+      backendReady,
+      onRefreshAgents,
+      reflectionMemoryKey,
+      reflectionPatience,
+      reflectionPending,
+      reflectionQuestionDraft,
+      reflectionSourceMode,
+      state.sessionId,
+    ],
+  );
   const applyProviderSnapshot = React.useCallback((payload) => {
     const runtime = payload?.runtime || null;
     const models = filterChatCapableProviderModels(payload?.models);
@@ -595,6 +1251,370 @@ const AgentConsole = ({
       setProviderContextDraft(String(runtime.context_length));
     }
   }, []);
+  const backgroundReflectionAgents = React.useMemo(
+    () => (Array.isArray(agents) ? agents : []).filter(isReflectionAgent),
+    [agents],
+  );
+
+  const renderBackgroundPanel = React.useCallback(() => {
+    if (backgroundPanelHidden) return null;
+    const taskLabel =
+      systemTaskCount === 1 ? "1 queue update" : `${systemTaskCount} queue updates`;
+    const activeLabel =
+      activeAgentCount === 1 ? "1 active" : `${activeAgentCount} active`;
+    const backgroundDetail =
+      typeof backgroundAgent?.summary === "string" && backgroundAgent.summary.trim()
+        ? backgroundAgent.summary.trim()
+        : `${activeLabel}, ${taskLabel}`;
+    const openBackgroundPromptComposer = () => {
+      setBackgroundPromptFeedback("");
+      setReflectionFeedback("");
+      setBackgroundComposerMode("prompt");
+      setBackgroundPromptOpen(true);
+    };
+    const closeComposer = () => {
+      setBackgroundPromptOpen(false);
+      setBackgroundPromptDraft("");
+      setBackgroundPromptFeedback("");
+      setReflectionQuestionDraft("");
+      setReflectionMemoryKey("");
+      setReflectionFeedback("");
+      setBackgroundComposerMode("prompt");
+    };
+    const reflectionCards = backgroundReflectionAgents
+      .filter((agent) => {
+        const key = String(agent?.id || agent?.agent_id || agent?.session_id || "").trim();
+        return !key || !hiddenAgents[key];
+      })
+      .map((agent) => {
+        const reflectionKey = String(
+          agent?.id || agent?.agent_id || agent?.session_id || agent?.label || "",
+        );
+        const reflectionTone = statusTone(agent.status);
+        const label = resolveAgentDisplayLabel(agent);
+        const events = getRenderableAgentActivity(agent, { showToolEntries: false })
+          .slice(-4)
+          .reverse();
+        const previewSource =
+          [...events].find((entry) =>
+            normalizePreviewText(
+              entry?.content || entry?.text || entry?.message || entry?.description,
+            ),
+          ) || {};
+        const preview = truncatePreviewText(
+          normalizePreviewText(
+            previewSource.content ||
+              previewSource.text ||
+              previewSource.message ||
+              previewSource.description ||
+              agent.summary ||
+              "",
+          ),
+          140,
+        );
+        const conversationTarget = resolveAgentConversationTarget(agent, label);
+        const canOpenConversation =
+          conversationTarget && typeof onOpenConversation === "function";
+        return (
+          <article
+            key={reflectionKey || label}
+            className="agent-background-reflection-card"
+            title={label}
+          >
+            <div className="agent-background-reflection-header">
+              <span
+                className="agent-status-dot"
+                style={{ backgroundColor: reflectionTone.hue }}
+                aria-hidden="true"
+              />
+              <strong>{label}</strong>
+              <span className="agent-status-label">{reflectionTone.label}</span>
+              {agent.updatedAt ? <time>{formatTimestamp(agent.updatedAt)}</time> : null}
+              {canOpenConversation ? (
+                <button
+                  type="button"
+                  className="agent-card-control-btn agent-open-chat-btn"
+                  onClick={() =>
+                    onOpenConversation(
+                      conversationTarget.conversationId,
+                      conversationTarget.label,
+                    )
+                  }
+                  title={`${conversationTarget.buttonLabel}: ${conversationTarget.label}`}
+                >
+                  {conversationTarget.buttonLabel}
+                </button>
+              ) : null}
+            </div>
+            {preview ? (
+              <p className="agent-background-reflection-preview" title={preview}>
+                {preview}
+              </p>
+            ) : null}
+            {events.length ? (
+              <div className="agent-background-reflection-events">
+                {events.map((entry) => {
+                  const eventText = truncatePreviewText(
+                    normalizePreviewText(
+                      entry?.content || entry?.text || entry?.message || entry?.description || "",
+                    ),
+                    92,
+                  );
+                  return (
+                    <div
+                      className="agent-background-reflection-event"
+                      key={activityEntryKey(agent, entry)}
+                    >
+                      <span className="agent-resource-pill">{entry.type || "update"}</span>
+                      {eventText ? <span>{eventText}</span> : null}
+                      {entry.timestamp ? <time>{formatTimestamp(entry.timestamp)}</time> : null}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
+          </article>
+        );
+      });
+
+    return (
+      <ConsoleObjectCard
+        title="background"
+        subtitle={`${activeLabel}, ${taskLabel}`}
+        preview={backgroundDetail}
+        ariaLabel="background"
+        className="agent-background-panel"
+        collapsed={backgroundPanelCollapsed}
+        onToggleCollapsed={() => setBackgroundPanelCollapsed((prev) => !prev)}
+        onHide={() => setBackgroundPanelHidden(true)}
+        expandLabel="Expand background"
+        collapseLabel="Collapse background"
+        hideLabel="Hide background"
+      >
+        <div className="agent-background-composer">
+          {reflectionCards.length ? (
+            <div className="agent-background-reflection-list" aria-label="background reflections">
+              {reflectionCards}
+            </div>
+          ) : null}
+          {backgroundPromptFeedback ? (
+            <p className="agent-background-composer-note" role="status">
+              {backgroundPromptFeedback}
+            </p>
+          ) : null}
+          {reflectionFeedback ? (
+            <p className="agent-background-composer-note" role="status">
+              {reflectionFeedback}
+            </p>
+          ) : null}
+          {backgroundPromptOpen ? (
+            <div className="agent-background-composer-form">
+              <label className="agent-background-composer-label" htmlFor="background-agent-mode">
+                Mode
+                <select
+                  id="background-agent-mode"
+                  className="agent-background-composer-input"
+                  value={backgroundComposerMode}
+                  onChange={(event) => {
+                    setBackgroundComposerMode(event.target.value);
+                    setBackgroundPromptFeedback("");
+                    setReflectionFeedback("");
+                  }}
+                >
+                  <option value="prompt">Background prompt</option>
+                  <option value="reflect">Reflection</option>
+                </select>
+              </label>
+              {backgroundComposerMode === "reflect" ? (
+                <>
+                  <label className="agent-background-composer-label" htmlFor="reflection-question">
+                    Reflection question
+                  </label>
+                  <textarea
+                    id="reflection-question"
+                    className="agent-background-composer-input"
+                    value={reflectionQuestionDraft}
+                    onChange={(event) => {
+                      setReflectionQuestionDraft(event.target.value);
+                      if (reflectionFeedback) {
+                        setReflectionFeedback("");
+                      }
+                    }}
+                    placeholder="What should Float think through?"
+                    rows={3}
+                  />
+                  <div className="agent-background-composer-grid">
+                    <label className="agent-background-composer-label" htmlFor="reflection-source">
+                      Source
+                      <select
+                        id="reflection-source"
+                        className="agent-background-composer-input"
+                        value={reflectionSourceMode}
+                        onChange={(event) => setReflectionSourceMode(event.target.value)}
+                      >
+                        <option value="current">Current thread</option>
+                        <option value="recent">Recent carry-over</option>
+                        <option value="memory">Memory key</option>
+                        <option value="manual">Manual topic</option>
+                      </select>
+                    </label>
+                    <label className="agent-background-composer-label" htmlFor="reflection-patience">
+                      Patience
+                      <select
+                        id="reflection-patience"
+                        className="agent-background-composer-input"
+                        value={reflectionPatience}
+                        onChange={(event) => setReflectionPatience(event.target.value)}
+                      >
+                        <option value="0">1 pass</option>
+                        <option value="1">2 passes</option>
+                        <option value="2">3 passes</option>
+                        <option value="3">4 passes</option>
+                      </select>
+                    </label>
+                  </div>
+                  {reflectionSourceMode === "memory" ? (
+                    <label className="agent-background-composer-label" htmlFor="reflection-memory-key">
+                      Memory key
+                      <input
+                        id="reflection-memory-key"
+                        className="agent-background-composer-input"
+                        value={reflectionMemoryKey}
+                        onChange={(event) => setReflectionMemoryKey(event.target.value)}
+                      />
+                    </label>
+                  ) : null}
+                  <div className="agent-background-composer-actions">
+                    <button
+                      type="button"
+                      className="agent-card-control-btn"
+                      disabled={
+                        !backendReady || reflectionPending || !reflectionQuestionDraft.trim()
+                      }
+                      onClick={() => submitReflectionTask(true)}
+                      title="Run reflection now"
+                    >
+                      {reflectionPending ? "Working..." : "Run now"}
+                    </button>
+                    <button
+                      type="button"
+                      className="agent-card-control-btn"
+                      disabled={reflectionPending || !reflectionQuestionDraft.trim()}
+                      onClick={() => submitReflectionTask(false)}
+                      title="Save reflection for later"
+                    >
+                      Save later
+                    </button>
+                    <button
+                      type="button"
+                      className="agent-card-control-btn danger"
+                      disabled={reflectionPending}
+                      onClick={closeComposer}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <label className="agent-background-composer-label" htmlFor="background-agent-prompt">
+                    Prompt
+                  </label>
+                  <textarea
+                    id="background-agent-prompt"
+                    className="agent-background-composer-input"
+                    value={backgroundPromptDraft}
+                    onChange={(event) => {
+                      setBackgroundPromptDraft(event.target.value);
+                      if (backgroundPromptFeedback) {
+                        setBackgroundPromptFeedback("");
+                      }
+                    }}
+                    placeholder="Describe the background agent task..."
+                    rows={3}
+                  />
+                  <div className="agent-background-composer-actions">
+                    <button
+                      type="button"
+                      className="agent-card-control-btn"
+                      disabled={
+                        !backendReady || backgroundPromptPending || !backgroundPromptDraft.trim()
+                      }
+                      onClick={startBackgroundPrompt}
+                      title="Start background agent"
+                    >
+                      {backgroundPromptPending ? "Starting..." : "Start"}
+                    </button>
+                    <button
+                      type="button"
+                      className="agent-card-control-btn"
+                      disabled={backgroundPromptPending || !backgroundPromptDraft.trim()}
+                      onClick={scheduleBackgroundPrompt}
+                      title="Schedule this background prompt"
+                    >
+                      Schedule
+                    </button>
+                    <button
+                      type="button"
+                      className="agent-card-control-btn danger"
+                      disabled={backgroundPromptPending}
+                      onClick={closeComposer}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          ) : (
+            <div className="agent-background-compose-buttons">
+              <button
+                type="button"
+                className="agent-background-compose-trigger"
+                onClick={openBackgroundPromptComposer}
+                aria-label="Start background agent"
+                title="Start background agent"
+              >
+                <span aria-hidden="true" className="agent-background-compose-rule">
+                  --
+                </span>
+                <span aria-hidden="true" className="agent-background-compose-plus">
+                  +
+                </span>
+                <span aria-hidden="true" className="agent-background-compose-rule">
+                  --
+                </span>
+              </button>
+            </div>
+          )}
+        </div>
+      </ConsoleObjectCard>
+    );
+  }, [
+    activeAgentCount,
+    backgroundAgent,
+    backgroundComposerMode,
+    backgroundPanelCollapsed,
+    backgroundPanelHidden,
+    backgroundPromptDraft,
+    backgroundPromptFeedback,
+    backgroundPromptOpen,
+    backgroundPromptPending,
+    backgroundReflectionAgents,
+    backendReady,
+    hiddenAgents,
+    onOpenConversation,
+    reflectionFeedback,
+    reflectionMemoryKey,
+    reflectionPatience,
+    reflectionPending,
+    reflectionQuestionDraft,
+    reflectionSourceMode,
+    scheduleBackgroundPrompt,
+    startBackgroundPrompt,
+    submitReflectionTask,
+    systemTaskCount,
+  ]);
   const clampSidebarWidth = React.useCallback((value, minWidth, maxWidth) => {
     if (!Number.isFinite(value)) return minWidth;
     return Math.min(maxWidth, Math.max(minWidth, value));
@@ -702,13 +1722,58 @@ const AgentConsole = ({
     });
     return map;
   }, [state.conversation]);
+  const currentConversationLabel = React.useMemo(
+    () =>
+      normalizePreviewText(
+        state.conversationTitle ||
+          state.currentConversationTitle ||
+          state.currentConversationName ||
+          state.sessionTitle ||
+          state.sessionName ||
+          state.chatTitle ||
+          "",
+      ),
+    [
+      state.chatTitle,
+      state.conversationTitle,
+      state.currentConversationName,
+      state.currentConversationTitle,
+      state.sessionName,
+      state.sessionTitle,
+    ],
+  );
+  const resolveToolChatDisplayName = React.useCallback(
+    (chatKey, message = null, agent = null) => {
+      const meta = message && typeof message === "object" ? message.metadata : null;
+      const provenance =
+        agent?.provenance && typeof agent.provenance === "object" ? agent.provenance : null;
+      const direct = normalizePreviewText(
+        meta?.conversation_title ||
+          meta?.conversation_name ||
+          meta?.chat_title ||
+          message?.conversation_title ||
+          message?.conversation_name ||
+          provenance?.conversation_title ||
+          provenance?.conversation_name ||
+          agent?.conversation_title ||
+          agent?.conversation_name ||
+          "",
+      );
+      if (direct) return direct;
+      const normalizedKey = String(chatKey || "").trim();
+      if (normalizedKey && normalizedKey === String(state.sessionId || "").trim()) {
+        return currentConversationLabel || "current chat";
+      }
+      return normalizedKey ? `chat ${shortOpaqueId(normalizedKey, 8)}` : "current chat";
+    },
+    [currentConversationLabel, state.sessionId],
+  );
   const actionHistoryByResponse = React.useMemo(
     () => groupActionsByResponse(actions),
     [actions],
   );
-  const visibleToolResponseIds = React.useMemo(() => {
+  const agentToolResponseIds = React.useMemo(() => {
     const ids = new Set();
-    if (!showToolEntries) return ids;
     agents.forEach((agent) => {
       (Array.isArray(agent?.events) ? agent.events : []).forEach((entry) => {
         if (!entry || entry.type !== "tool") return;
@@ -717,17 +1782,162 @@ const AgentConsole = ({
       });
     });
     return ids;
-  }, [agents, showToolEntries]);
-  const hasContextualActionHistory = React.useMemo(() => {
-    for (const responseId of actionHistoryByResponse.keys()) {
-      if (visibleToolResponseIds.has(responseId)) return true;
-    }
-    return false;
-  }, [actionHistoryByResponse, visibleToolResponseIds]);
+  }, [agents]);
+  const syntheticConversationToolAgents = React.useMemo(() => {
+    if (!showToolEntries) return [];
+    const conversation = Array.isArray(state.conversation) ? state.conversation : [];
+    return conversation.flatMap((message) => {
+      if (!message || typeof message !== "object") return [];
+      const messageId = String(message.id || message.message_id || "").trim();
+      if (!messageId || agentToolResponseIds.has(messageId)) return [];
+      const tools = Array.isArray(message.tools)
+        ? message.tools.filter((tool) => tool && typeof tool === "object")
+        : [];
+      if (!tools.length) return [];
+      const messageTimestampMs = resolveEventTimestamp(
+        message.timestamp || message.updated_at || message.created_at,
+      );
+      const fallbackSeconds = messageTimestampMs
+        ? messageTimestampMs / 1000
+        : Math.floor(Date.now() / 1000);
+      const metadata =
+        message.metadata && typeof message.metadata === "object" ? message.metadata : {};
+      const events = tools.map((tool, index) => {
+        const status =
+          getEffectiveToolStatus(tool) || normalizeToolStatus(tool?.status) || "proposed";
+        const normalizedArgs =
+          tool?.args && typeof tool.args === "object" ? tool.args : {};
+        const fallbackResult =
+          typeof tool?.result !== "undefined" ? tool.result : fallbackResultForStatus(status);
+        return {
+          type: "tool",
+          id:
+            String(tool?.id || tool?.request_id || "").trim()
+            || `conversation-tool:${messageId}:${index}`,
+          request_id: String(tool?.request_id || tool?.id || "").trim() || undefined,
+          name: String(tool?.name || "tool").trim() || "tool",
+          args: normalizedArgs,
+          ...(typeof fallbackResult !== "undefined" ? { result: fallbackResult } : {}),
+          status,
+          timestamp: buildSyntheticToolEventTimestamp(tool, message, fallbackSeconds, index),
+          chain_id: messageId,
+          message_id: messageId,
+          session_id: state.sessionId || null,
+          mode: metadata.mode,
+          model: metadata.model,
+        };
+      });
+      if (!events.length) return [];
+      const updatedAt = Math.max(
+        ...events.map((entry) => Number(entry?.timestamp) || 0),
+        fallbackSeconds,
+      );
+      const summary =
+        normalizePreviewText(message.text || message.content || message.message)
+        || `tool call: ${summarizeToolBatchLabel(events)}`;
+      return [
+        {
+          id: `conversation-tools:${messageId}`,
+          label: summarizeToolBatchLabel(events),
+          status: summarizeSyntheticAgentStatus(events),
+          updatedAt,
+          summary,
+          events,
+          session_id: state.sessionId || null,
+        },
+      ];
+    });
+  }, [agentToolResponseIds, showToolEntries, state.conversation, state.sessionId]);
+  const displayAgents = React.useMemo(
+    () => [...(Array.isArray(agents) ? agents : []), ...syntheticConversationToolAgents],
+    [agents, syntheticConversationToolAgents],
+  );
+  const visibleAgents = React.useMemo(
+    () =>
+      displayAgents.filter(
+        (agent) =>
+          !isReflectionAgent(agent) && shouldShowAgentInConsole(agent, { showToolEntries }),
+      ),
+    [displayAgents, showToolEntries],
+  );
+  const visibleToolChatStats = React.useMemo(() => {
+    const stats = new Map();
+    visibleAgents.forEach((agent) => {
+      if (!isToolOnlyAgent(agent)) return;
+      const chatKey = resolveAgentToolChatKey(agent, state.sessionId);
+      if (!chatKey) return;
+      const events = getRenderableAgentActivity(agent, { showToolEntries: true }).filter(
+        (entry) => entry?.type === "tool",
+      );
+      if (!events.length) return;
+      const chainIdentifier = String(events[0]?.message_id || events[0]?.chain_id || "").trim();
+      const message = chainIdentifier ? conversationById.get(chainIdentifier) : null;
+      const existing = stats.get(chatKey) || {
+        chatKey,
+        color: getThreadColor(chatKey),
+        label: resolveToolChatDisplayName(chatKey, message, agent),
+        agentCount: 0,
+        toolCount: 0,
+        latestTimestamp: 0,
+        preview: "",
+      };
+      existing.agentCount += 1;
+      existing.toolCount += events.length;
+      events.forEach((entry) => {
+        const ts = Number(entry?.timestamp) || 0;
+        if (ts >= existing.latestTimestamp) {
+          const bodyText = entry.content || entry.text || entry.message || "...";
+          const preview = buildEntryPreview(entry, bodyText);
+          existing.latestTimestamp = ts;
+          existing.preview = preview?.short || normalizePreviewText(bodyText);
+        }
+      });
+      stats.set(chatKey, existing);
+    });
+    return stats;
+  }, [
+    conversationById,
+    resolveToolChatDisplayName,
+    state.sessionId,
+    visibleAgents,
+  ]);
+  const visibleAgentItems = React.useMemo(() => {
+    const collapsedSeen = new Set();
+    const openGroups = new Map();
+    const items = [];
+    visibleAgents.forEach((agent) => {
+      const chatKey = resolveAgentToolChatKey(agent, state.sessionId);
+      if (!chatKey) {
+        items.push({ type: "agent", agent });
+        return;
+      }
+      if (collapsedToolChats[chatKey]) {
+        if (collapsedSeen.has(chatKey)) return;
+        collapsedSeen.add(chatKey);
+        items.push({
+          type: "tool-chat-summary",
+          key: chatKey,
+          summary: visibleToolChatStats.get(chatKey),
+        });
+        return;
+      }
+      let group = openGroups.get(chatKey);
+      if (!group) {
+        group = {
+          type: "tool-chat-group",
+          key: chatKey,
+          summary: visibleToolChatStats.get(chatKey),
+          agents: [],
+        };
+        openGroups.set(chatKey, group);
+        items.push(group);
+      }
+      group.agents.push(agent);
+    });
+    return items;
+  }, [collapsedToolChats, state.sessionId, visibleAgents, visibleToolChatStats]);
   const showStandaloneActionHistory =
-    Array.isArray(actions) &&
-    actions.length > 0 &&
-    (!showToolEntries || !hasContextualActionHistory);
+    Array.isArray(actions) && actions.length > 0;
   const pendingSyncReviews = React.useMemo(
     () => (Array.isArray(syncReviews?.pending) ? syncReviews.pending : []),
     [syncReviews],
@@ -1341,16 +2551,22 @@ const AgentConsole = ({
             continuation,
             updatedConversation[mIdx]?.metadata,
           );
-          updatedConversation[mIdx] = {
-            ...updatedConversation[mIdx],
-            text: joined,
-            timestamp: new Date().toISOString(),
-            metadata: {
-              ...(updatedConversation[mIdx]?.metadata || {}),
-              ...(md || {}),
-              tool_continued: true,
-            },
-          };
+            updatedConversation[mIdx] = {
+              ...updatedConversation[mIdx],
+              text: joined,
+              timestamp: new Date().toISOString(),
+              metadata: {
+                ...(updatedConversation[mIdx]?.metadata || {}),
+                ...(md || {}),
+                ...(Object.prototype.hasOwnProperty.call(
+                  md && typeof md === "object" ? md : {},
+                  "tool_response_pending",
+                )
+                  ? { tool_response_pending: md.tool_response_pending }
+                  : { tool_response_pending: false }),
+                tool_continued: true,
+              },
+            };
         }
         const hist = Array.isArray(prev.history) ? [...prev.history] : [];
         if (hist.length && hist[hist.length - 1].role === "ai") {
@@ -1404,6 +2620,26 @@ const AgentConsole = ({
     return str.replace(/[^a-zA-Z0-9_-]/g, (ch) => `\\${ch}`);
   };
 
+  const scrollConsoleTargetIntoView = React.useCallback((target, behavior = "smooth") => {
+    const body = scrollBodyRef.current;
+    if (!target || !body || typeof target.getBoundingClientRect !== "function") {
+      if (target && typeof target.scrollIntoView === "function") {
+        target.scrollIntoView({ behavior, block: "start" });
+      }
+      return;
+    }
+    const bodyRect = body.getBoundingClientRect();
+    const targetRect = target.getBoundingClientRect();
+    const targetTop = targetRect.top - bodyRect.top + body.scrollTop;
+    const topInset = 8;
+    const nextTop = Math.max(0, targetTop - topInset);
+    if (typeof body.scrollTo === "function") {
+      body.scrollTo({ top: nextTop, behavior });
+    } else {
+      body.scrollTop = nextTop;
+    }
+  }, []);
+
   const matchesFocus = React.useCallback(
     (entry) => {
       if (!normalizedFocus) return false;
@@ -1447,10 +2683,141 @@ const AgentConsole = ({
     const root = sidebarRef.current;
     if (!root || typeof root.querySelector !== "function") return;
     const target = root.querySelector(selectors.join(", "));
-    if (target && typeof target.scrollIntoView === "function") {
-      target.scrollIntoView({ behavior: "smooth", block: "center" });
-    }
-  }, [normalizedFocus]);
+    scrollConsoleTargetIntoView(target, "smooth");
+  }, [normalizedFocus, scrollConsoleTargetIntoView]);
+
+  React.useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+
+    const entryMatchesTarget = (entry, target) => {
+      if (!entry || typeof entry !== "object") return false;
+      const entryToolId = String(entry.id ?? entry.request_id ?? "").trim();
+      const entryChainId = String(
+        entry.chain_id ?? entry.message_id ?? entry.session_id ?? "",
+      ).trim();
+      const entryAgentId = String(entry.agent_id ?? entry.chain_id ?? entry.session_id ?? "").trim();
+      return (
+        (entryToolId && target.toolIds.includes(entryToolId)) ||
+        (entryChainId &&
+          [target.chainId, target.messageId, target.sessionId].includes(entryChainId)) ||
+        (entryAgentId && target.agentId && entryAgentId === target.agentId)
+      );
+    };
+
+  const openMatchingCards = (target) => {
+      if (!showToolEntries) return false;
+      const matchingAgentIds = new Set();
+      displayAgents.forEach((agent) => {
+        const agentId = String(agent?.id || "").trim();
+        if (!agentId) return;
+        if (target.agentId && agentId === target.agentId) {
+          matchingAgentIds.add(agentId);
+          return;
+        }
+        const events = Array.isArray(agent?.events) ? agent.events : [];
+        if (events.some((entry) => entryMatchesTarget(entry, target))) {
+          matchingAgentIds.add(agentId);
+        }
+      });
+      if (!matchingAgentIds.size) return false;
+      setCollapsedAgents((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        matchingAgentIds.forEach((id) => {
+          if (next[id] === false) return;
+          next[id] = false;
+          changed = true;
+        });
+        return changed ? next : prev;
+      });
+      setExpandedAgents((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        matchingAgentIds.forEach((id) => {
+          if (next[id] === true) return;
+          next[id] = true;
+          changed = true;
+        });
+        return changed ? next : prev;
+      });
+      return true;
+    };
+
+    const clickMatchingButton = (target, action) => {
+      const root = sidebarRef.current;
+      if (!root || typeof root.querySelector !== "function") return false;
+      const actionSelector = `.tool-action-btn.${action}`;
+      const scopes = toolReviewScopeSelectors(target);
+      const scopeNodes = scopes
+        .map((selector) => {
+          try {
+            return root.querySelector(selector);
+          } catch {
+            return null;
+          }
+        })
+        .filter(Boolean);
+      scopeNodes.forEach((node) => {
+        const closedToggle = node.querySelector?.(
+          '.agent-activity-toggle[aria-expanded="false"]',
+        );
+        if (closedToggle && typeof closedToggle.click === "function") {
+          closedToggle.click();
+        }
+      });
+      const selectors = scopes.map((scope) => `${scope} ${actionSelector}`);
+      for (const selector of selectors) {
+        let button = null;
+        try {
+          button = root.querySelector(selector);
+        } catch {
+          button = null;
+        }
+        if (!button || button.disabled || typeof button.click !== "function") {
+          continue;
+        }
+        button.click();
+        return true;
+      }
+      return false;
+    };
+
+    const handleToolReviewAction = (event) => {
+      const detail = event?.detail || {};
+      if (detail.handled) return;
+      const action = normalizeToolReviewAction(detail.action);
+      if (!action) return;
+      const target = normalizeToolReviewTarget(detail);
+      const claimed = openMatchingCards(target);
+      let actionCompleted = false;
+      const attempt = () => {
+        if (actionCompleted) return true;
+        if (!clickMatchingButton(target, action)) return false;
+        actionCompleted = true;
+        detail.handled = true;
+        return true;
+      };
+      if (attempt()) return;
+      if (!claimed) {
+        if (typeof onRefreshAgents === "function") {
+          onRefreshAgents();
+        }
+        return;
+      }
+      detail.handled = true;
+      if (typeof onRefreshAgents === "function") {
+        onRefreshAgents();
+      }
+      [120, 450, 900].forEach((delay) => {
+        window.setTimeout(attempt, delay);
+      });
+    };
+
+    window.addEventListener(TOOL_REVIEW_ACTION_EVENT, handleToolReviewAction);
+    return () => {
+      window.removeEventListener(TOOL_REVIEW_ACTION_EVENT, handleToolReviewAction);
+    };
+  }, [displayAgents, onRefreshAgents, showToolEntries]);
 
   React.useEffect(() => {
     const root = scrollBodyRef.current || sidebarRef.current;
@@ -1634,18 +3001,30 @@ const AgentConsole = ({
   const hiddenCount =
     Object.values(hiddenAgents).filter(Boolean).length +
     (showStandaloneActionHistory && actionHistoryHidden ? 1 : 0) +
-    (showSyncInbox && syncInboxHidden ? 1 : 0);
+    (showSyncInbox && syncInboxHidden ? 1 : 0) +
+    (backgroundPanelHidden ? 1 : 0) +
+    (runtimePanelHidden ? 1 : 0);
+  const hasConversationToolState = React.useMemo(() => {
+    const conversation = Array.isArray(state.conversation) ? state.conversation : [];
+    return conversation.some(
+      (message) =>
+        message &&
+        Array.isArray(message.tools) &&
+        message.tools.some((tool) => tool && typeof tool === "object"),
+    );
+  }, [state.conversation]);
   const hasInlineToolActivity = React.useMemo(() => {
     if (showToolEntries) return false;
+    if (hasConversationToolState) return true;
     return agents.some(
       (agent) =>
         Array.isArray(agent?.events) &&
         agent.events.some((entry) => entry && entry.type === "tool"),
     );
-  }, [agents, showToolEntries]);
+  }, [agents, hasConversationToolState, showToolEntries]);
   const browserSessionContexts = React.useMemo(() => {
     const sessions = new Map();
-    agents.forEach((agent) => {
+    displayAgents.forEach((agent) => {
       const events = Array.isArray(agent?.events) ? agent.events : [];
       events.forEach((entry) => {
         const context = getBrowserSessionToolContext(entry);
@@ -1657,7 +3036,7 @@ const AgentConsole = ({
       });
     });
     return sessions;
-  }, [agents]);
+  }, [displayAgents]);
   const activeBrowserSession = React.useMemo(() => {
     const sessionId =
       browserSessionPopup && typeof browserSessionPopup.sessionId === "string"
@@ -1668,18 +3047,105 @@ const AgentConsole = ({
   React.useEffect(() => {
     if (!showSyncInbox) {
       syncInboxInteractedRef.current = false;
-      setSyncInboxCollapsed(false);
+      setSyncInboxCollapsed(true);
       setSyncInboxHidden(false);
       return;
     }
     if (syncInboxInteractedRef.current) return;
-    setSyncInboxCollapsed(agents.length > 0 || hasInlineToolActivity);
+    setSyncInboxCollapsed(true);
   }, [agents.length, hasInlineToolActivity, showSyncInbox]);
   React.useEffect(() => {
-    if (showStandaloneActionHistory) return;
-    setActionHistoryCollapsed(false);
+    setActionHistoryCollapsed(true);
     setActionHistoryHidden(false);
   }, [showStandaloneActionHistory]);
+  React.useEffect(() => {
+    syncInboxInteractedRef.current = false;
+    setCollapsedChains({});
+    setCollapsedToolChats({});
+    setCollapsedAgents(() => {
+      const next = {};
+      (Array.isArray(agents) ? agents : []).forEach((agent) => {
+        const key = String(agent?.id || "").trim();
+        if (key) next[key] = true;
+      });
+      return next;
+    });
+    setExpandedAgents({});
+    setHiddenAgents({});
+    setActionHistoryCollapsed(true);
+    setActionHistoryHidden(false);
+    setOpenActionHistoryKey("");
+    setActionHistoryFeedback("");
+    setSyncReviewFeedback("");
+    setSyncInboxCollapsed(true);
+    setSyncInboxHidden(false);
+    setBackgroundPanelCollapsed(true);
+    setBackgroundPanelHidden(false);
+    setBackgroundPromptOpen(false);
+    setBackgroundComposerMode("prompt");
+    setBackgroundPromptDraft("");
+    setBackgroundPromptFeedback("");
+    setReflectionQuestionDraft("");
+    setReflectionMemoryKey("");
+    setReflectionFeedback("");
+    setRuntimePanelCollapsed(true);
+    setRuntimePanelHidden(false);
+    setRedirectEditorAgentId("");
+    setAgentControlFeedback("");
+  }, [state.sessionId]);
+  React.useEffect(() => {
+    const entries = Array.from(visibleToolChatStats.values()).filter(Boolean);
+    if (!entries.length) return;
+    const latest = entries.reduce((current, entry) => {
+      if (!current) return entry;
+      return (Number(entry.latestTimestamp) || 0) >=
+        (Number(current.latestTimestamp) || 0)
+        ? entry
+        : current;
+    }, null);
+    const latestKey = latest?.chatKey;
+    setCollapsedToolChats((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      entries.forEach((entry) => {
+        const key = String(entry.chatKey || "").trim();
+        if (!key || Object.prototype.hasOwnProperty.call(next, key)) return;
+        next[key] = key !== latestKey;
+        changed = true;
+      });
+      return changed ? next : prev;
+    });
+  }, [visibleToolChatStats]);
+  React.useEffect(() => {
+    if (backgroundPanelCollapsed) {
+      setBackgroundPromptOpen(false);
+      setBackgroundComposerMode("prompt");
+    }
+  }, [backgroundPanelCollapsed]);
+  React.useEffect(() => {
+    if (!backgroundPanelHidden) return;
+    setBackgroundPromptOpen(false);
+    setBackgroundComposerMode("prompt");
+    setBackgroundPromptDraft("");
+    setBackgroundPromptFeedback("");
+    setReflectionQuestionDraft("");
+    setReflectionMemoryKey("");
+    setReflectionFeedback("");
+  }, [backgroundPanelHidden]);
+  React.useEffect(() => {
+    if (!Array.isArray(agents) || !agents.length) return;
+    setCollapsedAgents((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const agent of agents) {
+        const key = String(agent?.id || "").trim();
+        if (!key || Object.prototype.hasOwnProperty.call(next, key)) continue;
+        next[key] = true;
+        changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [agents]);
   React.useEffect(() => {
     if (!activeBrowserSession?.sessionId) return;
     setBrowserNavigateDraft(activeBrowserSession.currentUrl || "");
@@ -1725,6 +3191,8 @@ const AgentConsole = ({
     setHiddenAgents({});
     setActionHistoryHidden(false);
     setSyncInboxHidden(false);
+    setBackgroundPanelHidden(false);
+    setRuntimePanelHidden(false);
   };
 
   const ensureActionHistoryDetails = React.useCallback(
@@ -1932,64 +3400,53 @@ const AgentConsole = ({
       );
     };
 
+    const pendingSyncCount = pendingSyncReviews.length;
+    const recentSyncCount = recentSyncReviews.length;
+    const syncInboxFullSubtitle = [
+      pendingSyncCount > 0 ? `${pendingSyncCount} pending` : "no pending approvals",
+      recentSyncCount > 0 ? `${recentSyncCount} recent` : "",
+    ]
+      .filter(Boolean)
+      .join(" / ");
+    const syncInboxSubtitle =
+      syncInboxCollapsed && pendingSyncCount === 0 && recentSyncCount > 0
+        ? `${recentSyncCount} recent`
+        : syncInboxFullSubtitle;
+
     return (
-      <section
+      <ConsoleObjectCard
+        title="sync inbox"
+        subtitle={syncInboxSubtitle}
+        preview={syncInboxFullSubtitle}
+        ariaLabel="sync inbox"
         className="agent-sync-panel"
-        aria-label="sync inbox"
-        data-collapsed={syncInboxCollapsed ? "true" : "false"}
+        collapsed={syncInboxCollapsed}
+        onToggleCollapsed={toggleSyncInboxCollapsed}
+        onHide={toggleSyncInboxHidden}
+        expandLabel="Expand sync inbox"
+        collapseLabel="Collapse sync inbox"
+        hideLabel="Hide sync inbox"
+        extraActions={
+          <button
+            type="button"
+            className="agent-card-control-btn"
+            onClick={() => navigate("/knowledge?tab=sync")}
+          >
+            Open sync
+          </button>
+        }
       >
-        <div className="agent-sync-panel-header">
-          <div className="agent-sync-panel-title">
-            <h3>sync inbox</h3>
-            <span className="agent-sync-panel-subtitle">
-              {pendingSyncReviews.length > 0
-                ? `${pendingSyncReviews.length} pending`
-                : "no pending approvals"}
-              {recentSyncReviews.length > 0
-                ? ` Â· ${recentSyncReviews.length} recent`
-                : ""}
-            </span>
-          </div>
-          <div className="agent-sync-panel-actions">
-            <button
-              type="button"
-              className="agent-card-control-btn"
-              aria-label="Hide sync inbox"
-              onClick={toggleSyncInboxHidden}
-              title="Hide sync inbox"
-            >
-              Hide
-            </button>
-            <button
-              type="button"
-              className="agent-card-control-btn"
-              aria-expanded={!syncInboxCollapsed}
-              aria-label={syncInboxCollapsed ? "Expand sync inbox" : "Collapse sync inbox"}
-              onClick={toggleSyncInboxCollapsed}
-              title={syncInboxCollapsed ? "Expand sync inbox" : "Collapse sync inbox"}
-            >
-              {syncInboxCollapsed ? "+" : "-"}
-            </button>
-            <button
-              type="button"
-              className="agent-card-control-btn"
-              onClick={() => navigate("/knowledge?tab=sync")}
-            >
-              Open sync
-            </button>
-          </div>
-        </div>
         {syncReviewFeedback ? (
           <p className="status-note" role="status">
             {syncReviewFeedback}
           </p>
         ) : null}
-        {!syncInboxCollapsed && pendingSyncReviews.length > 0 ? (
+        {pendingSyncReviews.length > 0 ? (
           <div className="agent-sync-review-list">
             {pendingSyncReviews.map((review) => renderReviewCard(review, "pending"))}
           </div>
         ) : null}
-        {!syncInboxCollapsed && recentSyncReviews.length > 0 ? (
+        {recentSyncReviews.length > 0 ? (
           <div className="agent-sync-review-history">
             <div className="agent-sync-history-label">recent decisions</div>
             <div className="agent-sync-review-list">
@@ -1997,7 +3454,7 @@ const AgentConsole = ({
             </div>
           </div>
         ) : null}
-      </section>
+      </ConsoleObjectCard>
     );
   }, [
     navigate,
@@ -2022,7 +3479,7 @@ const AgentConsole = ({
             <div>
               <strong>work history</strong>
               <div className="agent-history-popout-meta">
-                {group.responseLabel} Â· {group.actions.length} tracked
+                {group.responseLabel} · {group.actions.length} tracked
                 {group.actions.length === 1 ? " change" : " changes"}
               </div>
             </div>
@@ -2093,7 +3550,7 @@ const AgentConsole = ({
                       Revert
                     </button>
                   </div>
-                  {detail?.loading ? <p className="status-note">Loading diffâ€¦</p> : null}
+                  {detail?.loading ? <p className="status-note">Loading diffÃ¢â‚¬Â¦</p> : null}
                   {detail?.error ? <p className="status-note">{detail.error}</p> : null}
                   {detailItems.length ? (
                     <div className="agent-history-diff-list">
@@ -2149,6 +3606,46 @@ const AgentConsole = ({
       openActionHistoryKey,
       runActionHistoryRevert,
     ],
+  );
+
+  const runAgentControl = React.useCallback(
+    async (agentId, action, extra = {}) => {
+      const normalizedAgentId =
+        typeof agentId === "string" ? agentId.trim() : "";
+      const normalizedAction =
+        typeof action === "string" ? action.trim().toLowerCase() : "";
+      if (!normalizedAgentId || !normalizedAction) return;
+      const pendingKey = `${normalizedAction}:${normalizedAgentId}`;
+      setAgentControlPendingKey(pendingKey);
+      setAgentControlFeedback("");
+      try {
+        await axios.post(`/api/agents/console/${encodeURIComponent(normalizedAgentId)}/${normalizedAction}`, {
+          note:
+            typeof extra.note === "string" && extra.note.trim() ? extra.note.trim() : "",
+          workflow:
+            typeof extra.workflow === "string" && extra.workflow.trim()
+              ? extra.workflow.trim()
+              : "",
+        });
+        if (normalizedAction === "redirect") {
+          setRedirectEditorAgentId("");
+          setRedirectNoteDraft("");
+          setRedirectWorkflowDraft("");
+        }
+        await onRefreshAgents?.();
+      } catch (err) {
+        console.error(`Failed to ${normalizedAction} delegated run`, err);
+        const detail =
+          err?.response?.data?.detail ||
+          err?.response?.data?.message ||
+          err?.message ||
+          `Failed to ${normalizedAction} delegated run.`;
+        setAgentControlFeedback(String(detail));
+      } finally {
+        setAgentControlPendingKey("");
+      }
+    },
+    [onRefreshAgents],
   );
 
   const resolveContinueTarget = React.useCallback(
@@ -2649,6 +4146,8 @@ const AgentConsole = ({
 
   const renderToolActions = (entry) => {
       const normalizedStatus = getEffectiveToolStatus(entry);
+      const awaitingApproval =
+        !normalizedStatus || normalizedStatus === "proposed" || normalizedStatus === "pending";
       const targetChain = entry.chain_id || entry.message_id;
       const sessionForEntry = entry.session_id || state.sessionId || null;
       const messageForEntry = entry.message_id || entry.chain_id || null;
@@ -2661,7 +4160,19 @@ const AgentConsole = ({
       const canContinueResolvedBatch = Boolean(
         sessionForEntry && messageForEntry && resolvedBatch,
       );
-      if (normalizedStatus && normalizedStatus !== "proposed" && !canContinueResolvedBatch) {
+      const canRetryResolvedTool = Boolean(
+        normalizedStatus &&
+          !awaitingApproval &&
+          RETRIABLE_TOOL_STATUSES.has(normalizedStatus) &&
+          entry.name &&
+          targetChain,
+      );
+      if (
+        normalizedStatus &&
+        !awaitingApproval &&
+        !canContinueResolvedBatch &&
+        !canRetryResolvedTool
+      ) {
         return null;
       }
       const buildDecisionPayload = (decision, overrideArgs, overrideName) => {
@@ -2692,28 +4203,135 @@ const AgentConsole = ({
             ? entry.args
             : {},
       });
+      const retryResolvedTool = async (overrideArgs, overrideName, continueTarget) => {
+        const toolName = (overrideName || entry.name || "").trim() || entry.name;
+        if (!toolName || !targetChain) return;
+        const effectiveArgs = overrideArgs ?? entry.args ?? {};
+        try {
+          const resp = await axios.post("/api/tools/invoke", {
+            name: toolName,
+            args: effectiveArgs,
+            chain_id: targetChain,
+            session_id: entry.session_id || state.sessionId,
+            message_id: targetChain,
+          });
+          await maybeContinueBatch(
+            {
+              sessionId: sessionForEntry,
+              messageId: messageForEntry,
+              toolUpdate: {
+                id: entry.id,
+                name: toolName,
+                args: effectiveArgs,
+                ...(typeof resp?.data?.result !== "undefined"
+                  ? { result: resp.data?.result }
+                  : {}),
+                status: "invoked",
+              },
+            },
+            continueTarget,
+          );
+        } catch (err) {
+          console.error("Tool retry failed", err);
+          const detail =
+            err?.response?.data?.detail ||
+            err?.response?.data?.message ||
+            err?.message ||
+            "Tool retry failed.";
+          const statusCode = err?.response?.status;
+          const safeDetail = statusCode && statusCode >= 500 ? "Tool error." : detail;
+          await maybeContinueBatch(
+            {
+              sessionId: sessionForEntry,
+              messageId: messageForEntry,
+              toolUpdate: {
+                id: entry.id,
+                name: toolName,
+                args: effectiveArgs,
+                result: buildToolOutcomeResult("error", safeDetail),
+                status: "error",
+              },
+            },
+            continueTarget,
+          );
+        }
+      };
 
-      if (normalizedStatus && normalizedStatus !== "proposed") {
+      if (normalizedStatus && !awaitingApproval) {
         return (
-          <div className="agent-tool-actions">
-            <button
-              type="button"
-              className="tool-action-btn continue"
-              onClick={async (event) => {
-                event.stopPropagation();
-                await maybeContinueBatch(
-                  {
-                    sessionId: sessionForEntry,
-                    messageId: messageForEntry,
-                    toolUpdate: null,
-                  },
-                  null,
-                  { force: true },
-                );
-              }}
-            >
-              Continue
-            </button>
+          <div
+            className={`agent-tool-actions resolved${
+              canContinueResolvedBatch ? " needs-continue" : ""
+            }`}
+          >
+            {canRetryResolvedTool && (
+              <>
+                <button
+                  type="button"
+                  className="tool-action-btn retry"
+                  title={`Retry ${entry.name || "this tool"} with the same arguments`}
+                  onClick={async (event) => {
+                    event.stopPropagation();
+                    await retryResolvedTool();
+                  }}
+                >
+                  Retry
+                </button>
+                <button
+                  type="button"
+                  className="tool-action-btn edit"
+                  title={`Edit ${entry.name || "tool"} arguments and retry`}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setToolEditorState({
+                      tool: {
+                        name: entry.name,
+                        args: entry.args || {},
+                        id: entry.id,
+                        status: normalizedStatus || entry.status,
+                      },
+                      schedulePrefill: (() => {
+                        const base =
+                          state.selectedCalendarDate instanceof Date
+                            ? new Date(state.selectedCalendarDate)
+                            : new Date();
+                        return {
+                          start_time: Math.floor(base.getTime() / 1000),
+                          timezone: preferredTimezone,
+                          title: `Retry tool: ${entry.name || "tool"}`,
+                        };
+                      })(),
+                      onSubmit: async ({ args, name, continueTarget }) => {
+                        await retryResolvedTool(args, name, continueTarget);
+                      },
+                    });
+                  }}
+                >
+                  Edit & retry
+                </button>
+              </>
+            )}
+            {canContinueResolvedBatch && (
+              <button
+                type="button"
+                className="tool-action-btn continue needs-tool-continue"
+                title="Continue the assistant response using the latest resolved tool outcome."
+                onClick={async (event) => {
+                  event.stopPropagation();
+                  await maybeContinueBatch(
+                    {
+                      sessionId: sessionForEntry,
+                      messageId: messageForEntry,
+                      toolUpdate: null,
+                    },
+                    null,
+                    { force: true },
+                  );
+                }}
+              >
+                Continue
+              </button>
+            )}
           </div>
         );
       }
@@ -2723,6 +4341,11 @@ const AgentConsole = ({
             type="button"
             className="tool-action-btn accept"
             disabled={acceptDisabled}
+            title={
+              acceptDisabled
+                ? "This tool needs editable arguments before it can run."
+                : `Approve and run ${entry.name || "this tool"}`
+            }
             onClick={async (event) => {
             event.stopPropagation();
             if (acceptDisabled) return;
@@ -2840,6 +4463,11 @@ const AgentConsole = ({
           type="button"
           className="tool-action-btn deny"
           disabled={!entry.id && !localDenyAllowed}
+          title={
+            !entry.id && !localDenyAllowed
+              ? "This local fallback tool cannot be denied from the backend."
+              : `Deny ${entry.name || "this tool"}`
+          }
           onClick={async (event) => {
             event.stopPropagation();
             if (!entry.id && !localDenyAllowed) return;
@@ -2919,6 +4547,7 @@ const AgentConsole = ({
         <button
           type="button"
           className="tool-action-btn edit"
+          title={`Edit ${entry.name || "tool"} arguments before running`}
           onClick={async (event) => {
             event.stopPropagation();
             const current = JSON.stringify(entry.args || {}, null, 2);
@@ -3081,16 +4710,82 @@ const AgentConsole = ({
     );
   };
 
+  const renderToolChatSummaryCard = (summary) => {
+    if (!summary) return null;
+    const label = summary.label || "chat tools";
+    const toolLabel = summary.toolCount === 1 ? "1 tool update" : `${summary.toolCount} tool updates`;
+    const cardLabel = `${label}: ${toolLabel} hidden`;
+    return (
+      <article
+        key={`tool-chat-summary-${summary.chatKey}`}
+        className="agent-card agent-tool-chat-summary-card"
+        style={{ "--agent-chat-color": summary.color }}
+        title={cardLabel}
+      >
+        <button
+          type="button"
+          className="agent-chat-group-line"
+          onClick={() =>
+            setCollapsedToolChats((prev) => ({
+              ...prev,
+              [summary.chatKey]: false,
+            }))
+          }
+          aria-label={`Expand tools from ${label}`}
+          title={`Expand tools from ${label}`}
+        />
+        <div className="agent-tool-chat-summary-copy">
+          <div className="agent-tool-chat-summary-header">
+            <strong>{label}</strong>
+            <span className="agent-status-label">{toolLabel} hidden</span>
+          </div>
+          {summary.preview ? (
+            <p className="agent-activity-preview agent-tool-chat-summary-preview">
+              {summary.preview}
+            </p>
+          ) : null}
+        </div>
+      </article>
+    );
+  };
+
+  const renderToolChatGroup = (group) => {
+    if (!group?.agents?.length) return null;
+    const summary = group.summary || {};
+    const label = summary.label || "chat tools";
+    const toolLabel =
+      summary.toolCount === 1 ? "1 tool update" : `${summary.toolCount || 0} tool updates`;
+    return (
+      <section
+        key={`tool-chat-group-${group.key}`}
+        className="agent-tool-chat-group"
+        style={{ "--agent-chat-color": summary.color || getThreadColor(group.key) }}
+        aria-label={`${label} tools`}
+        title={`${label}: ${toolLabel}`}
+      >
+        <button
+          type="button"
+          className="agent-chat-group-line"
+          onClick={() =>
+            setCollapsedToolChats((prev) => ({
+              ...prev,
+              [group.key]: true,
+            }))
+          }
+          aria-label={`Collapse tools from ${label}`}
+          title={`Collapse tools from ${label}`}
+        />
+        <div className="agent-tool-chat-group-stack">
+          {group.agents.map((agent) => renderAgentCard(agent))}
+        </div>
+      </section>
+    );
+  };
+
   const renderAgentCard = (agent) => {
     if (!agent) return null;
     const tone = statusTone(agent.status);
-    const activity = Array.isArray(agent.events) ? agent.events : [];
-    const filteredActivity = activity.filter(
-      (entry) =>
-        entry &&
-        entry.type !== "content" &&
-        (showToolEntries || entry.type !== "tool"),
-    );
+    const filteredActivity = getRenderableAgentActivity(agent, { showToolEntries });
     const latestThought = [...filteredActivity]
       .reverse()
       .find((entry) => entry.type === "thought");
@@ -3110,6 +4805,39 @@ const AgentConsole = ({
       typeof promptTokens === "number" ||
       typeof completionTokens === "number" ||
       typeof totalTokens === "number";
+    const workflowMeta =
+      agent.workflow && typeof agent.workflow === "object" ? agent.workflow : null;
+    const provenanceMeta =
+      agent.provenance && typeof agent.provenance === "object" ? agent.provenance : null;
+    const handoffMeta =
+      agent.handoff && typeof agent.handoff === "object" ? agent.handoff : null;
+    const controlMeta =
+      agent.controls && typeof agent.controls === "object" ? agent.controls : null;
+    const workflowLine = formatWorkflowMeta(workflowMeta);
+    const provenanceLine = formatProvenanceMeta(provenanceMeta);
+    const handoffLine = formatHandoffMeta(handoffMeta);
+    const displayLabel = resolveAgentDisplayLabel(agent);
+    const toolOnlyAgent = isToolOnlyAgent(agent);
+    const conversationTarget = resolveAgentConversationTarget(agent, displayLabel);
+    const canOpenConversation =
+      !toolOnlyAgent && conversationTarget && typeof onOpenConversation === "function";
+    const canOpenConversationAction =
+      conversationTarget && typeof onOpenConversation === "function";
+    const openConversationFromCard = (event) => {
+      event?.stopPropagation?.();
+      if (!canOpenConversation) return;
+      onOpenConversation(conversationTarget.conversationId, conversationTarget.label);
+    };
+    const displayLabelKey = normalizePreviewText(displayLabel).toLowerCase();
+    const availableControls = Array.isArray(controlMeta?.available)
+      ? controlMeta.available.filter((value) => typeof value === "string" && value.trim())
+      : [];
+    const redirectOpen = agentKeyString && redirectEditorAgentId === agentKeyString;
+    const busyControlPrefix = agentKeyString ? `:${agentKeyString}` : "";
+    const pauseBusy = agentControlPendingKey === `pause${busyControlPrefix}`;
+    const resumeBusy = agentControlPendingKey === `resume${busyControlPrefix}`;
+    const stopBusy = agentControlPendingKey === `stop${busyControlPrefix}`;
+    const redirectBusy = agentControlPendingKey === `redirect${busyControlPrefix}`;
     const isHidden = !!(agentKeyString && hiddenAgents[agentKeyString]);
     const isCompact = !!(agentKeyString && collapsedAgents[agentKeyString]);
     const showAllActivity = !!(agentKeyString && expandedAgents[agentKeyString]);
@@ -3125,6 +4853,12 @@ const AgentConsole = ({
       ? [...filteredActivity].reverse()
       : filteredActivity.slice(-6).reverse();
     const canExpand = filteredActivity.length > 6;
+    const compactMetaNote = isCompact
+      ? truncatePreviewText(
+          normalizePreviewText(agent.summary || provenanceLine || workflowLine || handoffLine),
+          92,
+        )
+      : "";
     const toggleCompact = () => {
       if (!agentKeyString) return;
       setCollapsedAgents((prev) => ({
@@ -3152,11 +4886,58 @@ const AgentConsole = ({
         key={agent.id}
         className={cardClass}
         data-agent-id={agentKeyString || undefined}
+        onClick={(event) => {
+          const target = event.target;
+          if (
+            typeof Element !== "undefined" &&
+            target instanceof Element &&
+            target.closest(`${AGENT_CARD_INTERACTIVE_SELECTOR}, .agent-activity`)
+          ) {
+            return;
+          }
+          toggleCompact();
+        }}
+        role={isCompact ? "button" : undefined}
+        tabIndex={isCompact ? 0 : undefined}
+        onKeyDown={(event) => {
+          if (!isCompact) return;
+          if (
+            typeof Element !== "undefined" &&
+            event.target instanceof Element &&
+            event.target.closest(AGENT_CARD_INTERACTIVE_SELECTOR)
+          ) {
+            return;
+          }
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            toggleCompact();
+          }
+        }}
       >
         <header className="agent-card-header">
           <div className="agent-card-meta">
             <span className="agent-status-dot" style={{ backgroundColor: tone.hue }} />
-            <h3 title={agent.label}>{agent.label}</h3>
+            <div className="agent-card-title-stack">
+              <h3 title={displayLabel}>
+                {canOpenConversation ? (
+                  <button
+                    type="button"
+                    className="agent-card-title-button"
+                    onClick={openConversationFromCard}
+                    title={`${conversationTarget.buttonLabel}: ${conversationTarget.label}`}
+                  >
+                    {displayLabel}
+                  </button>
+                ) : (
+                  displayLabel
+                )}
+              </h3>
+              {compactMetaNote && (
+                <span className="agent-card-title-note" title={compactMetaNote}>
+                  {compactMetaNote}
+                </span>
+              )}
+            </div>
           </div>
           <div className="agent-card-actions">
             <div className="agent-card-submeta">
@@ -3168,7 +4949,76 @@ const AgentConsole = ({
               )}
             </div>
             <div className="agent-card-controls">
-              {canExpand && (
+              {availableControls.includes("pause") && (
+                <button
+                  type="button"
+                  className="agent-card-control-btn"
+                  onClick={() => runAgentControl(agentKeyString, "pause")}
+                  title={controlModeTitle(controlMeta?.modes?.pause)}
+                  aria-label="Pause delegated run"
+                  disabled={!agentKeyString || Boolean(agentControlPendingKey)}
+                >
+                  {pauseBusy ? "pausing..." : "pause"}
+                </button>
+              )}
+              {availableControls.includes("resume") && (
+                <button
+                  type="button"
+                  className="agent-card-control-btn"
+                  onClick={() => runAgentControl(agentKeyString, "resume")}
+                  title={controlModeTitle(controlMeta?.modes?.resume)}
+                  aria-label="Resume delegated run"
+                  disabled={!agentKeyString || Boolean(agentControlPendingKey)}
+                >
+                  {resumeBusy ? "resuming..." : "resume"}
+                </button>
+              )}
+              {availableControls.includes("redirect") && (
+                <button
+                  type="button"
+                  className={`agent-card-control-btn${redirectOpen ? " is-active" : ""}`}
+                  onClick={() => {
+                    if (!agentKeyString) return;
+                    setAgentControlFeedback("");
+                    setRedirectEditorAgentId((current) =>
+                      current === agentKeyString ? "" : agentKeyString,
+                    );
+                    setRedirectNoteDraft(controlMeta?.redirect_note || "");
+                    setRedirectWorkflowDraft(
+                      controlMeta?.redirect_workflow || workflowMeta?.id || "",
+                    );
+                  }}
+                  title={controlModeTitle(controlMeta?.modes?.redirect)}
+                  aria-label={redirectOpen ? "Close redirect editor" : "Redirect delegated run"}
+                  disabled={!agentKeyString || Boolean(agentControlPendingKey)}
+                >
+                  redirect
+                </button>
+              )}
+              {availableControls.includes("stop") && (
+                <button
+                  type="button"
+                  className="agent-card-control-btn danger"
+                  onClick={() => runAgentControl(agentKeyString, "stop")}
+                  title={controlModeTitle(controlMeta?.modes?.stop)}
+                  aria-label="Stop delegated run"
+                  disabled={!agentKeyString || Boolean(agentControlPendingKey)}
+                >
+                  {stopBusy ? "stopping..." : "stop"}
+                </button>
+              )}
+              {canOpenConversationAction && (
+                <button
+                  type="button"
+                  className="agent-card-control-btn agent-open-chat-btn"
+                  onClick={openConversationFromCard}
+                  title={`${conversationTarget.buttonLabel}: ${conversationTarget.label}`}
+                  aria-label={`${conversationTarget.buttonLabel} ${displayLabel}`}
+                >
+                  {conversationTarget.buttonLabel}
+                </button>
+              )}
+              {!isCompact && canExpand && (
                 <button
                   type="button"
                   className={`agent-card-control-btn${showAllActivity ? " is-active" : ""}`}
@@ -3182,23 +5032,25 @@ const AgentConsole = ({
               )}
               <button
                 type="button"
-                className={`agent-card-control-btn${isCompact ? " is-active" : ""}`}
+                className={`agent-card-control-btn agent-card-control-symbol${
+                  isCompact ? " is-active" : ""
+                }`}
                 onClick={toggleCompact}
                 title={isCompact ? "Expand agent card" : "Compact agent card"}
                 aria-label={isCompact ? "Expand agent card" : "Compact agent card"}
                 disabled={!agentKeyString}
               >
-                {isCompact ? "expand" : "compact"}
+                {isCompact ? "+" : "-"}
               </button>
               <button
                 type="button"
-                className="agent-card-control-btn danger"
+                className="agent-card-control-btn agent-card-control-symbol danger"
                 onClick={hideAgent}
                 title="Hide agent card"
                 aria-label="Hide agent card"
                 disabled={!agentKeyString}
               >
-                hide
+                X
               </button>
             </div>
           </div>
@@ -3207,6 +5059,70 @@ const AgentConsole = ({
           <p className="agent-card-summary" title={lastMessage}>
             {lastMessage}
           </p>
+        )}
+        {!isCompact && (workflowLine || provenanceLine || handoffLine) && (
+          <div className="agent-card-detail-stack">
+            {workflowLine && (
+              <div className="agent-card-detail-line">
+                <span className="agent-resource-pill">workflow</span>
+                <span>{workflowLine}</span>
+              </div>
+            )}
+            {provenanceLine && <p className="agent-card-detail-note">{provenanceLine}</p>}
+            {handoffLine && <p className="agent-card-detail-note">handoff: {handoffLine}</p>}
+          </div>
+        )}
+        {!isCompact && redirectOpen && (
+          <form
+            className="agent-card-redirect-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (!agentKeyString) return;
+              void runAgentControl(agentKeyString, "redirect", {
+                note: redirectNoteDraft,
+                workflow: redirectWorkflowDraft,
+              });
+            }}
+          >
+            <label>
+              <span className="agent-card-detail-label">Redirect note</span>
+              <textarea
+                value={redirectNoteDraft}
+                onChange={(event) => setRedirectNoteDraft(event.target.value)}
+                rows={2}
+                placeholder="What should this delegated run do next?"
+              />
+            </label>
+            <label>
+              <span className="agent-card-detail-label">Workflow target</span>
+              <input
+                type="text"
+                value={redirectWorkflowDraft}
+                onChange={(event) => setRedirectWorkflowDraft(event.target.value)}
+                placeholder="architect_planner, mini_execution, default"
+              />
+            </label>
+            <div className="agent-card-redirect-actions">
+              <button
+                type="submit"
+                className="agent-card-control-btn"
+                disabled={!agentKeyString || Boolean(agentControlPendingKey)}
+              >
+                {redirectBusy ? "sending..." : "send redirect"}
+              </button>
+              <button
+                type="button"
+                className="agent-card-control-btn"
+                onClick={() => setRedirectEditorAgentId("")}
+                disabled={Boolean(agentControlPendingKey)}
+              >
+                cancel
+              </button>
+            </div>
+          </form>
+        )}
+        {!isCompact && agentControlFeedback && redirectOpen && (
+          <p className="status-note">{agentControlFeedback}</p>
         )}
         {!isCompact && showTokens && (
           <div className="agent-card-resources">
@@ -3230,8 +5146,11 @@ const AgentConsole = ({
               const ts = formatTimestamp(entry.timestamp);
               const status = getEffectiveToolStatus(entry) || normalizeToolStatus(entry.status) || null;
               const displayStatus = status && status !== "active" ? status : null;
-              const isProposedTool = entry.type === "tool" && status === "proposed";
-              const isResolvedTool = entry.type === "tool" && status && status !== "proposed";
+              const toolTone = entry.type === "tool" ? statusTone(status || entry.status || "pending") : null;
+              const isProposedTool =
+                entry.type === "tool" && (status === "proposed" || status === "pending");
+              const isResolvedTool =
+                entry.type === "tool" && status && status !== "proposed" && status !== "pending";
               const eventAgeSeconds =
                 typeof entry.timestamp === "number" ? Date.now() / 1000 - entry.timestamp : null;
               const entryFocused = matchesFocus(entry);
@@ -3249,6 +5168,13 @@ const AgentConsole = ({
                 const meta = msg && typeof msg === "object" ? msg.metadata : null;
                 return formatModelSourceLabel(meta?.mode, meta?.model);
               })();
+              const toolInspectorRows = buildToolStateInspectorRows(entry, {
+                agentId: agentKeyString,
+                chainIdentifier,
+                sessionId: state.sessionId,
+                sourceLabel,
+                status,
+              });
               const collapsed =
                 chainIdentifier && Object.prototype.hasOwnProperty.call(collapsedChains, chainIdentifier)
                   ? !!collapsedChains[chainIdentifier]
@@ -3280,9 +5206,25 @@ const AgentConsole = ({
                   ? streamLabel || "streaming response"
                   : entry.content || entry.text || entry.message || "...";
             const preview = collapsed ? buildEntryPreview(entry, bodyText) : null;
+            const entryNameKey = normalizePreviewText(entry.name).toLowerCase();
+            const showEntryToolName =
+              entry.type === "tool" && entry.name && entryNameKey !== displayLabelKey;
+            const handleActivityClick = (event) => {
+              const target = event.target;
+              if (
+                typeof Element !== "undefined" &&
+                target instanceof Element &&
+                target.closest(AGENT_CARD_INTERACTIVE_SELECTOR)
+              ) {
+                return;
+              }
+              if (chainIdentifier) {
+                toggleCollapsed();
+              }
+            };
             return (
               <li
-                key={`${agent.id}-${entry.timestamp}-${entry.type}-${entry.name || entry.id || "log"}`}
+                key={activityEntryKey(agent, entry)}
                 className={`agent-activity agent-activity-${entry.type}${
                     isProposedTool ? " proposed" : ""
                   }${isResolvedTool ? " resolved" : ""}${isAged ? " aged" : ""}${
@@ -3294,27 +5236,78 @@ const AgentConsole = ({
                       : undefined
                   }
                   data-chain-id={chainIdentifier ? String(chainIdentifier) : undefined}
+                  data-tool-status={entry.type === "tool" && status ? status : undefined}
                   data-agent-id={agentKeyString || undefined}
-                  onClick={() => {
-                    if (chainIdentifier) {
-                      onSelectMessage?.(chainIdentifier);
-                    }
-                  }}
+                  onClick={handleActivityClick}
                   role={chainIdentifier ? "button" : undefined}
                   tabIndex={chainIdentifier ? 0 : undefined}
                   onKeyDown={(event) => {
+                    if (
+                      typeof Element !== "undefined" &&
+                      event.target instanceof Element &&
+                      event.target.closest(AGENT_CARD_INTERACTIVE_SELECTOR)
+                    ) {
+                      return;
+                    }
                     if ((event.key === "Enter" || event.key === " ") && chainIdentifier) {
                       event.preventDefault();
-                      onSelectMessage?.(chainIdentifier);
+                      toggleCollapsed();
                     }
                   }}
                 >
                   <div className="agent-activity-meta">
                     <span className="agent-activity-type">{displayType}</span>
-                    {entry.type === "tool" && entry.name && (
-                      <span className="agent-activity-name">{entry.name}</span>
+                    {showEntryToolName && (
+                      <button
+                        type="button"
+                        className="agent-activity-name agent-activity-name-button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          toggleCollapsed();
+                        }}
+                        title={
+                          collapsed
+                            ? `Expand ${entry.name} details`
+                            : `Collapse ${entry.name} details`
+                        }
+                        aria-label={
+                          collapsed
+                            ? `Expand ${entry.name} details`
+                            : `Collapse ${entry.name} details`
+                        }
+                      >
+                        {entry.name}
+                      </button>
                     )}
-                    {displayStatus && <span className="agent-activity-status">{displayStatus}</span>}
+                    {displayStatus && entry.type === "tool" ? (
+                      <span
+                        className="agent-tool-status-code"
+                        data-tool-status={status}
+                        title={`Tool status: ${displayStatus}`}
+                        aria-label={`Tool status: ${displayStatus}`}
+                      >
+                        <span
+                          className="agent-tool-status-pip"
+                          aria-hidden="true"
+                          style={{ backgroundColor: toolTone?.hue }}
+                        />
+                        <span className="agent-tool-status-text">{displayStatus}</span>
+                      </span>
+                    ) : (
+                      displayStatus && <span className="agent-activity-status">{displayStatus}</span>
+                    )}
+                    {entry.type === "tool" && (
+                      <StateInspector
+                        title="Why this tool is here"
+                        summary={
+                          isProposedTool
+                            ? "The assistant proposed this tool and the console is holding it for review."
+                            : "This console row reflects recorded tool activity for this chat turn."
+                        }
+                        rows={toolInspectorRows}
+                        ariaLabel={`Explain ${entry.name || "tool"} activity`}
+                      />
+                    )}
                     {ts && <time>{ts}</time>}
                     {responseHistory && (
                       <button
@@ -3356,7 +5349,6 @@ const AgentConsole = ({
                   <div className="agent-activity-body">
                     {entry.type === "tool" ? (
                       <>
-                        <strong>{entry.name || "tool"}</strong>
                         {sourceLabel && (
                           <div className="agent-activity-source">source: {sourceLabel}</div>
                         )}
@@ -3392,7 +5384,7 @@ const AgentConsole = ({
                     )}
                   </div>
                 )}
-                  {entry.type === "tool" && !collapsed && renderToolActions(entry)}
+                  {entry.type === "tool" && (!collapsed || isProposedTool) && renderToolActions(entry)}
                   {entry.type === "tool" && responseHistory && renderActionHistoryPopover(responseHistory)}
                 </li>
               );
@@ -3844,8 +5836,102 @@ const AgentConsole = ({
   const renderRuntimePanel = () => {
     const runtime = runtimeStatus;
     const modeLabel = state.backendMode || runtime?.mode || "api";
+    if (runtimePanelHidden) return null;
     if (modeLabel !== "local") {
-      return null;
+      const apiModel = state.apiModel || "api model not selected";
+      const transformerModel = state.transformerModel || "transformer model not selected";
+      const wsStatus = normalizeStatusValue(state.wsStatus);
+      const wsLabel =
+        wsStatus === "online"
+          ? "connected"
+          : wsStatus === "loading"
+            ? "connecting"
+            : wsStatus === "degraded"
+              ? "degraded"
+              : "offline";
+      const providerState = usingProviderRuntime && selectedLocalProvider ? providerStatus : null;
+      const providerLabel = providerState
+        ? providerState.model_loaded
+          ? "model loaded"
+          : providerState.server_running
+            ? "server running"
+            : providerState.installed
+              ? "installed"
+              : "checking"
+        : "api mode";
+      const renderApiRuntimePips = (compact = false) => (
+        <div
+          className={
+            compact
+              ? "agent-console-pip-row agent-console-pip-row--compact"
+              : "agent-console-pip-row"
+          }
+        >
+          {renderConsolePip({
+            key: "api-model",
+            label: "API",
+            value: apiModel,
+            title: `API model: ${apiModel}`,
+            tone: apiModel === "api model not selected" ? "idle" : "connected",
+            compact,
+          })}
+          {renderConsolePip({
+            key: "transformer-model",
+            label: "Transformer",
+            value: transformerModel,
+            title: `Transformer model: ${transformerModel}`,
+            tone:
+              transformerModel === "transformer model not selected"
+                ? "idle"
+                : "connected",
+            compact,
+          })}
+          {renderConsolePip({
+            key: "websocket",
+            label: "WebSocket",
+            value: wsLabel,
+            title: `WebSocket: ${wsLabel}`,
+            tone: wsStatus,
+            compact,
+          })}
+          {renderConsolePip({
+            key: "provider",
+            label: "Provider",
+            value: providerLabel,
+            title: `Provider: ${providerLabel}`,
+            tone: providerState ? "connected" : "idle",
+            compact,
+          })}
+        </div>
+      );
+
+      return (
+        <ConsoleObjectCard
+          title="runtime"
+          subtitle="api mode"
+          preview={`API ${apiModel}; Transformer ${transformerModel}; WebSocket ${wsLabel}`}
+          className="agent-runtime-panel"
+          collapsed={runtimePanelCollapsed}
+          onToggleCollapsed={() => setRuntimePanelCollapsed((prev) => !prev)}
+          onHide={() => setRuntimePanelHidden(true)}
+          expandLabel="Expand runtime details"
+          collapseLabel="Collapse runtime details"
+          hideLabel="Hide runtime"
+          controlButtonClassName="runtime-action-btn"
+          symbolButtonClassName="runtime-action-symbol"
+          status={
+            <div className="runtime-panel-status" title="runtime status">
+              api
+            </div>
+          }
+          collapsedContent={renderApiRuntimePips(true)}
+        >
+          {renderApiRuntimePips(false)}
+          <div className="runtime-panel-note runtime-panel-summary" role="status">
+            API mode is using {apiModel} with {transformerModel}.
+          </div>
+        </ConsoleObjectCard>
+      );
     }
     if (usingProviderRuntime && selectedLocalProvider) {
       const providerRuntime = providerStatus || runtime || {};
@@ -3856,6 +5942,7 @@ const AgentConsole = ({
       const installed = !!providerRuntime.installed;
       const serverRunning = !!providerRuntime.server_running;
       const modelLoaded = !!providerRuntime.model_loaded;
+      const providerLabel = formatLocalRuntimeLabel(selectedLocalProvider);
       const effectiveProviderModel =
         typeof providerRuntime.effective_model_id === "string"
           ? providerRuntime.effective_model_id.trim()
@@ -3900,22 +5987,52 @@ const AgentConsole = ({
         typeof providerRuntime.last_error === "string"
           ? providerRuntime.last_error.trim()
           : "";
+      const baseUrl =
+        typeof providerRuntime.base_url === "string" ? providerRuntime.base_url : "";
+      const serverOwnershipKnown =
+        typeof providerRuntime.server_owned_by_float === "boolean";
+      const serverOwnedByFloat = serverOwnershipKnown
+        ? providerRuntime.server_owned_by_float
+        : true;
+      const loadedModelOwnershipKnown =
+        typeof providerRuntime.loaded_model_owned_by_float === "boolean";
+      const loadedModelOwnedByFloat = loadedModelOwnershipKnown
+        ? providerRuntime.loaded_model_owned_by_float
+        : serverOwnedByFloat;
+      const externalManagedServer =
+        !externalEndpointMode &&
+        serverRunning &&
+        serverOwnershipKnown &&
+        !serverOwnedByFloat;
+      const externalManagedLoadedModel =
+        Boolean(loadedModel) &&
+        loadedModelOwnershipKnown &&
+        !loadedModelOwnedByFloat;
+      const providerOwnershipWarning =
+        externalManagedServer || externalManagedLoadedModel
+          ? `${providerLabel || selectedLocalProvider} is already running outside Float${
+              baseUrl ? ` at ${baseUrl}` : ""
+            }. Stop it in the external app or switch this lane to External HTTP only before using start, stop, load, or unload here.`
+          : "";
       const providerStatusLabel = modelLoaded
-        ? "model loaded"
+        ? externalManagedLoadedModel
+          ? "external model loaded"
+          : "model loaded"
         : embeddingOnlyLoadedModel
-          ? "embedding loaded"
+          ? externalManagedLoadedModel
+            ? "external embedding loaded"
+            : "embedding loaded"
           : externalEndpointMode
             ? providerEndpointReachable
               ? "endpoint reachable"
               : "endpoint offline"
+            : externalManagedServer
+              ? "external server running"
             : serverRunning
               ? "server running"
               : installed
                 ? "installed"
                 : "not installed";
-      const providerLabel = formatLocalRuntimeLabel(selectedLocalProvider);
-      const baseUrl =
-        typeof providerRuntime.base_url === "string" ? providerRuntime.base_url : "";
       const providerDetails =
         providerRuntime?.details && typeof providerRuntime.details === "object"
           ? providerRuntime.details
@@ -3934,6 +6051,10 @@ const AgentConsole = ({
             providerCheckedClock ? ` (${providerCheckedClock})` : ""
           }. Automatic provider refresh runs about once per minute.`
         : "Inventory has not been checked yet.";
+      const providerLastOperation = formatProviderLastOperation(
+        providerRuntime?.last_operation,
+        runtimeNow,
+      );
       const runtimeLastError =
         providerActionError ||
         (
@@ -3944,8 +6065,21 @@ const AgentConsole = ({
         ) ||
         runtimeError ||
         "";
+      const providerRuntimeInspectorRows = buildProviderRuntimeInspectorRows({
+        providerKey: selectedLocalProvider,
+        providerLabel: providerLabel || selectedLocalProvider,
+        providerRuntime,
+        status: providerStatusLabel,
+        summary: providerStatusLabel,
+        detail: runtimeLastError,
+        ownershipWarning: providerOwnershipWarning,
+        lastOperation: providerLastOperation,
+        actionMessage: providerActionError,
+      });
       const providerFreshnessTone = runtimeLastError
         ? "error"
+        : externalManagedServer || externalManagedLoadedModel
+          ? "warn"
         : modelLoaded
           ? "ok"
           : externalEndpointMode
@@ -4011,15 +6145,73 @@ const AgentConsole = ({
         startStopAvailable || showProviderInventory || loadControlsAvailable;
       const showProviderSecondaryRow =
         (contextSupported && loadControlsAvailable) || providerLogsSupported;
+      const renderProviderRuntimePips = (compact = false) => (
+        <div
+          className={
+            compact
+              ? "agent-console-pip-row agent-console-pip-row--compact"
+              : "agent-console-pip-row"
+          }
+        >
+          {renderConsolePip({
+            key: "provider-runtime",
+            label: "Provider",
+            value: providerLabel || selectedLocalProvider,
+            title: providerLabel || selectedLocalProvider,
+            tone: "provider",
+            compact,
+          })}
+          {renderConsolePip({
+            key: "provider-model",
+            label: "Model",
+            value: loadedModel || effectiveSelectedModel || "not selected",
+            title: loadedModel
+              ? `Loaded model: ${loadedModel}`
+              : effectiveSelectedModel
+                ? `Selected model: ${effectiveSelectedModel}`
+                : "No provider model selected",
+            tone: modelLoaded ? "connected" : "runtime",
+            compact,
+          })}
+          {renderConsolePip({
+            key: "provider-status",
+            label: "Status",
+            value: providerStatusLabel,
+            title: `Provider status: ${providerStatusLabel}`,
+            tone: providerFreshnessTone === "ok" ? "connected" : providerFreshnessTone,
+            compact,
+          })}
+          {renderConsolePip({
+            key: "provider-context",
+            label: "Context",
+            value: contextLength ? formatTokenCount(contextLength) : "unset",
+            title: contextLength
+              ? `Context length: ${formatTokenCount(contextLength)}`
+              : "Context length unset",
+            tone: contextLength ? "connected" : "idle",
+            compact,
+          })}
+        </div>
+      );
 
       return (
-        <section className="agent-runtime-panel">
-          <header className="runtime-panel-header">
-            <div className="runtime-panel-title">
-              <h3>runtime</h3>
-              <span className="runtime-panel-subtitle">{providerLabel || "local runtime"}</span>
-            </div>
-            <div className="runtime-panel-actions">
+        <ConsoleObjectCard
+          title="runtime"
+          subtitle={providerLabel || "local runtime"}
+          className="agent-runtime-panel"
+          collapsed={runtimePanelCollapsed}
+          preview={`${providerLabel || selectedLocalProvider}: ${providerStatusLabel}${
+            loadedModel ? `; loaded ${loadedModel}` : ""
+          }`}
+          onToggleCollapsed={() => setRuntimePanelCollapsed((prev) => !prev)}
+          onHide={() => setRuntimePanelHidden(true)}
+          expandLabel="Expand runtime details"
+          collapseLabel="Collapse runtime details"
+          hideLabel="Hide runtime"
+          controlButtonClassName="runtime-action-btn"
+          symbolButtonClassName="runtime-action-symbol"
+          extraActions={
+            <>
               <button
                 type="button"
                 className="runtime-action-btn"
@@ -4041,11 +6233,21 @@ const AgentConsole = ({
                 title={providerCheckTooltip}
                 aria-label="Provider inventory freshness"
               />
-              <div className="runtime-panel-status" title={`runtime status: ${providerStatusLabel}`}>
-                {providerStatusLabel}
-              </div>
+              <StateInspector
+                title="Why this runtime state is shown"
+                summary="Provider runtime status combines bridge inventory, ownership checks, and the last action result."
+                rows={providerRuntimeInspectorRows}
+                ariaLabel="Explain provider runtime state"
+              />
+            </>
+          }
+          status={
+            <div className="runtime-panel-status" title={`runtime status: ${providerStatusLabel}`}>
+              {providerStatusLabel}
             </div>
-          </header>
+          }
+          collapsedContent={renderProviderRuntimePips(true)}
+        >
           <div className="runtime-model-row">
             <span className="runtime-model-name" title={providerLabel || selectedLocalProvider}>
               {providerLabel || selectedLocalProvider}
@@ -4082,6 +6284,16 @@ const AgentConsole = ({
             <div className="runtime-panel-warning" role="status">
               Loaded model {loadedModel} looks like an embedding model. Chat requests need a
               language model loaded here.
+            </div>
+          ) : null}
+          {providerOwnershipWarning ? (
+            <div className="runtime-panel-warning" role="status">
+              {providerOwnershipWarning}
+            </div>
+          ) : null}
+          {providerLastOperation ? (
+            <div className="runtime-panel-note" role="status" title={providerLastOperation.title}>
+              {providerLastOperation.label}
             </div>
           ) : null}
           {showProviderActionRow ? (
@@ -4228,7 +6440,7 @@ const AgentConsole = ({
               </pre>
             </div>
           ) : null}
-        </section>
+        </ConsoleObjectCard>
       );
     }
     const modelName = selectedDirectLocalModel;
@@ -4432,7 +6644,7 @@ const AgentConsole = ({
         const label = gpu?.name
           ? `${gpu.name}`
           : `GPU ${gpu?.index ?? idx}`;
-        const meta = parts.join(" Â· ");
+        const meta = parts.join(" · ");
         return (
           <div key={gpu?.id || idx} className="runtime-meter-block">
             {renderMeter(label, used, total, meta, meta)}
@@ -4478,56 +6690,202 @@ const AgentConsole = ({
     if (tokenSource) {
       tokenMetaParts.push(tokenSource);
     }
-    const tokenMeta = tokenMetaParts.join(" Â· ");
+    const tokenMeta = tokenMetaParts.join(" · ");
     const tokenValue =
       typeof tokenTotal === "number"
         ? tokenLimit
           ? `${formatTokenCount(tokenTotal)} / ${formatTokenCount(tokenLimit)}`
           : `${formatTokenCount(tokenTotal)}`
         : "n/a";
+    const directRuntimeSummary = (
+      <div className="runtime-panel-note runtime-panel-summary" role="status">
+        <div className="runtime-model-row">
+          <span
+            className="runtime-model-name"
+            title={hasModel ? `local model: ${modelName}` : "no local model selected"}
+          >
+            {hasModel ? modelName : "local model"}
+          </span>
+          {activeModelDiffers ? (
+            <span className="runtime-pill" title={`loaded model: ${activeModelId}`}>
+              loaded {activeModelId}
+            </span>
+          ) : null}
+          {tokenLimit && (
+            <span className="runtime-pill" title="max context length">
+              ctx {formatTokenCount(tokenLimit)}
+            </span>
+          )}
+          {runtime?.quant_method && (
+            <span className="runtime-pill" title="quantization method">
+              {runtime.quant_method}
+            </span>
+          )}
+          {runtime?.model_dtype && (
+            <span className="runtime-pill" title="model dtype">
+              dtype {runtime.model_dtype}
+            </span>
+          )}
+          {runtime?.model_device && (
+            <span className="runtime-pill" title="model device">
+              {runtime.model_device}
+            </span>
+          )}
+        </div>
+      </div>
+    );
+    const renderDirectRuntimePips = (compact = false) => (
+      <div className="runtime-model-row runtime-model-row--compact">
+        {renderConsolePip({
+          key: "runtime-model",
+          label: "Runtime",
+          value: hasModel ? modelName : "local model",
+          title: hasModel ? `local model: ${modelName}` : "no local model selected",
+          tone: "runtime",
+          compact,
+        })}
+        {renderConsolePip({
+          key: "runtime-loaded",
+          label: "Loaded",
+          value: activeModelId || "none",
+          title: activeModelDiffers
+            ? `loaded model: ${activeModelId}`
+            : "No alternate model loaded",
+          tone: activeModelDiffers ? "provider" : "runtime",
+          compact,
+        })}
+        {renderConsolePip({
+          key: "runtime-ctx",
+          label: "Context",
+          value: tokenLimit ? formatTokenCount(tokenLimit) : "unset",
+          title: "Max context length",
+          tone: "task",
+          compact,
+        })}
+        {renderConsolePip({
+          key: "runtime-device",
+          label: "Device",
+          value: runtime?.model_device || "n/a",
+          title: "Model device",
+          tone: "provider",
+          compact,
+        })}
+      </div>
+    );
 
     return (
-      <section className="agent-runtime-panel">
-        <header className="runtime-panel-header">
-          <div className="runtime-panel-title">
-            <h3>runtime</h3>
-            <span className="runtime-panel-subtitle">
-              {modeLabel === "local"
-                ? "local inference"
-                : `mode: ${modeLabel}`}
+      <ConsoleObjectCard
+        title="runtime"
+        subtitle={modeLabel === "local" ? "local inference" : `mode: ${modeLabel}`}
+        className="agent-runtime-panel"
+        collapsed={runtimePanelCollapsed}
+        preview={`${hasModel ? modelName : "local model"}; ${statusText}${
+          tokenLimit ? `; ctx ${formatTokenCount(tokenLimit)}` : ""
+        }`}
+        onToggleCollapsed={() => setRuntimePanelCollapsed((prev) => !prev)}
+        onHide={() => setRuntimePanelHidden(true)}
+        expandLabel="Expand runtime details"
+        collapseLabel="Collapse runtime details"
+        hideLabel="Hide runtime"
+        controlButtonClassName="runtime-action-btn"
+        symbolButtonClassName="runtime-action-symbol"
+        extraActions={
+          modeLabel === "local" ? (
+            <span className="runtime-action-wrap" title={actionTitle}>
+              <button
+                type="button"
+                className="runtime-action-btn"
+                onClick={isLoaded ? handleUnloadLocalModel : handleLoadLocalModel}
+                disabled={actionPending}
+              >
+                {actionLabel}
+              </button>
             </span>
+          ) : null
+        }
+        status={
+          <div className="runtime-panel-status" title={`runtime status: ${statusText}`}>
+            {statusText}
           </div>
-          <div className="runtime-panel-actions">
-            {modeLabel === "local" && (
-              <span className="runtime-action-wrap" title={actionTitle}>
-                <button
-                  type="button"
-                  className="runtime-action-btn"
-                  onClick={isLoaded ? handleUnloadLocalModel : handleLoadLocalModel}
-                  disabled={actionPending}
-                >
-                  {actionLabel}
-                </button>
-              </span>
-            )}
-            <button
-              type="button"
-              className="runtime-action-btn runtime-action-symbol"
-              onClick={() => setRuntimePanelCollapsed((prev) => !prev)}
-              aria-expanded={!runtimePanelCollapsed}
-              aria-label={runtimePanelCollapsed ? "Expand runtime details" : "Collapse runtime details"}
-              title={runtimePanelCollapsed ? "Expand runtime details" : "Collapse runtime details"}
-            >
-              {runtimePanelCollapsed ? "+" : "-"}
-            </button>
-            <div className="runtime-panel-status" title={`runtime status: ${statusText}`}>
-              {statusText}
-            </div>
-          </div>
-        </header>
+        }
+        collapsedContent={
+          <>
+            {renderDirectRuntimePips(true)}
+            {directRuntimeSummary}
+          </>
+        }
+      >
         {runtimePanelCollapsed ? (
-          <div className="runtime-panel-note" role="status">
-            Runtime details hidden. Selected model: {hasModel ? modelName : "none"}.
+          <div className="runtime-model-row runtime-model-row--compact">
+            {renderConsolePip({
+              key: "runtime-model",
+              label: "Runtime",
+              value: hasModel ? modelName : "local model",
+              title: hasModel ? `local model: ${modelName}` : "no local model selected",
+              tone: "runtime",
+              compact: true,
+            })}
+            {renderConsolePip({
+              key: "runtime-loaded",
+              label: "Loaded",
+              value: activeModelId || "none",
+              title: activeModelDiffers ? `loaded model: ${activeModelId}` : "No alternate model loaded",
+              tone: activeModelDiffers ? "provider" : "runtime",
+              compact: true,
+            })}
+            {renderConsolePip({
+              key: "runtime-ctx",
+              label: "Context",
+              value: tokenLimit ? formatTokenCount(tokenLimit) : "unset",
+              title: "Max context length",
+              tone: "task",
+              compact: true,
+            })}
+            {renderConsolePip({
+              key: "runtime-device",
+              label: "Device",
+              value: runtime?.model_device || "n/a",
+              title: "Model device",
+              tone: "provider",
+              compact: true,
+            })}
+          </div>
+        ) : null}
+        {runtimePanelCollapsed ? (
+          <div className="runtime-panel-note runtime-panel-summary" role="status">
+            <div className="runtime-model-row">
+              <span
+                className="runtime-model-name"
+                title={hasModel ? `local model: ${modelName}` : "no local model selected"}
+              >
+                {hasModel ? modelName : "local model"}
+              </span>
+              {activeModelDiffers ? (
+                <span className="runtime-pill" title={`loaded model: ${activeModelId}`}>
+                  loaded {activeModelId}
+                </span>
+              ) : null}
+              {tokenLimit && (
+                <span className="runtime-pill" title="max context length">
+                  ctx {formatTokenCount(tokenLimit)}
+                </span>
+              )}
+              {runtime?.quant_method && (
+                <span className="runtime-pill" title="quantization method">
+                  {runtime.quant_method}
+                </span>
+              )}
+              {runtime?.model_dtype && (
+                <span className="runtime-pill" title="model dtype">
+                  dtype {runtime.model_dtype}
+                </span>
+              )}
+              {runtime?.model_device && (
+                <span className="runtime-pill" title="model device">
+                  {runtime.model_device}
+                </span>
+              )}
+            </div>
           </div>
         ) : (
           <>
@@ -4760,7 +7118,7 @@ const AgentConsole = ({
         </div>
           </>
         )}
-      </section>
+      </ConsoleObjectCard>
     );
   };
 
@@ -4820,58 +7178,64 @@ const AgentConsole = ({
         {">"}
       </button>
       <div className="sidebar-header right-header">
-        <button
-          className={`stream-toggle ${streamEnabled ? "on" : "off"}`}
-          onClick={onStreamToggle}
-          title={streamEnabled ? "Pause console stream" : "Resume console stream"}
-          aria-pressed={streamEnabled}
-        >
-          {streamEnabled ? "pause" : "resume"}
-        </button>
-        <h2>agent console</h2>
-        <div className="console-permission-control">
-          <label htmlFor="console-permission-select">permissions</label>
-          <select
-            id="console-permission-select"
-            className="console-permission-select"
-            value={state.approvalLevel}
-            onChange={handleApprovalLevelChange}
-            title="Select tool permissions level"
-            aria-label="Tool permissions level"
-          >
-            <option value="all">All</option>
-            <option value="high">High Risk Only</option>
-            <option value="auto">Full Auto</option>
-          </select>
-        </div>
-        {hiddenCount > 0 && (
+        <div className="right-header-title-row">
           <button
-            type="button"
-            className="console-hidden-btn"
-            onClick={handleShowHidden}
-            title="Show hidden console cards"
-            aria-label="Show hidden console cards"
+            className={`stream-toggle ${streamEnabled ? "on" : "off"}`}
+            onClick={onStreamToggle}
+            title={streamEnabled ? "Pause console stream" : "Resume console stream"}
+            aria-pressed={streamEnabled}
           >
-            show hidden ({hiddenCount})
+            {streamEnabled ? "pause" : "resume"}
           </button>
-        )}
-        <button
-          className="refresh-btn"
-          disabled={refreshDisabled}
-          onClick={handleRefreshClick}
-          aria-label="Refresh agent console"
-          title="Refresh"
-        >
-          <svg
-            width="16"
-            height="16"
-            viewBox="0 0 24 24"
-            fill="currentColor"
-            aria-hidden="true"
-          >
-            <path d="M17.65 6.35A7.95 7.95 0 0 0 12 4V1L7 6l5 5V7a5 5 0 1 1-4.9 6.1H5.02A7 7 0 1 0 17.65 6.35z" />
-          </svg>
-        </button>
+          <h2>agent console</h2>
+        </div>
+        <div className="right-header-controls-scroll history-controls-scroll">
+          <div className="history-controls-scroll-content right-header-controls-scroll-content">
+            <div className="console-permission-control">
+              <label htmlFor="console-permission-select">permissions</label>
+              <select
+                id="console-permission-select"
+                className="console-permission-select"
+                value={state.approvalLevel}
+                onChange={handleApprovalLevelChange}
+                title="Select tool permissions level"
+                aria-label="Tool permissions level"
+              >
+                <option value="all">All</option>
+                <option value="high">High Risk Only</option>
+                <option value="auto">Full Auto</option>
+              </select>
+            </div>
+            {hiddenCount > 0 && (
+              <button
+                type="button"
+                className="console-hidden-btn"
+                onClick={handleShowHidden}
+                title="Show hidden console cards"
+                aria-label="Show hidden console cards"
+              >
+                hidden ({hiddenCount})
+              </button>
+            )}
+            <button
+              className="refresh-btn"
+              disabled={refreshDisabled}
+              onClick={handleRefreshClick}
+              aria-label="Refresh agent console"
+              title="Refresh"
+            >
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="currentColor"
+                aria-hidden="true"
+              >
+                <path d="M17.65 6.35A7.95 7.95 0 0 0 12 4V1L7 6l5 5V7a5 5 0 1 1-4.9 6.1H5.02A7 7 0 1 0 17.65 6.35z" />
+              </svg>
+            </button>
+          </div>
+        </div>
       </div>
       <div className="agent-console-body" ref={scrollBodyRef}>
         {renderRuntimePanel()}
@@ -4886,6 +7250,7 @@ const AgentConsole = ({
             onHide={() => setActionHistoryHidden(true)}
           />
         ) : null}
+        {renderBackgroundPanel()}
         {isCalendar && renderCalendar()}
         {hasInlineToolActivity && (
           <p className="agent-console-note" role="status">
@@ -4894,12 +7259,18 @@ const AgentConsole = ({
           </p>
         )}
         {backendReady ? (
-          agents.length === 0 ? (
+          visibleAgentItems.length === 0 ? (
             <p className="agent-console-empty">
               {loadingSnapshot ? "Loading agents..." : "No active agents yet."}
             </p>
           ) : (
-            agents.map((agent) => renderAgentCard(agent))
+            visibleAgentItems.map((item) =>
+              item.type === "tool-chat-summary"
+                ? renderToolChatSummaryCard(item.summary)
+                : item.type === "tool-chat-group"
+                  ? renderToolChatGroup(item)
+                  : renderAgentCard(item.agent),
+            )
           )
         ) : (
           <p className="agent-console-empty">Console unavailable while API is offline.</p>

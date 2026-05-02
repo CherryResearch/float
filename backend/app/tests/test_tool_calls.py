@@ -263,6 +263,60 @@ def test_generate_via_api_uses_responses_tool_shape_for_gpt5(monkeypatch):
     ]
 
 
+def test_generate_via_api_uses_experimental_responses_ws_transport(monkeypatch):
+    captured = {}
+
+    class FakeTransport:
+        def __init__(self, **kwargs):
+            captured["transport_kwargs"] = kwargs
+            self.api_key = kwargs["api_key"]
+            self.url = kwargs["url"]
+
+        def run_response(self, **kwargs):
+            captured["run_kwargs"] = kwargs
+            return {
+                "text": "done over ws",
+                "thought": "",
+                "tools_used": [],
+                "metadata": {"transport": "openai_responses_ws"},
+            }
+
+    def fail_post(*args, **kwargs):
+        raise AssertionError("HTTP path should not be used")
+
+    monkeypatch.setattr(
+        "app.base_services.OpenAIResponsesWebSocketTransport", FakeTransport
+    )
+    monkeypatch.setattr("app.base_services.http_session.post", fail_post)
+
+    service = LLMService(
+        config={
+            "api_key": "test",
+            "api_url": "https://api.openai.com/v1/responses",
+            "api_model": "gpt-5.4",
+            "openai_responses_ws_enabled": True,
+            "openai_responses_ws_url": "wss://example.test/v1/responses",
+        }
+    )
+
+    result = service._generate_via_api(
+        "hi",
+        ModelContext(),
+        session_id="sess",
+        stream_message_id="m1",
+        previous_response_id="resp_prev",
+        tool_executor=lambda call: {"ok": True},
+    )
+
+    assert result["text"] == "done over ws"
+    assert captured["transport_kwargs"]["url"] == "wss://example.test/v1/responses"
+    assert captured["transport_kwargs"]["api_key"] == "test"
+    assert captured["run_kwargs"]["session_id"] == "sess"
+    assert captured["run_kwargs"]["stream_message_id"] == "m1"
+    assert captured["run_kwargs"]["payload"]["previous_response_id"] == "resp_prev"
+    assert callable(captured["run_kwargs"]["tool_executor"])
+
+
 def test_extract_native_responses_tool_calls_parses_computer_call():
     payload = {
         "output": [

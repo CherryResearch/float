@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import requests
 from fastapi.testclient import TestClient
 
 
@@ -290,3 +291,75 @@ def test_provider_models_endpoint_can_force_refresh(monkeypatch, client):
     )
     assert response.status_code == 200
     assert calls == [("lmstudio", True)]
+
+
+def test_server_models_endpoint_polls_lmstudio_inventory(monkeypatch, client):
+    from app import routes
+
+    called_urls = []
+
+    class DummyResponse:
+        status_code = 200
+        text = ""
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def fake_get(url, **kwargs):
+        called_urls.append(url)
+        assert kwargs.get("timeout") <= 1.0
+        if url.endswith("/api/v0/models"):
+            return DummyResponse(
+                {
+                    "data": [
+                        {"id": "text-embedding-nomic", "state": "not-loaded"},
+                        {"id": "gemma-4-26B-A4B-it", "state": "loaded"},
+                    ]
+                }
+            )
+        raise AssertionError(f"unexpected url {url}")
+
+    monkeypatch.setattr(routes, "_server_model_probe_request", fake_get)
+    response = client.get(
+        "/llm/server/models",
+        params={"server_url": "http://127.0.0.1:1234"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["models"] == ["gemma-4-26B-A4B-it", "text-embedding-nomic"]
+    assert payload["loaded_model"] == "gemma-4-26B-A4B-it"
+    assert payload["reachable"] is True
+    assert called_urls == ["http://127.0.0.1:1234/api/v0/models"]
+
+
+def test_server_models_probe_has_total_timeout_budget(monkeypatch):
+    from app import routes
+
+    ticks = [1000.0]
+    called_urls = []
+
+    def fake_monotonic():
+        return ticks[0]
+
+    def fake_get(url, **kwargs):
+        called_urls.append(url)
+        ticks[0] += 1.1
+        raise requests.ConnectTimeout("slow provider")
+
+    monkeypatch.setattr(routes.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(routes, "_server_model_probe_request", fake_get)
+
+    payload = routes._probe_server_model_inventory("http://127.0.0.1:1234")
+
+    assert payload["status"] == "success"
+    assert payload["reachable"] is False
+    assert payload["models"] == []
+    assert payload["error"] == "probe timed out"
+    assert called_urls == [
+        "http://127.0.0.1:1234/api/v0/models",
+        "http://127.0.0.1:1234/api/v1/models",
+    ]

@@ -31,9 +31,20 @@
   color: color-mix(in oklab, var(--color-white) 80%, var(--color-black) 20%);
 }
 
+.tool-action-btn.retry {
+  background: color-mix(in oklab, var(--color-primary) 28%, var(--glass-tint) 72%);
+  color: var(--color-text);
+}
+
 .tool-action-btn.continue {
   background: color-mix(in oklab, var(--color-lavender) 40%, var(--glass-tint) 60%);
   color: var(--color-text);
+}
+
+.tool-action-btn.needs-tool-continue,
+.agent-tool-actions.needs-continue .tool-action-btn.continue {
+  border: 1px solid color-mix(in oklab, var(--color-mint-green) 72%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--color-mint-green) 18%, transparent);
 }
 
 .tool-action-btn:disabled {

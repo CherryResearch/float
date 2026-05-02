@@ -2,6 +2,19 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
 
+_SKIP_IMPLICIT_DEFAULTS: Dict[str, set[str]] = {
+    "memory.save": {
+        "reflect_after_save",
+        "reflection_prompt",
+        "reflection_run_now",
+    },
+    "remember": {
+        "reflect_after_save",
+        "reflection_prompt",
+        "reflection_run_now",
+    },
+}
+
 
 def _coerce_int(value: Any) -> Optional[int]:
     if value is None:
@@ -110,7 +123,63 @@ def _apply_aliases(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
                 args["tool_name"] = str(args["name"]).strip()
         args.pop("tools", None)
         args.pop("name", None)
+    elif tool_name == "memory.save":
+        if "text" not in args:
+            for alias in ("content", "value", "note", "body"):
+                if alias in args:
+                    args["text"] = args.get(alias)
+                    break
+        for alias in ("content", "value", "note", "body"):
+            if alias != "text":
+                args.pop(alias, None)
+    elif tool_name == "remember":
+        if "value" not in args:
+            for alias in ("content", "text", "note", "body"):
+                if alias in args:
+                    args["value"] = args.get(alias)
+                    break
+        for alias in ("content", "text", "note", "body"):
+            args.pop(alias, None)
+    elif tool_name == "write_file":
+        if "content" not in args:
+            for alias in ("text", "value", "body"):
+                if alias in args:
+                    args["content"] = args.get(alias)
+                    break
+        for alias in ("text", "value", "body"):
+            args.pop(alias, None)
+    elif tool_name == "subchat":
+        if "action" not in args:
+            if (
+                _coerce_bool(args.get("continue")) is True
+                or _coerce_bool(args.get("more_time")) is True
+            ):
+                args["action"] = "continue"
+            elif _coerce_bool(args.get("stop")) is True:
+                args["action"] = "stop"
+        args.pop("continue", None)
+        args.pop("more_time", None)
+        args.pop("stop", None)
     return args
+
+
+def _normalize_tool_help_detail(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return "names"
+    aliases = {
+        "name": "names",
+        "names": "names",
+        "list": "names",
+        "brief": "brief",
+        "short": "brief",
+        "summary": "brief",
+        "rich": "rich",
+        "full": "rich",
+        "schema": "rich",
+        "schemas": "rich",
+    }
+    return aliases.get(text, "names")
 
 
 def normalize_tool_args(tool_name: str, raw_args: Any) -> Dict[str, Any]:
@@ -130,8 +199,11 @@ def normalize_tool_args(tool_name: str, raw_args: Any) -> Dict[str, Any]:
     else:
         base = {}
 
-    base = _apply_aliases(tool_name.strip(), base)
-    schema = _schema_for_tool(tool_name.strip())
+    normalized_tool_name = tool_name.strip()
+    base = _apply_aliases(normalized_tool_name, base)
+    if normalized_tool_name in {"help", "tool_help"}:
+        base["detail"] = _normalize_tool_help_detail(base.get("detail"))
+    schema = _schema_for_tool(normalized_tool_name)
     if not schema:
         return base
 
@@ -145,8 +217,11 @@ def normalize_tool_args(tool_name: str, raw_args: Any) -> Dict[str, Any]:
         base = {k: v for k, v in base.items() if k in properties}
 
     # Fill defaults so signatures match tool-side canonicalization.
+    skip_defaults = _SKIP_IMPLICIT_DEFAULTS.get(normalized_tool_name, set())
     for key, prop_schema in properties.items():
         if key in base:
+            continue
+        if key in skip_defaults:
             continue
         if isinstance(prop_schema, dict) and "default" in prop_schema:
             base[key] = prop_schema.get("default")

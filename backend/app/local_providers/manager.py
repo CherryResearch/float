@@ -5,7 +5,7 @@ import time
 from collections import deque
 from typing import Any, Callable, Deque, Dict, List, Optional
 
-from .base import normalize_base_url
+from .base import infer_openai_compatible_auth_token, normalize_base_url
 from .lmstudio import LMStudioAdapter
 from .ollama import OllamaAdapter
 
@@ -59,6 +59,25 @@ def _normalize_model_name(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _truncate_log_text(value: Any, limit: int = 160) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[: max(0, limit - 3)].rstrip()}..."
+
+
+def _format_command(args: Any) -> str:
+    if not isinstance(args, list):
+        return _truncate_log_text(args, limit=120)
+    rendered: List[str] = []
+    for item in args:
+        value = str(item or "").strip()
+        if not value:
+            continue
+        rendered.append(f'"{value}"' if any(ch.isspace() for ch in value) else value)
+    return _truncate_log_text(" ".join(rendered), limit=180)
+
+
 def _is_likely_embedding_model_name(value: Any) -> bool:
     model_name = _normalize_model_name(value).lower()
     if not model_name:
@@ -92,6 +111,16 @@ class LocalProviderManager:
             "lmstudio": 0,
             "ollama": 0,
             "custom-openai-compatible": 0,
+        }
+        self._operation_seq: Dict[str, int] = {
+            "lmstudio": 0,
+            "ollama": 0,
+            "custom-openai-compatible": 0,
+        }
+        self._last_operation: Dict[str, Optional[Dict[str, Any]]] = {
+            "lmstudio": None,
+            "ollama": None,
+            "custom-openai-compatible": None,
         }
         self._log_threads: Dict[str, Optional[threading.Thread]] = {
             "lmstudio": None,
@@ -274,9 +303,18 @@ class LocalProviderManager:
             last_error = self._last_error.get(provider_key, "")
             runtime_entry = self._runtime_cache.get(provider_key, {})
             models_entry = self._models_cache.get(provider_key, {})
+            owned_models_map = dict(self._owned_loaded_models.get(provider_key) or {})
+            server_owned_by_float = provider_key in self._owned_servers
+            last_operation = dict(self._last_operation.get(provider_key) or {})
+        owned_model_ids = sorted(
+            {str(name).strip() for name in owned_models_map.keys() if str(name).strip()}
+        )
         loaded_model = _normalize_model_name(runtime.get("loaded_model")) or None
         loaded_model_chat_capable = bool(
             loaded_model and not _is_likely_embedding_model_name(loaded_model)
+        )
+        loaded_model_owned_by_float = bool(
+            loaded_model and loaded_model in owned_model_ids
         )
         preferred_model = (
             _normalize_model_name(cfg.get("local_provider_preferred_model")) or None
@@ -309,6 +347,13 @@ class LocalProviderManager:
         runtime_entry_checked_at = runtime_entry.get("checked_at")
         models_entry_fetched_at = models_entry.get("checked_at")
         server_running = bool(runtime.get("server_running"))
+        server_owner = (
+            "float"
+            if server_running and server_owned_by_float
+            else "external"
+            if server_running
+            else "none"
+        )
         loaded_model_is_chat = bool(
             loaded_model and loaded_model_chat_capable and server_running
         )
@@ -318,6 +363,8 @@ class LocalProviderManager:
             "mode": cfg.get("local_provider_mode"),
             "installed": bool(install.get("installed")),
             "server_running": server_running,
+            "server_owned_by_float": server_owned_by_float,
+            "server_owner": server_owner,
             "status_reachable": server_running,
             "inventory_reachable": bool(inventory_reachable),
             "inventory_source": models_source,
@@ -326,6 +373,8 @@ class LocalProviderManager:
             "model_loaded": loaded_model_is_chat,
             "loaded_model": loaded_model,
             "loaded_model_chat_capable": loaded_model_chat_capable,
+            "loaded_model_owned_by_float": loaded_model_owned_by_float,
+            "owned_model_ids": owned_model_ids,
             "effective_model": effective_model,
             "preferred_model": preferred_model,
             "preferred_model_chat_capable": preferred_model_chat_capable,
@@ -356,6 +405,7 @@ class LocalProviderManager:
             and not bool(chat_inventory_models),
             "inventory_cached_at": models_entry_fetched_at,
             "checked_at": runtime_entry_checked_at,
+            "last_operation": last_operation or None,
         }
 
     def provider_snapshot(
@@ -418,6 +468,219 @@ class LocalProviderManager:
     def _clear_error(self, provider: str) -> None:
         with self._lock:
             self._last_error.pop(_normalize_provider(provider), None)
+
+    @staticmethod
+    def _operation_runtime_brief(runtime: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not isinstance(runtime, dict):
+            return {}
+        return {
+            "server_running": bool(runtime.get("server_running")),
+            "server_owned_by_float": bool(runtime.get("server_owned_by_float")),
+            "loaded_model": _normalize_model_name(runtime.get("loaded_model")) or None,
+            "loaded_model_owned_by_float": bool(
+                runtime.get("loaded_model_owned_by_float")
+            ),
+            "mode": str(runtime.get("mode") or "").strip() or None,
+        }
+
+    @staticmethod
+    def _operation_result_summary(result: Any) -> Dict[str, Any]:
+        if not isinstance(result, dict):
+            return {}
+        summary: Dict[str, Any] = {}
+        note = str(result.get("note") or "").strip()
+        error = str(result.get("error") or "").strip()
+        endpoint = str(result.get("endpoint") or "").strip()
+        base_url = str(result.get("base_url") or "").strip()
+        binary = str(result.get("binary") or "").strip()
+        stdout = str(result.get("stdout") or "").strip()
+        if note:
+            summary["note"] = _truncate_log_text(note)
+        if error:
+            summary["error"] = _truncate_log_text(error)
+        if endpoint:
+            summary["endpoint"] = endpoint
+        if base_url:
+            summary["base_url"] = base_url
+        if binary:
+            summary["binary"] = binary
+        pid = result.get("pid")
+        if isinstance(pid, int) and pid > 0:
+            summary["pid"] = pid
+        managed_process = result.get("managed_process")
+        if isinstance(managed_process, bool):
+            summary["managed_process"] = managed_process
+        cmd = result.get("cmd")
+        if isinstance(cmd, list) and cmd:
+            summary["cmd"] = _format_command(cmd)
+        targets = result.get("targets")
+        if isinstance(targets, list):
+            cleaned_targets = [
+                str(item).strip() for item in targets if str(item or "").strip()
+            ]
+            if cleaned_targets:
+                summary["targets"] = cleaned_targets[:5]
+        if stdout and "note" not in summary and "error" not in summary:
+            first_line = stdout.splitlines()[0].strip()
+            if first_line:
+                summary["stdout_preview"] = _truncate_log_text(first_line)
+        response = result.get("response")
+        if isinstance(response, dict):
+            response_keys = [
+                key for key in sorted(response.keys()) if isinstance(key, str)
+            ]
+            if response_keys:
+                summary["response_keys"] = response_keys[:8]
+        if bool(result.get("rejected")):
+            summary["rejected"] = True
+        return summary
+
+    @staticmethod
+    def _operation_message(
+        operation: Dict[str, Any],
+        *,
+        finish: bool,
+    ) -> str:
+        op_id = str(operation.get("id") or "").strip() or "op"
+        action = str(operation.get("action") or "operation").strip()
+        model = _normalize_model_name(operation.get("model")) or None
+        context_length = operation.get("context_length")
+        details = (
+            operation.get("details")
+            if isinstance(operation.get("details"), dict)
+            else {}
+        )
+        bits: List[str] = []
+        if model:
+            bits.append(f"model={model}")
+        if isinstance(context_length, int) and context_length > 0:
+            bits.append(f"ctx={context_length}")
+        mode = str(details.get("mode") or "").strip()
+        if mode:
+            bits.append(f"mode={mode}")
+        before = (
+            operation.get("before") if isinstance(operation.get("before"), dict) else {}
+        )
+        if before.get("server_running") and not before.get("server_owned_by_float"):
+            bits.append("server=external")
+        elif before.get("server_running"):
+            bits.append("server=running")
+        before_loaded = _normalize_model_name(before.get("loaded_model")) or None
+        if before_loaded:
+            bits.append(f"loaded={before_loaded}")
+        if finish:
+            status = str(operation.get("status") or "").strip() or "done"
+            duration_ms = operation.get("duration_ms")
+            if isinstance(duration_ms, int) and duration_ms >= 0:
+                bits.append(f"{duration_ms}ms")
+            result_summary = (
+                operation.get("result")
+                if isinstance(operation.get("result"), dict)
+                else {}
+            )
+            note = str(result_summary.get("note") or "").strip()
+            error = str(result_summary.get("error") or "").strip()
+            endpoint = str(result_summary.get("endpoint") or "").strip()
+            cmd = str(result_summary.get("cmd") or "").strip()
+            targets = result_summary.get("targets")
+            pid = result_summary.get("pid")
+            if isinstance(pid, int) and pid > 0:
+                bits.append(f"pid={pid}")
+            if isinstance(targets, list) and targets:
+                bits.append(f"targets={','.join(str(item) for item in targets[:3])}")
+            if endpoint:
+                bits.append(f"endpoint={endpoint}")
+            if cmd:
+                bits.append(f"cmd={cmd}")
+            if note:
+                bits.append(note)
+            elif error:
+                bits.append(error)
+            elif result_summary.get("stdout_preview"):
+                bits.append(str(result_summary.get("stdout_preview")))
+            return f"[{op_id}] {action} {status}" + (
+                f" {' '.join(bits)}" if bits else ""
+            )
+        return f"[{op_id}] {action} begin" + (f" {' '.join(bits)}" if bits else "")
+
+    def _begin_operation(
+        self,
+        provider: str,
+        action: str,
+        *,
+        model: Optional[str] = None,
+        context_length: Optional[int] = None,
+        current: Optional[Dict[str, Any]] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        provider_key = _normalize_provider(provider)
+        with self._lock:
+            self._operation_seq[provider_key] += 1
+            seq = self._operation_seq[provider_key]
+        operation: Dict[str, Any] = {
+            "id": f"{action}#{seq}",
+            "provider": provider_key,
+            "action": action,
+            "status": "running",
+            "started_at": time.time(),
+        }
+        cleaned_model = _normalize_model_name(model)
+        if cleaned_model:
+            operation["model"] = cleaned_model
+        if isinstance(context_length, int) and context_length > 0:
+            operation["context_length"] = context_length
+        before = self._operation_runtime_brief(current)
+        if before:
+            operation["before"] = before
+        if isinstance(details, dict) and details:
+            operation["details"] = {
+                str(key): value
+                for key, value in details.items()
+                if value not in (None, "", [], {})
+            }
+        with self._lock:
+            self._last_operation[provider_key] = dict(operation)
+        self._append_log(
+            provider_key,
+            "info",
+            self._operation_message(operation, finish=False),
+            operation,
+        )
+        return operation
+
+    def _finish_operation(
+        self,
+        provider: str,
+        operation: Dict[str, Any],
+        *,
+        ok: bool,
+        result: Any,
+        runtime: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        provider_key = _normalize_provider(provider)
+        finished_at = time.time()
+        completed = dict(operation or {})
+        completed["status"] = "ok" if ok else "error"
+        completed["finished_at"] = finished_at
+        started_at = float(completed.get("started_at") or finished_at)
+        completed["duration_ms"] = max(
+            0, int(round((finished_at - started_at) * 1000.0))
+        )
+        result_summary = self._operation_result_summary(result)
+        if result_summary:
+            completed["result"] = result_summary
+        after = self._operation_runtime_brief(runtime)
+        if after:
+            completed["after"] = after
+        with self._lock:
+            self._last_operation[provider_key] = dict(completed)
+        self._append_log(
+            provider_key,
+            "info" if ok else "error",
+            self._operation_message(completed, finish=True),
+            completed,
+        )
+        return completed
 
     def _append_log(
         self, provider: str, level: str, message: str, payload: Any = None
@@ -517,6 +780,16 @@ class LocalProviderManager:
         cfg = self._settings_for_provider(provider)
         provider_key = _normalize_provider(cfg.get("local_provider"))
         adapter = self._adapter(provider_key)
+        current = self._status(provider_key, quick=True)
+        operation = self._begin_operation(
+            provider_key,
+            "start",
+            current=current,
+            details={
+                "mode": cfg.get("local_provider_mode"),
+                "base_url": adapter.resolve_base_url(cfg, with_v1=True),
+            },
+        )
         result = adapter.start_server(cfg)
         if result.get("ok"):
             if (
@@ -538,16 +811,38 @@ class LocalProviderManager:
             refresh_models=True,
             force=True,
         )
+        runtime = dict(snapshot.get("runtime") or {})
+        operation = self._finish_operation(
+            provider_key,
+            operation,
+            ok=bool(result.get("ok")),
+            result=result,
+            runtime=runtime,
+        )
+        runtime["last_operation"] = operation
+        self._store_runtime(provider_key, runtime)
         return {
             "ok": bool(result.get("ok")),
             "result": result,
-            "runtime": snapshot.get("runtime") or {},
+            "runtime": runtime,
+            "operation": operation,
         }
 
     def provider_stop(self, provider: Optional[str] = None) -> Dict[str, Any]:
         cfg = self._settings_for_provider(provider)
         provider_key = _normalize_provider(cfg.get("local_provider"))
         current = self._status(provider_key)
+        operation = self._begin_operation(
+            provider_key,
+            "stop",
+            current=current,
+            details={
+                "mode": cfg.get("local_provider_mode"),
+                "base_url": self._adapter(provider_key).resolve_base_url(
+                    cfg, with_v1=True
+                ),
+            },
+        )
         if (
             provider_key == "lmstudio"
             and cfg.get("local_provider_mode") == "local-managed"
@@ -565,10 +860,21 @@ class LocalProviderManager:
                 refresh_models=True,
                 force=True,
             )
+            runtime = dict(snapshot.get("runtime") or {})
+            operation = self._finish_operation(
+                provider_key,
+                operation,
+                ok=False,
+                result={"ok": False, "error": error, "rejected": True},
+                runtime=runtime,
+            )
+            runtime["last_operation"] = operation
+            self._store_runtime(provider_key, runtime)
             return {
                 "ok": False,
                 "result": {"ok": False, "error": error},
-                "runtime": snapshot.get("runtime") or {},
+                "runtime": runtime,
+                "operation": operation,
             }
         adapter = self._adapter(provider_key)
         result = adapter.stop_server(cfg)
@@ -589,10 +895,21 @@ class LocalProviderManager:
             refresh_models=True,
             force=True,
         )
+        runtime = dict(snapshot.get("runtime") or {})
+        operation = self._finish_operation(
+            provider_key,
+            operation,
+            ok=bool(result.get("ok")),
+            result=result,
+            runtime=runtime,
+        )
+        runtime["last_operation"] = operation
+        self._store_runtime(provider_key, runtime)
         return {
             "ok": bool(result.get("ok")),
             "result": result,
-            "runtime": snapshot.get("runtime") or {},
+            "runtime": runtime,
+            "operation": operation,
         }
 
     def provider_load(
@@ -608,17 +925,42 @@ class LocalProviderManager:
         requested_model = str(
             model or cfg.get("local_provider_preferred_model") or ""
         ).strip()
+        current = self._status(provider_key)
+        operation = self._begin_operation(
+            provider_key,
+            "load",
+            model=requested_model or model,
+            context_length=context_length,
+            current=current,
+            details={
+                "mode": cfg.get("local_provider_mode"),
+                "base_url": adapter.resolve_base_url(cfg, with_v1=True),
+            },
+        )
         if not requested_model:
             error = "Model is required to load a provider runtime."
             self._record_error(provider_key, error)
-            snapshot = self.provider_snapshot(provider_key, refresh_models=True)
+            snapshot = self.provider_snapshot(
+                provider_key,
+                refresh_models=True,
+                force=True,
+            )
+            runtime = dict(snapshot.get("runtime") or {})
+            operation = self._finish_operation(
+                provider_key,
+                operation,
+                ok=False,
+                result={"ok": False, "error": error, "rejected": True},
+                runtime=runtime,
+            )
+            runtime["last_operation"] = operation
+            self._store_runtime(provider_key, runtime)
             return {
                 "ok": False,
                 "result": {"ok": False, "error": error},
-                "runtime": snapshot.get("runtime") or {},
+                "runtime": runtime,
+                "operation": operation,
             }
-
-        current = self._status(provider_key)
         if (
             cfg.get("local_provider_mode") == "local-managed"
             and cfg.get("local_provider_auto_start", True)
@@ -626,7 +968,38 @@ class LocalProviderManager:
         ):
             started = self.provider_start(provider_key)
             if not started.get("ok"):
-                return started
+                runtime = (
+                    started.get("runtime")
+                    if isinstance(started.get("runtime"), dict)
+                    else {}
+                )
+                error = str(
+                    (started.get("result") or {}).get("error") or ""
+                ).strip() or ("Failed to start provider server.")
+                operation = self._finish_operation(
+                    provider_key,
+                    operation,
+                    ok=False,
+                    result={
+                        "ok": False,
+                        "error": error,
+                        "blocked_by": "start",
+                        "blocked_operation_id": (started.get("operation") or {}).get(
+                            "id"
+                        )
+                        if isinstance(started.get("operation"), dict)
+                        else None,
+                    },
+                    runtime=runtime,
+                )
+                runtime["last_operation"] = operation
+                self._store_runtime(provider_key, runtime)
+                return {
+                    "ok": False,
+                    "result": {"ok": False, "error": error},
+                    "runtime": runtime,
+                    "operation": operation,
+                }
             current = (
                 started.get("runtime")
                 if isinstance(started.get("runtime"), dict)
@@ -649,10 +1022,21 @@ class LocalProviderManager:
                 refresh_models=True,
                 force=True,
             )
+            runtime = dict(snapshot.get("runtime") or {})
+            operation = self._finish_operation(
+                provider_key,
+                operation,
+                ok=False,
+                result={"ok": False, "error": error, "rejected": True},
+                runtime=runtime,
+            )
+            runtime["last_operation"] = operation
+            self._store_runtime(provider_key, runtime)
             return {
                 "ok": False,
                 "result": {"ok": False, "error": error},
-                "runtime": snapshot.get("runtime") or {},
+                "runtime": runtime,
+                "operation": operation,
             }
 
         result = adapter.load_model(
@@ -680,10 +1064,21 @@ class LocalProviderManager:
             refresh_models=True,
             force=True,
         )
+        runtime = dict(snapshot.get("runtime") or {})
+        operation = self._finish_operation(
+            provider_key,
+            operation,
+            ok=bool(result.get("ok")),
+            result=result,
+            runtime=runtime,
+        )
+        runtime["last_operation"] = operation
+        self._store_runtime(provider_key, runtime)
         return {
             "ok": bool(result.get("ok")),
             "result": result,
-            "runtime": snapshot.get("runtime") or {},
+            "runtime": runtime,
+            "operation": operation,
         }
 
     def provider_unload(
@@ -695,6 +1090,18 @@ class LocalProviderManager:
         cfg = self._settings_for_provider(provider)
         provider_key = _normalize_provider(cfg.get("local_provider"))
         current = self._status(provider_key)
+        operation = self._begin_operation(
+            provider_key,
+            "unload",
+            model=model,
+            current=current,
+            details={
+                "mode": cfg.get("local_provider_mode"),
+                "base_url": self._adapter(provider_key).resolve_base_url(
+                    cfg, with_v1=True
+                ),
+            },
+        )
         if (
             provider_key == "lmstudio"
             and cfg.get("local_provider_mode") == "local-managed"
@@ -712,10 +1119,21 @@ class LocalProviderManager:
                 refresh_models=True,
                 force=True,
             )
+            runtime = dict(snapshot.get("runtime") or {})
+            operation = self._finish_operation(
+                provider_key,
+                operation,
+                ok=False,
+                result={"ok": False, "error": error, "rejected": True},
+                runtime=runtime,
+            )
+            runtime["last_operation"] = operation
+            self._store_runtime(provider_key, runtime)
             return {
                 "ok": False,
                 "result": {"ok": False, "error": error},
-                "runtime": snapshot.get("runtime") or {},
+                "runtime": runtime,
+                "operation": operation,
             }
         adapter = self._adapter(provider_key)
         result = adapter.unload_model(cfg, model=model)
@@ -737,10 +1155,21 @@ class LocalProviderManager:
             refresh_models=True,
             force=True,
         )
+        runtime = dict(snapshot.get("runtime") or {})
+        operation = self._finish_operation(
+            provider_key,
+            operation,
+            ok=bool(result.get("ok")),
+            result=result,
+            runtime=runtime,
+        )
+        runtime["last_operation"] = operation
+        self._store_runtime(provider_key, runtime)
         return {
             "ok": bool(result.get("ok")),
             "result": result,
-            "runtime": snapshot.get("runtime") or {},
+            "runtime": runtime,
+            "operation": operation,
         }
 
     def provider_logs(
@@ -769,6 +1198,78 @@ class LocalProviderManager:
             "next_cursor": next_cursor,
             "entries": items,
         }
+
+    def describe_model_locks(
+        self,
+        model_name: str,
+        *,
+        providers: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        normalized_model = _normalize_model_name(model_name)
+        if not normalized_model:
+            return []
+
+        provider_candidates: List[str] = []
+        if isinstance(providers, list):
+            provider_candidates.extend(
+                _normalize_provider(provider) for provider in providers if provider
+            )
+        else:
+            configured_provider = _normalize_provider(
+                self._base_config().get("local_provider")
+            )
+            provider_candidates.append(configured_provider)
+            with self._lock:
+                provider_candidates.extend(sorted(self._owned_servers))
+                provider_candidates.extend(
+                    provider
+                    for provider, owned_models in self._owned_loaded_models.items()
+                    if owned_models
+                )
+
+        seen: set[str] = set()
+        lock_hints: List[Dict[str, Any]] = []
+        for candidate in provider_candidates:
+            provider_key = _normalize_provider(candidate)
+            if provider_key in seen:
+                continue
+            seen.add(provider_key)
+            try:
+                snapshot = self.provider_snapshot(
+                    provider_key,
+                    quick=True,
+                    refresh_models=False,
+                )
+            except Exception:
+                continue
+            runtime = snapshot.get("runtime")
+            if not isinstance(runtime, dict):
+                continue
+            loaded_model = _normalize_model_name(runtime.get("loaded_model"))
+            owned_model_ids = [
+                _normalize_model_name(item)
+                for item in runtime.get("owned_model_ids") or []
+            ]
+            if (
+                loaded_model != normalized_model
+                and normalized_model not in owned_model_ids
+            ):
+                continue
+            lock_hints.append(
+                {
+                    "provider": provider_key,
+                    "base_url": str(runtime.get("base_url") or "").strip() or None,
+                    "server_running": bool(runtime.get("server_running")),
+                    "server_owned_by_float": bool(runtime.get("server_owned_by_float")),
+                    "loaded_model": loaded_model or None,
+                    "loaded_model_owned_by_float": bool(
+                        runtime.get("loaded_model_owned_by_float")
+                    ),
+                    "owned_model_ids": [item for item in owned_model_ids if item],
+                    "mode": str(runtime.get("mode") or "").strip() or None,
+                }
+            )
+        return lock_hints
 
     def shutdown(self) -> Dict[str, Any]:
         results: Dict[str, Any] = {
@@ -943,13 +1444,15 @@ class LocalProviderManager:
             if not runtime.get("model_loaded"):
                 raise RuntimeError(f"Failed to load model '{model}' on {provider_key}.")
 
+        base_url = normalize_base_url(
+            self._adapter(provider_key).resolve_base_url(cfg, with_v1=True),
+            with_v1=True,
+        )
+
         return {
             "provider": provider_key,
             "model": model,
-            "base_url": normalize_base_url(
-                self._adapter(provider_key).resolve_base_url(cfg, with_v1=True),
-                with_v1=True,
-            ),
-            "api_token": str(cfg.get("local_provider_api_token") or "").strip(),
+            "base_url": base_url,
+            "api_token": infer_openai_compatible_auth_token(cfg, base_url),
             "runtime": runtime,
         }

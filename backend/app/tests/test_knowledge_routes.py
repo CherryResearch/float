@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import types
 from pathlib import Path
@@ -121,6 +122,26 @@ def test_knowledge_rag_rehydrate_reindexes_canonical_docs(client, monkeypatch):
             "doc-1",
         )
     ]
+
+
+def test_reload_memory_manager_from_store_invokes_manager_loader():
+    from app import routes
+
+    calls = []
+
+    class DummyMemoryManager:
+        def _load_persisted_store(self):
+            calls.append("reloaded")
+
+    request = types.SimpleNamespace(
+        app=types.SimpleNamespace(
+            state=types.SimpleNamespace(memory_manager=DummyMemoryManager())
+        )
+    )
+
+    routes._reload_memory_manager_from_store(request)
+
+    assert calls == ["reloaded"]
 
 
 def test_knowledge_reveal_local_file_under_data_files(client, tmp_path):
@@ -278,6 +299,114 @@ def test_knowledge_api_masks_external_absolute_source(client):
     )
 
 
+def test_knowledge_query_surfaces_canonical_title_and_source_matches(
+    client, monkeypatch
+):
+    from app import routes
+
+    class FakeService:
+        def search_canonical(self, query, top_k=5):
+            assert query == "tea party story"
+            assert top_k == 4
+            return [
+                {
+                    "id": "tea-doc",
+                    "text": "Tea party planning notes",
+                    "metadata": {
+                        "source": "workspace/tea_party_story.md",
+                        "title": "tea_party_story",
+                    },
+                    "score": 0.95,
+                }
+            ]
+
+        def query(self, query, top_k=5):
+            assert query == "tea party story"
+            assert top_k == 4
+            return [
+                {
+                    "id": "vector-doc",
+                    "text": "General planning notes",
+                    "metadata": {"source": "workspace/general.md"},
+                    "score": 0.72,
+                }
+            ]
+
+    monkeypatch.setattr(routes, "_get_rag_service", lambda: FakeService())
+
+    query_resp = client.get(
+        "/knowledge/query",
+        params={"q": "tea party story", "k": 4, "mode": "text"},
+    )
+    assert query_resp.status_code == 200
+    matches = query_resp.json().get("matches") or []
+    assert [match.get("id") for match in matches[:2]] == ["tea-doc", "vector-doc"]
+
+
+def test_knowledge_query_emits_operation_progress_notifications(client, monkeypatch):
+    from app import routes
+
+    asyncio.__float_notifications__ = []  # type: ignore[attr-defined]
+
+    class FakeService:
+        def search_canonical(self, query, top_k=5):
+            assert query == "tea party story"
+            assert top_k == 4
+            return [
+                {
+                    "id": "tea-doc",
+                    "text": "Tea party planning notes",
+                    "metadata": {
+                        "source": "workspace/tea_party_story.md",
+                        "title": "tea_party_story",
+                    },
+                    "score": 0.95,
+                }
+            ]
+
+        def query(self, query, top_k=5):
+            assert query == "tea party story"
+            assert top_k == 4
+            return [
+                {
+                    "id": "vector-doc",
+                    "text": "General planning notes",
+                    "metadata": {"source": "workspace/general.md"},
+                    "score": 0.72,
+                }
+            ]
+
+    monkeypatch.setattr(routes, "_get_rag_service", lambda: FakeService())
+    monkeypatch.setattr(routes, "_get_clip_rag_service", lambda **_kwargs: None)
+
+    query_resp = client.get(
+        "/knowledge/query",
+        params={"q": "tea party story", "k": 4, "mode": "text"},
+    )
+    assert query_resp.status_code == 200
+
+    notifications_resp = client.get("/notifications/recent")
+    assert notifications_resp.status_code == 200
+    notifications = notifications_resp.json().get("notifications") or []
+    progress_entries = [
+        entry
+        for entry in notifications
+        if entry.get("category") == "operation_progress"
+        and entry.get("data", {}).get("kind") == "rag_query"
+        and entry.get("title") == "Searching knowledge"
+    ]
+    assert progress_entries
+    statuses = [entry.get("data", {}).get("status") for entry in progress_entries]
+    assert "running" in statuses
+    assert "complete" in statuses
+    final_entry = progress_entries[-1]
+    assert final_entry.get("data", {}).get("phase_label") == "RAG query finished"
+    assert final_entry.get("data", {}).get("counts", {}).get("returned_matches") == 2
+    assert str(final_entry.get("data", {}).get("operation_id") or "").startswith(
+        "rag-query:knowledge:"
+    )
+
+
 def test_knowledge_cleanup_dry_run_then_apply_external_exclusion(client):
     add_resp = client.post(
         "/knowledge/text",
@@ -367,6 +496,9 @@ def test_attachment_caption_crud(client, monkeypatch):
     assert get_saved.status_code == 200
     assert get_saved.json()["exists"] is True
     assert get_saved.json()["caption"] == "A generated sample caption."
+    assert get_saved.json()["caption_model"] == "manual-caption"
+    assert get_saved.json()["caption_status"] == "manual"
+    assert get_saved.json()["caption_updated_at"]
 
     delete_resp = client.delete(f"/attachments/caption/{content_hash}")
     assert delete_resp.status_code == 200
@@ -456,6 +588,80 @@ def test_attachment_upload_supports_captured_origin_and_list_status_fields(
     assert entry["placeholder_caption"] is False
 
 
+def test_attachment_upload_emits_operation_progress_notifications(client, monkeypatch):
+    from app import routes
+
+    asyncio.__float_notifications__ = []  # type: ignore[attr-defined]
+
+    def fake_caption_and_index(*_args, **kwargs):
+        progress_callback = kwargs.get("progress_callback")
+        if callable(progress_callback):
+            progress_callback(
+                {
+                    "status": "running",
+                    "phase_label": "Generating image caption",
+                    "phase_index": 2,
+                    "phase_count": 4,
+                    "detail": "Running the caption step for the uploaded image.",
+                }
+            )
+            progress_callback(
+                {
+                    "status": "complete",
+                    "phase_label": "Attachment indexing finished",
+                    "phase_index": 4,
+                    "phase_count": 4,
+                    "detail": "Caption and index data are ready.",
+                    "counts": {"clip_saved": True, "embedding_dim": 512},
+                }
+            )
+        return {
+            "id": "caption-doc",
+            "caption": "Indexed image",
+            "caption_model": "fake-captioner",
+            "saved": True,
+            "embedding_dim": 512,
+            "placeholder": False,
+            "clip": {"saved": True, "dim": 512, "error": None},
+        }
+
+    monkeypatch.setattr(
+        routes, "_caption_and_index_image_bytes", fake_caption_and_index
+    )
+
+    resp = client.post(
+        "/attachments/upload",
+        data={"origin": "upload"},
+        files={"file": ("progress.png", b"progress-bytes", "image/png")},
+    )
+    assert resp.status_code == 200
+    content_hash = resp.json()["content_hash"]
+
+    notifications_resp = client.get("/notifications/recent")
+    assert notifications_resp.status_code == 200
+    notifications = notifications_resp.json().get("notifications") or []
+    progress_entries = [
+        entry
+        for entry in notifications
+        if entry.get("category") == "operation_progress"
+    ]
+    assert progress_entries
+    statuses = [entry.get("data", {}).get("status") for entry in progress_entries]
+    assert "queued" in statuses
+    assert "running" in statuses
+    assert "complete" in statuses
+    final_entry = progress_entries[-1]
+    assert final_entry["title"] == "Indexing image attachment"
+    assert final_entry["body"] == "progress.png"
+    assert (
+        final_entry.get("data", {}).get("operation_id")
+        == f"attachment-index:{content_hash}"
+    )
+    assert final_entry.get("data", {}).get("phase_label") == (
+        "Attachment indexing finished"
+    )
+
+
 def test_attachments_list_returns_caption_fields_from_metadata(client, monkeypatch):
     from app import routes
 
@@ -477,8 +683,12 @@ def test_attachments_list_returns_caption_fields_from_metadata(client, monkeypat
             "caption": "A small orange dog on a stair landing.",
             "caption_model": "local-caption-model",
             "caption_status": "generated",
+            "caption_generated_at": "2026-04-23T17:20:00Z",
             "index_status": "indexed",
+            "indexed_at": "2026-04-23T17:21:00Z",
             "index_warning": "clip-sync-pending",
+            "clip_embedding_model": "clip:ViT-B-32",
+            "clip_embedding_dim": 512,
         },
     )
 
@@ -492,9 +702,115 @@ def test_attachments_list_returns_caption_fields_from_metadata(client, monkeypat
     assert entry["caption"] == "A small orange dog on a stair landing."
     assert entry["caption_model"] == "local-caption-model"
     assert entry["caption_status"] == "generated"
+    assert entry["caption_generated_at"] == "2026-04-23T17:20:00Z"
     assert entry["index_status"] == "indexed"
+    assert entry["indexed_at"] == "2026-04-23T17:21:00Z"
     assert entry["index_warning"] == "clip-sync-pending"
+    assert entry["embedding_model"] == "clip:ViT-B-32"
+    assert entry["embedding_dim"] == 512
     assert entry["placeholder_caption"] is False
+
+
+def test_attachment_rehydrate_preserves_existing_generated_caption(client, monkeypatch):
+    from app import routes
+
+    content_hash = "captionpreservehash"
+    target = routes._resolve_data_files_root() / "uploads" / content_hash / "image.png"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"image bytes")
+    routes._write_attachment_meta(
+        content_hash,
+        {
+            "filename": "image.png",
+            "content_type": "image/png",
+            "relative_path": f"uploads/{content_hash}/image.png",
+            "caption": "A green notebook beside a mug.",
+            "caption_model": "local-vision-model",
+            "caption_status": "generated",
+            "placeholder_caption": False,
+        },
+    )
+
+    calls = []
+
+    class FakeRagService:
+        def ingest_text(self, text, metadata):
+            calls.append((text, dict(metadata)))
+            return "caption-doc"
+
+    def fail_caption(*_args, **_kwargs):
+        raise AssertionError("existing generated caption should be reused")
+
+    monkeypatch.setattr(routes, "_get_rag_service", lambda: FakeRagService())
+    monkeypatch.setattr(routes, "_get_clip_rag_service", lambda **_kwargs: None)
+    monkeypatch.setattr(routes, "_generate_image_caption", fail_caption)
+
+    resp = client.post(
+        "/attachments/rag/rehydrate",
+        json={"content_hashes": [content_hash]},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"scanned": 1, "reindexed": 1}
+    assert calls == [
+        (
+            "A green notebook beside a mug.",
+            {
+                "kind": "image_caption",
+                "type": "image_caption",
+                "source": f"image:{content_hash}",
+                "filename": "image.png",
+                "content_type": "image/png",
+                "caption_model": "local-vision-model",
+                "placeholder": False,
+                "content_hash": content_hash,
+                "url": f"/api/attachments/{content_hash}/image.png",
+                "relative_path": f"uploads/{content_hash}/image.png",
+            },
+        )
+    ]
+    meta = routes._read_attachment_meta(content_hash)
+    assert meta["caption"] == "A green notebook beside a mug."
+    assert meta["caption_model"] == "local-vision-model"
+    assert meta["caption_status"] == "generated"
+    assert meta["placeholder_caption"] is False
+
+
+def test_attachment_rehydrate_limits_to_requested_hashes(client, monkeypatch):
+    from app import routes
+
+    indexed = []
+    for content_hash in ("syncimageone", "syncimagetwo"):
+        target = (
+            routes._resolve_data_files_root() / "uploads" / content_hash / "image.png"
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"image bytes")
+        routes._write_attachment_meta(
+            content_hash,
+            {
+                "filename": "image.png",
+                "content_type": "image/png",
+                "relative_path": f"uploads/{content_hash}/image.png",
+            },
+        )
+
+    def fake_caption_and_index(*_args, **kwargs):
+        indexed.append(kwargs["content_hash"])
+        return {"id": kwargs["content_hash"]}
+
+    monkeypatch.setattr(
+        routes, "_caption_and_index_image_bytes", fake_caption_and_index
+    )
+
+    resp = client.post(
+        "/attachments/rag/rehydrate",
+        json={"content_hashes": ["syncimageone"]},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"scanned": 1, "reindexed": 1}
+    assert indexed == ["syncimageone"]
 
 
 def test_attachments_list_recovers_media_type_and_filename_for_hash_only_uploads(

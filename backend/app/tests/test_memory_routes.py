@@ -53,3 +53,23 @@ def test_memory_list_can_include_archived_items_on_demand(client):
     assert "archived-note" in archived_items
     assert archived_items["archived-note"]["pruned_at"] is not None
     assert "last_accessed_at" in archived_items["archived-note"]
+
+
+def test_memory_search_matches_normalized_key_and_hint(client):
+    create_resp = client.post(
+        "/memory/tea_party-story",
+        json={
+            "value": "Assorted notes",
+            "importance": 1.0,
+            "hint": "Tea party ideas",
+        },
+    )
+    assert create_resp.status_code == 200
+
+    search_resp = client.post(
+        "/api/memory/search",
+        json={"query": "tea party story", "limit": 10},
+    )
+    assert search_resp.status_code == 200
+    results = search_resp.json()["results"]
+    assert any(item["key"] == "tea_party-story" for item in results)

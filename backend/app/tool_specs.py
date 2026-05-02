@@ -32,7 +32,7 @@ _SENSITIVITY_ENUM = ["mundane", "public", "personal", "protected", "secret"]
 BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
     "help": _spec(
         "help",
-        "List available tools or inspect one tool with compact defaults.",
+        "List tool names with {} or inspect one tool with compact defaults.",
         {
             "type": "object",
             "additionalProperties": False,
@@ -45,8 +45,8 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                 "detail": {
                     "type": "string",
                     "title": "Detail level",
-                    "enum": ["brief", "rich"],
-                    "default": "brief",
+                    "enum": ["names", "brief", "rich"],
+                    "default": "names",
                 },
                 "include_schema": {
                     "type": "boolean",
@@ -56,25 +56,44 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                 "max_tools": {
                     "type": "integer",
                     "title": "Maximum tools in list mode",
-                    "default": 8,
+                    "default": 50,
                     "minimum": 1,
                     "maximum": 50,
+                },
+                "failed_tool_name": {
+                    "type": "string",
+                    "title": "Failed tool name",
+                    "default": "",
+                },
+                "failed_args": {
+                    "type": "object",
+                    "title": "Failed tool args",
+                    "default": {},
+                },
+                "failed_error": {
+                    "type": "string",
+                    "title": "Failed tool error",
+                    "default": "",
                 },
             },
         },
         metadata={
             "ui": {
                 "tool_name": {
-                    "placeholder": "computer.session.start",
+                    "placeholder": "computer, files, tasks, or exact tool",
                 },
+                "detail": {"placeholder": "names"},
                 "include_schema": {"advanced": True},
                 "max_tools": {"advanced": True},
+                "failed_tool_name": {"advanced": True},
+                "failed_args": {"advanced": True},
+                "failed_error": {"advanced": True},
             }
         },
     ),
     "tool_help": _spec(
         "tool_help",
-        "Return tool guidance for one tool or a filtered list of tools.",
+        "Return tool guidance for one tool or list tools with {}.",
         {
             "type": "object",
             "additionalProperties": False,
@@ -87,8 +106,8 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                 "detail": {
                     "type": "string",
                     "title": "Detail level",
-                    "enum": ["brief", "rich"],
-                    "default": "brief",
+                    "enum": ["names", "brief", "rich"],
+                    "default": "names",
                 },
                 "include_schema": {
                     "type": "boolean",
@@ -98,25 +117,44 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                 "max_tools": {
                     "type": "integer",
                     "title": "Maximum tools in list mode",
-                    "default": 8,
+                    "default": 50,
                     "minimum": 1,
                     "maximum": 50,
+                },
+                "failed_tool_name": {
+                    "type": "string",
+                    "title": "Failed tool name",
+                    "default": "",
+                },
+                "failed_args": {
+                    "type": "object",
+                    "title": "Failed tool args",
+                    "default": {},
+                },
+                "failed_error": {
+                    "type": "string",
+                    "title": "Failed tool error",
+                    "default": "",
                 },
             },
         },
         metadata={
             "ui": {
                 "tool_name": {
-                    "placeholder": "remember",
+                    "placeholder": "memory, web, files, or exact tool",
                 },
+                "detail": {"placeholder": "names"},
                 "include_schema": {"advanced": True},
                 "max_tools": {"advanced": True},
+                "failed_tool_name": {"advanced": True},
+                "failed_args": {"advanced": True},
+                "failed_error": {"advanced": True},
             }
         },
     ),
     "tool_info": _spec(
         "tool_info",
-        "Return one tool capability record, including sandbox and limit details.",
+        "Return one exact tool capability record, or a compact family menu for fuzzy queries.",
         {
             "type": "object",
             "additionalProperties": False,
@@ -130,15 +168,224 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                     "title": "Include schema",
                     "default": True,
                 },
+                "failed_tool_name": {
+                    "type": "string",
+                    "title": "Failed tool name",
+                    "default": "",
+                },
+                "failed_args": {
+                    "type": "object",
+                    "title": "Failed tool args",
+                    "default": {},
+                },
+                "failed_error": {
+                    "type": "string",
+                    "title": "Failed tool error",
+                    "default": "",
+                },
             },
             "required": ["tool_name"],
         },
         metadata={
             "ui": {
                 "tool_name": {
-                    "placeholder": "search_web",
+                    "placeholder": "search_web or family like web",
                 },
                 "include_schema": {"advanced": True},
+                "failed_tool_name": {"advanced": True},
+                "failed_args": {"advanced": True},
+                "failed_error": {"advanced": True},
+            }
+        },
+    ),
+    "subchat": _spec(
+        "subchat",
+        "Control a child subchat: return to the parent chat or request more time.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "title": "Action",
+                    "enum": ["return", "stop", "continue"],
+                    "default": "return",
+                },
+                "note": {
+                    "type": "string",
+                    "title": "Brief note",
+                    "default": "",
+                },
+                "requested_minutes": {
+                    "type": "integer",
+                    "title": "Requested minutes",
+                    "default": 0,
+                    "minimum": 0,
+                    "maximum": 240,
+                },
+                "parent_session_id": {
+                    "type": "string",
+                    "title": "Parent session ID",
+                    "default": "",
+                },
+                "parent_message_id": {
+                    "type": "string",
+                    "title": "Parent message ID",
+                    "default": "",
+                },
+            },
+        },
+        metadata={
+            "ui": {
+                "parent_session_id": {"advanced": True},
+                "parent_message_id": {"advanced": True},
+            }
+        },
+    ),
+    "reflect": _spec(
+        "reflect",
+        "Create a bounded thought task and optionally run one background reflection pass.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "title": "Question or topic",
+                },
+                "title": {
+                    "type": "string",
+                    "title": "Title",
+                    "default": "",
+                },
+                "source_thread_id": {
+                    "type": "string",
+                    "title": "Source conversation",
+                    "default": "",
+                },
+                "source": {
+                    "type": "string",
+                    "title": "Source",
+                    "enum": ["user", "assistant", "reflection", "tool"],
+                    "default": "user",
+                },
+                "patience": {
+                    "type": "integer",
+                    "title": "Patience",
+                    "default": 1,
+                    "minimum": 0,
+                    "maximum": 3,
+                },
+                "memory_keys": {
+                    "type": "array",
+                    "title": "Linked memory keys",
+                    "items": {"type": "string"},
+                    "default": [],
+                },
+                "event_id": {
+                    "type": "string",
+                    "title": "Linked event/task id",
+                    "default": "",
+                },
+                "run_now": {
+                    "type": "boolean",
+                    "title": "Run now",
+                    "default": False,
+                },
+            },
+            "required": ["question"],
+        },
+        metadata={
+            "ui": {
+                "question": {"multiline": True, "rows": 4},
+                "source_thread_id": {"advanced": True},
+                "source": {"advanced": True},
+                "memory_keys": {"advanced": True},
+                "event_id": {"advanced": True},
+            }
+        },
+    ),
+    "list_reflections": _spec(
+        "list_reflections",
+        "List recent/open thought tasks and optional reflection runs.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "title": "Status",
+                    "enum": ["", "open", "waiting", "cooling", "resolved", "archived"],
+                    "default": "",
+                },
+                "limit": {
+                    "type": "integer",
+                    "title": "Limit",
+                    "default": 20,
+                    "minimum": 1,
+                    "maximum": 200,
+                },
+                "include_runs": {
+                    "type": "boolean",
+                    "title": "Include runs",
+                    "default": False,
+                },
+            },
+        },
+    ),
+    "route_to_local_model": _spec(
+        "route_to_local_model",
+        "Ask the user to continue this turn on a local model before sending private text to a non-local model.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "target_mode": {
+                    "type": "string",
+                    "title": "Target mode",
+                    "enum": ["local", "server", "api"],
+                    "default": "local",
+                },
+                "target_model": {
+                    "type": "string",
+                    "title": "Target model",
+                    "default": "",
+                },
+                "reason": {
+                    "type": "string",
+                    "title": "Reason",
+                    "default": "",
+                },
+                "sensitivity": {
+                    "type": "string",
+                    "title": "Detected sensitivity",
+                    "default": "",
+                },
+                "labels": {
+                    "type": "string",
+                    "title": "Detected labels",
+                    "default": "",
+                },
+                "source_mode": {
+                    "type": "string",
+                    "title": "Original mode",
+                    "default": "",
+                },
+                "source_model": {
+                    "type": "string",
+                    "title": "Original model",
+                    "default": "",
+                },
+            },
+            "required": ["target_mode"],
+        },
+        metadata={
+            "ui": {
+                "reason": {"wide": True},
+                "sensitivity": {"advanced": True},
+                "labels": {"advanced": True},
+                "source_mode": {"advanced": True},
+                "source_model": {"advanced": True},
             }
         },
     ),
@@ -678,6 +925,244 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
             "properties": {},
         },
     ),
+    "compact_conversation_plan": _spec(
+        "compact_conversation_plan",
+        "Plan conversation compaction from a target context budget without writing state.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "conversation_id": {
+                    "type": "string",
+                    "title": "Conversation ID",
+                },
+                "context_window_tokens": {
+                    "type": "integer",
+                    "title": "Context window tokens",
+                    "default": 24000,
+                    "minimum": 4096,
+                    "maximum": 1000000,
+                },
+                "reserve_output_tokens": {
+                    "type": "integer",
+                    "title": "Reserved output tokens",
+                    "default": 2048,
+                    "minimum": 0,
+                    "maximum": 200000,
+                },
+                "reserve_tool_tokens": {
+                    "type": "integer",
+                    "title": "Reserved tool tokens",
+                    "default": 2500,
+                    "minimum": 0,
+                    "maximum": 200000,
+                },
+                "reserve_retrieval_tokens": {
+                    "type": "integer",
+                    "title": "Reserved retrieval tokens",
+                    "default": 2500,
+                    "minimum": 0,
+                    "maximum": 200000,
+                },
+                "reserve_system_tokens": {
+                    "type": "integer",
+                    "title": "Reserved system tokens",
+                    "default": 1500,
+                    "minimum": 0,
+                    "maximum": 200000,
+                },
+                "soft_trigger_ratio": {
+                    "type": "number",
+                    "title": "Soft trigger ratio",
+                    "default": 0.75,
+                    "minimum": 0.1,
+                    "maximum": 1.0,
+                },
+                "hard_trigger_ratio": {
+                    "type": "number",
+                    "title": "Hard trigger ratio",
+                    "default": 0.9,
+                    "minimum": 0.1,
+                    "maximum": 1.0,
+                },
+                "summary_mode": {
+                    "type": "string",
+                    "title": "Summary mode for recommended payloads",
+                    "enum": ["deterministic", "llm"],
+                    "default": "deterministic",
+                },
+                "summary_workflow": {
+                    "type": "string",
+                    "title": "Summary workflow for recommended payloads",
+                    "enum": [
+                        "conversation_handoff",
+                        "decision_focus",
+                        "task_state",
+                    ],
+                    "default": "conversation_handoff",
+                },
+                "summary_format_notes": {
+                    "type": "string",
+                    "title": "Optional format notes",
+                    "default": "",
+                },
+                "summary_model": {
+                    "type": "string",
+                    "title": "Model override (optional)",
+                    "default": "",
+                },
+            },
+            "required": ["conversation_id"],
+        },
+        metadata={
+            "ui": {
+                "reserve_output_tokens": {"advanced": True},
+                "reserve_tool_tokens": {"advanced": True},
+                "reserve_retrieval_tokens": {"advanced": True},
+                "reserve_system_tokens": {"advanced": True},
+                "soft_trigger_ratio": {"advanced": True},
+                "hard_trigger_ratio": {"advanced": True},
+                "summary_format_notes": {"advanced": True},
+                "summary_model": {"advanced": True},
+            }
+        },
+    ),
+    "compact_conversation_preview": _spec(
+        "compact_conversation_preview",
+        "Preview conversation context compaction without writing state.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "conversation_id": {
+                    "type": "string",
+                    "title": "Conversation ID",
+                },
+                "keep_last": {
+                    "type": "integer",
+                    "title": "Recent messages to keep",
+                    "default": 40,
+                    "minimum": 1,
+                    "maximum": 200,
+                },
+                "max_summary_chars": {
+                    "type": "integer",
+                    "title": "Summary character cap",
+                    "default": 6000,
+                    "minimum": 500,
+                    "maximum": 20000,
+                },
+                "summary_mode": {
+                    "type": "string",
+                    "title": "Summary mode",
+                    "enum": ["deterministic", "llm"],
+                    "default": "deterministic",
+                },
+                "summary_workflow": {
+                    "type": "string",
+                    "title": "Summary workflow",
+                    "enum": [
+                        "conversation_handoff",
+                        "decision_focus",
+                        "task_state",
+                    ],
+                    "default": "conversation_handoff",
+                },
+                "summary_format_notes": {
+                    "type": "string",
+                    "title": "Optional format notes",
+                    "default": "",
+                },
+                "summary_model": {
+                    "type": "string",
+                    "title": "Model override (optional)",
+                    "default": "",
+                },
+            },
+            "required": ["conversation_id"],
+        },
+        metadata={
+            "ui": {
+                "max_summary_chars": {"advanced": True},
+                "summary_format_notes": {"advanced": True},
+                "summary_model": {"advanced": True},
+            }
+        },
+    ),
+    "compact_conversation_write": _spec(
+        "compact_conversation_write",
+        "Write a compacted conversation copy after preview or explicit approval.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "conversation_id": {
+                    "type": "string",
+                    "title": "Conversation ID",
+                },
+                "keep_last": {
+                    "type": "integer",
+                    "title": "Recent messages to keep",
+                    "default": 40,
+                    "minimum": 1,
+                    "maximum": 200,
+                },
+                "max_summary_chars": {
+                    "type": "integer",
+                    "title": "Summary character cap",
+                    "default": 6000,
+                    "minimum": 500,
+                    "maximum": 20000,
+                },
+                "summary_mode": {
+                    "type": "string",
+                    "title": "Summary mode",
+                    "enum": ["deterministic", "llm"],
+                    "default": "deterministic",
+                },
+                "summary_workflow": {
+                    "type": "string",
+                    "title": "Summary workflow",
+                    "enum": [
+                        "conversation_handoff",
+                        "decision_focus",
+                        "task_state",
+                    ],
+                    "default": "conversation_handoff",
+                },
+                "summary_format_notes": {
+                    "type": "string",
+                    "title": "Optional format notes",
+                    "default": "",
+                },
+                "summary_model": {
+                    "type": "string",
+                    "title": "Model override (optional)",
+                    "default": "",
+                },
+                "target_conversation_id": {
+                    "type": "string",
+                    "title": "Target conversation ID",
+                    "default": "",
+                },
+                "replace": {
+                    "type": "boolean",
+                    "title": "Replace source conversation",
+                    "default": False,
+                },
+            },
+            "required": ["conversation_id"],
+        },
+        metadata={
+            "ui": {
+                "max_summary_chars": {"advanced": True},
+                "summary_format_notes": {"advanced": True},
+                "summary_model": {"advanced": True},
+                "target_conversation_id": {"advanced": True},
+                "replace": {"advanced": True},
+            }
+        },
+    ),
     "create_event": _spec(
         "create_event",
         "Compatibility alias for creating or updating a calendar event with flexible time input.",
@@ -971,10 +1456,36 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                 },
                 "privacy": {"type": "string", "title": "Privacy"},
                 "source": {"type": "string", "title": "Source"},
+                "reflect_after_save": {
+                    "type": "boolean",
+                    "title": "Reflect after save",
+                    "default": False,
+                },
+                "reflection_prompt": {
+                    "type": "string",
+                    "title": "Reflection prompt",
+                    "default": "",
+                },
+                "reflection_run_now": {
+                    "type": "boolean",
+                    "title": "Run reflection now",
+                    "default": False,
+                },
             },
             "required": ["text"],
         },
-        metadata={"ui": {"text": {"multiline": True, "rows": 6}}},
+        metadata={
+            "ui": {
+                "text": {"multiline": True, "rows": 6},
+                "reflect_after_save": {"advanced": True},
+                "reflection_prompt": {
+                    "advanced": True,
+                    "multiline": True,
+                    "rows": 3,
+                },
+                "reflection_run_now": {"advanced": True},
+            }
+        },
     ),
     "remember": _spec(
         "remember",
@@ -1030,6 +1541,21 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                     "type": ["number", "string"],
                     "title": "Decay at",
                 },
+                "reflect_after_save": {
+                    "type": "boolean",
+                    "title": "Reflect after save",
+                    "default": False,
+                },
+                "reflection_prompt": {
+                    "type": "string",
+                    "title": "Reflection prompt",
+                    "default": "",
+                },
+                "reflection_run_now": {
+                    "type": "boolean",
+                    "title": "Run reflection now",
+                    "default": False,
+                },
             },
             "required": ["key", "value"],
         },
@@ -1047,6 +1573,13 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                 "occurs_at": {"advanced": True},
                 "review_at": {"advanced": True},
                 "decay_at": {"advanced": True},
+                "reflect_after_save": {"advanced": True},
+                "reflection_prompt": {
+                    "advanced": True,
+                    "multiline": True,
+                    "rows": 3,
+                },
+                "reflection_run_now": {"advanced": True},
             }
         },
     ),

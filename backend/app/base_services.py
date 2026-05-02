@@ -37,6 +37,10 @@ from urllib.parse import urlparse, urlunparse
 
 import requests
 from app import hooks
+from app.provider_transports.openai_responses_ws import (
+    OpenAIResponsesWebSocketError,
+    OpenAIResponsesWebSocketTransport,
+)
 from app.utils.blob_store import get_blob as load_blob
 from app.utils.graph_store import GraphStore
 from app.utils.hardware import gpu_memory_snapshot, system_memory_snapshot
@@ -936,6 +940,9 @@ class LLMService:
         self._local_load_error: Optional[str] = None
         self._local_load_started_at: Optional[float] = None
         self._local_load_finished_at: Optional[float] = None
+        self._openai_responses_ws_transport: Optional[
+            OpenAIResponsesWebSocketTransport
+        ] = None
 
     def set_context(self, context: ModelContext, session_id: str = "default"):
         """Set the model context for a session."""
@@ -1864,6 +1871,71 @@ class LLMService:
             backoff_end,
         )
         return (connect, progressive)
+
+    def _openai_responses_ws_enabled(self) -> bool:
+        transport = (
+            str(self.config.get("openai_provider_transport") or "").strip().lower()
+        )
+        if transport in {
+            "ws",
+            "websocket",
+            "responses_ws",
+            "openai_responses_ws",
+        }:
+            return True
+        return bool(self.config.get("openai_responses_ws_enabled", False))
+
+    def _openai_responses_ws_url(self, responses_url: str) -> str:
+        configured = str(self.config.get("openai_responses_ws_url") or "").strip()
+        if configured:
+            return configured.rstrip("/")
+        parsed = urlparse(responses_url)
+        scheme = "wss" if parsed.scheme == "https" else "ws"
+        return urlunparse(parsed._replace(scheme=scheme)).rstrip("/")
+
+    def _get_openai_responses_ws_transport(
+        self,
+        *,
+        api_key: str,
+        url: str,
+    ) -> OpenAIResponsesWebSocketTransport:
+        existing = self._openai_responses_ws_transport
+        if existing is not None and existing.api_key == api_key and existing.url == url:
+            return existing
+        if existing is not None:
+            try:
+                existing.close()
+            except Exception:
+                pass
+        try:
+            connect_timeout = float(
+                self.config.get("openai_responses_ws_connect_timeout") or 15
+            )
+        except (TypeError, ValueError):
+            connect_timeout = 15.0
+        try:
+            max_tool_rounds = int(
+                self.config.get("openai_responses_ws_max_tool_rounds") or 4
+            )
+        except (TypeError, ValueError):
+            max_tool_rounds = 4
+        try:
+            max_age = int(
+                self.config.get("openai_responses_ws_max_age_seconds") or 3300
+            )
+        except (TypeError, ValueError):
+            max_age = 3300
+        request_timeout = max(float(self.stream_idle_timeout), float(self.timeout))
+        transport = OpenAIResponsesWebSocketTransport(
+            api_key=api_key,
+            url=url,
+            connect_timeout=connect_timeout,
+            request_timeout=request_timeout,
+            max_tool_rounds=max_tool_rounds,
+            max_session_age_seconds=max_age,
+        )
+        self._openai_responses_ws_transport = transport
+        return transport
 
     @staticmethod
     def _strip_inline_tool_objects(text: str) -> str:
@@ -3040,6 +3112,7 @@ class LLMService:
         """
         Generate text via an OpenAI-style Chat Completion API.
         """
+        tool_executor = kwargs.pop("tool_executor", None)
         attachments_param = kwargs.pop("attachments", None) or []
         if isinstance(attachments_param, dict):
             attachments_param = [attachments_param]
@@ -3392,12 +3465,12 @@ class LLMService:
         config_model = self.config.get("api_model")
         if isinstance(config_model, str):
             config_model = config_model.strip() or None
-        model = override_model or config_model
-        if use_server:
+        model = override_model if use_server else override_model or config_model
+        if use_server and model:
             model = resolve_model_alias(model)
         if isinstance(model, str):
             model = model.strip()
-        if not model:
+        if not model and not use_server:
             return {
                 "text": f"You said: {prompt}",
                 "thought": "",
@@ -3713,16 +3786,12 @@ class LLMService:
                 return converted
 
             if structured_content_present:
-                payload = {
-                    "model": model,
-                    "input": _convert_messages_for_responses(messages),
-                }
+                payload = {"input": _convert_messages_for_responses(messages)}
             else:
                 transcript = _collapse(messages)
-                payload = {
-                    "model": model,
-                    "input": transcript,
-                }
+                payload = {"input": transcript}
+            if model:
+                payload["model"] = model
             if reasoning is not None:
                 payload["reasoning"] = reasoning
             if send_response_format:
@@ -3736,6 +3805,7 @@ class LLMService:
                 "top_p",
                 "max_completion_tokens",
                 "metadata",
+                "previous_response_id",
                 "stop",
                 "frequency_penalty",
                 "presence_penalty",
@@ -3746,10 +3816,11 @@ class LLMService:
                     payload[k] = kwargs[k]
         else:
             payload = {
-                "model": model,
                 "messages": messages,
                 **kwargs,
             }
+            if model:
+                payload["model"] = model
             if send_response_format:
                 payload["response_format"] = {"type": send_response_format}
             if tool_definitions and "tools" not in payload:
@@ -3768,6 +3839,92 @@ class LLMService:
             # Keep native Responses tools on the non-streaming path until output-item
             # streaming is normalized into Float's proposal lifecycle.
             streaming_enabled = False
+        if (
+            self._openai_responses_ws_enabled()
+            and self.mode == "api"
+            and not use_server
+            and url.endswith(suffix_resp)
+            and not native_tools_present
+        ):
+            ws_url = self._openai_responses_ws_url(url)
+            try:
+                transport = self._get_openai_responses_ws_transport(
+                    api_key=str(api_key or ""),
+                    url=ws_url,
+                )
+                ws_result = transport.run_response(
+                    session_id=session_id,
+                    payload=payload,
+                    stream_consumer=stream_consumer,
+                    stream_message_id=stream_message_id,
+                    tool_executor=tool_executor if callable(tool_executor) else None,
+                )
+                if isinstance(ws_result, dict):
+                    meta = ws_result.get("metadata")
+                    if not isinstance(meta, dict):
+                        meta = {}
+                        ws_result["metadata"] = meta
+                    if capture_raw_api:
+                        try:
+                            capture_path = write_oai_api_capture(
+                                endpoint=ws_url,
+                                request_payload=payload,
+                                response_payload={
+                                    "text": ws_result.get("text"),
+                                    "thought": ws_result.get("thought"),
+                                    "tools_used": ws_result.get("tools_used"),
+                                    "metadata": meta,
+                                },
+                                session_id=session_id,
+                                message_id=stream_message_id,
+                            )
+                        except Exception:
+                            capture_path = None
+                        if capture_path:
+                            meta["oai_api_log_path"] = capture_path
+                    return ws_result
+            except OpenAIResponsesWebSocketError as exc:
+                logger.warning(
+                    "LLMService: OpenAI Responses WebSocket failed (%s); %s",
+                    exc.code or "unknown",
+                    str(exc),
+                )
+                if not bool(
+                    self.config.get("openai_responses_ws_fallback_to_http", True)
+                ):
+                    meta = {
+                        "error": str(exc),
+                        "category": "openai_responses_ws_error",
+                        "code": exc.code,
+                        "endpoint": ws_url,
+                        "transport": "openai_responses_ws",
+                    }
+                    return {
+                        "text": f"Provider WebSocket error: {str(exc)[:200]}",
+                        "thought": "",
+                        "tools_used": [],
+                        "metadata": meta,
+                    }
+            except Exception as exc:
+                logger.warning(
+                    "LLMService: unexpected OpenAI Responses WebSocket failure; "
+                    "falling back to HTTP",
+                    exc_info=True,
+                )
+                if not bool(
+                    self.config.get("openai_responses_ws_fallback_to_http", True)
+                ):
+                    return {
+                        "text": f"Provider WebSocket error: {str(exc)[:200]}",
+                        "thought": "",
+                        "tools_used": [],
+                        "metadata": {
+                            "error": str(exc),
+                            "category": "openai_responses_ws_error",
+                            "endpoint": ws_url,
+                            "transport": "openai_responses_ws",
+                        },
+                    }
         if use_server:
             try:
                 log_llm_server_event(
@@ -5446,6 +5603,23 @@ class MemoryManager:
         }
         if item.get("rag_excluded") is not None:
             normalized["rag_excluded"] = bool(item.get("rag_excluded"))
+        for field in (
+            "sensitivity_source",
+            "privacy_filter_status",
+            "privacy_filter_mode",
+            "privacy_filter_model",
+            "privacy_filter_action",
+            "privacy_filter_checked_at",
+            "privacy_filter_suggested_sensitivity",
+            "privacy_filter_applied_sensitivity",
+            "privacy_filter_detected_labels",
+            "privacy_filter_label_counts",
+            "privacy_filter_max_score",
+            "privacy_filter_truncated",
+            "privacy_filter_error",
+        ):
+            if field in item:
+                normalized[field] = copy.deepcopy(item.get(field))
         if pruned_at is not None:
             normalized["vectorize"] = False
             normalized["vectorized_at"] = None

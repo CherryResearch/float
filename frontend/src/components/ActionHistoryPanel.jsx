@@ -1,6 +1,7 @@
 import React from "react";
 import axios from "axios";
 import { Link, useNavigate } from "react-router-dom";
+import ConsoleObjectCard from "./ConsoleObjectCard";
 
 const formatTimestamp = (value) => {
   const ts = Number(value);
@@ -375,34 +376,28 @@ const ActionHistoryPanel = ({
   }
 
   return (
-    <section
+    <ConsoleObjectCard
+      title="write history"
+      subtitle={`${totalActionCount} write${totalActionCount === 1 ? "" : "s"}`}
+      preview={`${totalActionCount} tracked write${totalActionCount === 1 ? "" : "s"}`}
+      ariaLabel="write history"
       className={`action-history-panel${collapsed ? " compact" : ""}`}
-      aria-label="write history"
-    >
-      <div className="action-history-header">
-        <div className="action-history-title">
-          <div className="action-history-title-row">
-            <h3>write history</h3>
-            <Link
-              to="/work-history"
-              className="agent-card-control-btn"
-              aria-label="Open full work history page"
-              title="Open full work history page"
-            >
-              open page
-            </Link>
-          </div>
-          {collapsed ? (
-            <p className="action-group-meta">
-              {totalActionCount} tracked write{totalActionCount === 1 ? "" : "s"}
-            </p>
-          ) : (
-            <p className="status-note">
-              Revert tracked writes individually, by response, or by conversation.
-            </p>
-          )}
-        </div>
-        <div className="action-history-header-actions">
+      collapsed={collapsed}
+      onToggleCollapsed={onToggleCollapsed}
+      onHide={onHide}
+      expandLabel="Expand write history"
+      collapseLabel="Minimize write history"
+      hideLabel="Hide write history"
+      extraActions={
+        <>
+          <Link
+            to="/work-history"
+            className="agent-card-control-btn"
+            aria-label="Open full work history page"
+            title="Open full work history page"
+          >
+            open page
+          </Link>
           {hiddenActionCount > 0 ? (
             <button
               type="button"
@@ -411,37 +406,16 @@ const ActionHistoryPanel = ({
               aria-label="Show hidden write items"
               title="Show hidden write items"
             >
-              show hidden ({hiddenActionCount})
+              hidden ({hiddenActionCount})
             </button>
           ) : null}
-          {showConsoleControls ? (
-            <div className="agent-card-controls">
-              {typeof onToggleCollapsed === "function" ? (
-                <button
-                  type="button"
-                  className={`agent-card-control-btn agent-card-control-symbol${collapsed ? " is-active" : ""}`}
-                  onClick={onToggleCollapsed}
-                  aria-label={collapsed ? "Expand write history" : "Minimize write history"}
-                  title={collapsed ? "Expand write history" : "Minimize write history"}
-                >
-                  {collapsed ? "+" : "-"}
-                </button>
-              ) : null}
-              {typeof onHide === "function" ? (
-                <button
-                  type="button"
-                  className="agent-card-control-btn danger"
-                  onClick={onHide}
-                  aria-label="Hide write history"
-                  title="Hide write history"
-                >
-                  hide
-                </button>
-              ) : null}
-            </div>
-          ) : null}
-        </div>
-      </div>
+        </>
+      }
+      toggleOnCardClick={showConsoleControls}
+    >
+      <p className="status-note">
+        Revert tracked writes individually, by response, or by conversation.
+      </p>
 
       {feedback ? <p className="agent-console-note">{feedback}</p> : null}
 
@@ -672,7 +646,7 @@ const ActionHistoryPanel = ({
           ))}
         </div>
       ) : null}
-    </section>
+    </ConsoleObjectCard>
   );
 };
 

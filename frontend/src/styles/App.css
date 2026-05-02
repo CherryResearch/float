@@ -65,6 +65,7 @@ h1 {
   --topbar-card-gap: 8px; /* vertical margin used by .topbar-inner */
   --topbar-total-height: calc(var(--topbar-height) + 2 * var(--topbar-card-gap));
   --center-rail-max: clamp(820px, 58vw, 1220px);
+  --center-rail-width: var(--center-rail-max);
   /* Space reserved so floating input doesn't cover last messages */
   --input-offset: 148px;
   --card-border-inner: color-mix(in oklab, var(--color-lavender) 70%, var(--glass-border) 30%);
@@ -128,20 +129,22 @@ body:not(.dark-mode)
 }
 
 .center-rail {
-  max-width: var(--center-rail-max);
+  max-width: min(var(--center-rail-width, var(--center-rail-max)), 100%);
   margin: 0 auto;
   width: 100%;
   padding-left: 12px;
   padding-right: 12px;
+  box-sizing: border-box;
   flex: 1;
   display: flex;
   flex-direction: column;
 }
 
 .topbar-inner {
-  max-width: var(--center-rail-max);
+  max-width: min(var(--center-rail-width, var(--center-rail-max)), 100%);
   margin: var(--topbar-card-gap) auto; /* keep a consistent top offset */
   width: 100%;
+  box-sizing: border-box;
   background:
     var(--glass-sheen),
     linear-gradient(136deg, color-mix(in oklab, var(--color-lavender) 18%, transparent), transparent 58%),
@@ -248,22 +251,22 @@ body.dark-mode .show-sidebar-btn {
   background:
     radial-gradient(
       1420px 780px at -6% 16%,
-      color-mix(in oklab, var(--color-lavender) 18%, var(--theme-warm-black)),
+      color-mix(in oklab, var(--color-lavender) 10%, var(--theme-warm-black)),
       transparent 74%
     ),
     radial-gradient(
       1220px 720px at 108% 14%,
-      color-mix(in oklab, var(--color-purple) 30%, var(--theme-warm-black)),
+      color-mix(in oklab, var(--color-purple) 14%, var(--theme-warm-black)),
       transparent 76%
     ),
     radial-gradient(
       1020px 640px at 48% 118%,
-      color-mix(in oklab, var(--color-indigo) 20%, var(--theme-warm-black)),
+      color-mix(in oklab, var(--color-indigo) 8%, var(--theme-warm-black)),
       transparent 82%
     ),
     radial-gradient(
       720px 400px at 100% 100%,
-      color-mix(in oklab, var(--color-accent) 12%, var(--theme-warm-black)),
+      color-mix(in oklab, var(--color-accent) 7%, var(--theme-warm-black)),
       transparent 86%
     ),
     linear-gradient(
@@ -276,7 +279,7 @@ body.dark-mode .show-sidebar-btn {
   background-repeat: no-repeat;
   background-size: cover;
   background-attachment: fixed;
-  background-color: color-mix(in oklab, var(--theme-warm-black) 95%, var(--color-petrol) 5%);
+  background-color: color-mix(in oklab, var(--theme-warm-black) 97%, var(--color-petrol) 3%);
 }
 
 .show-sidebar-btn.left {

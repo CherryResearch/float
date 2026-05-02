@@ -6,6 +6,7 @@ embedding full guidance in every model prompt.
 
 from __future__ import annotations
 
+import json
 from difflib import get_close_matches
 from pathlib import Path
 from typing import Any, Dict, List
@@ -16,16 +17,198 @@ from app.tool_specs import BUILTIN_TOOL_SPECS
 from app.utils import verify_signature
 from app.workflow_profiles import workflow_catalog_payload
 
+_DEFAULT_DISCOVERY_PRIORITY = [
+    "help",
+    "tool_help",
+    "tool_info",
+    "remember",
+    "recall",
+    "create_task",
+    "list_tasks",
+    "list_dir",
+    "read_file",
+    "write_file",
+    "search_web",
+    "crawl",
+    "list_actions",
+    "read_action_diff",
+    "revert_actions",
+    "reflect",
+    "list_reflections",
+    "read_threads_summary",
+    "camera.capture",
+    "capture.list",
+]
+_DISCOVERY_OVERFLOW_PRIORITY = [
+    "list_actions",
+    "read_action_diff",
+    "revert_actions",
+    *_DEFAULT_DISCOVERY_PRIORITY,
+]
+_DEFAULT_HELP_HIDDEN_NAMES = {
+    "memory.save",
+    "create_event",
+    "open_url",
+    "subchat",
+    "route_to_local_model",
+    "shell.exec",
+    "patch.apply",
+    "mcp.call",
+    "generate_threads",
+    "compact_conversation_plan",
+    "compact_conversation_preview",
+    "compact_conversation_write",
+    "computer.session.start",
+    "computer.session.stop",
+    "computer.observe",
+    "computer.act",
+    "computer.navigate",
+    "computer.windows.list",
+    "computer.windows.focus",
+    "computer.app.launch",
+    "capture.promote",
+    "capture.delete",
+}
+_FAMILY_HELP_HIDDEN_NAMES = {
+    "memory.save",
+    "create_event",
+    "open_url",
+}
+_DEFAULT_DISCOVERY_SUITES = [
+    {
+        "name": "compact_conversation.*",
+        "family": "conversation",
+        "tools": [
+            "compact_conversation_plan",
+            "compact_conversation_preview",
+            "compact_conversation_write",
+        ],
+        "summary": "Plan, preview, and write long-chat compaction.",
+    },
+    {
+        "name": "computer.*",
+        "family": "computer",
+        "tools": [
+            "computer.session.start",
+            "computer.session.stop",
+            "computer.observe",
+            "computer.act",
+            "computer.navigate",
+            "computer.windows.list",
+            "computer.windows.focus",
+            "computer.app.launch",
+        ],
+        "summary": "Browser and desktop observation, navigation, and actions.",
+    },
+    {
+        "name": "capture.*",
+        "family": "capture",
+        "tools": ["capture.list", "capture.promote", "capture.delete"],
+        "summary": "List, promote, or delete transient captures.",
+    },
+    {
+        "name": "system",
+        "family": "system",
+        "tools": ["shell.exec", "patch.apply", "mcp.call"],
+        "summary": "Approval-gated shell, patch, and MCP access; inspect before use.",
+    },
+]
+_COMPAT_TOOL_NAME_HINTS: Dict[str, tuple[str, ...]] = {
+    "memory.read": ("recall", "remember", "memory.save"),
+    "memory.recall": ("recall", "remember", "memory.save"),
+    "memory.search": ("recall", "remember", "memory.save"),
+    "memory.store": ("remember", "recall", "memory.save"),
+    "memory.write": ("remember", "recall", "memory.save"),
+    "memory.remember": ("remember", "recall", "memory.save"),
+    "open.url": ("computer.navigate", "open_url"),
+    "browser.open": ("computer.navigate", "open_url"),
+    "shell": ("shell.exec",),
+    "patch": ("patch.apply",),
+    "mcp": ("mcp.call",),
+}
+_SPECIAL_ENTRY_ALIASES = {
+    "addon": "modules",
+    "addons": "modules",
+    "add-on": "modules",
+    "add-ons": "modules",
+    "module": "modules",
+    "modules": "modules",
+    "runtime": "modules",
+    "workflow": "modules",
+    "workflows": "modules",
+    "skill": "skills",
+    "skills": "skills",
+}
+_TOOL_FAMILY_ALIASES: Dict[str, tuple[str, ...]] = {
+    "action": ("history",),
+    "actions": ("history",),
+    "agent": ("workflow",),
+    "agents": ("workflow",),
+    "app": ("computer",),
+    "apps": ("computer",),
+    "browser": ("computer", "web"),
+    "browsing": ("computer", "web"),
+    "calendar": ("calendar",),
+    "camera": ("capture",),
+    "chat": ("conversation",),
+    "chats": ("conversation",),
+    "compact": ("conversation",),
+    "compaction": ("conversation",),
+    "context": ("conversation",),
+    "desktop": ("computer",),
+    "event": ("calendar",),
+    "events": ("calendar",),
+    "file": ("files",),
+    "files": ("files",),
+    "folder": ("files",),
+    "folders": ("files",),
+    "internet": ("web",),
+    "knowledge": ("memory",),
+    "memories": ("memory",),
+    "mcp": ("integration",),
+    "patch": ("system",),
+    "patches": ("system",),
+    "reminder": ("calendar",),
+    "reminders": ("calendar",),
+    "revert": ("history",),
+    "schedule": ("calendar",),
+    "scheduled": ("calendar",),
+    "scheduler": ("calendar",),
+    "screenshot": ("capture", "computer"),
+    "screenshots": ("capture", "computer"),
+    "search": ("web",),
+    "shell": ("system",),
+    "task": ("calendar",),
+    "tasks": ("calendar",),
+    "thread": ("threads",),
+    "tool": ("help",),
+    "tools": ("help",),
+    "undo": ("history",),
+    "url": ("web",),
+    "urls": ("web",),
+    "web": ("web",),
+    "window": ("computer",),
+    "windows": ("computer",),
+    "workspace": ("files",),
+    "workspaces": ("files",),
+}
+
 _TOOL_NOTES: Dict[str, Dict[str, Any]] = {
     "help": {
         "notes": [
-            "Use this as the primary built-in documentation tool: omit `tool_name` to list tools, or pass one tool name for a focused guide.",
-            "Defaults stay intentionally lean so the model can verify capabilities without dumping full schemas into context.",
+            "Use this as the primary built-in documentation tool: call it with `{}` or omit `tool_name` to list tools, or pass one tool name for a focused guide.",
+            "Default list mode returns a curated menu and suite summaries; use detail='brief' for one-line descriptions or pass a family/tool name for exact members.",
+            "Only add `failed_tool_name`, `failed_args`, and `failed_error` when recovering from a real failed tool call; ordinary discovery should stay on the plain menu path.",
             "If browser or desktop control is needed, inspect `computer.session.start` first, then follow with `computer.navigate`, `computer.observe`, or `computer.act`.",
             "Pass `tool_name='modules'` to inspect live workflows, enabled modules, and packaged add-ons, or `tool_name='skills'` to inspect packaged skill files.",
         ],
         "examples": [
-            {"tool_name": ""},
+            {},
+            {
+                "failed_tool_name": "tool_info",
+                "failed_args": {},
+                "failed_error": "missing_tool",
+            },
             {"tool_name": "computer.session.start"},
             {"tool_name": "modules"},
             {"tool_name": "skills"},
@@ -36,10 +219,16 @@ _TOOL_NOTES: Dict[str, Dict[str, Any]] = {
             "Use this when the model needs one authoritative capability record for a built-in tool.",
             "The response mirrors the built-in catalog used by the UI.",
             "Inspect runtime and sandbox fields before assuming a tool has network, filesystem, or Python-style execution access.",
+            "If a previous tool attempt failed, you can pass `failed_tool_name`, `failed_args`, and `failed_error` so the response carries a one-line recovery breadcrumb.",
             "It also accepts the special entries `modules` and `skills` for non-tool runtime catalogs.",
         ],
         "examples": [
             {"tool_name": "search_web", "include_schema": True},
+            {
+                "tool_name": "write_file",
+                "failed_tool_name": "writefile",
+                "failed_error": "unknown_tool",
+            },
             {"tool_name": "modules", "include_schema": False},
         ],
     },
@@ -88,6 +277,9 @@ _TOOL_NOTES: Dict[str, Dict[str, Any]] = {
         "notes": [
             "Use this to discover which tools actually exist in the current environment before planning a multi-tool workflow.",
             "Prefer `help` for new calls; `tool_help` remains as a compatibility alias.",
+            "Call `tool_help` with `{}` or omit `tool_name` when you need the curated menu for ordinary browsing; use `tool_name` as a fuzzy/category filter such as `computer`.",
+            "Use detail='brief' when descriptions are needed, then `tool_info` with one exact name for schema.",
+            "If a previous tool call failed, you can pass `failed_tool_name`, `failed_args`, and `failed_error` to get a one-line recovery breadcrumb without losing the menu.",
             "Prefer calling this over hand-listing tool handles from memory when the user asks what float can do.",
             "Pass `tool_name='modules'` for workflow/module/add-on state or `tool_name='skills'` for packaged skill-file discovery.",
             "If the user is asking about Float itself, its setup, or project layout, inspect the repo's root `README.md`; because that file is outside the managed `data/` sandbox, prefer `shell.exec` over `read_file` for that path.",
@@ -97,11 +289,12 @@ _TOOL_NOTES: Dict[str, Dict[str, Any]] = {
             "For structured or semi-structured artifacts such as CSV, JSON, logs, or sampled document sets, prefer typed summaries and stable handles when the available tools support that flow.",
         ],
         "examples": [
+            {},
             {
                 "tool_name": "",
-                "detail": "brief",
-                "include_schema": False,
-                "max_tools": 8,
+                "failed_tool_name": "tool_info",
+                "failed_args": {},
+                "failed_error": "missing_tool",
             },
             {"tool_name": "tool_info", "include_schema": True},
         ],
@@ -234,6 +427,7 @@ _TOOL_NOTES: Dict[str, Dict[str, Any]] = {
         "notes": [
             "Runs a shell command through Float's managed approval and journaling path.",
             "Inspect runtime and sandbox metadata before assuming network, filesystem, or interpreter access.",
+            "Use the host shell's syntax: on Windows this usually means `cmd.exe`-style commands unless the runtime explicitly says PowerShell.",
             "Prefer narrow, task-specific commands and capture the important output rather than dumping entire transcripts.",
         ],
         "safety": [
@@ -448,6 +642,152 @@ def _available_tool_names() -> List[str]:
     ]
 
 
+def _default_discovery_suite_entries(available: List[str]) -> List[Dict[str, Any]]:
+    available_set = set(available)
+    suites: List[Dict[str, Any]] = []
+    for suite in _DEFAULT_DISCOVERY_SUITES:
+        names = [
+            name
+            for name in suite.get("tools", [])
+            if isinstance(name, str) and name in available_set
+        ]
+        if not names:
+            continue
+        suites.append(
+            {
+                "name": suite["name"],
+                "family": suite["family"],
+                "count": len(names),
+                "summary": suite["summary"],
+                "exact_tools": names,
+                "hint": (
+                    f"Call help with tool_name='{suite['family']}' and detail='brief' "
+                    "for descriptions, or tool_info with one exact tool for schema."
+                ),
+            }
+        )
+    return suites
+
+
+def _default_discovery_names(available: List[str]) -> tuple[List[str], List[str]]:
+    hidden = [name for name in available if name in _DEFAULT_HELP_HIDDEN_NAMES]
+    visible = [name for name in available if name not in _DEFAULT_HELP_HIDDEN_NAMES]
+    return visible, hidden
+
+
+def _family_discovery_names(names: List[str]) -> List[str]:
+    visible = [name for name in names if name not in _FAMILY_HELP_HIDDEN_NAMES]
+    return visible or list(names)
+
+
+def _compat_tool_name_suggestions(
+    requested_name: str,
+    available: List[str],
+    *,
+    limit: int = 4,
+) -> List[str]:
+    key = str(requested_name or "").strip().lower().replace("_", ".")
+    hints = _COMPAT_TOOL_NAME_HINTS.get(key, ())
+    suggestions: List[str] = []
+    for hint in hints:
+        if hint in available and hint not in suggestions:
+            suggestions.append(hint)
+        if len(suggestions) >= limit:
+            return suggestions
+    return suggestions
+
+
+def _family_token(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _split_family_tokens(value: Any) -> set[str]:
+    token = _family_token(value)
+    if not token:
+        return set()
+    tokens = {token}
+    normalized = token.replace("_", ".")
+    tokens.add(normalized)
+    for part in token.replace(".", "_").split("_"):
+        if part:
+            tokens.add(part)
+            if part.endswith("s") and len(part) > 3:
+                tokens.add(part[:-1])
+    for part in normalized.split("."):
+        if part:
+            tokens.add(part)
+            if part.endswith("s") and len(part) > 3:
+                tokens.add(part[:-1])
+    if token.endswith("s") and len(token) > 3:
+        tokens.add(token[:-1])
+    return tokens
+
+
+def _query_family_terms(requested_name: str) -> set[str]:
+    base = _family_token(requested_name)
+    if not base:
+        return set()
+    normalized = base.replace("_", ".")
+    terms = {base, normalized}
+    if "." in normalized:
+        terms.add(normalized.split(".", 1)[0])
+    elif "_" in base:
+        primary = base.split("_", 1)[0]
+        if primary in _TOOL_FAMILY_ALIASES:
+            terms.add(primary)
+    else:
+        terms.update(_split_family_tokens(base))
+    expanded = set(terms)
+    for term in terms:
+        expanded.update(_TOOL_FAMILY_ALIASES.get(term, ()))
+    return {term for term in expanded if term}
+
+
+def _tool_family_terms(name: str) -> set[str]:
+    terms = _split_family_tokens(name)
+    lowered = str(name or "").strip().lower()
+    parts = [part for part in lowered.split(".") if part]
+    for idx in range(1, len(parts)):
+        terms.add(".".join(parts[:idx]))
+    try:
+        catalog = get_tool_catalog_entry(name)
+    except Exception:
+        catalog = {}
+    category = _family_token(
+        catalog.get("category") if isinstance(catalog, dict) else ""
+    )
+    if category:
+        terms.add(category)
+        if category.endswith("s") and len(category) > 3:
+            terms.add(category[:-1])
+    for alias, targets in _TOOL_FAMILY_ALIASES.items():
+        if any(target in terms for target in targets):
+            terms.add(alias)
+    return {term for term in terms if term}
+
+
+def _tool_family_summaries(available: List[str]) -> List[Dict[str, Any]]:
+    families: Dict[str, List[str]] = {}
+    for name in available:
+        try:
+            catalog = get_tool_catalog_entry(name)
+        except Exception:
+            catalog = {}
+        category = _family_token(
+            catalog.get("category") if isinstance(catalog, dict) else ""
+        )
+        if category:
+            families.setdefault(category, []).append(name)
+        dotted_prefix = str(name or "").split(".", 1)[0]
+        if dotted_prefix and dotted_prefix != name:
+            families.setdefault(dotted_prefix, []).append(name)
+    return [
+        {"name": family, "count": len(sorted(set(names)))}
+        for family, names in sorted(families.items())
+        if names
+    ]
+
+
 def _balanced_tool_name_selection(
     names: List[str], limit: int
 ) -> tuple[List[str], List[str]]:
@@ -456,17 +796,108 @@ def _balanced_tool_name_selection(
     if len(names) <= limit:
         return list(names), []
 
-    head_count = (limit + 1) // 2
-    tail_count = limit - head_count
     selected: List[str] = []
     seen: set[str] = set()
-    for name in names[:head_count] + names[-tail_count:]:
+
+    def ordered_omitted() -> List[str]:
+        priority_tail: List[str] = []
+        priority_seen: set[str] = set()
+        for name in _DISCOVERY_OVERFLOW_PRIORITY:
+            if name not in names or name in seen or name in priority_seen:
+                continue
+            priority_tail.append(name)
+            priority_seen.add(name)
+        return priority_tail + [
+            name for name in names if name not in seen and name not in priority_seen
+        ]
+
+    for name in _DEFAULT_DISCOVERY_PRIORITY:
+        if name not in names or name in seen:
+            continue
+        selected.append(name)
+        seen.add(name)
+        if len(selected) >= limit:
+            return selected, ordered_omitted()
+
+    remaining_names = [name for name in names if name not in seen]
+    remaining_slots = limit - len(selected)
+    head_count = (remaining_slots + 1) // 2
+    tail_count = remaining_slots - head_count
+    for name in remaining_names[:head_count] + remaining_names[-tail_count:]:
         if name in seen:
             continue
         seen.add(name)
         selected.append(name)
-    omitted = [name for name in names if name not in seen]
-    return selected, omitted
+    return selected, ordered_omitted()
+
+
+def _compact_recovery_value(value: Any, *, max_chars: int = 48) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        compact = " ".join(value.split())
+        if len(compact) > max_chars:
+            return compact[: max(0, max_chars - 3)].rstrip() + "..."
+        return compact
+    if isinstance(value, dict):
+        named = value.get("id") or value.get("name") or value.get("title")
+        if isinstance(named, str) and named.strip():
+            return named.strip()
+        return "object"
+    if isinstance(value, list):
+        return f"{len(value)} item(s)"
+    try:
+        compact = json.dumps(value, ensure_ascii=False)
+    except Exception:
+        compact = str(value)
+    compact = " ".join(compact.split())
+    if len(compact) > max_chars:
+        return compact[: max(0, max_chars - 3)].rstrip() + "..."
+    return compact
+
+
+def _compact_recovery_args(args: Any, *, max_parts: int = 3) -> str:
+    if not isinstance(args, dict):
+        return ""
+    parts: list[str] = []
+    for key in sorted(args.keys(), key=lambda item: str(item)):
+        value = args.get(key)
+        if value in (None, "", [], {}):
+            continue
+        compact = _compact_recovery_value(value)
+        if not compact:
+            continue
+        parts.append(f"{key}={compact}")
+        if len(parts) >= max_parts:
+            break
+    return ", ".join(parts)
+
+
+def _compact_failed_call_line(
+    tool_name: str = "",
+    args: Any = None,
+    error: str = "",
+) -> str | None:
+    normalized_tool = str(tool_name or "").strip()
+    normalized_error = " ".join(str(error or "").split()).strip()
+    if not normalized_tool and not normalized_error:
+        return None
+    args_text = _compact_recovery_args(args)
+    if normalized_tool:
+        call_text = (
+            f"{normalized_tool}({args_text})" if args_text else f"{normalized_tool}()"
+        )
+    else:
+        call_text = "tool call"
+    if normalized_error:
+        if len(normalized_error) > 72:
+            normalized_error = normalized_error[:69].rstrip() + "..."
+        return f"{call_text} -> {normalized_error}"
+    return call_text
 
 
 def _tool_name_suggestions(
@@ -476,6 +907,7 @@ def _tool_name_suggestions(
     if not needle:
         return []
 
+    family_matches = _matching_tool_names(requested_name, available)
     lowered = {name.lower(): name for name in available}
     suggestions: List[str] = []
     seen: set[str] = set()
@@ -487,6 +919,16 @@ def _tool_name_suggestions(
         seen.add(resolved)
         suggestions.append(resolved)
 
+    for name in _compat_tool_name_suggestions(
+        requested_name, available, limit=limit
+    ):
+        _add(name)
+        if len(suggestions) >= limit:
+            return suggestions[:limit]
+    for name in family_matches:
+        _add(name)
+        if len(suggestions) >= limit:
+            return suggestions[:limit]
     for candidate in get_close_matches(
         needle, list(lowered.keys()), n=limit, cutoff=0.55
     ):
@@ -500,6 +942,68 @@ def _tool_name_suggestions(
         if len(suggestions) >= limit:
             break
     return suggestions[:limit]
+
+
+def _normalize_detail_mode(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return "names"
+    aliases = {
+        "name": "names",
+        "names": "names",
+        "list": "names",
+        "brief": "brief",
+        "short": "brief",
+        "summary": "brief",
+        "rich": "rich",
+        "full": "rich",
+        "schema": "rich",
+        "schemas": "rich",
+    }
+    return aliases.get(text, "names")
+
+
+def _matching_tool_names(
+    requested_name: str, available: List[str], *, include_close: bool = True
+) -> List[str]:
+    needle = _family_token(requested_name)
+    if not needle:
+        return []
+    matches: List[str] = []
+    seen: set[str] = set()
+
+    def _add(name: str) -> None:
+        if not name or name in seen:
+            return
+        seen.add(name)
+        matches.append(name)
+
+    query_terms = _query_family_terms(requested_name)
+    for name in available:
+        if _tool_family_terms(name).intersection(query_terms):
+            _add(name)
+    if matches:
+        return matches
+
+    for name in available:
+        lowered = name.lower()
+        parts = lowered.split(".")
+        if (
+            needle in lowered
+            or lowered.startswith(needle)
+            or any(part.startswith(needle) for part in parts)
+        ):
+            _add(name)
+    if matches:
+        return matches
+    if not include_close:
+        return matches
+    lowered_available = {name.lower(): name for name in available}
+    for candidate in get_close_matches(
+        needle, list(lowered_available.keys()), n=8, cutoff=0.55
+    ):
+        _add(lowered_available.get(candidate, candidate))
+    return matches
 
 
 def _prop_type(prop: Dict[str, Any]) -> str:
@@ -557,14 +1061,6 @@ def _build_tool_entry(
         "required_args": sorted(required_keys),
     }
     if detail == "brief":
-        base["arguments"] = argument_summary
-        runtime = catalog.get("runtime")
-        if isinstance(runtime, dict):
-            base["runtime"] = {
-                key: runtime.get(key)
-                for key in ("executor", "network", "filesystem")
-                if key in runtime
-            }
         return base
 
     notes = _TOOL_NOTES.get(name, {})
@@ -653,7 +1149,9 @@ def _build_special_entry(
     detail: str,
     include_schema: bool,
 ) -> Dict[str, Any] | None:
-    normalized = str(name or "").strip().lower()
+    normalized = _SPECIAL_ENTRY_ALIASES.get(
+        _family_token(name), str(name or "").strip().lower()
+    )
     if normalized == "modules":
         catalog = workflow_catalog_payload()
         entry: Dict[str, Any] = {
@@ -663,7 +1161,7 @@ def _build_special_entry(
             "summary": "Runtime workflow catalog including built-in workflows, modules, and packaged add-ons.",
             "description": "Inspect this when you need the current workflow/module surface rather than guessing from memory.",
         }
-        if detail == "brief":
+        if detail in {"names", "brief"}:
             entry["workflows"] = [
                 item.get("id")
                 for item in catalog.get("workflows", [])
@@ -709,7 +1207,7 @@ def _build_special_entry(
             "summary": "Packaged skill markdown files available in this repo.",
             "description": "These are repo-shipped guidance files, not first-class executable tools.",
         }
-        if detail == "brief":
+        if detail in {"names", "brief"}:
             entry["skills"] = [
                 item.get("id")
                 for item in catalog.get("skills", [])
@@ -735,21 +1233,104 @@ def _build_special_entry(
     return None
 
 
+def _tool_menu_payload(
+    available: List[str],
+    *,
+    detail: str,
+    include_schema: bool,
+    max_tools: int,
+    default_menu: bool = False,
+) -> Dict[str, Any]:
+    menu_available = list(available)
+    hidden_names: List[str] = []
+    suites: List[Dict[str, Any]] = []
+    if default_menu:
+        menu_available, hidden_names = _default_discovery_names(available)
+        suites = _default_discovery_suite_entries(available)
+    selected_names, omitted_names = _balanced_tool_name_selection(
+        menu_available, max_tools
+    )
+    if detail == "names":
+        tools_payload: List[Any] = list(selected_names)
+    else:
+        tools_payload = [
+            _build_tool_entry(
+                name,
+                detail=detail,
+                include_schema=include_schema,
+            )
+            for name in selected_names
+        ]
+    response: Dict[str, Any] = {
+        "count": len(selected_names),
+        "total_count": len(available),
+        "tools": tools_payload,
+    }
+    if default_menu:
+        response["default_menu"] = True
+        response["hidden_count"] = len(hidden_names)
+        response["hint"] = (
+            "This is the curated default menu. Use detail='brief' for one-line "
+            "descriptions, or pass a family/tool_name to inspect exact tools."
+        )
+        if suites:
+            response["suites"] = suites
+    families = _tool_family_summaries(available)
+    if families:
+        response["families"] = families
+    remaining_count = len(omitted_names) + (
+        len(hidden_names) if default_menu else 0
+    )
+    if remaining_count:
+        response["remaining_count"] = remaining_count
+    if omitted_names:
+        response["more_tools"] = omitted_names[:max_tools]
+    if detail == "rich":
+        response["note"] = "Pass tool_name to get a single full tool guide."
+    return response
+
+
+def _recovery_menu_payload(
+    available: List[str], *, max_tools: int = 8
+) -> Dict[str, Any]:
+    menu = _tool_menu_payload(
+        available,
+        detail="names",
+        include_schema=False,
+        max_tools=max_tools,
+    )
+    return {
+        "count": menu.get("count", 0),
+        "total_count": menu.get("total_count", len(available)),
+        "tools": menu.get("tools", []),
+        **(
+            {"remaining_count": menu["remaining_count"]}
+            if "remaining_count" in menu
+            else {}
+        ),
+        **({"more_tools": menu["more_tools"]} if "more_tools" in menu else {}),
+    }
+
+
 def _run_tool_help(
     *,
     tool_key: str,
     tool_name: str = "",
-    detail: str = "brief",
+    detail: str = "names",
     include_schema: bool = False,
-    max_tools: int = 8,
+    max_tools: int = 50,
+    failed_tool_name: str = "",
+    failed_args: Any = None,
+    failed_error: str = "",
     user: str,
     signature: str,
 ) -> Dict[str, Any]:
     requested_name = str(tool_name or "").strip()
-    normalized_detail = str(detail or "brief").strip().lower()
-    if normalized_detail not in {"brief", "rich"}:
-        normalized_detail = "brief"
-    limited_max_tools = max(1, min(int(max_tools or 8), 50))
+    failed_tool_name_text = str(failed_tool_name or "").strip()
+    failed_args_value = failed_args if isinstance(failed_args, dict) else {}
+    failed_error_text = str(failed_error or "").strip()
+    normalized_detail = _normalize_detail_mode(detail)
+    limited_max_tools = max(1, min(int(max_tools or 50), 50))
     include_schema_flag = bool(include_schema)
 
     payload = {
@@ -757,10 +1338,18 @@ def _run_tool_help(
         "detail": normalized_detail,
         "include_schema": include_schema_flag,
         "max_tools": limited_max_tools,
+        "failed_tool_name": failed_tool_name_text,
+        "failed_args": failed_args_value,
+        "failed_error": failed_error_text,
     }
     verify_signature(signature, user, tool_key, payload)
 
     available = _available_tool_names()
+    recovery_line = _compact_failed_call_line(
+        failed_tool_name_text,
+        failed_args_value,
+        failed_error_text,
+    )
     if requested_name:
         special_entry = _build_special_entry(
             requested_name,
@@ -768,20 +1357,74 @@ def _run_tool_help(
             include_schema=include_schema_flag,
         )
         if special_entry is not None:
-            return {
+            response = {
                 "query": payload,
                 "count": 1,
                 "tools": [special_entry],
             }
+            if recovery_line:
+                response["failed_call"] = recovery_line
+            return response
         if requested_name not in BUILTIN_TOOL_SPECS:
+            compat_suggestions = _compat_tool_name_suggestions(requested_name, available)
+            if compat_suggestions:
+                response = {
+                    "query": payload,
+                    "error": "unknown_tool",
+                    "tool_name": requested_name,
+                    "message": "That compatibility-style name is not a primary tool in this environment.",
+                    "hint": "Use one of the suggested exact tool names, or call tool_info on one exact name for schema.",
+                    "did_you_mean": compat_suggestions,
+                    **_tool_menu_payload(
+                        compat_suggestions,
+                        detail=normalized_detail,
+                        include_schema=include_schema_flag,
+                        max_tools=limited_max_tools,
+                    ),
+                }
+                if recovery_line:
+                    response["failed_call"] = recovery_line
+                return response
+            matched_names = _family_discovery_names(
+                _matching_tool_names(requested_name, available)
+            )
+            if matched_names:
+                response = {
+                    "query": payload,
+                    "filtered_by": requested_name,
+                    **_tool_menu_payload(
+                        matched_names,
+                        detail=normalized_detail,
+                        include_schema=include_schema_flag,
+                        max_tools=limited_max_tools,
+                    ),
+                }
+                if recovery_line:
+                    response["failed_call"] = recovery_line
+                return response
             response = {
+                "query": payload,
                 "error": "unknown_tool",
                 "tool_name": requested_name,
                 "available": available,
+                "message": "Couldn't inspect that exact tool; showing a compact menu instead.",
+                "hint": "Retry with one returned tool name, or call help/tool_help with {} to browse the menu.",
+                **_tool_menu_payload(
+                    available,
+                    detail=normalized_detail,
+                    include_schema=include_schema_flag,
+                    max_tools=limited_max_tools,
+                    default_menu=True,
+                ),
             }
             suggestions = _tool_name_suggestions(requested_name, available)
             if suggestions:
                 response["did_you_mean"] = suggestions
+            response["failed_call"] = recovery_line or _compact_failed_call_line(
+                tool_key,
+                {"tool_name": requested_name},
+                "unknown_tool",
+            )
             return response
         entries = [
             _build_tool_entry(
@@ -790,46 +1433,38 @@ def _run_tool_help(
                 include_schema=include_schema_flag,
             )
         ]
-        return {
+        response = {
             "query": payload,
             "count": 1,
             "tools": entries,
         }
+        if recovery_line:
+            response["failed_call"] = recovery_line
+        return response
 
-    selected_names, omitted_names = _balanced_tool_name_selection(
-        available, limited_max_tools
-    )
-    tools_payload: List[Any]
-    if normalized_detail == "brief":
-        tools_payload = list(selected_names)
-    else:
-        tools_payload = [
-            _build_tool_entry(
-                name,
-                detail=normalized_detail,
-                include_schema=include_schema_flag,
-            )
-            for name in selected_names
-        ]
     response: Dict[str, Any] = {
         "query": payload,
-        "count": len(selected_names),
-        "total_count": len(available),
-        "tools": tools_payload,
+        **_tool_menu_payload(
+            available,
+            detail=normalized_detail,
+            include_schema=include_schema_flag,
+            max_tools=limited_max_tools,
+            default_menu=True,
+        ),
     }
-    if omitted_names:
-        response["remaining_count"] = len(omitted_names)
-        response["more_tools"] = omitted_names[:limited_max_tools]
-    if normalized_detail == "rich":
-        response["note"] = "Pass tool_name to get a single full tool guide."
+    if recovery_line:
+        response["failed_call"] = recovery_line
     return response
 
 
 def tool_help(
     tool_name: str = "",
-    detail: str = "brief",
+    detail: str = "names",
     include_schema: bool = False,
-    max_tools: int = 8,
+    max_tools: int = 50,
+    failed_tool_name: str = "",
+    failed_args: Any = None,
+    failed_error: str = "",
     *,
     user: str,
     signature: str,
@@ -841,6 +1476,9 @@ def tool_help(
         detail=detail,
         include_schema=include_schema,
         max_tools=max_tools,
+        failed_tool_name=failed_tool_name,
+        failed_args=failed_args,
+        failed_error=failed_error,
         user=user,
         signature=signature,
     )
@@ -848,9 +1486,12 @@ def tool_help(
 
 def help_tool(
     tool_name: str = "",
-    detail: str = "brief",
+    detail: str = "names",
     include_schema: bool = False,
-    max_tools: int = 8,
+    max_tools: int = 50,
+    failed_tool_name: str = "",
+    failed_args: Any = None,
+    failed_error: str = "",
     *,
     user: str,
     signature: str,
@@ -862,6 +1503,9 @@ def help_tool(
         detail=detail,
         include_schema=include_schema,
         max_tools=max_tools,
+        failed_tool_name=failed_tool_name,
+        failed_args=failed_args,
+        failed_error=failed_error,
         user=user,
         signature=signature,
     )
@@ -870,6 +1514,9 @@ def help_tool(
 def tool_info(
     tool_name: str,
     include_schema: bool = True,
+    failed_tool_name: str = "",
+    failed_args: Any = None,
+    failed_error: str = "",
     *,
     user: str,
     signature: str,
@@ -877,36 +1524,95 @@ def tool_info(
     """Return one capability record for a built-in tool."""
 
     requested_name = str(tool_name or "").strip()
+    failed_tool_name_text = str(failed_tool_name or "").strip()
+    failed_args_value = failed_args if isinstance(failed_args, dict) else {}
+    failed_error_text = str(failed_error or "").strip()
     include_schema_flag = bool(include_schema)
     payload = {
         "tool_name": requested_name,
         "include_schema": include_schema_flag,
+        "failed_tool_name": failed_tool_name_text,
+        "failed_args": failed_args_value,
+        "failed_error": failed_error_text,
     }
     verify_signature(signature, user, "tool_info", payload)
     available = _available_tool_names()
+    recovery_line = _compact_failed_call_line(
+        failed_tool_name_text,
+        failed_args_value,
+        failed_error_text,
+    )
     if not requested_name:
-        return {
+        response = {
             "error": "missing_tool",
             "available": available,
+            "message": "Couldn't inspect a single tool because tool_name was missing.",
+            "hint": "Call help or tool_help with {} first, then retry with one returned name.",
+            "menu": _recovery_menu_payload(available),
         }
+        response["failed_call"] = recovery_line or _compact_failed_call_line(
+            "tool_info",
+            {},
+            "missing_tool",
+        )
+        return response
     special_entry = _build_special_entry(
         requested_name,
         detail="rich",
         include_schema=include_schema_flag,
     )
     if special_entry is not None:
+        if recovery_line:
+            special_entry["failed_call"] = recovery_line
         return special_entry
     if requested_name not in BUILTIN_TOOL_SPECS:
+        compat_suggestions = _compat_tool_name_suggestions(requested_name, available)
+        if compat_suggestions:
+            response = {
+                "error": "unknown_tool",
+                "tool_name": requested_name,
+                "message": "That compatibility-style name is not a primary tool in this environment.",
+                "hint": "Use one of the suggested exact tool names, or call help with tool_name='memory' for the current memory surface.",
+                "did_you_mean": compat_suggestions,
+                "menu": _recovery_menu_payload(compat_suggestions),
+            }
+            if recovery_line:
+                response["failed_call"] = recovery_line
+            return response
+        matched_names = _family_discovery_names(
+            _matching_tool_names(requested_name, available, include_close=False)
+        )
+        if matched_names:
+            response = {
+                "error": "tool_family",
+                "tool_name": requested_name,
+                "message": "That looks like a tool family or fuzzy query, not one exact tool.",
+                "hint": "Call help or tool_help with the same tool_name to browse the matching family, or retry tool_info with one exact returned name.",
+                "menu": _recovery_menu_payload(matched_names),
+            }
+            if recovery_line:
+                response["failed_call"] = recovery_line
+            return response
         response = {
             "error": "unknown_tool",
             "tool_name": requested_name,
             "available": available,
+            "message": "Couldn't inspect that exact tool; showing a compact menu instead.",
+            "hint": "Call help or tool_help with {} for a menu, or retry with one returned name.",
+            "menu": _recovery_menu_payload(available),
         }
         suggestions = _tool_name_suggestions(requested_name, available)
         if suggestions:
             response["did_you_mean"] = suggestions
+        response["failed_call"] = recovery_line or _compact_failed_call_line(
+            "tool_info",
+            {"tool_name": requested_name},
+            "unknown_tool",
+        )
         return response
-    entry = get_tool_catalog_entry(requested_name)
+    entry = dict(get_tool_catalog_entry(requested_name))
     if not include_schema_flag:
         entry.pop("input_schema", None)
+    if recovery_line:
+        entry["failed_call"] = recovery_line
     return entry

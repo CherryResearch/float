@@ -35,6 +35,25 @@ def test_user_settings_persist(client, tmp_path, monkeypatch):
         "capture_allow_summary_fallback": True,
         "default_workflow": "mini_execution",
         "enabled_workflow_modules": ["computer_use", "camera_capture"],
+        "workspace_profiles": [
+            {
+                "id": "root",
+                "name": "Main workspace",
+                "privacy_mode": "protected",
+                "private_patterns": ["notes/private/*"],
+            },
+            {
+                "id": "work",
+                "name": "Work",
+                "slug": "work",
+                "namespace": "work",
+                "root_path": "data/files/workspace/work",
+                "privacy_mode": "default",
+                "private_patterns": ["drafts/*", "*.pem"],
+            },
+        ],
+        "active_workspace_id": "root",
+        "sync_selected_workspace_ids": ["root", "work"],
     }
     r = client.post("/user-settings", json=payload)
     assert r.status_code == 200
@@ -62,6 +81,13 @@ def test_user_settings_persist(client, tmp_path, monkeypatch):
     assert data["capture_allow_summary_fallback"] is True
     assert data["default_workflow"] == "mini_execution"
     assert data["enabled_workflow_modules"] == ["computer_use", "camera_capture"]
+    assert data["workspace_profiles"][0]["privacy_mode"] == "protected"
+    assert data["workspace_profiles"][0]["private_patterns"] == ["notes/private/*"]
+    assert data["workspace_profiles"][1]["private_patterns"] == [
+        "drafts/*",
+        "*.pem",
+    ]
+    assert data["sync_selected_workspace_ids"] == ["root", "work"]
 
     r2 = client.get("/user-settings")
     assert r2.status_code == 200
@@ -76,6 +102,11 @@ def test_user_settings_persist(client, tmp_path, monkeypatch):
     assert r2.json()["capture_default_sensitivity"] == "protected"
     assert r2.json()["default_workflow"] == "mini_execution"
     assert r2.json()["enabled_workflow_modules"] == ["computer_use", "camera_capture"]
+    assert r2.json()["workspace_profiles"][0]["privacy_mode"] == "protected"
+    assert r2.json()["workspace_profiles"][1]["private_patterns"] == [
+        "drafts/*",
+        "*.pem",
+    ]
 
 
 def test_user_settings_default_tool_review_notifications_enabled(tmp_path, monkeypatch):

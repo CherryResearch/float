@@ -4,6 +4,16 @@ export const DEFAULT_API_MODELS = [
   "gpt-5.4-nano",
 ];
 
+const MODEL_SIZE_RANK = {
+  base: 5,
+  chat: 4,
+  codex: 3,
+  pro: 2,
+  max: 1,
+  mini: -1,
+  nano: -2,
+};
+
 const DIRECT_LOCAL_GEMMA_MODELS = new Set([
   "gemma-3",
   "gemma-3-270m",
@@ -37,6 +47,13 @@ export const SUGGESTED_LOCAL_MODELS = [
   "gemma-4-E2B-it",
 ];
 
+export const SUGGESTED_SERVER_MODELS = [
+  ...SUGGESTED_LOCAL_MODELS,
+  "gemma-4-E4B-it",
+  "gemma-4-26B-A4B-it",
+  "gemma-4-31B-it",
+];
+
 export const LOCAL_RUNTIME_ENTRIES = [
   "lmstudio",
   "ollama",
@@ -50,6 +67,54 @@ const _cleanModelList = (list) =>
 
 const _cleanModelValue = (value) =>
   typeof value === "string" ? value.trim() : "";
+
+const _parseModelDate = (value) => {
+  const match = String(value || "").match(/(?:^|-)(20\d{2})-(\d{2})-(\d{2})(?:$|-)/);
+  if (!match) return 0;
+  return Number(`${match[1]}${match[2]}${match[3]}`);
+};
+
+const _parseGptSortKey = (value) => {
+  const raw = _cleanModelValue(value);
+  const lowered = raw.toLowerCase();
+  const match = lowered.match(/^gpt-(\d+)(?:\.(\d+))?/);
+  if (!match) return null;
+  const suffix = lowered.slice(match[0].length).replace(/^-+/, "");
+  const size =
+    suffix.split("-").find((part) =>
+      Object.prototype.hasOwnProperty.call(MODEL_SIZE_RANK, part),
+    ) || "base";
+  return {
+    major: Number(match[1]) || 0,
+    minor: Number(match[2]) || 0,
+    date: _parseModelDate(lowered),
+    sizeRank: MODEL_SIZE_RANK[size] ?? MODEL_SIZE_RANK.base,
+    raw,
+  };
+};
+
+export const compareModelIds = (left, right) => {
+  const leftClean = _cleanModelValue(left);
+  const rightClean = _cleanModelValue(right);
+  const leftGpt = _parseGptSortKey(leftClean);
+  const rightGpt = _parseGptSortKey(rightClean);
+  if (leftGpt || rightGpt) {
+    if (!leftGpt) return 1;
+    if (!rightGpt) return -1;
+    if (rightGpt.major !== leftGpt.major) return rightGpt.major - leftGpt.major;
+    if (rightGpt.minor !== leftGpt.minor) return rightGpt.minor - leftGpt.minor;
+    if (rightGpt.sizeRank !== leftGpt.sizeRank) {
+      return rightGpt.sizeRank - leftGpt.sizeRank;
+    }
+    if (rightGpt.date !== leftGpt.date) return rightGpt.date - leftGpt.date;
+  }
+  return leftClean.localeCompare(rightClean, undefined, {
+    numeric: true,
+    sensitivity: "base",
+  });
+};
+
+export const sortModelIds = (models) => _cleanModelList(models).sort(compareModelIds);
 
 export const normalizeModelId = (value) => {
   if (typeof value !== "string") return "";
@@ -128,11 +193,14 @@ export const buildModelGroups = ({ defaults = [], discovered = [], current = "" 
       return true;
     });
 
-  const defaultModels = dedupe(defaultsClean);
-  const extraModels = dedupe(discoveredClean.filter((m) => !defaultModels.includes(m)));
+  const hasDiscoveredModels = discoveredClean.length > 0;
+  const primaryModels = hasDiscoveredModels ? discoveredClean : defaultsClean;
+  const defaultModels = dedupe(sortModelIds(primaryModels));
+  const extraModels = [];
 
   const currentClean = typeof current === "string" ? current.trim() : "";
-  if (currentClean && !defaultModels.includes(currentClean) && !extraModels.includes(currentClean)) {
+  if (currentClean && !seen.has(currentClean)) {
+    seen.add(currentClean);
     extraModels.unshift(currentClean);
   }
 
@@ -140,6 +208,7 @@ export const buildModelGroups = ({ defaults = [], discovered = [], current = "" 
     defaults: defaultModels,
     extras: extraModels,
     all: [...defaultModels, ...extraModels],
+    source: hasDiscoveredModels ? "discovered" : "defaults",
   };
 };
 
@@ -215,7 +284,7 @@ export const resolveModelForMode = ({
     return configuredLocal || api;
   }
   if (mode === "server") {
-    return isLocalRuntimeEntry(transformer) ? api : transformer || api;
+    return isLocalRuntimeEntry(transformer) ? "" : transformer;
   }
   return api;
 };
@@ -242,10 +311,7 @@ export const resolveRequestModelForMode = ({
     return resolveConcreteModelSelection(selectedLocal);
   }
   if (mode === "server") {
-    return (
-      resolveConcreteModelSelection(transformer) ||
-      resolveConcreteModelSelection(local)
-    );
+    return resolveConcreteModelSelection(transformer);
   }
   if (mode === "api") {
     return api;

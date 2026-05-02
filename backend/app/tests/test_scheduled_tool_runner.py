@@ -297,6 +297,11 @@ async def test_scheduled_tool_runner_routes_new_chat_followup_to_task_conversati
         if isinstance(entry, dict)
     )
     generated_conv = conversation_store.load_conversation(generated_session)
+    generated_meta = conversation_store.get_metadata(generated_session)
+    assert generated_meta["provenance"]["kind"] == "subchat"
+    assert generated_meta["provenance"]["parent_session_id"] == session_id
+    assert generated_meta["provenance"]["parent_message_id"] == message_id
+    assert generated_meta["handoff"]["summary"] == "Schedule tool: remember"
     assert any(
         entry.get("role") == "user"
         and entry.get("text") == "Write the follow-up in a new task chat."
@@ -304,8 +309,7 @@ async def test_scheduled_tool_runner_routes_new_chat_followup_to_task_conversati
         if isinstance(entry, dict)
     )
     assert any(
-        entry.get("role") == "ai"
-        and entry.get("text") == "New chat follow-up response"
+        entry.get("role") == "ai" and entry.get("text") == "New chat follow-up response"
         for entry in generated_conv
         if isinstance(entry, dict)
     )

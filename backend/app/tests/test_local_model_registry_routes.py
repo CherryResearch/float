@@ -109,3 +109,58 @@ def test_register_local_model_rejects_missing_path(tmp_path: Path, monkeypatch):
     )
     assert register.status_code == 400
     assert "path does not exist" in str(register.json().get("detail", ""))
+
+
+def test_delete_model_reports_runtime_lock_details(tmp_path: Path, monkeypatch):
+    from app import routes
+
+    client = _make_client(tmp_path, monkeypatch)
+    model_dir = tmp_path / "models_root" / "gpt-oss-20b"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    (model_dir / "config.json").write_text("{}", encoding="utf-8")
+
+    def _raise_permission_error(path):
+        raise PermissionError("access denied")
+
+    monkeypatch.setattr(routes.shutil, "rmtree", _raise_permission_error)
+    monkeypatch.setattr(
+        routes.llm_service,
+        "local_runtime_status",
+        lambda: {
+            "model": "gpt-oss-20b",
+            "effective_model_id": "gpt-oss-20b",
+            "loaded": True,
+            "load_state": "ready",
+        },
+    )
+    monkeypatch.setattr(
+        routes.provider_manager,
+        "describe_model_locks",
+        lambda model_name, providers=None: [
+            {
+                "provider": "lmstudio",
+                "base_url": "http://127.0.0.1:1234/v1",
+                "server_running": True,
+                "server_owned_by_float": False,
+                "loaded_model": "gpt-oss-20b",
+                "loaded_model_owned_by_float": False,
+                "owned_model_ids": ["gpt-oss-20b"],
+                "mode": "local-managed",
+            }
+        ],
+    )
+
+    deleted = client.delete("/api/models/gpt-oss-20b")
+
+    assert deleted.status_code == 409
+    detail = deleted.json().get("detail", {})
+    assert "Direct local runtime still has 'gpt-oss-20b' loaded." in detail["message"]
+    assert "outside Float" in detail["message"]
+    assert "External HTTP only" in detail["message"]
+    explanation = detail["state_explanation"]
+    assert explanation["title"] == "Why this model cannot be deleted"
+    rows = {row["label"]: row["value"] for row in explanation["rows"]}
+    assert rows["Source"] == "model delete guard"
+    assert rows["Model"] == "gpt-oss-20b"
+    assert "Direct local runtime" in rows["Evidence 1"]
+    assert "External HTTP only" in rows["Evidence 2"]

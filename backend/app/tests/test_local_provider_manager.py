@@ -72,6 +72,41 @@ def test_resolve_inference_target_rejects_embedding_only_loaded_model():
         )
 
 
+def test_resolve_inference_target_uses_hf_token_for_huggingface_endpoint():
+    from app.local_providers.manager import LocalProviderManager
+
+    manager = LocalProviderManager(
+        lambda: {
+            "local_provider": "custom-openai-compatible",
+            "local_provider_mode": "remote-unmanaged",
+            "local_provider_base_url": "https://router.huggingface.co/v1",
+            "local_provider_api_token": "",
+            "local_provider_preferred_model": "openai/gpt-oss-120b",
+            "hf_token": "hf-secret-token",
+        }
+    )
+    manager.provider_snapshot = lambda provider, **kwargs: {  # type: ignore[method-assign]
+        "provider": provider,
+        "models": ["openai/gpt-oss-120b"],
+        "runtime": {
+            "provider": provider,
+            "server_running": True,
+            "model_loaded": True,
+            "loaded_model": "openai/gpt-oss-120b",
+            "effective_model": "openai/gpt-oss-120b",
+        },
+    }
+
+    target = manager.resolve_inference_target(
+        provider="custom-openai-compatible",
+        requested_model="custom-openai-compatible",
+    )
+
+    assert target["base_url"] == "https://router.huggingface.co/v1"
+    assert target["api_token"] == "hf-secret-token"
+    assert target["model"] == "openai/gpt-oss-120b"
+
+
 def test_provider_snapshot_does_not_resurrect_ready_state_from_cache():
     from app.local_providers.manager import LocalProviderManager
 
@@ -287,6 +322,240 @@ def test_provider_load_rejects_external_lmstudio_server_in_managed_mode():
     assert "outside Float" in unload_result["result"]["error"]
     assert stop_result["ok"] is False
     assert "outside Float" in stop_result["result"]["error"]
+
+
+def test_provider_load_records_operation_telemetry_and_logs():
+    from app.local_providers.manager import LocalProviderManager
+
+    class _FakeAdapter:
+        def __init__(self):
+            self.loaded_model = None
+
+        def detect_installation(self, cfg):
+            return {"ok": True, "installed": True, "binary": "fake-ollama"}
+
+        def resolve_base_url(self, cfg, *, with_v1):
+            return "http://127.0.0.1:11434/v1" if with_v1 else "http://127.0.0.1:11434"
+
+        def poll_status(self, cfg, *, quick=False):
+            return {
+                "ok": True,
+                "server_running": True,
+                "model_loaded": bool(self.loaded_model),
+                "loaded_model": self.loaded_model,
+                "context_length": 4096 if self.loaded_model else None,
+                "details": {},
+            }
+
+        def list_models(self, cfg):
+            return {
+                "ok": True,
+                "models": [self.loaded_model] if self.loaded_model else [],
+            }
+
+        def start_server(self, cfg):
+            return {"ok": True}
+
+        def stop_server(self, cfg):
+            return {"ok": True}
+
+        def load_model(self, cfg, *, model, context_length=None):
+            self.loaded_model = model
+            return {
+                "ok": True,
+                "endpoint": "http://127.0.0.1:11434/api/generate",
+                "targets": [model],
+            }
+
+        def unload_model(self, cfg, *, model=None):
+            self.loaded_model = None
+            return {"ok": True}
+
+        def stream_logs(self, cfg, stop_event):
+            if False:
+                yield {}
+
+        def capabilities(self, cfg):
+            return {
+                "start_stop": True,
+                "load_unload": True,
+                "context_length": True,
+                "logs_stream": True,
+            }
+
+    manager = LocalProviderManager(
+        lambda: {
+            "local_provider": "ollama",
+            "local_provider_mode": "local-managed",
+            "local_provider_host": "127.0.0.1",
+            "local_provider_port": 11434,
+            "local_provider_api_token": "",
+            "local_provider_preferred_model": "",
+        }
+    )
+    manager._adapters["ollama"] = _FakeAdapter()
+
+    result = manager.provider_load(
+        provider="ollama",
+        model="gpt-oss-20b",
+        context_length=4096,
+    )
+
+    assert result["ok"] is True
+    operation = result["operation"]
+    assert operation["id"] == "load#1"
+    assert operation["status"] == "ok"
+    assert operation["context_length"] == 4096
+    assert operation["result"]["endpoint"] == "http://127.0.0.1:11434/api/generate"
+    assert operation["result"]["targets"] == ["gpt-oss-20b"]
+
+    runtime = result["runtime"]
+    assert runtime["loaded_model"] == "gpt-oss-20b"
+    assert runtime["last_operation"]["id"] == "load#1"
+    assert runtime["last_operation"]["status"] == "ok"
+
+    logs = manager.provider_logs(provider="ollama", cursor=0, limit=20)["entries"]
+    messages = [str(entry.get("message") or "") for entry in logs]
+    assert any(msg.startswith("[load#1] load begin") for msg in messages)
+    assert any("[load#1] load ok" in msg for msg in messages)
+
+
+def test_provider_stop_rejection_records_operation_telemetry():
+    from app.local_providers.manager import LocalProviderManager
+
+    class _FakeAdapter:
+        def detect_installation(self, cfg):
+            return {"ok": True, "installed": True, "binary": "fake"}
+
+        def resolve_base_url(self, cfg, *, with_v1):
+            return "http://127.0.0.1:1234/v1" if with_v1 else "http://127.0.0.1:1234"
+
+        def poll_status(self, cfg, *, quick=False):
+            return {
+                "ok": True,
+                "server_running": True,
+                "model_loaded": True,
+                "loaded_model": "gpt-oss-20b",
+                "context_length": 8192,
+                "details": {},
+            }
+
+        def list_models(self, cfg):
+            return {"ok": True, "models": ["gpt-oss-20b"]}
+
+        def start_server(self, cfg):
+            return {"ok": True}
+
+        def stop_server(self, cfg):
+            raise AssertionError(
+                "stop_server should not run against external LM Studio"
+            )
+
+        def load_model(self, cfg, *, model, context_length=None):
+            return {"ok": True}
+
+        def unload_model(self, cfg, *, model=None):
+            return {"ok": True}
+
+        def stream_logs(self, cfg, stop_event):
+            if False:
+                yield {}
+
+        def capabilities(self, cfg):
+            return {
+                "start_stop": True,
+                "load_unload": True,
+                "context_length": True,
+                "logs_stream": True,
+            }
+
+    manager = LocalProviderManager(
+        lambda: {
+            "local_provider": "lmstudio",
+            "local_provider_mode": "local-managed",
+            "local_provider_host": "127.0.0.1",
+            "local_provider_port": 1234,
+            "local_provider_api_token": "",
+            "local_provider_preferred_model": "gpt-oss-20b",
+        }
+    )
+    manager._adapters["lmstudio"] = _FakeAdapter()
+
+    result = manager.provider_stop(provider="lmstudio")
+
+    assert result["ok"] is False
+    operation = result["operation"]
+    assert operation["id"] == "stop#1"
+    assert operation["status"] == "error"
+    assert operation["result"]["rejected"] is True
+    assert "outside Float" in operation["result"]["error"]
+    assert result["runtime"]["last_operation"]["id"] == "stop#1"
+    assert result["runtime"]["last_operation"]["status"] == "error"
+
+    logs = manager.provider_logs(provider="lmstudio", cursor=0, limit=20)["entries"]
+    messages = [str(entry.get("message") or "") for entry in logs]
+    assert any(msg.startswith("[stop#1] stop begin") for msg in messages)
+    assert any(
+        "[stop#1] stop error" in msg and "outside Float" in msg for msg in messages
+    )
+
+
+def test_provider_snapshot_marks_external_server_and_loaded_model_as_unowned():
+    from app.local_providers.manager import LocalProviderManager
+
+    class _FakeAdapter:
+        def detect_installation(self, cfg):
+            return {"ok": True, "installed": False, "binary": None}
+
+        def resolve_base_url(self, cfg, *, with_v1):
+            return "http://127.0.0.1:1234/v1" if with_v1 else "http://127.0.0.1:1234"
+
+        def poll_status(self, cfg, *, quick=False):
+            return {
+                "ok": True,
+                "server_running": True,
+                "model_loaded": True,
+                "loaded_model": "gpt-oss-20b",
+                "context_length": 8192,
+                "details": {},
+            }
+
+        def list_models(self, cfg):
+            return {"ok": True, "models": ["gpt-oss-20b"]}
+
+        def capabilities(self, cfg):
+            return {
+                "start_stop": True,
+                "load_unload": True,
+                "context_length": True,
+                "logs_stream": True,
+            }
+
+    manager = LocalProviderManager(
+        lambda: {
+            "local_provider": "lmstudio",
+            "local_provider_mode": "local-managed",
+            "local_provider_host": "127.0.0.1",
+            "local_provider_port": 1234,
+            "local_provider_api_token": "",
+            "local_provider_preferred_model": "gpt-oss-20b",
+        }
+    )
+    manager._adapters["lmstudio"] = _FakeAdapter()
+
+    snapshot = manager.provider_snapshot("lmstudio", refresh_models=True)
+    runtime = snapshot["runtime"]
+    hints = manager.describe_model_locks("gpt-oss-20b", providers=["lmstudio"])
+
+    assert runtime["server_running"] is True
+    assert runtime["server_owned_by_float"] is False
+    assert runtime["loaded_model"] == "gpt-oss-20b"
+    assert runtime["loaded_model_owned_by_float"] is False
+    assert runtime["owned_model_ids"] == []
+    assert len(hints) == 1
+    assert hints[0]["server_owned_by_float"] is False
+    assert hints[0]["loaded_model_owned_by_float"] is False
+    assert hints[0]["loaded_model"] == "gpt-oss-20b"
 
 
 def test_provider_load_stops_when_managed_start_fails():

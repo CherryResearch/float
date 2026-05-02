@@ -5,6 +5,7 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import "../styles/ThreadsTab.css";
 import FilterBar from "./FilterBar";
 import { GlobalContext } from "../main";
+import { getConversationTrimMeta } from "../utils/proxy";
 
 // Parse "#rrggbb" into RGB channels for contrast calculations.
 const parseHexColor = (value) => {
@@ -441,6 +442,7 @@ const ThreadsTab = () => {
   const [optionsOpen, setOptionsOpen] = useState(false);
   const [topBarCollapsed, setTopBarCollapsed] = useState(false);
   const [conversationCache, setConversationCache] = useState({});
+  const [conversationCacheMeta, setConversationCacheMeta] = useState({});
   const [conversationLoadingKey, setConversationLoadingKey] = useState("");
   const [focusedConversation, setFocusedConversation] = useState("");
   const inlineMessageRefs = useRef(new Map());
@@ -797,13 +799,25 @@ const ThreadsTab = () => {
         const encodedName = encodeURIComponent(normalizedConversation);
         const res = await axios.get(`/api/conversations/${encodedName}`);
         const loadedMessages = Array.isArray(res?.data?.messages) ? res.data.messages : [];
+        const trimMeta = getConversationTrimMeta(res?.data);
         setConversationCache((prev) => (
           prev[normalizedConversation] ? prev : { ...prev, [normalizedConversation]: loadedMessages }
+        ));
+        setConversationCacheMeta((prev) => (
+          prev[normalizedConversation] || !trimMeta
+            ? prev
+            : { ...prev, [normalizedConversation]: trimMeta }
         ));
       } catch {
         setConversationCache((prev) => (
           prev[normalizedConversation] ? prev : { ...prev, [normalizedConversation]: [] }
         ));
+        setConversationCacheMeta((prev) => {
+          if (!prev[normalizedConversation]) return prev;
+          const next = { ...prev };
+          delete next[normalizedConversation];
+          return next;
+        });
       } finally {
         setConversationLoadingKey((prev) => (
           prev === normalizedConversation ? "" : prev
@@ -949,6 +963,7 @@ const ThreadsTab = () => {
       const encodedName = encodeURIComponent(normalizedConversation);
       const res = await axios.get(`/api/conversations/${encodedName}`);
       const loadedMessages = Array.isArray(res?.data?.messages) ? res.data.messages : [];
+      const conversationTrimMeta = getConversationTrimMeta(res?.data);
       if (typeof sessionStorage !== "undefined") {
         try {
           sessionStorage.setItem(
@@ -960,6 +975,7 @@ const ThreadsTab = () => {
       setState((prev) => ({
         ...prev,
         conversation: loadedMessages,
+        conversationTrimMeta,
         sessionId: normalizedConversation,
         sessionName: normalizedConversation,
       }));
@@ -1753,9 +1769,16 @@ const ThreadsTab = () => {
     && Array.isArray(conversationCache[activeConversationParam])
     ? conversationCache[activeConversationParam]
     : [];
-  const resolvedInlineMessageIndex = Number.isInteger(activeMessageParam)
+  const activeConversationWindow = activeConversationParam
+    ? conversationCacheMeta[activeConversationParam] || null
+    : null;
+  const activeConversationStartIndex = Number.isInteger(activeConversationWindow?.start_index)
+    ? activeConversationWindow.start_index
+    : 0;
+  const resolvedInlineMessageFullIndex = Number.isInteger(activeMessageParam)
     ? activeMessageParam
     : selectedConversationFallbackIndex;
+  const resolvedInlineMessageIndex = resolvedInlineMessageFullIndex - activeConversationStartIndex;
   const clampedInlineMessageIndex = activeConversationMessages.length
     ? Math.max(0, Math.min(activeConversationMessages.length - 1, resolvedInlineMessageIndex))
     : resolvedInlineMessageIndex;
@@ -2269,6 +2292,7 @@ const ThreadsTab = () => {
                             ) : activeConversationMessages.length ? (
                               <div className="threads-inline-scroll">
                                 {activeConversationMessages.map((message, messageIndex) => {
+                                  const fullMessageIndex = activeConversationStartIndex + messageIndex;
                                   const role = normalizeMessageRole(message);
                                   const roleMarker = formatMessageRole(message);
                                   const isSelectedMessage = messageIndex === clampedInlineMessageIndex;
@@ -2277,8 +2301,8 @@ const ThreadsTab = () => {
                                   return (
                                     <button
                                       type="button"
-                                      key={`${activeConversationParam}-inline-${messageIndex}`}
-                                      ref={bindInlineMessageRef(activeConversationParam, messageIndex)}
+                                      key={`${activeConversationParam}-inline-${fullMessageIndex}`}
+                                      ref={bindInlineMessageRef(activeConversationParam, fullMessageIndex)}
                                       className={`threads-inline-message${
                                         isSelectedMessage ? " is-selected" : ""
                                       }${isNeighborUp ? " is-neighbor-up" : ""}${
@@ -2286,7 +2310,7 @@ const ThreadsTab = () => {
                                       }`}
                                       onClick={(event) => {
                                         event.stopPropagation();
-                                        selectConversationFocus(activeConversationParam, messageIndex);
+                                        selectConversationFocus(activeConversationParam, fullMessageIndex);
                                       }}
                                     >
                                       <span className="threads-inline-message-meta">
@@ -2297,7 +2321,7 @@ const ThreadsTab = () => {
                                         >
                                           {roleMarker}
                                         </span>
-                                        {role} #{messageIndex}
+                                        {role} #{fullMessageIndex}
                                       </span>
                                       <pre className="pre-wrap">
                                         {extractMessageText(message) || "(no text payload)"}

@@ -114,6 +114,12 @@ class OllamaAdapter(LocalProviderAdapter):
                                 context_length = int(raw)
                                 break
         loaded_model = loaded_models[0] if loaded_models else None
+        managed_process = self._managed_process
+        managed_process_pid = (
+            managed_process.pid
+            if managed_process is not None and managed_process.poll() is None
+            else None
+        )
         return {
             "ok": True,
             "server_running": running,
@@ -124,6 +130,7 @@ class OllamaAdapter(LocalProviderAdapter):
             "details": {
                 "version": version or {},
                 "loaded_models": loaded_models,
+                "managed_process_pid": managed_process_pid,
             },
         }
 
@@ -149,10 +156,18 @@ class OllamaAdapter(LocalProviderAdapter):
             return {"ok": False, "error": "Ollama CLI was not found."}
         current = self.poll_status(cfg)
         if current.get("server_running"):
-            return {"ok": True, "note": "Ollama server already running."}
+            result = {"ok": True, "note": "Ollama server already running."}
+            if self._managed_process and self._managed_process.poll() is None:
+                result["pid"] = self._managed_process.pid
+                result["managed_process"] = True
+            return result
         if self._managed_process and self._managed_process.poll() is None:
             if self._wait_until_running(cfg):
-                return {"ok": True}
+                return {
+                    "ok": True,
+                    "pid": self._managed_process.pid,
+                    "managed_process": True,
+                }
         try:
             self._managed_process = subprocess.Popen(
                 [str(install.get("binary") or ""), "serve"],
@@ -166,7 +181,11 @@ class OllamaAdapter(LocalProviderAdapter):
             return {"ok": False, "error": str(exc)}
         if not self._wait_until_running(cfg):
             return {"ok": False, "error": "Ollama server did not become ready in time."}
-        return {"ok": True}
+        return {
+            "ok": True,
+            "pid": self._managed_process.pid if self._managed_process else None,
+            "managed_process": True,
+        }
 
     def stop_server(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
         if self._mode(cfg) == "remote-unmanaged":
@@ -190,7 +209,7 @@ class OllamaAdapter(LocalProviderAdapter):
                 pass
         finally:
             self._managed_process = None
-        return {"ok": True}
+        return {"ok": True, "pid": process.pid, "managed_process": True}
 
     def load_model(
         self,
@@ -216,7 +235,11 @@ class OllamaAdapter(LocalProviderAdapter):
             response.raise_for_status()
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
-        return {"ok": True}
+        return {
+            "ok": True,
+            "endpoint": f"{base}/api/generate",
+            "targets": [chosen],
+        }
 
     def unload_model(
         self,
@@ -260,7 +283,11 @@ class OllamaAdapter(LocalProviderAdapter):
                 errors.append(str(exc))
         if errors:
             return {"ok": False, "error": "; ".join(errors)}
-        return {"ok": True}
+        return {
+            "ok": True,
+            "endpoint": f"{base}/api/generate",
+            "targets": targets,
+        }
 
     def stream_logs(self, cfg: Dict[str, Any], stop_event) -> Iterator[Dict[str, Any]]:
         process = self._managed_process

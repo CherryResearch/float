@@ -2,4 +2,8 @@ device sync and streaming is the planned layer that would let float feel continu
 
 In plain language, this is the feature that would let a desktop, laptop, or other personal device share state and sometimes share a live session too. It matters because float is designed as a persistent assistant, and persistence feels incomplete if it breaks every time the user changes devices.
 
-The trusted-device sync slice is real enough to treat as an alpha preview now, not just a hidden roadmap note, but the broader streaming and multi-device story is still unfinished. Current limits are mostly around copy polish, workspace ergonomics, and the fact that this is not yet a background-sync or generic public-gateway system. The public references for the current shipped surface are `README.md`, `docs/data_directory.md`, and `docs/api_reference.md`.
+The trusted-device sync slice is real enough to treat as an alpha preview now, not just a hidden roadmap note, but the broader streaming and multi-device story is still unfinished. Current limits are mostly around copy polish, workspace ergonomics, and the fact that this is not yet a background-sync or generic public-gateway system.
+
+The 2026-04-12 Cherry consolidation pass exposed a few concrete sync/documentation gaps that should stay visible in this feature area: imported/manual image captions need to be preserved atomically against delayed background caption jobs, generated captions need quality guards before replacing existing captions, CLIP dependency/index state needs clearer surfacing, and conversation import counts should explain the difference between API-visible conversation JSON files and metadata-only sidecars on disk.
+
+The public references for the current shipped surface are `README.md`, `docs/data_directory.md`, and `docs/api_reference.md`.

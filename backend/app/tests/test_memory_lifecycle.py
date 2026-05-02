@@ -178,7 +178,24 @@ def test_remember_uses_shared_relative_weekday_resolution(memory_manager, monkey
         lambda: {"user_timezone": "America/New_York"},
     )
     user = "alice"
-    source_ts = datetime(2026, 3, 15, 14, 0, tzinfo=timezone.utc).timestamp()
+    user_tz = ZoneInfo("America/New_York")
+    future_local = datetime.now(tz=user_tz) + timedelta(days=14)
+    days_until_sunday = (6 - future_local.weekday()) % 7
+    source_local = (future_local + timedelta(days=days_until_sunday)).replace(
+        hour=10,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    expected_local = (source_local + timedelta(days=2)).replace(
+        hour=18,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    source_ts = source_local.astimezone(timezone.utc).timestamp()
+    expected_date = expected_local.date().isoformat()
+    expected_ts = expected_local.astimezone(timezone.utc).timestamp()
     args = {
         "key": "karate_series",
         "value": "user has karate next tuesday at 6pm",
@@ -198,10 +215,8 @@ def test_remember_uses_shared_relative_weekday_resolution(memory_manager, monkey
     stored = memory_manager.get_item("karate_series", touch=False)
     assert stored is not None
     assert "next tuesday" not in stored["value"].lower()
-    assert "2026-03-17" in stored["value"]
-    assert stored["occurs_at"] == pytest.approx(
-        datetime(2026, 3, 17, 22, 0, tzinfo=timezone.utc).timestamp()
-    )
+    assert expected_date in stored["value"]
+    assert stored["occurs_at"] == pytest.approx(expected_ts)
     assert stored["review_at"] == pytest.approx(stored["occurs_at"])
 
 

@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 import requests
 from app import config as app_config
 from app import hooks
+from app.services import privacy_filter_service
 from app.services.text_chunks import chunk_text as shared_chunk_text
 from app.utils.knowledge_store import KnowledgeStore
 from services.weaviate_client import create_client
@@ -1473,6 +1474,11 @@ class RAGService:
         mirror_vector: bool,
         knowledge_id: Optional[str] = None,
     ) -> str:
+        metadata = privacy_filter_service.apply_to_metadata(
+            text,
+            metadata,
+            purpose=str(metadata.get("kind") or metadata.get("type") or "knowledge"),
+        )
         source = str(metadata.get("source") or "").strip()
         if self.canonical_store is None:
             doc_id = self._add_text(text, source, metadata)

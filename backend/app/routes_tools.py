@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from typing import List
 
-from fastapi import APIRouter, HTTPException, Request
-
 from app.tool_catalog import get_tool_catalog, get_tool_catalog_entry, get_tool_limits
+from app.tool_policies import tool_policy_payload
 from app.tools import BUILTIN_TOOLS
+from app.utils import user_settings
+from fastapi import APIRouter, HTTPException, Request
 
 router = APIRouter()
 
@@ -20,11 +21,24 @@ def _available_tool_names(request: Request) -> List[str]:
     return sorted(str(name) for name in BUILTIN_TOOLS.keys())
 
 
+def _with_policy(entry: dict, settings: dict) -> dict:
+    tool_id = str(entry.get("id") or "").strip()
+    if not tool_id:
+        return entry
+    return {**entry, "policy": tool_policy_payload(tool_id, settings)}
+
+
 @router.get("/tools/catalog")
 async def tool_catalog(request: Request) -> dict:
     """Return capability metadata for currently available tools."""
 
-    return {"tools": get_tool_catalog(_available_tool_names(request))}
+    settings = user_settings.load_settings()
+    return {
+        "tools": [
+            _with_policy(entry, settings)
+            for entry in get_tool_catalog(_available_tool_names(request))
+        ]
+    }
 
 
 @router.get("/tools/catalog/{tool_name}")
@@ -34,7 +48,8 @@ async def tool_catalog_entry(tool_name: str, request: Request) -> dict:
     available = set(_available_tool_names(request))
     if tool_name not in available:
         raise HTTPException(status_code=404, detail="Tool not found")
-    return {"tool": get_tool_catalog_entry(tool_name)}
+    settings = user_settings.load_settings()
+    return {"tool": _with_policy(get_tool_catalog_entry(tool_name), settings)}
 
 
 @router.get("/tools/limits")

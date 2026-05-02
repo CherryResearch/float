@@ -36,11 +36,15 @@ def _normalize_tool_path(path: str, *, workspace_only: bool) -> str:
     while normalized.startswith("./"):
         normalized = normalized[2:]
     if workspace_only:
+        if normalized in {"data", "workspace", "data/workspace"}:
+            return "."
         for prefix in ("data/workspace/", "workspace/", "data/"):
             if normalized.startswith(prefix):
                 normalized = normalized[len(prefix) :]
                 break
     else:
+        if normalized == "data":
+            return "."
         if normalized.startswith("data/"):
             normalized = normalized[len("data/") :]
     return normalized or "."
@@ -321,4 +325,11 @@ def write_file(path: str, content: str, *, user: str, signature: str) -> str:
     resolved = _resolve_rooted_path(normalized, workspace_dir)
     resolved.parent.mkdir(parents=True, exist_ok=True)
     resolved.write_text(content, encoding="utf-8")
-    return "written"
+    from app.services import privacy_filter_service
+
+    privacy_decision = privacy_filter_service.decide_sensitivity(
+        content,
+        purpose="write_file",
+    )
+    privacy_notice = privacy_filter_service.notice(privacy_decision)
+    return f"written ({privacy_notice})" if privacy_notice else "written"

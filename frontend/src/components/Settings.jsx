@@ -17,6 +17,7 @@ import "../styles/Settings.css";
 import "../styles/ProgressBar.css";
 
 import { GlobalContext } from "../main";
+import StateInspector from "./StateInspector";
 import {
   DEFAULT_VISUAL_THEME,
   getVisualTheme,
@@ -47,8 +48,20 @@ import {
 } from "../utils/modelUtils";
 import {
   filterChatCapableProviderModels,
+  formatProviderLastOperation,
   isChatCapableProviderModelName,
 } from "../utils/providerRuntime";
+import {
+  buildModelDeleteLockInspectorRows,
+  buildProviderRuntimeInspectorRows,
+  extractStateExplanationMessage,
+  getStateExplanationSummary,
+  getStateExplanationTitle,
+} from "../utils/stateExplanations";
+import {
+  CAPTURE_SENSITIVITY_OPTIONS,
+  getSensitivityTooltip,
+} from "../utils/privacyLevels";
 
 const FLOAT_SETTING_FIELDS = new Set([
   "gpu_memory_fraction",
@@ -76,6 +89,19 @@ const MANAGED_LOCAL_PROVIDERS = new Set([
 ]);
 
 const PROVIDER_RUNTIME_STATUS_POLL_MS = 60000;
+
+const expandSettingsSearchTerm = (value) => {
+  const term = String(value || "").trim().toLowerCase();
+  if (!term) return [];
+  const variants = new Set([term]);
+  if (term.length > 3 && term.endsWith("s")) {
+    variants.add(term.slice(0, -1));
+  }
+  if (term.length > 3 && !term.endsWith("s")) {
+    variants.add(`${term}s`);
+  }
+  return Array.from(variants);
+};
 
 const SETTINGS_SECTIONS = [
   {
@@ -208,6 +234,9 @@ const SETTINGS_SECTIONS = [
       "workflow module",
       "capture retention",
       "capture sensitivity",
+      "privacy filter",
+      "automatic privacy",
+      "memory sensitivity",
       "prompt stack",
       "restrictions",
       "permissions",
@@ -271,13 +300,93 @@ const CAPTURE_RETENTION_OPTIONS = [
   { value: 30, label: "1 month" },
 ];
 
-const CAPTURE_SENSITIVITY_OPTIONS = [
-  { value: "mundane", label: "Mundane" },
-  { value: "public", label: "Public" },
-  { value: "personal", label: "Personal" },
-  { value: "protected", label: "Protected" },
-  { value: "secret", label: "Secret" },
+const PRIVACY_FILTER_MODE_OPTIONS = [
+  {
+    value: "off",
+    label: "Never use it",
+    description: "Do not run the automatic text privacy classifier on writes.",
+  },
+  {
+    value: "auto",
+    label: "Auto on writes",
+    description: "Classify text writes and escalate sensitivity only when the user did not choose one.",
+  },
+  {
+    value: "always",
+    label: "Always check",
+    description: "Classify text writes and report suggestions, while keeping explicit user choices.",
+  },
 ];
+
+const PRIVACY_ROUTE_MODE_OPTIONS = [
+  {
+    value: "off",
+    label: "Do not ask",
+    description: "Do not suggest model routing based on the text privacy classifier.",
+  },
+  {
+    value: "ask",
+    label: "Ask before non-local model",
+    description:
+      "When protected or secret text is detected before an API/server call, pause and suggest continuing locally.",
+  },
+];
+
+const normalizePrivacyFilterMode = (value) => {
+  const raw = String(value || "").trim().toLowerCase();
+  return PRIVACY_FILTER_MODE_OPTIONS.some((option) => option.value === raw) ? raw : "off";
+};
+
+const normalizePrivacyRouteMode = (value) => {
+  const raw = String(value || "").trim().toLowerCase();
+  return PRIVACY_ROUTE_MODE_OPTIONS.some((option) => option.value === raw) ? raw : "off";
+};
+
+const TOOL_WORKFLOW_OPTIONS = [
+  { value: "disabled", label: "Disabled" },
+  { value: "text", label: "Text" },
+  { value: "live", label: "Live" },
+  { value: "both", label: "Both" },
+];
+
+const TOOL_APPROVAL_OPTIONS = [
+  { value: "low", label: "Low" },
+  { value: "high", label: "High" },
+];
+
+const normalizeToolWorkflow = (value, fallback = "text") => {
+  const raw = String(value || "").trim().toLowerCase();
+  return TOOL_WORKFLOW_OPTIONS.some((option) => option.value === raw)
+    ? raw
+    : fallback;
+};
+
+const normalizeToolApproval = (value, fallback = "high") => {
+  const raw = String(value || "").trim().toLowerCase();
+  return TOOL_APPROVAL_OPTIONS.some((option) => option.value === raw)
+    ? raw
+    : fallback;
+};
+
+const normalizeToolPolicy = (policy) => ({
+  workflow: normalizeToolWorkflow(policy?.workflow, "text"),
+  approval: normalizeToolApproval(policy?.approval, "high"),
+  workflows:
+    policy?.workflows && typeof policy.workflows === "object"
+      ? {
+          text: !!policy.workflows.text,
+          live: !!policy.workflows.live,
+        }
+      : {
+          text: ["text", "both"].includes(normalizeToolWorkflow(policy?.workflow, "text")),
+          live: ["live", "both"].includes(normalizeToolWorkflow(policy?.workflow, "text")),
+        },
+  live_auto: !!policy?.live_auto,
+  live_unavailable_reason: String(policy?.live_unavailable_reason || ""),
+});
+
+const toolPolicyControlId = (toolId, field) =>
+  `tool-policy-${field}-${String(toolId || "tool").replace(/[^a-z0-9_-]+/gi, "-")}`;
 
 const DEFAULT_WORKFLOW_CATALOG = {
   workflows: [
@@ -793,6 +902,16 @@ const Settings = () => {
     }
   }, [selectedCustomTheme, themeEditorMode, themeDraftId, showThemeEditor]);
 
+  const formatCeleryStatusNote = (value) => {
+    const raw = String(value || "").trim();
+    if (!raw) return "";
+    const lowered = raw.toLowerCase();
+    if (lowered.includes("broker") || lowered.includes("redis")) {
+      return `${raw}. Background jobs are paused until the broker and worker are running.`;
+    }
+    return raw;
+  };
+
   const applyCelerySnapshot = (snapshot) => {
 
     if (!snapshot || typeof snapshot !== "object") return false;
@@ -837,7 +956,7 @@ const Settings = () => {
 
       statusValue = "offline";
 
-      note = String(snapshot.error);
+      note = formatCeleryStatusNote(snapshot.error);
 
     } else {
 
@@ -1087,6 +1206,9 @@ const Settings = () => {
     stream_backend: "api",
     realtime_model: "gpt-realtime",
     realtime_voice: "alloy",
+    live_agent_mode: "local",
+    live_agent_model: "",
+    live_multimodal_model: "",
     realtime_base_url: "https://api.openai.com/v1/realtime/client_secrets",
     realtime_connect_url: "https://api.openai.com/v1/realtime/calls",
 
@@ -1180,6 +1302,8 @@ const Settings = () => {
   const [captureAllowSummaryFallback, setCaptureAllowSummaryFallback] = useState(
     state.captureAllowSummaryFallback !== false,
   );
+  const [privacyFilterMode, setPrivacyFilterMode] = useState("off");
+  const [privacyRouteMode, setPrivacyRouteMode] = useState("off");
   const [defaultWorkflow, setDefaultWorkflow] = useState(state.workflowProfile || "default");
   const [enabledWorkflowModules, setEnabledWorkflowModules] = useState(
     Array.isArray(state.enabledWorkflowModules) ? state.enabledWorkflowModules : [],
@@ -1219,6 +1343,8 @@ const Settings = () => {
   const [toolCatalogLoading, setToolCatalogLoading] = useState(false);
   const [toolCatalogError, setToolCatalogError] = useState("");
   const [toolCatalogFilter, setToolCatalogFilter] = useState("");
+  const [toolPolicySaving, setToolPolicySaving] = useState("");
+  const [toolPolicyMessage, setToolPolicyMessage] = useState("");
 
   const [availableModels, setAvailableModels] = useState([]);
   const [providerRuntime, setProviderRuntime] = useState(null);
@@ -1244,6 +1370,7 @@ const Settings = () => {
   const [registerModelType, setRegisterModelType] = useState("transformer");
   const [registerModelBusy, setRegisterModelBusy] = useState(false);
   const [registerModelMessage, setRegisterModelMessage] = useState("");
+  const [registerModelExplanation, setRegisterModelExplanation] = useState(null);
   const availableModelSet = useMemo(() => {
     const set = new Set();
     (availableModels || []).forEach((model) => {
@@ -1262,6 +1389,30 @@ const Settings = () => {
     });
     return set;
   }, [registeredLocalModels]);
+
+  const providerModelOptionsSet = useMemo(() => {
+    const set = new Set();
+    (providerModelOptions || []).forEach((model) => {
+      if (typeof model === "string" && model.trim()) {
+        set.add(model.trim());
+      }
+    });
+    return set;
+  }, [providerModelOptions]);
+
+  const providerPreferredModelOptions = useMemo(() => {
+    const seen = new Set();
+    const options = [];
+    const add = (value) => {
+      const model = typeof value === "string" ? value.trim() : "";
+      if (!model || seen.has(model)) return;
+      seen.add(model);
+      options.push(model);
+    };
+    (providerModelOptions || []).forEach(add);
+    add(settings.local_provider_preferred_model);
+    return options;
+  }, [providerModelOptions, settings.local_provider_preferred_model]);
 
   const apiModelsAvailable = Array.isArray(state.apiModels) ? state.apiModels : [];
   const apiModelsAvailableSet = useMemo(
@@ -1376,13 +1527,16 @@ const Settings = () => {
         .trim()
         .toLowerCase()
         .split(/\s+/)
-        .filter(Boolean),
+        .filter(Boolean)
+        .map(expandSettingsSearchTerm),
     [settingsSearch],
   );
   const visibleSettingsSections = useMemo(() => {
     if (!settingsSearchTerms.length) return SETTINGS_SECTIONS;
     return SETTINGS_SECTIONS.filter((section) =>
-      settingsSearchTerms.every((term) => section.searchText.includes(term)),
+      settingsSearchTerms.every((terms) =>
+        terms.some((term) => section.searchText.includes(term)),
+      ),
     );
   }, [settingsSearchTerms]);
   const visibleSettingsSectionIds = useMemo(
@@ -1612,14 +1766,38 @@ const Settings = () => {
       }
       return { key: "local", label: "Local" };
     }
-    if (normalizedField === "vision_model") {
-      return { key: "local", label: "Local" };
-    }
-    if (normalizedField === "rag_embedding_model") {
-      return normalizedValue.startsWith("api:")
-        ? { key: "api", label: "API" }
-        : { key: "local", label: "Local" };
-    }
+      if (normalizedField === "vision_model") {
+        return { key: "local", label: "Local" };
+      }
+      if (
+        normalizedField === "live_agent_model" ||
+        normalizedField === "live_multimodal_model"
+      ) {
+        if (isLocalRuntimeEntry(raw)) {
+          return { key: "provider", label: "Server / LAN" };
+        }
+        if (
+          isDirectLocalGemmaModel(raw) ||
+          info?.lane === "local" ||
+          info?.local_download_supported ||
+          isKnownDirectDownloadModel(raw)
+        ) {
+          return { key: "local", label: "Local" };
+        }
+        if (
+          isProviderFirstGemmaModel(raw) ||
+          info?.lane === "server_lan" ||
+          (info?.provider_supported && !info?.local_download_supported)
+        ) {
+          return { key: "provider", label: "Server / LAN" };
+        }
+        return { key: "local", label: "Local" };
+      }
+      if (normalizedField === "rag_embedding_model") {
+        return normalizedValue.startsWith("api:")
+          ? { key: "api", label: "API" }
+          : { key: "local", label: "Local" };
+      }
     if (normalizedField === "rag_clip_model") {
       return { key: "local", label: "Local" };
     }
@@ -1847,6 +2025,42 @@ const Settings = () => {
     "shimmer",
     "verse",
   ];
+  const liveBridgeSuggestedModels = [
+    "gpt-oss-20b",
+    "gemma-4-E2B-it",
+    "gemma-4-E4B-it",
+    "gemma-4-26B-A4B-it",
+    "gemma-4-31B-it",
+    "pixtral-12b-2409",
+  ];
+  const liveBridgeModelOptions = useMemo(() => {
+    const seen = new Set();
+    const options = [];
+    const add = (value) => {
+      const model = typeof value === "string" ? value.trim() : "";
+      if (!model || seen.has(model)) return;
+      seen.add(model);
+      options.push(model);
+    };
+    liveBridgeSuggestedModels.forEach(add);
+    (providerModelOptions || []).forEach(add);
+    (registeredLocalModels || []).forEach((entry) => add(entry?.alias));
+    filterAvailableModelsForField("transformer_model", availableModels, {
+      includeAll: includeCacheUnfiltered,
+    }).forEach(add);
+    add(settings.live_agent_model);
+    add(settings.live_multimodal_model);
+    add(settings.local_provider_preferred_model);
+    return options;
+  }, [
+    availableModels,
+    includeCacheUnfiltered,
+    providerModelOptions,
+    registeredLocalModels,
+    settings.live_agent_model,
+    settings.live_multimodal_model,
+    settings.local_provider_preferred_model,
+  ]);
   const kittenVoiceOptions = [
     "expr-voice-2-f",
     "expr-voice-3-f",
@@ -1883,6 +2097,18 @@ const Settings = () => {
   const realtimeVoiceIsKnown =
     !settings.realtime_voice ||
     realtimeVoiceOptions.includes(settings.realtime_voice);
+  const normalizedStreamBackend = String(settings.stream_backend || "api")
+    .trim()
+    .toLowerCase();
+  const liveStreamingLaneKey = normalizedStreamBackend === "api" ? "api" : "local";
+  const localLiveTransportValue =
+    normalizedStreamBackend === "livekit" ? "livekit" : "local";
+  const liveStreamingCapabilityField =
+    liveStreamingLaneKey === "api" ? "realtime_model" : "live_agent_model";
+  const liveStreamingCapabilityValue =
+    liveStreamingLaneKey === "api"
+      ? settings.realtime_model
+      : settings.live_agent_model;
 
   const ragEmbeddingPresets = [
     { label: "Hash fallback (local)", value: "simple" },
@@ -2354,6 +2580,9 @@ const Settings = () => {
           stream_backend: data.stream_backend || "api",
           realtime_model: data.realtime_model || "gpt-realtime",
           realtime_voice: data.realtime_voice || "alloy",
+          live_agent_mode: data.live_agent_mode || "local",
+          live_agent_model: data.live_agent_model || "",
+          live_multimodal_model: data.live_multimodal_model || "",
           realtime_base_url:
             data.realtime_base_url ||
             "https://api.openai.com/v1/realtime/client_secrets",
@@ -2588,6 +2817,58 @@ const Settings = () => {
   useEffect(() => {
     refreshToolCatalog();
   }, []);
+
+  const handleToolPolicyChange = async (toolId, field, value) => {
+    const normalizedId = String(toolId || "").trim();
+    if (!normalizedId) return;
+    const currentEntry = (toolCatalog || []).find(
+      (entry) => String(entry?.id || "") === normalizedId,
+    );
+    const currentPolicy = normalizeToolPolicy(currentEntry?.policy);
+    const nextPolicy = {
+      workflow:
+        field === "workflow"
+          ? normalizeToolWorkflow(value, currentPolicy.workflow)
+          : currentPolicy.workflow,
+      approval:
+        field === "approval"
+          ? normalizeToolApproval(value, currentPolicy.approval)
+          : currentPolicy.approval,
+    };
+    const nextPolicyPayload = {
+      ...currentPolicy,
+      ...nextPolicy,
+      workflows: {
+        text: ["text", "both"].includes(nextPolicy.workflow),
+        live: ["live", "both"].includes(nextPolicy.workflow),
+      },
+      overridden: true,
+    };
+    setToolCatalog((prev) =>
+      (prev || []).map((entry) =>
+        String(entry?.id || "") === normalizedId
+          ? { ...entry, policy: nextPolicyPayload }
+          : entry,
+      ),
+    );
+    setToolPolicySaving(`${normalizedId}:${field}`);
+    setToolPolicyMessage("");
+    try {
+      await axios.post("/api/user-settings", {
+        tool_policies: {
+          [normalizedId]: nextPolicy,
+        },
+      });
+      setToolPolicyMessage(
+        `${currentEntry?.display_name || normalizedId} tool policy saved.`,
+      );
+      refreshToolCatalog();
+    } catch (err) {
+      setToolPolicyMessage("Failed to save tool policy.");
+    } finally {
+      setToolPolicySaving("");
+    }
+  };
 
 
 
@@ -2980,7 +3261,7 @@ const Settings = () => {
       ragStatus && typeof ragStatus.embedding_runtime === "object"
         ? ragStatus.embedding_runtime
         : null;
-  const wsLastEventAgo = formatRelativeTime(state.wsLastEventAt);
+    const wsLastEventAgo = formatRelativeTime(state.wsLastEventAt);
     const wsLastEventClock = formatClockTime(state.wsLastEventAt);
     const wsLastEventLabel =
       wsLastEventAgo && wsLastEventClock
@@ -2997,6 +3278,36 @@ const Settings = () => {
       wsErrorMessage && wsErrorMessage.length > 200
         ? `${wsErrorMessage.slice(0, 197)}...`
         : wsErrorMessage;
+    const normalizedWsStatus = normalizeStatus(svcWs);
+    const wsStatusSummary =
+      normalizedWsStatus === "online"
+        ? "Live thought stream connected."
+        : normalizedWsStatus === "loading"
+          ? "Connecting to live thought stream."
+          : "Live thought stream not connected.";
+    const celeryStatusNormalized = normalizeStatus(svcCelery);
+    const celeryNoticeTitle =
+      celeryStatusNormalized === "offline"
+        ? "Background queue unavailable"
+        : celeryStatusNormalized === "degraded"
+          ? "Background queue degraded"
+          : celeryStatusNormalized === "loading"
+            ? "Checking background queue"
+            : "";
+    const celeryNoticeBody =
+      celeryStatusNormalized === "offline"
+        ? "Background jobs will not start until a Celery worker responds."
+        : celeryStatusNormalized === "degraded"
+          ? "Some workers did not respond during the last check."
+          : celeryStatusNormalized === "loading"
+            ? "Fetching worker and task state."
+            : "";
+    const celeryEmptyLabel =
+      celeryStatusNormalized === "offline"
+        ? "Queue unavailable"
+        : celeryLoading
+          ? "Loading tasks"
+          : "No tasks in this view";
     return (
 
       <div className="settings-section">
@@ -3028,6 +3339,10 @@ const Settings = () => {
           </div>
 
         </div>
+
+        <p className="status-summary-copy" role="status">
+          API, websocket, background queue, provider bridge, and storage health.
+        </p>
 
         <div className="status-grid">
 
@@ -3075,7 +3390,7 @@ const Settings = () => {
 
           <div className="status-item" title="WebSocket: /api/ws/thoughts">
 
-            {renderStatusDot(normalizeStatus(svcWs))}
+            {renderStatusDot(normalizedWsStatus)}
 
             <div>
 
@@ -3084,6 +3399,14 @@ const Settings = () => {
               <div className="status-sub status-sub--stacked">
 
                 {renderStatusBadge(svcWs)}
+
+                <span
+                  className={`status-note status-note--primary ${
+                    normalizedWsStatus === "online" ? "" : "warn"
+                  }`}
+                >
+                  {wsStatusSummary}
+                </span>
 
                 {wsLastEventLabel && (
 
@@ -3208,7 +3531,11 @@ const Settings = () => {
 
               {svcCeleryNote && (
 
-                <span className={`status-note ${svcCelery === 'degraded' ? 'warn' : ''}`}>
+                <span
+                  className={`status-note ${
+                    celeryStatusNormalized === 'degraded' ? 'warn' : ''
+                  }`}
+                >
 
                   {svcCeleryNote}
 
@@ -3274,15 +3601,27 @@ const Settings = () => {
 
           </div>
 
-            <div className="inline-flex" style={{ justifyContent: 'space-between', marginTop: 8 }}>
+            {celeryNoticeTitle && (
+              <div
+                className={`celery-notice celery-notice--${celeryStatusNormalized}`}
+                role="status"
+              >
+                <strong>{celeryNoticeTitle}</strong>
+                <span>{celeryNoticeBody}</span>
+              </div>
+            )}
 
-              <div className="inline-flex" style={{ gap: 8 }}>
+            <div className="celery-action-row">
 
-                <label title="Queue name to purge">Queue</label>
+              <div className="celery-action-group">
+
+                <label className="celery-control-label" title="Queue name to purge">
+                  Queue
+                </label>
 
                 <input
 
-                  style={{ width: 160 }}
+                  className="celery-input celery-input--queue"
 
                   type="text"
 
@@ -3294,7 +3633,11 @@ const Settings = () => {
 
                 />
 
-                <label className="inline-flex" style={{ gap: 6 }} title="Terminate running tasks too">
+                <label
+                  className="inline-flex celery-check"
+                  style={{ gap: 6 }}
+                  title="Terminate running tasks too"
+                >
 
                   <input
 
@@ -3368,13 +3711,15 @@ const Settings = () => {
 
               </div>
 
-              <div className="inline-flex" style={{ gap: 8 }}>
+              <div className="celery-action-group celery-action-group--retry">
 
-                <label title="Retry a task by name">Retry name</label>
+                <label className="celery-control-label" title="Retry a task by name">
+                  Retry name
+                </label>
 
                 <input
 
-                  style={{ width: 260 }}
+                  className="celery-input celery-input--retry"
 
                   type="text"
 
@@ -3446,9 +3791,9 @@ const Settings = () => {
 
                     <tr>
 
-                      <td colSpan={6} style={{ textAlign: 'center', opacity: 0.7 }}>
+                      <td colSpan={7} className="celery-empty">
 
-                        no tasks
+                        {celeryEmptyLabel}
 
                       </td>
 
@@ -4030,6 +4375,14 @@ const Settings = () => {
         if (typeof s.capture_allow_summary_fallback === "boolean") {
           setCaptureAllowSummaryFallback(s.capture_allow_summary_fallback);
         }
+        if (typeof s.privacy_filter_mode === "string") {
+          setPrivacyFilterMode(normalizePrivacyFilterMode(s.privacy_filter_mode));
+        }
+        if (typeof s.privacy_filter_route_private_mode === "string") {
+          setPrivacyRouteMode(
+            normalizePrivacyRouteMode(s.privacy_filter_route_private_mode),
+          );
+        }
         if (typeof s.default_workflow === "string" && s.default_workflow.trim()) {
           setDefaultWorkflow(s.default_workflow.trim());
         }
@@ -4490,6 +4843,17 @@ const Settings = () => {
   const providerEndpointReachable =
     !!providerRuntime?.server_running ||
     (providerExternalEndpointMode && providerModelOptions.length > 0);
+  const providerCliName =
+    selectedProviderKey === "ollama"
+      ? "Ollama CLI (ollama)"
+      : selectedProviderKey === "lmstudio"
+        ? "LM Studio CLI (lms)"
+        : "";
+  const providerCliMissing =
+    providerRuntimeInspectable &&
+    !!providerCliName &&
+    !providerExternalEndpointMode &&
+    providerRuntime?.installed === false;
   const providerRuntimeLastError =
     typeof providerRuntime?.last_error === "string"
       ? providerRuntime.last_error.trim()
@@ -4499,12 +4863,58 @@ const Settings = () => {
     /remote load endpoint is unavailable/i.test(providerRuntimeLastError)
       ? providerRuntimeError || ""
       : providerRuntimeError || providerRuntimeLastError;
+  const providerLabelText =
+    formatLocalRuntimeLabel(selectedProviderKey) || selectedProviderKey || "provider";
+  const providerServerOwnershipKnown =
+    typeof providerRuntime?.server_owned_by_float === "boolean";
+  const providerServerOwnedByFloat = providerServerOwnershipKnown
+    ? providerRuntime.server_owned_by_float
+    : true;
+  const providerLoadedModelOwnershipKnown =
+    typeof providerRuntime?.loaded_model_owned_by_float === "boolean";
+  const providerLoadedModelOwnedByFloat = providerLoadedModelOwnershipKnown
+    ? providerRuntime.loaded_model_owned_by_float
+    : providerServerOwnedByFloat;
+  const providerExternalManagedServer =
+    !providerExternalEndpointMode &&
+    !!providerRuntime?.server_running &&
+    providerServerOwnershipKnown &&
+    !providerServerOwnedByFloat;
+  const providerExternalManagedLoadedModel =
+    !!providerRuntime?.loaded_model &&
+    providerLoadedModelOwnershipKnown &&
+    !providerLoadedModelOwnedByFloat;
+  const providerOwnershipGuidance =
+    providerExternalManagedServer || providerExternalManagedLoadedModel
+      ? `${providerLabelText} is already running outside Float${
+          providerRuntime?.base_url ? ` at ${providerRuntime.base_url}` : ""
+        }. Stop it in the external app or switch this lane to External HTTP only before using start, stop, load, unload, or delete here.`
+      : "";
+  const providerCliWarning = providerCliMissing
+    ? providerExternalManagedServer
+      ? `${providerCliName} was not detected on this system PATH${
+          selectedProviderKey === "lmstudio" && settings.lmstudio_path
+            ? " or configured LM Studio CLI path"
+            : ""
+        }. Float can inspect the already-running ${providerLabelText} server${
+          providerRuntime?.base_url ? ` at ${providerRuntime.base_url}` : ""
+        }, but process control stays in the external app until this lane is switched to External HTTP only.`
+      : `${providerCliName} was not detected on this system PATH${
+          selectedProviderKey === "lmstudio" && settings.lmstudio_path
+            ? " or configured LM Studio CLI path"
+            : ""
+        }. Float cannot start, stop, or stream logs for this provider until it is available.`
+    : "";
   const providerRuntimeStatus = !providerRuntimeInspectable
     ? "offline"
     : providerRuntimeLoading && !providerRuntime
       ? "loading"
       : providerRuntimeDisplayError
         ? "offline"
+        : providerExternalManagedServer || providerExternalManagedLoadedModel
+          ? "degraded"
+        : providerCliMissing
+          ? "degraded"
         : providerExternalEndpointMode
           ? providerEndpointReachable
             ? "online"
@@ -4567,15 +4977,21 @@ const Settings = () => {
       .toString()
       .trim();
   const providerRuntimeSummary = providerRuntime?.loaded_model
-    ? isChatCapableProviderModelName(providerRuntime.loaded_model)
-      ? `Loaded: ${providerRuntime.loaded_model}`
-      : `Loaded non-chat model: ${providerRuntime.loaded_model}`
+    ? providerExternalManagedLoadedModel
+      ? isChatCapableProviderModelName(providerRuntime.loaded_model)
+        ? `Loaded outside Float: ${providerRuntime.loaded_model}`
+        : `Loaded non-chat model outside Float: ${providerRuntime.loaded_model}`
+      : isChatCapableProviderModelName(providerRuntime.loaded_model)
+        ? `Loaded: ${providerRuntime.loaded_model}`
+        : `Loaded non-chat model: ${providerRuntime.loaded_model}`
     : providerExternalEndpointMode
       ? providerEndpointReachable
         ? providerTargetModel
           ? `Endpoint reachable. Target: ${providerTargetModel}.`
           : "Endpoint reachable."
         : "Endpoint is not reachable."
+      : providerExternalManagedServer
+        ? "Server is running outside Float."
       : providerRuntime?.server_running
         ? "Server is running without a model loaded."
         : "Server is not running.";
@@ -4583,6 +4999,8 @@ const Settings = () => {
     ? "Inventory polling is available for LM Studio, Ollama, or a custom OpenAI-compatible endpoint."
     : providerRuntimeDisplayError
       ? providerRuntimeDisplayError
+      : providerOwnershipGuidance
+        ? providerOwnershipGuidance
       : providerRuntime?.loaded_model &&
           !isChatCapableProviderModelName(providerRuntime.loaded_model)
         ? `${providerRuntime.loaded_model} looks like an embedding model. Load a language model here for chat requests.`
@@ -4600,8 +5018,27 @@ const Settings = () => {
         providerRuntimeCheckedClock ? ` (${providerRuntimeCheckedClock})` : ""
       }. Automatic provider refresh runs about once per minute.`
     : "Inventory has not been checked yet.";
+  const providerRuntimeLastOperation = formatProviderLastOperation(
+    providerRuntime?.last_operation,
+    runtimeNow,
+  );
+  const providerRuntimeInspectorRows = buildProviderRuntimeInspectorRows({
+    providerKey: selectedProviderKey,
+    providerLabel: providerLabelText,
+    providerRuntime,
+    status: providerRuntimeStatus,
+    summary: providerRuntimeSummary,
+    detail: providerRuntimeDetail,
+    ownershipWarning: providerOwnershipGuidance || providerCliWarning,
+    lastOperation: providerRuntimeLastOperation,
+    actionMessage: providerActionMessage,
+  });
   const providerRuntimeFreshnessTone = providerRuntimeDisplayError
     ? "error"
+    : providerCliWarning
+      ? "warn"
+    : providerExternalManagedServer || providerExternalManagedLoadedModel
+      ? "warn"
     : providerRuntime?.loaded_model
       ? isChatCapableProviderModelName(providerRuntime.loaded_model)
         ? "ok"
@@ -4627,9 +5064,16 @@ const Settings = () => {
     tts_model: "Text-to-speech voice synthesis engine.",
 
     voice_model: "Voice preset for TTS (OpenAI, Kitten, Kokoro).",
-    stream_backend: "Backend used when you start live streaming from chat.",
+    stream_backend:
+      "Primary live streaming lane. API uses OpenAI Realtime; Local groups the Float bridge and legacy LiveKit transports.",
     realtime_model: "OpenAI Realtime model used for live streaming sessions.",
     realtime_voice: "Voice used by OpenAI Realtime during live streaming sessions.",
+    live_agent_mode:
+      "Target runtime lane for non-Realtime live orchestration such as LiveKit or a future Float local bridge.",
+    live_agent_model:
+      "Response model for non-Realtime live orchestration. Keep this separate from the transport model.",
+    live_multimodal_model:
+      "Optional visual-context model for live camera or screen input. Use this when the live response model is not itself multimodal.",
 
     vision_model: "Local caption and image-fallback model used when chat vision is not natively available.",
 
@@ -4697,7 +5141,7 @@ const Settings = () => {
 
     try {
 
-      const generic = ["gpt-4o", "gpt-4.1", "gpt-5-mini", "gpt-5", "gpt-5.1", "gpt-5.2"];
+      const generic = ["gpt-4o", "gpt-4.1", "gpt-5-mini", "gpt-5", "gpt-5.1", "gpt-5.2", "gpt-5.4"];
 
       return models
 
@@ -4944,6 +5388,8 @@ const Settings = () => {
 
     try {
 
+      setRegisterModelMessage("");
+      setRegisterModelExplanation(null);
       setDownloadingModel((prev) => ({ ...prev, [field]: true }));
 
       await axios.delete(`/api/models/${encodeURIComponent(catalogModel)}`,
@@ -4961,12 +5407,21 @@ const Settings = () => {
       setModelAvailable((prev) => ({ ...prev, [field]: false }));
 
       setModelLocalSizes((prev) => ({ ...prev, [field]: 0 }));
+      setRegisterModelExplanation(null);
+      setRegisterModelMessage(`Removed local model '${catalogModel}'.`);
 
       fetchAvailableModels(useCustomModelsFolder ? settings.models_folder : undefined);
 
     } catch (err) {
 
-      alert("Model deletion failed.");
+      const detail = err?.response?.data?.detail || err?.message;
+      const message = extractStateExplanationMessage(detail, "Model deletion failed.");
+      setRegisterModelExplanation({
+        detail,
+        model: catalogModel,
+      });
+      setRegisterModelMessage(message);
+      alert(message);
 
     } finally {
 
@@ -4992,6 +5447,7 @@ const Settings = () => {
     }
     setRegisterModelBusy(true);
     setRegisterModelMessage("");
+    setRegisterModelExplanation(null);
     try {
       const res = await axios.post("/api/models/registered", payload);
       const savedAlias = String(res?.data?.model?.alias || alias || "").trim();
@@ -5006,9 +5462,11 @@ const Settings = () => {
           ? `Registered local model '${savedAlias}'.`
           : "Registered local model.",
       );
+      setRegisterModelExplanation(null);
     } catch (err) {
       const detail = err?.response?.data?.detail || "Failed to register local model.";
       setRegisterModelMessage(String(detail));
+      setRegisterModelExplanation(null);
     } finally {
       setRegisterModelBusy(false);
     }
@@ -5019,6 +5477,7 @@ const Settings = () => {
     if (!modelAlias) return;
     setRegisterModelBusy(true);
     setRegisterModelMessage("");
+    setRegisterModelExplanation(null);
     try {
       await axios.delete(`/api/models/registered/${encodeURIComponent(modelAlias)}`);
       await fetchAvailableModels(
@@ -5052,10 +5511,12 @@ const Settings = () => {
           .post("/api/settings", { transformer_model: fallbackTransformerModel })
           .catch(() => {});
       }
+      setRegisterModelExplanation(null);
       setRegisterModelMessage(`Removed local model '${modelAlias}'.`);
     } catch (err) {
       const detail = err?.response?.data?.detail || "Failed to remove local model.";
       setRegisterModelMessage(String(detail));
+      setRegisterModelExplanation(null);
     } finally {
       setRegisterModelBusy(false);
     }
@@ -5120,6 +5581,9 @@ const Settings = () => {
       stream_backend: s.stream_backend || "api",
       realtime_model: s.realtime_model || "",
       realtime_voice: s.realtime_voice || "",
+      live_agent_mode: s.live_agent_mode || "local",
+      live_agent_model: s.live_agent_model || "",
+      live_multimodal_model: s.live_multimodal_model || "",
       realtime_base_url: s.realtime_base_url || "",
       realtime_connect_url: s.realtime_connect_url || "",
 
@@ -5343,15 +5807,24 @@ const Settings = () => {
             (isLanguageField && suggestedApiLangModels.includes(value))),
       );
       const isSuggested = Boolean(value && suggestions.includes(value));
-      const isAvailable = Boolean(value && availableModelSet.has(value));
+      const isProviderInventory = Boolean(
+        isLanguageField && value && providerModelOptionsSet.has(value),
+      );
+      const isAvailable = Boolean(
+        value && (availableModelSet.has(value) || isProviderInventory),
+      );
       const isRegistered = Boolean(value && registeredModelAliasSet.has(value));
       const optionLaneKey =
         isLanguageField && suggestedApiLangModels.includes(value)
           ? "api"
+          : isProviderInventory
+            ? "provider"
           : getModelLaneMeta(field, value)?.key || laneMeta?.key || "local";
       const className = `model-option ${
         isApiOnly
           ? "model-option-api"
+          : isProviderInventory
+            ? "model-option-provider-available"
           : isAvailable
             ? "model-option-available"
             : isSuggested
@@ -5360,12 +5833,16 @@ const Settings = () => {
       }`;
       const labelText = isApiOnly
         ? `${value} (API)`
+        : isProviderInventory
+          ? `✓ ${value}`
         : isAvailable
           ? `✓ ${value}`
-          : isSuggested
-            ? `☆ ${value}`
-            : value;
-      const providerLabel = describeModelProvider(field, value);
+        : isSuggested
+          ? `☆ ${value}`
+          : value;
+      const providerLabel = isProviderInventory
+        ? "available on provider"
+        : describeModelProvider(field, value);
       return {
         value,
         className,
@@ -5665,6 +6142,9 @@ const Settings = () => {
       stream_backend: settings.stream_backend || "api",
       realtime_model: settings.realtime_model,
       realtime_voice: settings.realtime_voice,
+      live_agent_mode: settings.live_agent_mode,
+      live_agent_model: settings.live_agent_model,
+      live_multimodal_model: settings.live_multimodal_model,
       realtime_base_url: settings.realtime_base_url,
       realtime_connect_url: settings.realtime_connect_url,
 
@@ -5763,6 +6243,7 @@ const Settings = () => {
           !nextSettings.stream_backend ||
           !nextSettings.realtime_model ||
           !nextSettings.realtime_voice ||
+          !nextSettings.live_agent_mode ||
           !nextSettings.realtime_base_url ||
           !nextSettings.realtime_connect_url;
         if (normalizedRealtimeDefaults) {
@@ -5771,6 +6252,9 @@ const Settings = () => {
             stream_backend: nextSettings.stream_backend || "api",
             realtime_model: nextSettings.realtime_model || "gpt-realtime",
             realtime_voice: nextSettings.realtime_voice || "alloy",
+            live_agent_mode: nextSettings.live_agent_mode || "local",
+            live_agent_model: nextSettings.live_agent_model || "",
+            live_multimodal_model: nextSettings.live_multimodal_model || "",
             realtime_base_url:
               nextSettings.realtime_base_url ||
               "https://api.openai.com/v1/realtime/client_secrets",
@@ -5960,6 +6444,8 @@ const Settings = () => {
     );
     const nextWorkflow = String(defaultWorkflow || "default").trim() || "default";
     const nextRetentionDays = Math.max(1, Number(captureRetentionDays) || 7);
+    const nextPrivacyFilterMode = normalizePrivacyFilterMode(privacyFilterMode);
+    const nextPrivacyRouteMode = normalizePrivacyRouteMode(privacyRouteMode);
     setCaptureWorkflowSaving(true);
     setCaptureWorkflowMessage("");
     try {
@@ -5968,9 +6454,13 @@ const Settings = () => {
         capture_default_sensitivity: captureDefaultSensitivity || "personal",
         capture_allow_model_raw_image_access: captureAllowModelRawImageAccess !== false,
         capture_allow_summary_fallback: captureAllowSummaryFallback !== false,
+        privacy_filter_mode: nextPrivacyFilterMode,
+        privacy_filter_route_private_mode: nextPrivacyRouteMode,
         default_workflow: nextWorkflow,
         enabled_workflow_modules: nextModules,
       });
+      setPrivacyFilterMode(nextPrivacyFilterMode);
+      setPrivacyRouteMode(nextPrivacyRouteMode);
       setState((prev) => ({
         ...prev,
         captureRetentionDays: nextRetentionDays,
@@ -5980,7 +6470,7 @@ const Settings = () => {
         workflowProfile: nextWorkflow,
         enabledWorkflowModules: nextModules,
       }));
-      setCaptureWorkflowMessage("Capture and workflow defaults saved.");
+      setCaptureWorkflowMessage("Capture, privacy, and workflow defaults saved.");
     } catch {
       setCaptureWorkflowMessage("Failed to save capture and workflow defaults.");
     } finally {
@@ -6681,7 +7171,7 @@ const Settings = () => {
 
               >
 
-                <optgroup label="defaults">
+                <optgroup label={apiModelGroups.source === "discovered" ? "available" : "defaults"}>
                   {apiModelGroups.defaults.map((m) => {
                     const disabled =
                       apiModelsAvailableSet.size > 0 &&
@@ -6696,7 +7186,7 @@ const Settings = () => {
                 </optgroup>
                 {apiModelGroups.extras.length > 0 && (
                   <optgroup
-                    label={`available${apiModelsAvailable.length ? ` (${apiModelsAvailable.length})` : ""}`}
+                    label="current selection"
                   >
                     {apiModelGroups.extras.map((m) => (
                       <option key={m} value={m}>
@@ -6731,25 +7221,42 @@ const Settings = () => {
 
               >
 
-                {suggestedLangModels.map((m) => (
+                {suggestedLangModels.map((m) => {
+                  const modelAvailableHere =
+                    availableModelSet.has(m) || providerModelOptionsSet.has(m);
+                  const label = isLocalRuntimeEntry(m) ? formatLocalRuntimeLabel(m) : m;
+                  return (
+                    <option
+                      key={m}
+                      value={m}
+                      className={
+                        providerModelOptionsSet.has(m)
+                          ? "model-option model-option-provider-available"
+                          : modelAvailableHere
+                            ? "model-option model-option-available"
+                            : "model-option model-option-suggested"
+                      }
+                    >
+                      {label}
+                    </option>
+                  );
+                })}
 
-                  <option key={m} value={m}>
-
-                    {isLocalRuntimeEntry(m) ? formatLocalRuntimeLabel(m) : m}
-
-                  </option>
-
-                ))}
-
-                {settings.transformer_model && !suggestedLangModels.includes(settings.transformer_model) && (
-
-                  <option value={settings.transformer_model}>
-                    {isLocalRuntimeEntry(settings.transformer_model)
-                      ? formatLocalRuntimeLabel(settings.transformer_model)
-                      : settings.transformer_model}
-                  </option>
-
-                )}
+                {settings.transformer_model &&
+                  !suggestedLangModels.includes(settings.transformer_model) && (
+                    <option
+                      value={settings.transformer_model}
+                      className={
+                        availableModelSet.has(settings.transformer_model)
+                          ? "model-option model-option-available"
+                          : "model-option model-option-unknown"
+                      }
+                    >
+                      {isLocalRuntimeEntry(settings.transformer_model)
+                        ? formatLocalRuntimeLabel(settings.transformer_model)
+                        : settings.transformer_model}
+                    </option>
+                  )}
 
               </select>
 
@@ -6760,7 +7267,9 @@ const Settings = () => {
               </p>
 
               <details className="advanced-block mt-sm">
-                <summary>External provider compatibility (LM Studio / Ollama)</summary>
+                <summary>
+                  External provider compatibility (LM Studio / Ollama / OpenAI-compatible)
+                </summary>
 
                 <label title="Select the external provider bridge used when the local model points at a provider marker.">
                   External Provider
@@ -6813,14 +7322,15 @@ const Settings = () => {
                   />
                 </div>
 
-                <label title="Optional explicit base URL for provider HTTP API.">
+                <label title="Optional explicit base URL for provider HTTP API. Hugging Face router URLs can reuse the stored HF token; OpenAI URLs can reuse the stored OpenAI key.">
                   Provider Base URL
                 </label>
                 <input
                   name="local_provider_base_url"
                   value={settings.local_provider_base_url || ""}
                   onChange={handleChange}
-                  placeholder="http://127.0.0.1:1234/v1"
+                  placeholder="http://127.0.0.1:1234/v1 or https://router.huggingface.co/v1"
+                  title="Set an OpenAI-compatible endpoint. If Provider API Token is blank, Hugging Face URLs use the stored HF token and OpenAI URLs use the stored OpenAI key."
                 />
 
                 <label title="Path to LM Studio CLI binary (lms). Leave empty if it is already on PATH.">
@@ -6845,8 +7355,14 @@ const Settings = () => {
                     settings.local_provider_api_token_set
                       ? "Stored (not displayed)"
                       : "Provider API token (optional)"
-                  }
+                    }
                 />
+                <div className="status-note form-note">
+                  Explicit provider token wins. If blank, Hugging Face router URLs
+                  use the stored HF token and OpenAI API URLs use the stored
+                  OpenAI key; local LM Studio/Ollama endpoints stay unauthenticated
+                  unless you set this field.
+                </div>
                 {!settings.local_provider_api_token &&
                   settings.local_provider_api_token_preview && (
                     <div className="secret-preview">
@@ -6902,7 +7418,15 @@ const Settings = () => {
                         {providerRuntime?.base_url ? ` • ${providerRuntime.base_url}` : ""}
                       </div>
                     </div>
-                    {renderStatusBadge(providerRuntimeStatus)}
+                    <div className="inline-flex" style={{ gap: 8, alignItems: "center" }}>
+                      {renderStatusBadge(providerRuntimeStatus)}
+                      <StateInspector
+                        title="Why this provider runtime is shown"
+                        summary="Provider status combines runtime inventory, ownership checks, and the last bridge action."
+                        rows={providerRuntimeInspectorRows}
+                        ariaLabel="Explain provider runtime state"
+                      />
+                    </div>
                   </div>
                   <p className="status-note" style={{ marginTop: 6 }}>
                     {providerRuntimeSummary}
@@ -6910,10 +7434,25 @@ const Settings = () => {
                   <p className={`status-note${providerRuntimeError ? " warn" : ""}`}>
                     {providerRuntimeDetail}
                   </p>
+                  {providerRuntimeLastOperation ? (
+                    <p
+                      className={`status-note${
+                        providerRuntimeLastOperation.status === "failed" ? " warn" : ""
+                      }`}
+                      title={providerRuntimeLastOperation.title}
+                    >
+                      {providerRuntimeLastOperation.label}
+                    </p>
+                  ) : null}
                   {providerRuntime?.context_length ? (
                     <p className="status-note">
                       Active context length: {providerRuntime.context_length}
                     </p>
+                  ) : null}
+                  {providerCliWarning ? (
+                    <div className="runtime-inline-message runtime-inline-message--error">
+                      {providerCliWarning}
+                    </div>
                   ) : null}
                   <div className="inline-flex" style={{ gap: 10, marginTop: 8, flexWrap: "wrap" }}>
                     <button
@@ -6993,6 +7532,41 @@ const Settings = () => {
                         : undefined
                     }
                   />
+                  {providerRuntimeInspectable && providerPreferredModelOptions.length > 0 && (
+                    <select
+                      className="provider-model-picker"
+                      value={
+                        providerModelOptionsSet.has(settings.local_provider_preferred_model)
+                          ? settings.local_provider_preferred_model
+                          : ""
+                      }
+                      onChange={(event) => {
+                        const nextModel = event.target.value;
+                        if (nextModel) {
+                          commitSettingValue("local_provider_preferred_model", nextModel);
+                        }
+                      }}
+                      title="Models reported by the selected provider runtime."
+                      aria-label="Provider reported models"
+                    >
+                      <option value="">Reported models...</option>
+                      {providerPreferredModelOptions.map((model) => (
+                        <option
+                          key={model}
+                          value={model}
+                          className={
+                            providerModelOptionsSet.has(model)
+                              ? "model-option model-option-provider-available"
+                              : "model-option model-option-unknown"
+                          }
+                        >
+                          {providerModelOptionsSet.has(model)
+                            ? `● ${model}`
+                            : model}
+                        </option>
+                      ))}
+                    </select>
+                  )}
                   {providerRuntimeInspectable && providerModelOptions.length > 0 && (
                     <datalist id="provider-model-options">
                       {providerModelOptions.map((model) => (
@@ -7133,7 +7707,24 @@ const Settings = () => {
               </div>
               {registerModelMessage && (
                 <div className="settings-message model-register-message" role="status">
-                  {registerModelMessage}
+                  <span>{registerModelMessage}</span>
+                  {registerModelExplanation ? (
+                    <StateInspector
+                      title={getStateExplanationTitle(
+                        registerModelExplanation.detail,
+                        "Why this model message is shown",
+                      )}
+                      summary={getStateExplanationSummary(
+                        registerModelExplanation.detail,
+                        "The model library action returned structured source and ownership details.",
+                      )}
+                      rows={buildModelDeleteLockInspectorRows(
+                        registerModelExplanation.detail,
+                        registerModelExplanation.model,
+                      )}
+                      ariaLabel="Explain model library message"
+                    />
+                  ) : null}
                 </div>
               )}
               {registeredLocalModels.length > 0 && (
@@ -7280,10 +7871,14 @@ const Settings = () => {
                             </span>
                             <span className="runtime-inline-chip">
                               {providerRuntime?.model_loaded
-                                ? "loaded"
-                                : providerRuntime?.server_running
-                                  ? "ready"
-                                  : "idle"}
+                                ? providerExternalManagedLoadedModel
+                                  ? "external loaded"
+                                  : "loaded"
+                                : providerExternalManagedServer
+                                  ? "external server"
+                                  : providerRuntime?.server_running
+                                    ? "ready"
+                                    : "idle"}
                             </span>
                             {(providerRuntimeLoading || providerActionBusy) && (
                               <span className="runtime-inline-chip runtime-inline-chip--busy">
@@ -7298,6 +7893,11 @@ const Settings = () => {
                             <p className="status-note form-note">
                               Endpoint: {providerRuntime.base_url}
                             </p>
+                          ) : null}
+                          {providerCliWarning ? (
+                            <div className="runtime-inline-message runtime-inline-message--error">
+                              {providerCliWarning}
+                            </div>
                           ) : null}
                           {providerRuntimeError && (
                             <div className="runtime-inline-message runtime-inline-message--error">
@@ -7461,94 +8061,207 @@ const Settings = () => {
                 <div>
                   <h3>Live streaming</h3>
                   <p className="settings-subcard-copy">
-                    OpenAI Realtime stays the live voice lane. Realtime model and voice are separate from TTS.
+                    OpenAI Realtime is the shipped live voice lane. Transport and live runtime models are kept separate so future local or provider-backed live sessions can use their own response and visual models.
                   </p>
                 </div>
                 <div className="settings-model-heading-meta">
-                  <span className="model-lane-pill model-lane-pill--api">Cloud live</span>
-                  {renderCapabilityStrip("realtime_model", settings.realtime_model)}
+                  {renderLaneSelector(
+                    "live streaming",
+                    liveStreamingLaneKey,
+                    ["local", "api"],
+                    (nextLaneKey) => {
+                      commitSettingValue(
+                        "stream_backend",
+                        nextLaneKey === "api" ? "api" : "local",
+                      );
+                    },
+                  )}
+                  {renderCapabilityStrip(
+                    liveStreamingCapabilityField,
+                    liveStreamingCapabilityValue,
+                  )}
                 </div>
               </div>
-            <label title={fieldTooltips.stream_backend}>
-              Streaming backend
-            </label>
-            <select
-              name="stream_backend"
-              value={settings.stream_backend || "api"}
-              onChange={handleChange}
-              title={fieldTooltips.stream_backend}
-            >
-              <option value="api">OpenAI Realtime (WebRTC)</option>
-              <option value="livekit">LiveKit room</option>
-            </select>
+              {liveStreamingLaneKey === "api" ? (
+                <>
+                  <label title={fieldTooltips.realtime_model}>
+                    Realtime model
+                  </label>
+                  <input
+                    name="realtime_model"
+                    value={settings.realtime_model || ""}
+                    onChange={handleChange}
+                    list="realtime-model-options"
+                    placeholder="gpt-realtime"
+                    title={fieldTooltips.realtime_model}
+                  />
+                  <datalist id="realtime-model-options">
+                    {realtimeModelOptions.map((model) => (
+                      <option key={model} value={model} />
+                    ))}
+                  </datalist>
 
-            <label title={fieldTooltips.realtime_model}>
-              Realtime model
-            </label>
-            <input
-              name="realtime_model"
-              value={settings.realtime_model || ""}
-              onChange={handleChange}
-              list="realtime-model-options"
-              placeholder="gpt-realtime"
-              title={fieldTooltips.realtime_model}
-            />
-            <datalist id="realtime-model-options">
-              {realtimeModelOptions.map((model) => (
-                <option key={model} value={model} />
-              ))}
-            </datalist>
+                  <label title={fieldTooltips.realtime_voice}>
+                    Realtime voice
+                  </label>
+                  <select
+                    name="realtime_voice"
+                    value={settings.realtime_voice || ""}
+                    onChange={handleChange}
+                    title={fieldTooltips.realtime_voice}
+                    className={realtimeVoiceIsKnown ? "" : "field-select--warn"}
+                  >
+                    {realtimeVoiceOptions.map((voice) => (
+                      <option key={voice} value={voice}>
+                        {voice}
+                      </option>
+                    ))}
+                    {settings.realtime_voice &&
+                      !realtimeVoiceOptions.includes(settings.realtime_voice) && (
+                        <option value={settings.realtime_voice}>
+                          {settings.realtime_voice}
+                        </option>
+                      )}
+                  </select>
+                  {!realtimeVoiceIsKnown && (
+                    <p className="status-note warn form-note">
+                      The current live voice is not a supported OpenAI Realtime
+                      voice. Speech models like Voxtral do not belong in this
+                      selector.
+                    </p>
+                  )}
 
-            <label title={fieldTooltips.realtime_voice}>
-              Realtime voice
-            </label>
-            <select
-              name="realtime_voice"
-              value={settings.realtime_voice || ""}
-              onChange={handleChange}
-              title={fieldTooltips.realtime_voice}
-              className={realtimeVoiceIsKnown ? "" : "field-select--warn"}
-            >
-              {realtimeVoiceOptions.map((voice) => (
-                <option key={voice} value={voice}>
-                  {voice}
-                </option>
-              ))}
-              {settings.realtime_voice &&
-                !realtimeVoiceOptions.includes(settings.realtime_voice) && (
-                  <option value={settings.realtime_voice}>
-                    {settings.realtime_voice}
-                  </option>
-                )}
-            </select>
-            {!realtimeVoiceIsKnown && (
-              <p className="status-note warn form-note">
-                The current live voice is not a supported OpenAI Realtime voice.
-                Speech models like Voxtral do not belong in this selector.
-              </p>
-            )}
+                  <label title="Endpoint used by the backend to mint short-lived OpenAI Realtime client secrets.">
+                    Realtime session URL
+                  </label>
+                  <input
+                    name="realtime_base_url"
+                    value={settings.realtime_base_url || ""}
+                    onChange={handleChange}
+                    placeholder="https://api.openai.com/v1/realtime/client_secrets"
+                    title="Endpoint used by the backend to mint short-lived OpenAI Realtime client secrets."
+                  />
 
-            <label title="Endpoint used by the backend to mint short-lived OpenAI Realtime client secrets.">
-              Realtime session URL
-            </label>
-            <input
-              name="realtime_base_url"
-              value={settings.realtime_base_url || ""}
-              onChange={handleChange}
-              placeholder="https://api.openai.com/v1/realtime/client_secrets"
-              title="Endpoint used by the backend to mint short-lived OpenAI Realtime client secrets."
-            />
+                  <label title="Endpoint the browser uses for the OpenAI Realtime WebRTC SDP exchange.">
+                    Realtime connect URL
+                  </label>
+                  <input
+                    name="realtime_connect_url"
+                    value={settings.realtime_connect_url || ""}
+                    onChange={handleChange}
+                    placeholder="https://api.openai.com/v1/realtime/calls"
+                    title="Endpoint the browser uses for the OpenAI Realtime WebRTC SDP exchange."
+                  />
 
-            <label title="Endpoint the browser uses for the OpenAI Realtime WebRTC SDP exchange.">
-              Realtime connect URL
-            </label>
-            <input
-              name="realtime_connect_url"
-              value={settings.realtime_connect_url || ""}
-              onChange={handleChange}
-              placeholder="https://api.openai.com/v1/realtime/calls"
-              title="Endpoint the browser uses for the OpenAI Realtime WebRTC SDP exchange."
-            />
+                  <p className="status-note form-note">
+                    OpenAI Realtime uses a short-lived client secret from the
+                    backend and connects from the browser over WebRTC. The TTS
+                    voice field above is separate and only affects speech
+                    synthesis, not live streaming mode.
+                  </p>
+                  <p className="status-note form-note">
+                    Keep the local lane configured as well if you want a
+                    persistent voice shell to hand camera or tool-heavy turns
+                    off to a separate non-Realtime runtime.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <label title={fieldTooltips.stream_backend}>
+                    Local transport
+                  </label>
+                  <select
+                    name="stream_backend"
+                    value={localLiveTransportValue}
+                    onChange={handleChange}
+                    title={fieldTooltips.stream_backend}
+                  >
+                    <option value="local">Float local bridge</option>
+                    <option value="livekit">LiveKit room</option>
+                  </select>
+
+                  <label title={fieldTooltips.live_agent_mode}>
+                    Live agent mode
+                  </label>
+                  <select
+                    name="live_agent_mode"
+                    value={settings.live_agent_mode || "local"}
+                    onChange={handleChange}
+                    title={fieldTooltips.live_agent_mode}
+                  >
+                    <option value="local">Local</option>
+                    <option value="server">Server / LAN</option>
+                    <option value="api">API</option>
+                  </select>
+
+                  <label title={fieldTooltips.live_agent_model}>
+                    Live agent model
+                  </label>
+                  <input
+                    name="live_agent_model"
+                    value={settings.live_agent_model || ""}
+                    onChange={handleChange}
+                    list="live-bridge-model-options"
+                    placeholder="gemma-4-E4B-it"
+                    title={fieldTooltips.live_agent_model}
+                  />
+                  <div className="model-row-trailing">
+                    {renderCapabilityStrip(
+                      "live_agent_model",
+                      settings.live_agent_model,
+                    )}
+                  </div>
+
+                  <label title={fieldTooltips.live_multimodal_model}>
+                    Live multimodal model
+                  </label>
+                  <input
+                    name="live_multimodal_model"
+                    value={settings.live_multimodal_model || ""}
+                    onChange={handleChange}
+                    list="live-bridge-model-options"
+                    placeholder="gemma-4-E4B-it"
+                    title={fieldTooltips.live_multimodal_model}
+                  />
+                  <div className="model-row-trailing">
+                    {renderCapabilityStrip(
+                      "live_multimodal_model",
+                      settings.live_multimodal_model,
+                    )}
+                  </div>
+
+                  <datalist id="live-bridge-model-options">
+                    {liveBridgeModelOptions.map((model) => (
+                      <option key={model} value={model} />
+                    ))}
+                  </datalist>
+
+                  <p className="status-note form-note">
+                    Live agent model is the response model for the Local lane.
+                    Live multimodal model is the visual model for camera or
+                    screen context when that response model is text-only.
+                  </p>
+                  <p className="status-note form-note">
+                    For Gemma 4 on LM Studio or another provider-backed lane,
+                    keep the voice transport separate and set both the response
+                    and multimodal checkpoints explicitly instead of relying on
+                    the generic caption fallback.
+                  </p>
+                  <p className="status-note form-note">
+                    Float local bridge is the intended path for persistent local
+                    live sessions. LiveKit remains available as a legacy room
+                    transport when you are intentionally running a LiveKit
+                    server.
+                  </p>
+                  {settings.stream_backend === "livekit" && (
+                    <p className="status-note form-note">
+                      LiveKit is currently selected inside the Local lane. The
+                      live agent and multimodal model fields still describe the
+                      non-Realtime runtime returned in session metadata.
+                    </p>
+                  )}
+                </>
+              )}
 
             <label title="Show the current live transcript inside chat while live streaming mode is active.">
               Show live transcript
@@ -7580,20 +8293,6 @@ const Settings = () => {
               title="Start the camera automatically when live streaming mode begins."
             />
 
-            <p className="status-note form-note">
-              OpenAI Realtime uses a short-lived client secret from the backend and
-              connects from the browser over WebRTC. The TTS voice field above is separate
-              and only affects speech synthesis, not live streaming mode.
-            </p>
-            <p className="status-note form-note">
-              Use LiveKit only when you are intentionally running a LiveKit server. Leave
-              the OpenAI URLs at their defaults unless you are targeting a compatible proxy.
-            </p>
-            {settings.stream_backend === "livekit" && (
-              <p className="status-note form-note">
-                OpenAI Realtime model and URL fields are ignored while LiveKit is selected.
-              </p>
-            )}
             <p className="status-note form-note">
               The transcript and camera-start toggles are UI preferences and save
               automatically; backend and model changes still use the main Save button.
@@ -8815,8 +9514,7 @@ const Settings = () => {
               </button>
             </div>
             <p className="status-note">
-              Read-only browser for built-ins today, with source status for MCP and future custom
-              tool management.
+              Set which workflow can see each tool and how much approval it needs before auto use.
             </p>
             <div className="tool-browser-source-card" style={{ marginBottom: 12 }}>
               <div className="status-header">
@@ -8911,6 +9609,11 @@ const Settings = () => {
                 {toolCatalogError}
               </p>
             )}
+            {toolPolicyMessage && (
+              <p className="status-note" style={{ marginTop: 6 }}>
+                {toolPolicyMessage}
+              </p>
+            )}
             {!toolCatalogLoading && !toolCatalogError && filteredToolCatalog.length === 0 ? (
               <div className="tool-browser-empty-state" role="status">
                 <strong>No tools match &quot;{toolCatalogFilter.trim()}&quot;.</strong>
@@ -8925,6 +9628,12 @@ const Settings = () => {
                   }
                   if (entry?.runtime?.network) runtimeHints.push("network");
                   if (entry?.runtime?.filesystem) runtimeHints.push("filesystem");
+                  const policy = normalizeToolPolicy(entry?.policy);
+                  const workflowSelectId = toolPolicyControlId(entry?.id, "workflow");
+                  const approvalSelectId = toolPolicyControlId(entry?.id, "approval");
+                  const policySaving =
+                    toolPolicySaving === `${String(entry?.id || "")}:workflow` ||
+                    toolPolicySaving === `${String(entry?.id || "")}:approval`;
                   return (
                     <article key={entry.id} className="tool-browser-card">
                       <div className="status-header">
@@ -8952,6 +9661,64 @@ const Settings = () => {
                             </span>
                           ))}
                         </div>
+                      )}
+                      <div className="tool-browser-policy-grid">
+                        <label htmlFor={workflowSelectId}>
+                          <span className="tool-browser-label">Workflow availability</span>
+                          <select
+                            id={workflowSelectId}
+                            value={policy.workflow}
+                            aria-label={`${entry.display_name || entry.id} workflow availability`}
+                            disabled={policySaving}
+                            onChange={(event) =>
+                              handleToolPolicyChange(entry.id, "workflow", event.target.value)
+                            }
+                          >
+                            {TOOL_WORKFLOW_OPTIONS.map((option) => (
+                              <option key={option.value} value={option.value}>
+                                {option.label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label htmlFor={approvalSelectId}>
+                          <span className="tool-browser-label">Approval requirement</span>
+                          <select
+                            id={approvalSelectId}
+                            value={policy.approval}
+                            aria-label={`${entry.display_name || entry.id} approval requirement`}
+                            disabled={policySaving}
+                            onChange={(event) =>
+                              handleToolPolicyChange(entry.id, "approval", event.target.value)
+                            }
+                          >
+                            {TOOL_APPROVAL_OPTIONS.map((option) => (
+                              <option key={option.value} value={option.value}>
+                                {option.label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <div className="tool-browser-policy-state">
+                          <span className="tool-browser-chip">
+                            Text {policy.workflows.text ? "on" : "off"}
+                          </span>
+                          <span className="tool-browser-chip">
+                            Live {policy.workflows.live ? "on" : "off"}
+                          </span>
+                          {policy.workflows.live && (
+                            <span className="tool-browser-chip">
+                              {policy.live_auto ? "Live auto" : "Live gated"}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                      {policy.live_unavailable_reason && policy.workflows.live && (
+                        <p className="status-note" style={{ marginTop: 6 }}>
+                          {policy.live_unavailable_reason === "client_resolution_required"
+                            ? "Live mode can see this tool setting, but it still needs the client-resolution bridge before realtime can call it directly."
+                            : "Live mode keeps this out of the realtime tool list while it is marked high approval."}
+                        </p>
                       )}
                       <div className="tool-browser-detail-grid">
                         <div>
@@ -9034,7 +9801,7 @@ const Settings = () => {
                 <label
                   className="field-label"
                   htmlFor="capture-sensitivity"
-                  title="Default sensitivity label attached when a capture is created."
+                  title={getSensitivityTooltip(captureDefaultSensitivity)}
                 >
                   Default capture sensitivity
                 </label>
@@ -9042,6 +9809,7 @@ const Settings = () => {
                   id="capture-sensitivity"
                   value={captureDefaultSensitivity}
                   onChange={(event) => setCaptureDefaultSensitivity(event.target.value)}
+                  title={getSensitivityTooltip(captureDefaultSensitivity)}
                 >
                   {CAPTURE_SENSITIVITY_OPTIONS.map((option) => (
                     <option key={option.value} value={option.value}>
@@ -9079,6 +9847,63 @@ const Settings = () => {
                   Computer observations, camera captures, and screen stills stay transient for
                   this window unless promoted. Promoted captures remain accessible as durable
                   attachments for later memory workflows.
+                </p>
+                <label
+                  className="field-label"
+                  htmlFor="privacy-filter-mode"
+                  title="Automatic first-pass text privacy classification for saved memories, conversations, knowledge, and file writes."
+                >
+                  Text privacy filter on writes
+                </label>
+                <select
+                  id="privacy-filter-mode"
+                  value={privacyFilterMode}
+                  onChange={(event) =>
+                    setPrivacyFilterMode(normalizePrivacyFilterMode(event.target.value))
+                  }
+                >
+                  {PRIVACY_FILTER_MODE_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                <p className="status-note" style={{ marginTop: 6 }}>
+                  {
+                    PRIVACY_FILTER_MODE_OPTIONS.find(
+                      (option) => option.value === normalizePrivacyFilterMode(privacyFilterMode),
+                    )?.description
+                  }{" "}
+                  Uses openai/privacy-filter for text only. Image access remains controlled by
+                  the raw-image and summary-fallback settings above.
+                </p>
+                <label
+                  className="field-label"
+                  htmlFor="privacy-route-mode"
+                  title="Optional preflight before sending protected or secret text to a non-local model."
+                >
+                  Private message rerouting
+                </label>
+                <select
+                  id="privacy-route-mode"
+                  value={privacyRouteMode}
+                  onChange={(event) =>
+                    setPrivacyRouteMode(normalizePrivacyRouteMode(event.target.value))
+                  }
+                >
+                  {PRIVACY_ROUTE_MODE_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                <p className="status-note" style={{ marginTop: 6 }}>
+                  {
+                    PRIVACY_ROUTE_MODE_OPTIONS.find(
+                      (option) => option.value === normalizePrivacyRouteMode(privacyRouteMode),
+                    )?.description
+                  }{" "}
+                  The route is never automatic; it uses the same accept, edit, or deny review card.
                 </p>
                 <label
                   className="field-label"
@@ -9302,16 +10127,75 @@ const Settings = () => {
                   tunnel. The current sync preview still expects a trusted
                   remote Float API and does not replace a real pairing wizard.
                 </p>
+                <h3>Instance sync</h3>
+                <p className="status-note">
+                  Preview a section-by-section merge against another Float instance,
+                  then pull its state here or push this instance there.
+                </p>
+                <label className="field-label" htmlFor="sync-remote-url">
+                  <span>Remote Float URL</span>
+                </label>
+                <input
+                  id="sync-remote-url"
+                  type="text"
+                  value={syncRemoteUrl}
+                  onChange={(event) => setSyncRemoteUrl(event.target.value)}
+                  placeholder="http://192.168.1.25:5000"
+                />
+                <label
+                  className="inline-flex"
+                  style={{ gap: 8, marginTop: 10, alignItems: "center", flexWrap: "wrap" }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={syncLinkToSourceDevice}
+                    onChange={(event) => setSyncLinkToSourceDevice(event.target.checked)}
+                  />
+                  Link synced data to its source device/workspace
+                </label>
+                <label className="field-label" htmlFor="sync-source-namespace">
+                  <span>This device label / namespace</span>
+                </label>
+                <input
+                  id="sync-source-namespace"
+                  type="text"
+                  value={syncSourceNamespace}
+                  onChange={(event) => setSyncSourceNamespace(event.target.value)}
+                  placeholder="desktop"
+                />
+                <p className="status-note">
+                  The remote instance must already be reachable over a private
+                  transport such as a LAN, VPN, or user-operated tunnel. This
+                  preview flow registers a temporary sync device automatically, but
+                  it is not a public discovery or login layer.
+                </p>
+                <p className="status-note">
+                  When source-linking is enabled, receivers keep synced
+                  conversations, attachments, memories, graph state, calendar
+                  events, and knowledge rows under a source namespace so nested
+                  device or workspace deployments can coexist.
+                </p>
                 <div className="inline-flex" style={{ gap: 10, marginTop: 10, flexWrap: "wrap" }}>
                   <button
                     type="button"
                     className="icon-btn"
-                    onClick={() => scrollToSettingsSection("output")}
+                    onClick={handleSyncDefaultsSave}
+                    disabled={syncDefaultsSaving}
                     style={{ marginTop: 0 }}
                   >
-                    Open sync preview
+                    {syncDefaultsSaving ? "Saving..." : "Save sync defaults"}
+                  </button>
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    onClick={previewSync}
+                    disabled={syncBusy || syncActionBusy}
+                    style={{ marginTop: 0 }}
+                  >
+                    {syncBusy ? "Checking..." : "Preview sync"}
                   </button>
                 </div>
+                {syncMessage && <p className="status-note">{syncMessage}</p>}
               </div>
             </section>
           )}
@@ -9414,78 +10298,6 @@ const Settings = () => {
               </button>
             </div>
             {exportMessage && <p className="status-note">{exportMessage}</p>}
-          </div>
-
-          <div className="settings-section">
-            <h3>Instance sync</h3>
-            <p className="status-note">
-              Preview a section-by-section merge against another Float instance,
-              then pull its state here or push this instance there.
-            </p>
-            <label className="field-label" htmlFor="sync-remote-url">
-              <span>Remote Float URL</span>
-            </label>
-            <input
-              id="sync-remote-url"
-              type="text"
-              value={syncRemoteUrl}
-              onChange={(event) => setSyncRemoteUrl(event.target.value)}
-              placeholder="http://192.168.1.25:5000"
-            />
-            <label
-              className="inline-flex"
-              style={{ gap: 8, marginTop: 10, alignItems: "center", flexWrap: "wrap" }}
-            >
-              <input
-                type="checkbox"
-                checked={syncLinkToSourceDevice}
-                onChange={(event) => setSyncLinkToSourceDevice(event.target.checked)}
-              />
-              Link synced data to its source device/workspace
-            </label>
-            <label className="field-label" htmlFor="sync-source-namespace">
-              <span>This device label / namespace</span>
-            </label>
-            <input
-              id="sync-source-namespace"
-              type="text"
-              value={syncSourceNamespace}
-              onChange={(event) => setSyncSourceNamespace(event.target.value)}
-              placeholder="desktop"
-            />
-            <p className="status-note">
-              The remote instance must already be reachable over a private
-              transport such as a LAN, VPN, or user-operated tunnel. This
-              preview flow registers a temporary sync device automatically, but
-              it is not a public discovery or login layer.
-            </p>
-            <p className="status-note">
-              When source-linking is enabled, receivers keep synced
-              conversations, attachments, memories, graph state, calendar
-              events, and knowledge rows under a source namespace so nested
-              device or workspace deployments can coexist.
-            </p>
-            <div className="inline-flex" style={{ gap: 10, marginTop: 10, flexWrap: "wrap" }}>
-              <button
-                type="button"
-                className="icon-btn"
-                onClick={handleSyncDefaultsSave}
-                disabled={syncDefaultsSaving}
-                style={{ marginTop: 0 }}
-              >
-                {syncDefaultsSaving ? "Saving..." : "Save sync defaults"}
-              </button>
-              <button
-                type="button"
-                className="icon-btn"
-                onClick={previewSync}
-                disabled={syncBusy || syncActionBusy}
-                style={{ marginTop: 0 }}
-              >
-                {syncBusy ? "Checking..." : "Preview sync"}
-              </button>
-            </div>
-            {syncMessage && <p className="status-note">{syncMessage}</p>}
           </div>
 
           <div className="settings-section">

@@ -6,10 +6,12 @@ const API_BASE =
 
 const DEVICE_ID_KEY = "device_id";
 const DEVICE_TOKEN_KEY = "device_token";
+const DEVICE_PUBLIC_KEY_KEY = "device_public_key";
 
 export const getStoredDevice = () => ({
   id: localStorage.getItem(DEVICE_ID_KEY) || null,
   token: localStorage.getItem(DEVICE_TOKEN_KEY) || null,
+  publicKey: localStorage.getItem(DEVICE_PUBLIC_KEY_KEY) || null,
 });
 
 export const registerDevice = async (publicKey, name = undefined, capabilities = undefined) => {
@@ -22,14 +24,23 @@ export const registerDevice = async (publicKey, name = undefined, capabilities =
   if (id) {
     localStorage.setItem(DEVICE_ID_KEY, id);
   }
+  if (publicKey) {
+    localStorage.setItem(DEVICE_PUBLIC_KEY_KEY, publicKey);
+  }
   return id;
 };
 
-export const issueToken = async (deviceId, scopes = ["sync", "stream"], ttlSeconds = 3600) => {
+export const issueToken = async (
+  deviceId,
+  scopes = ["sync", "stream"],
+  ttlSeconds = 3600,
+  publicKey = localStorage.getItem(DEVICE_PUBLIC_KEY_KEY) || null,
+) => {
   const res = await axios.post(`${API_BASE}/devices/token`, {
     device_id: deviceId,
     scopes,
     ttl_seconds: ttlSeconds,
+    public_key: publicKey,
   });
   const token = res.data?.token;
   if (token) {
@@ -39,14 +50,19 @@ export const issueToken = async (deviceId, scopes = ["sync", "stream"], ttlSecon
 };
 
 export const ensureDeviceAndToken = async () => {
-  let { id, token } = getStoredDevice();
-  if (!id) {
-    // For Phase 1, generate a simple ephemeral "public key"
-    const pub = crypto.randomUUID();
-    id = await registerDevice(pub, navigator.userAgent.slice(0, 60));
+  let { id, token, publicKey } = getStoredDevice();
+  if (!id || !publicKey) {
+    publicKey = crypto.randomUUID();
+    id = await registerDevice(publicKey, navigator.userAgent.slice(0, 60), {
+      instance_sync: true,
+      requested_scopes: ["sync", "stream"],
+      sync: true,
+      stream: true,
+    });
+    token = null;
   }
   if (!token) {
-    token = await issueToken(id);
+    token = await issueToken(id, ["sync", "stream"], 3600, publicKey);
   }
   return { id, token };
 };

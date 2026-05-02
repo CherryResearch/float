@@ -244,6 +244,12 @@ describe("Settings tools browser", () => {
                 runtime: { executor: "backend_python", network: true, filesystem: false },
                 can_access: ["public search results from supported providers"],
                 limit_hints: ["`max_results` is capped at 10."],
+                policy: {
+                  workflow: "both",
+                  approval: "low",
+                  workflows: { text: true, live: true },
+                  live_auto: true,
+                },
               },
               {
                 id: "open_url",
@@ -433,6 +439,135 @@ describe("Settings tools browser", () => {
       expect(screen.getByText("Open URL")).toBeInTheDocument();
       expect(screen.queryByText("Web Search")).not.toBeInTheDocument();
     });
+  });
+
+  it("saves per-tool workflow and approval policies", async () => {
+    renderWithState();
+
+    const card = (await screen.findByText("Web Search")).closest(".tool-browser-card");
+    expect(card).not.toBeNull();
+    const workflowSelect = within(card).getByRole("combobox", {
+      name: /web search workflow availability/i,
+    });
+    expect(workflowSelect).toHaveValue("both");
+
+    fireEvent.change(workflowSelect, { target: { value: "text" } });
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith("/api/user-settings", {
+        tool_policies: {
+          search_web: {
+            workflow: "text",
+            approval: "low",
+          },
+        },
+      });
+    });
+    expect(await screen.findByText(/Web Search tool policy saved\./i)).toBeInTheDocument();
+  });
+
+  it("makes service outages readable in the status panel", async () => {
+    renderWithState({
+      stateOverrides: {
+        wsStatus: "offline",
+        wsLastError: "connection closed unexpectedly",
+        wsLastErrorAt: Date.now() - 5000,
+      },
+    });
+
+    expect(
+      await screen.findByText(
+        /API, websocket, background queue, provider bridge, and storage health\./i,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Live thought stream not connected.", {
+        selector: ".status-note--primary",
+      }),
+    ).toBeInTheDocument();
+    expect(await screen.findByText("Background queue unavailable")).toBeInTheDocument();
+    expect(
+      screen.getByText("Background jobs will not start until a Celery worker responds."),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Queue unavailable")).toBeInTheDocument();
+  });
+
+  it("explains when a provider server is running outside Float", async () => {
+    settingsResponse = {
+      ...settingsResponse,
+      mode: "local",
+      transformer_model: "lmstudio",
+      local_provider: "lmstudio",
+      local_provider_mode: "local-managed",
+      local_provider_preferred_model: "gpt-oss-20b",
+    };
+    const defaultGet = axios.get.getMockImplementation();
+    axios.get.mockImplementation((url, ...rest) => {
+      if (url === "/api/llm/provider/status") {
+        return Promise.resolve({
+          data: {
+            runtime: {
+              provider: "lmstudio",
+              installed: false,
+              server_running: true,
+              server_owned_by_float: false,
+              model_loaded: true,
+              loaded_model: "gpt-oss-20b",
+              loaded_model_owned_by_float: false,
+              context_length: 8192,
+              base_url: "http://127.0.0.1:1234/v1",
+              capabilities: {
+                start_stop: true,
+                load_unload: true,
+                context_length: true,
+              },
+            },
+          },
+        });
+      }
+      if (url === "/api/llm/provider/models") {
+        return Promise.resolve({
+          data: {
+            models: ["gpt-oss-20b"],
+            runtime: {
+              provider: "lmstudio",
+              installed: false,
+              server_running: true,
+              server_owned_by_float: false,
+              model_loaded: true,
+              loaded_model: "gpt-oss-20b",
+              loaded_model_owned_by_float: false,
+              effective_model_id: "gpt-oss-20b",
+              checked_at: Math.floor(Date.now() / 1000) - 6,
+              base_url: "http://127.0.0.1:1234/v1",
+              capabilities: {
+                start_stop: true,
+                load_unload: true,
+                context_length: true,
+              },
+            },
+          },
+        });
+      }
+      return defaultGet ? defaultGet(url, ...rest) : Promise.resolve({ data: {} });
+    });
+
+    renderWithState({
+      stateOverrides: {
+        transformerModel: "lmstudio",
+      },
+    });
+
+    expect(await screen.findByText("Loaded outside Float: gpt-oss-20b")).toBeInTheDocument();
+    expect(
+      screen.getByText(/switch this lane to External HTTP only before using start, stop, load, unload, or delete here\./i),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("Explain provider runtime state"));
+    const inspector = screen.getByRole("dialog", {
+      name: "Why this provider runtime is shown",
+    });
+    expect(within(inspector).getByText("Owner")).toBeInTheDocument();
+    expect(within(inspector).getByText("outside Float")).toBeInTheDocument();
   });
 
   it("persists the tool review notification toggle", async () => {
@@ -652,13 +787,15 @@ describe("Settings tools browser", () => {
         capture_default_sensitivity: "protected",
         capture_allow_model_raw_image_access: false,
         capture_allow_summary_fallback: true,
+        privacy_filter_mode: "off",
+        privacy_filter_route_private_mode: "off",
         default_workflow: "mini_execution",
         enabled_workflow_modules: ["computer_use", "camera_capture"],
       });
     });
     expect(setState).toHaveBeenCalled();
     expect(
-      await screen.findByText(/capture and workflow defaults saved/i),
+      await screen.findByText(/capture, privacy, and workflow defaults saved/i),
     ).toBeInTheDocument();
   });
 
@@ -741,6 +878,7 @@ describe("Settings tools browser", () => {
     const select = await screen.findByLabelText("Visual theme");
     expect(select).toHaveValue("spring");
     expect(screen.getByRole("option", { name: "Spring" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Blossom" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "Ash" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "Cappucino" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "Sunset Citrus" })).toBeInTheDocument();
@@ -876,7 +1014,9 @@ describe("Settings tools browser", () => {
       transformerModel: "lmstudio",
     });
 
-    expect(await screen.findByText("External provider compatibility (LM Studio / Ollama)")).toBeInTheDocument();
+    expect(
+      await screen.findByText(/External provider compatibility \(LM Studio \/ Ollama \/ OpenAI-compatible\)/i),
+    ).toBeInTheDocument();
     expect(
       screen.getByText(/Direct Transformers checkpoints are the primary local runtime path\./i),
     ).toBeInTheDocument();
@@ -922,6 +1062,85 @@ describe("Settings tools browser", () => {
     expect(freshnessIndicator).toHaveAttribute(
       "title",
       expect.stringContaining("Automatic provider refresh runs about once per minute."),
+    );
+  });
+
+  it("shows the last provider action in settings without requiring raw logs", async () => {
+    settingsResponse = {
+      ...settingsResponse,
+      mode: "local",
+      transformer_model: "lmstudio",
+      local_provider: "lmstudio",
+      devices: [],
+    };
+    const defaultGet = axios.get.getMockImplementation();
+    axios.get.mockImplementation((url, ...rest) => {
+      if (url === "/api/llm/provider/status") {
+        return Promise.resolve({
+          data: {
+            runtime: {
+              provider: "lmstudio",
+              server_running: true,
+              model_loaded: true,
+              loaded_model: "gpt-oss-20b",
+              context_length: 8192,
+              base_url: "http://127.0.0.1:1234/v1",
+              last_operation: {
+                id: "unload#3",
+                action: "unload",
+                status: "ok",
+                model: "gpt-oss-20b",
+                started_at: Math.floor(Date.now() / 1000) - 7,
+                finished_at: Math.floor(Date.now() / 1000) - 6,
+                duration_ms: 412,
+                result: {
+                  note: "Unloaded requested model",
+                  endpoint: "http://127.0.0.1:1234/v1/responses",
+                },
+              },
+            },
+          },
+        });
+      }
+      if (url === "/api/llm/provider/models") {
+        return Promise.resolve({
+          data: {
+            models: ["gpt-oss-20b", "qwen2.5-coder-7b-instruct"],
+            runtime: {
+              provider: "lmstudio",
+              loaded_model: "gpt-oss-20b",
+              effective_model_id: "gpt-oss-20b",
+              checked_at: Math.floor(Date.now() / 1000) - 6,
+              last_operation: {
+                id: "unload#3",
+                action: "unload",
+                status: "ok",
+                model: "gpt-oss-20b",
+                started_at: Math.floor(Date.now() / 1000) - 7,
+                finished_at: Math.floor(Date.now() / 1000) - 6,
+                duration_ms: 412,
+                result: {
+                  note: "Unloaded requested model",
+                  endpoint: "http://127.0.0.1:1234/v1/responses",
+                },
+              },
+            },
+          },
+        });
+      }
+      return defaultGet ? defaultGet(url, ...rest) : Promise.resolve({ data: {} });
+    });
+
+    renderWithState({ transformerModel: "lmstudio" });
+
+    expect(await screen.findByText("Provider bridge runtime")).toBeInTheDocument();
+    const lastAction = await screen.findByText(
+      /Last action: unload#3 ok for gpt-oss-20b/i,
+    );
+    expect(lastAction).toBeInTheDocument();
+    expect(lastAction).toHaveAttribute(
+      "title",
+      expect.stringContaining("Unloaded requested model"),
     );
   });
 
@@ -1105,6 +1324,42 @@ describe("Settings tools browser", () => {
     expect(
       screen.getByText(/not a supported OpenAI Realtime voice/i),
     ).toBeInTheDocument();
+  });
+
+  it("switches live streaming between local and api lanes", async () => {
+    settingsResponse = {
+      ...settingsResponse,
+      stream_backend: "local",
+      live_agent_mode: "server",
+      live_agent_model: "gemma-4-E4B-it",
+      live_multimodal_model: "gemma-4-26B-A4B-it",
+      realtime_model: "gpt-realtime",
+      realtime_voice: "cedar",
+    };
+
+    renderWithState();
+
+    const heading = await screen.findByRole("heading", { name: "Live streaming" });
+    const block = heading.closest(".settings-subcard");
+
+    expect(block).not.toBeNull();
+    expect(
+      within(block).getByRole("button", { name: "Local" }),
+    ).toHaveClass("is-active");
+    expect(within(block).getByDisplayValue("gemma-4-E4B-it")).toBeInTheDocument();
+    expect(
+      within(block).getByDisplayValue("gemma-4-26B-A4B-it"),
+    ).toBeInTheDocument();
+    expect(within(block).getByText("Live agent mode")).toBeInTheDocument();
+    expect(
+      within(block).getByText(/set both the response and multimodal checkpoints explicitly/i),
+    ).toBeInTheDocument();
+
+    fireEvent.click(within(block).getByRole("button", { name: "API" }));
+
+    expect(await within(block).findByDisplayValue("gpt-realtime")).toBeInTheDocument();
+    expect(within(block).getByDisplayValue("cedar")).toBeInTheDocument();
+    expect(within(block).queryByText("Live agent mode")).not.toBeInTheDocument();
   });
 
   it("previews instance sync sections and starts a pull", async () => {

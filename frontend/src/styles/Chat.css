@@ -55,6 +55,27 @@ body.dark-mode .chat-container {
     border: 1px solid var(--glass-border);
 }
 
+.subchat-return-btn {
+    align-self: flex-start;
+    margin: -10px 0 8px;
+    padding: 2px 0;
+    border: none;
+    background: transparent;
+    color: color-mix(in oklab, var(--color-text-muted) 80%, var(--color-lavender) 20%);
+    cursor: pointer;
+    font-size: 0.78rem;
+    font-style: italic;
+    line-height: 1.2;
+}
+
+.subchat-return-btn:hover,
+.subchat-return-btn:focus-visible {
+    color: color-mix(in oklab, var(--color-text) 74%, var(--color-lavender) 26%);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    outline: none;
+}
+
 .popout-btn {
     padding: var(--space-xs) var(--space-sm);
     font-size: 0.8rem;
@@ -91,6 +112,120 @@ body.dark-mode .chat-container {
     backdrop-filter: none;
     -webkit-backdrop-filter: none;
     box-shadow: none;
+}
+
+.conversation-compaction-notice {
+  position: fixed;
+  top: calc(var(--topbar-total-height, 76px) + 10px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1450;
+  width: min(760px, calc(100vw - 56px));
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 14px;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in oklab, var(--color-accent) 28%, var(--glass-border) 72%);
+  border-radius: 8px;
+  background: color-mix(in oklab, var(--glass-tint) 88%, transparent);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.08);
+}
+
+.conversation-compaction-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: min(100%, 260px);
+  color: var(--color-text);
+}
+
+.conversation-compaction-copy strong {
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.conversation-compaction-copy span {
+  font-size: 0.76rem;
+  color: var(--color-text-muted);
+}
+
+.conversation-compaction-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.conversation-compaction-progress {
+  flex-basis: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid color-mix(in oklab, var(--glass-border) 80%, transparent);
+}
+
+.conversation-compaction-progress-track {
+  width: min(320px, 100%);
+}
+
+.conversation-compaction-progress span {
+  font-size: 0.74rem;
+  color: var(--color-text-muted);
+}
+
+.conversation-compaction-mode {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--color-text-muted);
+  font-size: 0.76rem;
+}
+
+.conversation-compaction-mode select {
+  border: 1px solid var(--glass-border);
+  border-radius: 8px;
+  background: color-mix(in oklab, var(--glass-tint) 90%, var(--color-surface) 10%);
+  color: var(--color-text);
+  padding: 5px 8px;
+  font: inherit;
+}
+
+.conversation-compaction-result {
+  flex-basis: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid color-mix(in oklab, var(--glass-border) 80%, transparent);
+  color: var(--color-text-muted);
+  font-size: 0.78rem;
+}
+
+.conversation-compaction-result.is-error {
+  color: color-mix(in oklab, var(--color-error) 82%, var(--color-text) 18%);
+}
+
+.conversation-compaction-meta {
+  font-size: 0.74rem;
+  color: var(--color-text-muted);
+}
+
+.conversation-compaction-result pre {
+  max-height: 180px;
+  margin: 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border-radius: 8px;
+  padding: 8px;
+  background: color-mix(in oklab, var(--color-surface) 76%, transparent);
+  color: var(--color-text);
+  font: 0.76rem/1.45 var(--font-stack);
 }
 
 .live-streaming-indicator {
@@ -365,6 +500,12 @@ body.dark-mode .ai-msg {
     color: color-mix(in oklab, var(--color-accent) 82%, var(--color-text) 18%);
 }
 
+.message-status-pending {
+    border-color: color-mix(in oklab, var(--color-lavender) 55%, var(--glass-border) 45%);
+    background: color-mix(in oklab, var(--color-lavender) 24%, transparent);
+    color: var(--color-text);
+}
+
 .message-status-error {
     border-color: color-mix(in oklab, var(--color-error) 55%, var(--glass-border) 45%);
     background: color-mix(in oklab, var(--color-error) 22%, transparent);
@@ -441,6 +582,12 @@ body.dark-mode .ai-msg {
   filter: brightness(1.04);
 }
 
+.msg-action-chip.needs-tool-continue {
+  border-color: color-mix(in oklab, var(--color-mint-green) 66%, var(--glass-border) 34%);
+  background: color-mix(in oklab, var(--color-mint-green) 16%, var(--glass-tint) 84%);
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--color-mint-green) 14%, transparent);
+}
+
 .msg-action-chip:disabled {
   opacity: 0.58;
   box-shadow: none;
@@ -515,6 +662,79 @@ body.dark-mode .ai-msg {
   outline: none;
 }
 
+.inline-subchat-list {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.inline-subchat-toolbar {
+  display: flex;
+  justify-content: flex-start;
+  gap: 6px;
+}
+
+.inline-subchat-label {
+  font-size: 0.7rem;
+  text-transform: lowercase;
+  color: var(--color-text-muted);
+}
+
+.inline-subchat-items {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.inline-subchat-link {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in oklab, var(--color-lavender) 38%, var(--glass-border) 62%);
+  background: color-mix(in oklab, var(--glass-tint) 88%, transparent);
+  color: var(--color-text);
+  cursor: pointer;
+  text-align: left;
+  transition: transform 120ms ease, box-shadow 120ms ease, border-color 120ms ease;
+}
+
+.inline-subchat-link:hover,
+.inline-subchat-link:focus-visible {
+  transform: translateY(-1px);
+  border-color: color-mix(in oklab, var(--color-accent) 52%, var(--glass-border) 48%);
+  box-shadow: 0 6px 14px color-mix(in oklab, var(--theme-warm-black) 72%, transparent);
+  outline: none;
+}
+
+.inline-subchat-kind,
+.inline-subchat-count {
+  font-size: 0.68rem;
+  text-transform: lowercase;
+  color: var(--color-text-muted);
+  white-space: nowrap;
+}
+
+.inline-subchat-kind {
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--color-lavender) 32%, transparent);
+  color: var(--color-text);
+}
+
+.inline-subchat-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.78rem;
+  font-weight: 650;
+}
+
 .inline-tool-list {
   margin-top: 8px;
   display: flex;
@@ -526,6 +746,15 @@ body.dark-mode .ai-msg {
   display: flex;
   justify-content: flex-end;
   gap: 6px;
+}
+
+.inline-tool-list.has-actionable-tools .inline-tool-toolbar {
+  justify-content: flex-start;
+}
+
+.inline-tool-list.has-actionable-tools .tool-collapse-btn {
+  border-color: color-mix(in oklab, var(--color-accent) 42%, var(--glass-border) 58%);
+  background: color-mix(in oklab, var(--color-accent) 10%, var(--glass-tint) 90%);
 }
 
 .tool-collapse-btn {
@@ -785,8 +1014,13 @@ body.dark-mode .ai-msg {
   align-items: center;
 }
 
+.tool-actions.inline.resolved {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .tool-actions.inline .tool-action-btn {
-  padding: 2px 6px;
+  padding: 3px 8px;
   font-size: 0.7rem;
   line-height: 1.1;
 }
@@ -1033,8 +1267,10 @@ body.dark-mode .ai-msg {
     --input-action-top-width: calc((2 * var(--input-action-size)) + var(--input-action-gap) + 12px);
     --input-action-bottom-width: calc((3 * var(--input-action-size)) + var(--input-send-size) + (3 * var(--input-action-gap)));
     --input-action-rail-width: max(var(--input-action-top-width), var(--input-action-bottom-width));
-    /* Slightly wider than center rail, but avoid clipping */
-    width: min(calc(var(--center-rail-max) + 48px), 96vw);
+    width: min(
+      max(320px, calc(var(--center-rail-width, var(--center-rail-max)) - 24px)),
+      calc(100vw - 16px)
+    );
     padding: calc(var(--space-sm) * 0.7) calc(var(--space-sm) * 0.7) calc(var(--space-sm) * 0.7) calc(1.2rem * 0.7);
     background:
       var(--glass-sheen),
@@ -1066,7 +1302,7 @@ body.dark-mode .ai-msg {
     backdrop-filter: blur(20px) saturate(190%);
     -webkit-backdrop-filter: blur(20px) saturate(190%);
     max-height: calc(100vh - var(--topbar-total-height) - 10px);
-    z-index: 1450; /* above sidebars and bubble-adjacent overlays */
+    z-index: 2150; /* keep composer independent from sidebar open/close state */
     overflow-x: visible;
     overflow-y: auto;
     overscroll-behavior: contain;
@@ -2183,7 +2419,7 @@ body.dark-mode .input-actions .stop-chip {
   height: 48px;
   cursor: pointer;
   box-shadow: 0 10px 24px rgba(28, 92, 48, 0.14);
-  z-index: 1450;
+  z-index: 2150;
 }
 
 body.dark-mode .open-entry-btn {
@@ -2229,6 +2465,9 @@ body.dark-mode .input-actions .composer-action-row-top {
 
 /* Small/portrait: nearly full width and compact controls */
 @media (max-width: 600px), (orientation: portrait) and (max-width: 900px) {
+  .chat-window-resizer {
+    display: none;
+  }
   .input-box {
     width: min(96vw, calc(100vw - 16px));
     padding-right: 12px;
@@ -2316,6 +2555,59 @@ body.dark-mode .input-actions .composer-action-row-top {
   filter: brightness(1.04);
   transform: translateX(-50%) translateY(-1px);
   box-shadow: 0 6px 16px rgba(0,0,0,0.15);
+}
+
+.chat-window-resizer {
+  position: absolute;
+  top: 12px;
+  bottom: 12px;
+  right: -10px;
+  width: 18px;
+  cursor: col-resize;
+  z-index: 4;
+  touch-action: none;
+}
+
+.chat-window-resizer:focus-visible {
+  outline: 2px solid color-mix(in oklab, var(--color-lavender) 55%, transparent);
+  outline-offset: 1px;
+}
+
+.chat-window-resizer::after {
+  content: "";
+  position: absolute;
+  top: 12px;
+  bottom: 12px;
+  left: 50%;
+  width: 2px;
+  transform: translateX(-50%);
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--color-lavender) 55%, transparent);
+  box-shadow:
+    0 0 10px color-mix(in oklab, var(--color-lavender) 24%, transparent),
+    0 0 18px color-mix(in oklab, var(--color-mint-green) 12%, transparent);
+  opacity: 0;
+  transition: opacity 120ms ease, box-shadow 120ms ease, background 120ms ease;
+}
+
+.chat-window-resizer:hover::after,
+.chat-window-resizer:focus-visible::after {
+  opacity: 0.68;
+}
+
+.chat-window-resizer.is-resizing::after {
+  opacity: 0.96;
+  background: color-mix(in oklab, var(--color-lavender) 75%, var(--color-mint-green) 25%);
+  box-shadow:
+    0 0 14px color-mix(in oklab, var(--color-lavender) 34%, transparent),
+    0 0 24px color-mix(in oklab, var(--color-mint-green) 18%, transparent);
+}
+
+body.dark-mode .chat-window-resizer::after {
+  background: color-mix(in oklab, var(--color-indigo) 52%, var(--color-lavender) 48%);
+  box-shadow:
+    0 0 10px color-mix(in oklab, var(--color-indigo) 28%, transparent),
+    0 0 18px color-mix(in oklab, var(--color-lavender) 18%, transparent);
 }
 
 /* Inline message attachments */

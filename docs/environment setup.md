@@ -6,12 +6,11 @@ This document outlines the steps to set up the development environment for the F
 
 ## Prerequisites
 
-- **Python 3.8+**
+- **Python 3.11+**
 - **Poetry** for Python package management.
 - **Node.js 16+** with npm for frontend development.
 - **Docker** (Optional, for containerized deployment).
-- **Redis** (Optional, for Celery task queue).
-- **PostgreSQL** (Optional, for relational database features).
+- **Redis** (Optional, for Celery/background workers).
 
 ---
 
@@ -100,19 +99,19 @@ Open the `.env` file and add your OpenAI API key and any other necessary configu
 # Your OpenAI API Key
 OPENAI_API_KEY=your_openai_api_key
 
-# The default model to use for the API mode
-OPENAI_MODEL=gpt-5
+# The default model to use for API mode
+OPENAI_MODEL=gpt-5.4
 
 # The URL for a local LLM (e.g., Ollama)
 LOCAL_LLM_URL=http://localhost:11434
 ```
 
-Optional Hugging Face settings (backend defaults transfer on):
+Optional Hugging Face settings (backend defaults XET high-performance mode on):
 
 ```env
-# Speed up large downloads via the hf-transfer native lib.
-# The backend sets this to 1 by default; set to 0 to disable.
-# HF_HUB_ENABLE_HF_TRANSFER=0
+# Speed up large downloads through the Hugging Face XET backend.
+# The backend sets this to 1 by default.
+# HF_XET_HIGH_PERFORMANCE=1
 
 # Use an existing HF cache location (backend also auto-detects ~/.cache/huggingface/hub)
 # HF_HOME=C:\\Users\\<you>\\.cache\\huggingface
@@ -222,19 +221,21 @@ docker build -f docker/backend.Dockerfile -t float-backend .
 docker run -p 8000:8000 --env-file .env float-backend
 ```
 
-For a full multi-container setup including the frontend, Redis, and PostgreSQL, you can use the `docker-compose.yml` file:
+For a full multi-container setup including the frontend and optional services, you can use the `docker-compose.yml` file:
 ```bash
 docker-compose up --build
 ```
 
 ---
 
-## Weaviate (RAG)
+## Vector Stores (RAG)
 
-RAG features use a Weaviate vector store.
+RAG defaults to a local Chroma vector mirror stored under `data/databases/chroma/`. SQLite remains the canonical durable store for memory and knowledge rows. Weaviate is still available as an optional backend for experiments or deployments that explicitly choose it, but it is not required for normal local RAG.
+
+### Optional Weaviate
 
 - The Python client (`weaviate-client`) is installed by `poetry install`.
-- A running Weaviate instance is required for persistent knowledge features.
+- A running Weaviate instance is required only when `FLOAT_RAG_BACKEND=weaviate`.
 - Start via Docker Compose (local dev):
   - `docker compose up -d weaviate`
 - Configure URL via env:

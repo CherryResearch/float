@@ -1,14 +1,14 @@
 # float 
 
-float is a latent-thought based learning agent designed to run on locally managed hardware with a focus on privacy. float specializes in efficient latent modeling and data collection and is intended to be modular: designed to be augmented by external systems.
+float is an experimental local-first learning agent designed to run on locally managed hardware with a focus on privacy. float specializes in long-term memory, background reflection, and user-controlled data collection, and is intended to be modular without requiring hosted infrastructure.
 
 please know: float is still in the early stages of development. feedback, testing, and suggestions would be appreciated.
 
-<img width="1920" height="1920" alt="floatlogo_transparent" src="https://github.com/user-attachments/assets/5ac87100-0234-4c72-97b8-7060bfdb407a" />
+<img width="180" alt="float logo" src="docs/resources/floatlogo.png" />
 
 ## Overview
 
-float leverages advanced language models and a modular architecture to provide a robust platform for learning and interaction. It integrates with various tools and APIs to enhance its capabilities. I started working on this app to have a space to learn about AI and create a central, user-controlled platform for researching inference techniques and building domain-specific reinforcement learning sets.
+float leverages language models and a modular architecture to provide a platform for learning and interaction. I started working on this app to have a space to learn about AI and create a central, user-controlled platform for researching inference techniques and building domain-specific reinforcement learning sets. The long-term goal for float is a passive background knowledge agent that can learn, iterate, and model topics from serious research to daily life while keeping local data and user oversight first.
 
 ![Float UI snapshot](docs/ui-snapshot-2026-04-12.png)
 
@@ -19,17 +19,20 @@ float leverages advanced language models and a modular architecture to provide a
 - Privacy levels for memories to prevent automatic RAG uploading secrets to cloud.
 - Built-in tools with approvals and scheduling; tool calls and thought/tool streams show up in the Agent Console.
 - Browser-first computer use with shared session-backed tools, screenshot results in chat, native OpenAI computer-tool passthrough for API mode, and an experimental Windows desktop runtime.
-- Memory + RAG (Chroma) with Knowledge UI, plus threads/semantic tagging.
+- Memory + RAG with Knowledge UI, plus `threads` semantic tagging. Text-based durable memories and flexible embeddings work in tandem.
 - Attachments + media viewer for images, PDFs, and common audio formats.
 - Calendar events + scheduled actions/tasks.
-- Conversation export/import (markdown/json/text) and history management, can ingest OpenAI-style export ZIPs from the History sidebar via file upload (MD/JSON/text/ZIP), currently by selecting a zip and saving a new conversation, but this flow is not yet manually smoke-tested.
+- Conversation export/import (markdown/json/text) and history management, including OpenAI-style export ZIP ingest from the History sidebar via file upload (MD/JSON/text/ZIP), currently by selecting a zip and saving a new conversation, but this flow is not yet manually tested.
+- Reflections: bounded background thought tasks can review recent chats, memories, or a user-supplied question, then store useful notes or follow-ups without becoming an always-on autonomous process.
+- Write history: action/write tracking with tunable retention helps inspect and recover from tool-side changes.
 
 ### Planned / In progress
 - *workflows* chain together models to create a smooth and customizable experience; bounded recursion allows for more complex behavior.
 - *streaming* live, voice, and video based interaction with plans to connect to a Float server (pc -> cloud gpu, or pc -> phone) securely.
 - *file management* float is intended to work with a desktop environment; control over files in the `data/` directory is a long-term goal.
-- *persistence* float is intended to spend more time observing and thinking than responding: independently reasoning about memories, priorities, or tasks while the user is not connected, watching through a live-mode stream, and long-form rolling conversations with context compacting.
+- *persistence* float is intended to spend more time observing and thinking than responding. The current reflection system is bounded and inspectable; unattended background review, live observation, and long-form rolling conversations with context compacting are still being expanded.
 - *proactive* float aims to grow into the ability to message the user directly for clarification while reasoning and to suggest tasks and events (for example, a "project review").
+- *sensitivity detection* privacy-aware routing and masking so sensitive requests can stay local or be redacted before leaving the device.
 
 ## Command entry shortcuts
 float's composer understands inline command tokens so you can trigger tools or search helpers without leaving the textarea. Typing `%{toolname}` (e.g. `%remember ...`) immediately flags the name as a tool call, `./` starts file search, `//` starts embedded-memory search, and `.//` blends both result sets. Suggestions appear alphabetically (like a terminal's `Tab` completion), render with a hyperlink-like treatment, and backspace at the end of a linked argument removes the link without losing the text.
@@ -44,11 +47,12 @@ These inline tokens remain clickable until you delete the trailing space or the 
 
 ## Architecture
 
-- **Language Models**: Local Transformers (GPT-OSS, Qwen 3, Llama 3.1, Gemma) plus OpenAI-compatible API endpoints (OpenAI Responses, LM Studio/Ollama/custom servers). Defaults focus on `gpt-5.4` (API) and `gpt-oss-20b` (local).
-- **Data Store**: SQLite is the canonical store for durable memory, knowledge chunks, and the lightweight graph/claim substrate; Chroma is the local retrieval mirror, and Weaviate remains an optional vector backend. Using tool calls or manual user input, float can update, edit, store and reason about memories. ideally, long form content is kept but not fully vectorized for later naive searches alongside automatic RAG memory.
-- **Tool Calling**: Built-in tools for memory, web, and local files with approvals/scheduling, plus MCP integration for external tool servers.
+- **Language Models**: Local Transformers checkpoints (GPT-OSS and Gemma 4 lanes first), managed local providers (LM Studio/Ollama/custom OpenAI-compatible servers), and cloud API endpoints. Defaults focus on `gpt-5.4` (API) and `gpt-oss-20b` (local). Hugging Face is used for gated local downloads, and API endpoints can be changed to other providers.
+- **Data Store**: SQLite is the canonical store for durable memory, knowledge chunks, and the lightweight graph/claim substrate; Chroma is the local retrieval mirror, and Weaviate remains an optional vector backend. Using tool calls or manual user input, float can update, edit, store, and reason about memories. Ideally, long-form content is preserved without forcing everything into a naive vector-only search path. File-system interaction with markdown in a float workspace is being tested.
+- **Tool Calling**: Built-in tools cover discovery, memory, retrieval, web, managed file access, compaction, reflections, action history, and guarded computer/capture surfaces. MCP remains available for external tool servers but is not required for built-ins.
 - **Modular Design**: Allows for easy replacement of internal models and features.
 - **Privacy**: Locally managed data with encrypted memories and selectively masked API calls allows you to use the same knowledge base across models. 
+- **Workspaces**: each float deployment is based around an internal workspace folder that contains these databases and files, which can be synced selectively, including as nested source-owned workspaces, between devices or instances.
 
 
 ## Setup Instructions
@@ -57,10 +61,8 @@ These inline tokens remain clickable until you delete the trailing space or the 
 
 - **Python 3.11+**
 - **Node.js 16+** with npm (in WSL use NVM)
-- **Redis** (for Celery backend)
---optional
-- *PostgreSQL* (if using a relational database) #is this still used or is it sqlite now?
-- *Docker* (optional, future plan for containerized deployment)
+- **Redis** (optional, for Celery/background workers)
+- *Docker* (optional backend-image experiment; not the recommended alpha path)
 
 ### Dependency Management with Poetry
 
@@ -105,14 +107,14 @@ This installs the Playwright browser runtime, installs Chromium, and runs direct
 
 once launched, navigate to settings, and ensure the url points to https://api.openai.com/v1/responses
 then add your openai API key from platform.openai.com
-  -Float keeps a small default model list, and will also poll the configured provider for available models (via `/api/openai/models`) so newer entries (e.g. `gpt-5.2`) and other OpenAI-compatible providers show up in the selectors.
+  - Float keeps a small default model list, and will also poll the configured provider for available models (via `/api/openai/models`) so current and future provider entries show up in the selectors. The API default is currently `gpt-5.4`.
 
 ### Hugging Face tokens (for gated model downloads)
 
 Some local models (e.g. Gemma) are gated on Hugging Face. Create a personal access token at https://huggingface.co/settings/tokens with read access, accept the model license on the repo page, and set it in Settings (HF Token) or via `HF_TOKEN` / `HUGGINGFACE_HUB_TOKEN` in the environment.
 
 ## Local Providers
-Float can run local inference directly on the machine or through a managed provider.
+Float can run local inference directly on the machine or through a managed provider. Direct local Transformers is intended for checkpoints Float can load itself; managed providers and `Server/LAN` are for OpenAI-compatible runtimes that are already running elsewhere, including LM Studio, Ollama, or another local/server endpoint.
 
 Managed local providers:
 
@@ -133,15 +135,15 @@ Gemma 4 now follows an explicit three-lane split in Float:
 - `Server/LAN`: use LM Studio or another OpenAI-compatible endpoint for larger Gemma 4 deployments such as `gemma-4-E4B-it`, `gemma-4-26B-A4B-it`, and `gemma-4-31B-it`.
 - `Local (on-device)`: direct local Transformers support now targets `gemma-4-E2B-it` as the first real Gemma 4 checkpoint.
 
-Direct local Gemma 4 uses Hugging Face's multimodal `AutoProcessor` + `AutoModelForImageTextToText` path, so `gemma-4-E2B-it` can handle text-only turns and still-image plus text turns locally. The larger Gemma 4 checkpoints remain provider/server-first in this pass and are intentionally not exposed as built-in direct-download recommendations.
+Direct local Gemma 4 uses Hugging Face's multimodal `AutoProcessor` + `AutoModelForImageTextToText` path, so `gemma-4-E2B-it` can handle text-only turns and still-image plus text turns locally. The larger Gemma 4 checkpoints remain provider/server-first in this pass and are intentionally not exposed as built-in direct-download recommendations. Gemma also informs local live/multimodal experiments, but live voice remains API-first in this patch.
 
 Routing snapshot:
 
 - Chat uses `api`, `local`, or `server` mode.
 - Text embeddings use `rag_embedding_model` (`local:*`, `api:*`, or `simple`) and do not automatically follow `server_url`.
 - TTS uses OpenAI `tts-1` / `tts-1-hd` or local `kitten` / `kokoro` style models.
-- Live voice uses OpenAI Realtime by default, with LiveKit kept as a fallback transport.
-- The public capability-by-mode overview lives in `docs/feature_overviews/models-and-runtime-modes.md`.
+- Live voice uses OpenAI Realtime by default. Gemma 4 is not a supported live-voice transport in this pass; use Gemma 4 through the local or server language-model lanes instead. LiveKit remains a fallback/experimental transport, and Pipecat is still an explored pipeline option rather than the default.
+- The public capability-by-mode overview lives in `docs/feature_overviews/models-and-runtime-modes.md`; endpoint details live in `docs/api_reference.md`.
 
 ## Private Sync, Streaming, and Workspaces
 Float should treat sync and live streaming as device-trust problems, not public-account problems.
@@ -154,7 +156,7 @@ The secure individual-focused model is:
 - Per-feature scopes with revocation, so a device can be trusted for sync but not voice, or voice but not file access.
 - No public exposure by default.
 
-OAuth-style login can still make sense for hosted collaboration later, but for a personal Float deployment the first-class path should be trusted devices and scoped sessions.
+OAuth-style login can still make sense for hosted collaboration later, but for a personal float deployment the first-class path should be trusted devices and scoped sessions. Tailscale is recommended as an external layer if this type of remote access is desired.
 
 Workspaces now sit under that same model.
 
@@ -210,7 +212,11 @@ For more detail, see:
 - `docs/feature_overviews/conversations-history-and-storage.md`
 
 
-## Notebooks
+## Developer Notes
+
+These sections are mostly for development and local maintenance. They may move into a dedicated developer README as the public-facing README gets shorter.
+
+### Notebooks
 Run notebooks in the Poetry environment by installing a kernel once:
 `poetry run python -m ipykernel install --user --name float-project --display-name "float (poetry)"`
 
@@ -237,7 +243,7 @@ To create or update a Desktop launcher named lowercase `float`:
 powershell -ExecutionPolicy Bypass -File scripts/create_desktop_shortcut.ps1
 ```
 
-This creates `float.lnk` on your Desktop and uses the existing logo asset `frontend/public/floatgpt.png` (converted to `frontend/public/float.ico`) as the shortcut icon. The shortcut launches `poetry run float` from this repository root.
+This creates `float.lnk` on your Desktop and uses the logo asset `docs/resources/floatlogo.png` (converted to `frontend/public/float.ico`) as the shortcut icon. The shortcut launches `poetry run float` from this repository root.
 
 ### Developer mode (/dev)
 
@@ -331,26 +337,22 @@ LIVEKIT_SECRET=your_livekit_secret
 
 In Realtime API mode the browser streams directly to OpenAI, so `/api/voice/stream` is not used. In LiveKit mode, `/api/voice/connect` returns the room token and the older worker-backed streaming path remains available. Live browser verification is still recommended for microphone permissions, turn-taking, and transcript/event surfacing.
 
-### Model Catalog
+### Runtime and Tool Catalog
 
-| Type                         | Local Examples                                      | API Examples                                              | Notes & Extensions                                          |
-|------------------------------|-----------------------------------------------------|-----------------------------------------------------------|-------------------------------------------------------------|
-| **Turn Detection**            | `webrtcvad`                                         | —                                                         | Speech segmentation via Voice Activity Detection (VAD).     |
-| **ASR (Speech-to-Text)**      | `Whisper.cpp`, `Vosk`, **Voxtral (local)**          | OpenAI Whisper API, **Voxtral API**                       | Voxtral supports low-latency, high-quality ASR.              |
-| **TTS (Text-to-Speech)**      | `Coqui TTS`, `Piper`, **Voxtral (local)**           | OpenAI TTS API, **Voxtral API**                           | Voxtral excels in multilingual and natural voice synthesis.  |
-| **Speech-to-Speech (S2S)**    | **Voxtral (local)**                                 | OpenAI Speech-to-Speech API (Beta), **Voxtral API**       | Voxtral offers streamlined S2S pipelines (local & API).      |
-| **LLM (Language Models)**     | Mistral (GPT-OSS/transformers), Gemma, Paligemma (multimodal)     | OpenAI GPT-4, **GPT-4.1 (tool-call optimized)**, Gemini   | GPT-4.1 excels at structured tool calls.                    |
-| **CV (Computer Vision)**      | OpenCV, Mediapipe                                   | Google Vision API, OpenAI Vision (GPT-4o)                 | Local CV for gestures/faces; API for OCR & image tasks.      |
-| **Embeddings (Text)**         | `sentence-transformers` (all-mpnet-base-v2)         | OpenAI Embeddings API                                     | Local SentenceTransformers are flexible & efficient.         |
-| **Embeddings (Multimodal)**   | CLIP (local), OpenAI CLIP (via GPT-4o)              | OpenAI GPT-4o embeddings, Google Gemini                   | For image-text and audio embeddings.                         |
-| **Extraction & Summarization** | `LangExtract` | — | Distills transcripts into structured summaries that feed embedding stores. |
-| **Observational Context (Visual)** | OpenCV (frame capture), screen-capture scripts     | —                                                         | Snapshots from videos/screens for context injection.         |
-| **Observational Context (Audio)**  | Live stream embeddings (Whisper, Voxtral)          | —                                                         | Segment & embed meaningful audio for context.                |
-| **Tool Calls / API Tooling**  | Internal ETL tools, MCP schema                      | API Proxy Wrappers, **GPT-4.1 dynamic tool calls**        | GPT-4.1’s tool-call features enhance Float’s agent chains.   |
-| **Memory & World Modeling**   | ChromaDB, PostgreSQL Graphs                        | Weaviate                                                  | Embedding stores, graph relationships, proactive updates.    |
+Float's runtime selectors are lane-based rather than a fixed model zoo. The table below describes the current surfaces users are most likely to touch.
 
-
-Use LangExtract to convert transcripts into concise summaries before embedding them for efficient recall.
+| Surface | Current primary paths | Notes |
+| --- | --- | --- |
+| Chat LLM | Cloud API default `gpt-5.4`; direct local default `gpt-oss-20b`; custom OpenAI-compatible API, Server/LAN, LM Studio, or Ollama endpoints. | Chat can route through API, direct local Transformers, managed local providers, or Server/LAN. Runtime parity is still in progress. |
+| Gemma 4 | Direct local `gemma-4-E2B-it`; larger Gemma 4 checkpoints through Server/LAN or managed providers. | Still-image plus text is the current local target. Live/multimodal work is experimental. |
+| Speech and live voice | OpenAI Realtime for live voice; OpenAI TTS/STT by default; local voice paths remain experimental. | Browser microphone and transcript behavior still need live smoke testing after changes. |
+| Retrieval and memory | SQLite durable store, Chroma retrieval mirror, optional provider embeddings, and optional Weaviate backend. | Durable memories and vector retrieval are deliberately separate so private or long-form text does not have to be mirrored everywhere. |
+| Attachments and media | Images, PDFs, and common audio files through chat attachments and the media viewer. | Captions, retrieval indexing, and media metadata are visible in the UI but still evolving. |
+| Tool discovery | `help`, `tool_help`, and `tool_info`. | Default help is curated. Ask for brief detail, a family, or an exact `tool_info` lookup when a model needs schema details. |
+| Core tools | `remember`, `recall`, `search_web`, `crawl`, `read_file`, `list_dir`, `write_file`, tasks/calendar, and action history. | Tool calls are surfaced through chat and the Agent Console, with approvals and recovery paths for risky or malformed calls. |
+| Background reflection | `reflect`, `list_reflections`, and optional `reflect_after_save` from memory tools. | Reflection is bounded background thinking over explicit context, not an unbounded autonomous daemon. |
+| Conversation compaction | `compact_conversation_plan`, `compact_conversation_preview`, and `compact_conversation_write`. | Compaction is staged so a model can plan or preview before writing a compacted conversation artifact. |
+| Guarded/experimental tools | Computer-use, capture, `mcp.call`, shell/patch helpers, and local-model routing. | These are intentionally guarded, hidden from the default tool menu when appropriate, or still being stabilized. |
 
 ## Harmony Message Format
 
@@ -377,7 +379,7 @@ Harmony-formatted responses.
 - Public feature overviews: `docs/feature_overviews/README.md`, `docs/feature_overviews/tools-and-actions.md`, `docs/feature_overviews/models-and-runtime-modes.md`, and `docs/feature_overviews/personalization-and-modules.md`.
 - Workflow runbooks and provider/mode coverage: `docs/feature_overviews/voice-live-and-passthrough.md` and `docs/feature_overviews/models-and-runtime-modes.md`. Model readiness defaults live in `backend/config/model_catalog.yaml`.
 - Modules/add-ons overview: `docs/feature_overviews/personalization-and-modules.md`.
-- SAE inspection/steering is still experimental and not part of the current public snapshot.
+- SAE inspection/steering scaffolding is experimental and intended for user-supplied compatible weights.
 
 ## Companion Codex Skills
 
@@ -385,7 +387,9 @@ Float-specific Codex skills live in a separate repository so the app code and th
 
 - `https://github.com/CherryResearch/float-codex-skills`
 
-### Docker Deployment
+### Docker Backend Image (experimental)
+
+The Poetry launcher is the recommended alpha path. The backend Dockerfile remains available for image experiments, but Docker is not the supported deployment path for this patch.
 
 1. **Build and Run the Backend Image**:
    ```bash
@@ -424,21 +428,15 @@ curl -X POST http://localhost:8000/tools/invoke \
 
 ### Tool Invocation and Model Selection
 
-Float uses the Model Context Protocol to call tools. When the language model
-wants to run a tool it emits a small JSON block, for example:
+Float exposes built-in tools through the backend registry. MCP integration is available for external tool servers, but built-in tools do not require an MCP server. When the language model wants to run a tool it emits a small JSON block, for example:
 
 ```json
-{"name": "search", "parameters": {"q": "weather"}}
+{"name": "search_web", "args": {"query": "weather", "topn": 3}}
 ```
 
-The backend matches the tool by name, executes it and returns the result.  You
-can also use a shorthand such as `[tool: search {"q":"weather"}]` if the model
-is fine‑tuned to recognise that format.
+The backend matches the tool by exact name, executes it, and returns a structured result or error into the same chat flow. The default discovery menu is intentionally curated: use `help` for a compact menu, `help` with `detail="brief"` or a family name for descriptions, and `tool_info` for exact schemas. Compatibility aliases still exist for older calls, but models should prefer canonical names such as `remember`, `recall`, and `compact_conversation.*`.
 
-The `LLMService` can work with external models as well.  Set environment
-variables like `OPENAI_MODEL` or `LOCAL_LLM_URL` and choose the `api`, `local`
-or `dynamic` mode to switch between them.  Use `DYNAMIC_MODEL` and
-`DYNAMIC_PORT` to start additional local servers when required.
+The `LLMService` can work with external models as well. Set environment variables like `OPENAI_MODEL` or `LOCAL_LLM_URL` and choose the `api`, `local`, or `server` mode to switch between them.
 
 ### Supported Models and Defaults
 
@@ -447,15 +445,7 @@ The **Settings** selectors accept any API/local endpoint pair; defaults are pred
 - `gpt-5.4` *(OpenAI API default)*
 - `gpt-oss-20b` *(local default)*
 
-Additional suggested options (kept available, not restricted):
-
-- `qwen3-8b` / `qwen3-70b` *(transformers/OSS)*
-- `llama-3.1-8b` / `llama-3.1-70b` *(transformers/OSS)*
-- `gemma-2b` / `gemma-7b` *(transformers/OSS)*
-- `gemini-3` *(API)*
-- `mistral-7b` *(transformers/OSS)*
-  
-You can point to any endpoint+API key+model combo; presets are hardcoded for convenience, and custom entries are allowed. Hugging Face cache clutter (showing unrelated tiny models) is known; the list will be filtered per modality as the download UX improves. Some downloads may need a manual HF fetch and then selection from `data/models/` until reliability is improved.
+Additional local/server options are allowed through custom endpoints, managed providers, or manually selected local checkpoints. Presets are convenience defaults, not a closed list. Hugging Face cache clutter and modality filtering are still being improved, so some downloads may need a manual HF fetch and then selection from `data/models/`.
 
 > GPT-OSS can handle roughly 7B-20B locally on a modern GPU. 120B-class models usually require a remote GPT-OSS server or multi-GPU setup.
 

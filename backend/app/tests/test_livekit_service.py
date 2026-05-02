@@ -83,11 +83,30 @@ def test_openai_realtime_connect_uses_client_secret_flow(monkeypatch):
         "client_secret": "ephemeral-secret",
         "expires_at": 1_234_567_890,
         "model": "gpt-realtime",
+        "response_model": "gpt-realtime",
+        "multimodal_model": "",
+        "caption_model": "",
         "session": {
             "id": "sess_123",
             "model": "gpt-realtime",
         },
         "session_id": "sess_123",
+        "source": "live",
+        "transport": "webrtc",
+        "mode": "api",
+        "runtime": {
+            "source": "live",
+            "transport_backend": "api",
+            "provider": "openai-realtime",
+            "mode": "api",
+            "response_model": "gpt-realtime",
+            "multimodal_model": "",
+            "caption_model": "",
+            "stt_model": "",
+            "tts_model": "",
+            "voice_model": "marin",
+            "supports_visual_input": False,
+        },
         "voice": "marin",
     }
 
@@ -110,4 +129,111 @@ def test_livekit_connect_returns_room_token():
     assert result["provider"] == "livekit"
     assert result["url"] == "ws://localhost:7880"
     assert result["token"] == "token-for:user-1:float"
+    assert result["runtime"]["provider"] == "livekit"
+    assert result["runtime"]["mode"] == "local"
+    assert result["response_model"] == ""
+    assert result["multimodal_model"] == ""
     assert "float" in service.rooms
+
+
+def test_local_bridge_connect_returns_runtime_metadata():
+    from app.services.livekit_service import LiveKitService
+
+    service = LiveKitService(
+        {
+            "stream_backend": "local",
+            "live_agent_mode": "local",
+            "live_agent_model": "gemma-4-E2B-it",
+            "live_multimodal_model": "gemma-4-E4B-it",
+            "vision_model": "google/paligemma2-3b-pt-224",
+        }
+    )
+
+    result = service.connect("user-1", "float")
+
+    assert result["provider"] == "float-local-live"
+    assert result["transport"] == "local-bridge"
+    assert result["status"] == "planned"
+    assert result["detail"] == (
+        "Local live bridge is selected, but browser duplex audio is not wired yet."
+    )
+    assert result["mode"] == "local"
+    assert result["model"] == "gemma-4-E2B-it"
+    assert result["response_model"] == "gemma-4-E2B-it"
+    assert result["multimodal_model"] == "gemma-4-E4B-it"
+    assert result["caption_model"] == "google/paligemma2-3b-pt-224"
+    assert result["session_id"].startswith("local-live-")
+    assert result["runtime"] == {
+        "source": "live",
+        "transport_backend": "local",
+        "provider": "float-local-live",
+        "mode": "local",
+        "response_model": "gemma-4-E2B-it",
+        "multimodal_model": "gemma-4-E4B-it",
+        "caption_model": "google/paligemma2-3b-pt-224",
+        "stt_model": "",
+        "tts_model": "",
+        "voice_model": "",
+        "supports_visual_input": True,
+    }
+
+
+def test_livekit_connect_reports_live_runtime_models():
+    from app.services.livekit_service import LiveKitService
+
+    service = LiveKitService(
+        {
+            "stream_backend": "livekit",
+            "livekit_api_key": "api-key",
+            "livekit_secret": "secret",
+            "livekit_url": "ws://localhost:7880",
+            "live_agent_mode": "server",
+            "live_agent_model": "gemma-4-E4B-it",
+            "live_multimodal_model": "gemma-4-26B-A4B-it",
+            "vision_model": "google/paligemma2-3b-pt-224",
+        }
+    )
+    service.generate_token = lambda identity, room: f"token-for:{identity}:{room}"
+
+    result = service.connect("user-1", "float")
+
+    assert result["mode"] == "server"
+    assert result["model"] == "gemma-4-E4B-it"
+    assert result["response_model"] == "gemma-4-E4B-it"
+    assert result["multimodal_model"] == "gemma-4-26B-A4B-it"
+    assert result["caption_model"] == "google/paligemma2-3b-pt-224"
+    assert result["runtime"] == {
+        "source": "live",
+        "transport_backend": "livekit",
+        "provider": "livekit",
+        "mode": "server",
+        "response_model": "gemma-4-E4B-it",
+        "multimodal_model": "gemma-4-26B-A4B-it",
+        "caption_model": "google/paligemma2-3b-pt-224",
+        "stt_model": "",
+        "tts_model": "",
+        "voice_model": "",
+        "supports_visual_input": True,
+    }
+
+
+def test_livekit_runtime_defaults_multimodal_to_vision_capable_response_model():
+    from app.services.livekit_service import LiveKitService
+
+    service = LiveKitService(
+        {
+            "stream_backend": "livekit",
+            "livekit_api_key": "api-key",
+            "livekit_secret": "secret",
+            "livekit_url": "ws://localhost:7880",
+            "live_agent_mode": "server",
+            "live_agent_model": "gemma-4-E4B-it",
+            "vision_model": "google/paligemma2-3b-pt-224",
+        }
+    )
+    service.generate_token = lambda identity, room: f"token-for:{identity}:{room}"
+
+    result = service.connect("user-1", "float")
+
+    assert result["multimodal_model"] == "gemma-4-E4B-it"
+    assert result["runtime"]["supports_visual_input"] is True

@@ -1,9 +1,14 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  buildModelGroups,
+  compareModelIds,
   isKnownDownloadableModel,
   resolveLocalCatalogModelId,
   resolveModelForMode,
+  resolveRequestModelForMode,
+  SUGGESTED_LOCAL_MODELS,
+  SUGGESTED_SERVER_MODELS,
 } from "../modelUtils";
 
 describe("modelUtils", () => {
@@ -23,7 +28,66 @@ describe("modelUtils", () => {
     expect(resolveLocalCatalogModelId("openai/gpt-oss-20b")).toBe("gpt-oss-20b");
   });
 
+  it("does not fall back to api or local models for server mode", () => {
+    const selection = {
+      backendMode: "server",
+      apiModel: "gpt-5.4",
+      transformerModel: "",
+      localModel: "gpt-oss-20b",
+    };
+
+    expect(resolveModelForMode(selection)).toBe("");
+    expect(resolveRequestModelForMode(selection)).toBe("");
+  });
+
+  it("keeps provider-first Gemma 4 variants in server suggestions only", () => {
+    expect(SUGGESTED_SERVER_MODELS).toEqual(
+      expect.arrayContaining([
+        "gemma-4-E4B-it",
+        "gemma-4-26B-A4B-it",
+        "gemma-4-31B-it",
+      ]),
+    );
+    expect(SUGGESTED_LOCAL_MODELS).not.toEqual(
+      expect.arrayContaining(["gemma-4-26B-A4B-it", "gemma-4-31B-it"]),
+    );
+  });
+
   it("treats provider-first e4b as downloadable", () => {
     expect(isKnownDownloadableModel("gemma-4-E4B-it")).toBe(true);
+  });
+
+  it("sorts GPT API models newest to oldest", () => {
+    const models = [
+      "deepseek-chat",
+      "gpt-4.1-mini",
+      "gpt-5.4-mini",
+      "gpt-5.5",
+      "gpt-5.5-pro",
+      "gpt-5.4",
+      "gpt-5.4-nano",
+    ].sort(compareModelIds);
+
+    expect(models).toEqual([
+      "gpt-5.5",
+      "gpt-5.5-pro",
+      "gpt-5.4",
+      "gpt-5.4-mini",
+      "gpt-5.4-nano",
+      "gpt-4.1-mini",
+      "deepseek-chat",
+    ]);
+  });
+
+  it("uses live API models as the primary model group when available", () => {
+    const groups = buildModelGroups({
+      defaults: ["gpt-5.4", "gpt-5.4-mini"],
+      discovered: ["gpt-4.1-mini", "gpt-5.5", "gpt-5.4"],
+      current: "gpt-5.4-mini",
+    });
+
+    expect(groups.source).toBe("discovered");
+    expect(groups.defaults).toEqual(["gpt-5.5", "gpt-5.4", "gpt-4.1-mini"]);
+    expect(groups.extras).toEqual(["gpt-5.4-mini"]);
   });
 });

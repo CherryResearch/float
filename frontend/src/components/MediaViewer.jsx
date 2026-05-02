@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { createPortal } from "react-dom";
 import axios from "axios";
 import { useNavigate } from "react-router-dom";
+import StateInspector from "./StateInspector";
 import "../styles/MediaViewer.css";
 
 const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "svg", "webp"];
@@ -74,6 +75,7 @@ const normalizeItems = (items, fallback) => {
         file: item.file || null,
         label: item.label || item.alt || "",
         caption: item.caption || "",
+        captionModel: item.captionModel || item.caption_model || null,
         size:
           typeof item.size === "number" && Number.isFinite(item.size)
             ? item.size
@@ -83,8 +85,20 @@ const normalizeItems = (items, fallback) => {
         relativePath: item.relativePath || item.relative_path || null,
         captureSource: item.captureSource || item.capture_source || null,
         captionStatus: item.captionStatus || item.caption_status || null,
+        captionGeneratedAt: item.captionGeneratedAt || item.caption_generated_at || null,
+        captionUpdatedAt: item.captionUpdatedAt || item.caption_updated_at || null,
+        captionRecordedAt: item.captionRecordedAt || item.caption_recorded_at || null,
         indexStatus: item.indexStatus || item.index_status || null,
         indexWarning: item.indexWarning || item.index_warning || null,
+        indexedAt: item.indexedAt || item.indexed_at || null,
+        embeddingModel: item.embeddingModel || item.embedding_model || null,
+        embeddingDim:
+          typeof item.embeddingDim === "number"
+            ? item.embeddingDim
+            : typeof item.embedding_dim === "number"
+              ? item.embedding_dim
+              : null,
+        clipIndexedAt: item.clipIndexedAt || item.clip_indexed_at || null,
         placeholderCaption:
           typeof item.placeholderCaption === "boolean"
             ? item.placeholderCaption
@@ -121,12 +135,12 @@ const formatBytes = (value) => {
   if (value < 1024) return `${value} B`;
   const units = ["KB", "MB", "GB", "TB"];
   let size = value;
-  let unit = 0;
+  let unit = -1;
   while (size >= 1024 && unit < units.length - 1) {
     size /= 1024;
     unit += 1;
   }
-  return `${size.toFixed(size >= 10 ? 0 : 1)} ${units[unit]}`;
+  return `${size.toFixed(size >= 10 ? 0 : 1)} ${units[Math.max(unit, 0)]}`;
 };
 
 const formatUploadedAt = (value) => {
@@ -134,6 +148,130 @@ const formatUploadedAt = (value) => {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
   return date.toLocaleString();
+};
+
+const firstString = (...values) => {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+};
+
+const normalizeCaptionTracker = (item = {}, metadata = {}) => ({
+  captionStatus: firstString(metadata.caption_status, item.captionStatus),
+  captionModel: firstString(metadata.caption_model, item.captionModel),
+  captionUpdatedAt: firstString(metadata.caption_updated_at, item.captionUpdatedAt),
+  captionGeneratedAt: firstString(
+    metadata.caption_generated_at,
+    item.captionGeneratedAt,
+  ),
+  captionRecordedAt: firstString(
+    metadata.caption_recorded_at,
+    item.captionRecordedAt,
+  ),
+  indexStatus: firstString(metadata.index_status, item.indexStatus),
+  indexedAt: firstString(metadata.indexed_at, item.indexedAt),
+  indexWarning: firstString(metadata.index_warning, item.indexWarning),
+  embeddingModel: firstString(
+    metadata.embedding_model,
+    item.embeddingModel,
+    metadata.clip?.model,
+  ),
+  embeddingDim:
+    typeof metadata.embedding_dim === "number"
+      ? metadata.embedding_dim
+      : typeof item.embeddingDim === "number"
+        ? item.embeddingDim
+        : typeof metadata.clip?.dim === "number"
+          ? metadata.clip.dim
+          : null,
+  clipIndexedAt: firstString(metadata.clip_indexed_at, item.clipIndexedAt),
+  placeholderCaption:
+    metadata.placeholder_caption === true || item.placeholderCaption === true,
+});
+
+export const buildMediaProvenanceRows = (item = {}, metadata = {}) => {
+  const tracker = normalizeCaptionTracker(item, metadata);
+  const captionDate =
+    tracker.captionUpdatedAt || tracker.captionGeneratedAt || tracker.captionRecordedAt;
+  const captionDateLabel = tracker.captionUpdatedAt
+    ? "Caption edited"
+    : tracker.captionGeneratedAt
+      ? "Caption generated"
+      : "Caption date";
+  const imageIndexValue = [
+    tracker.indexStatus,
+    tracker.embeddingModel ? `model ${tracker.embeddingModel}` : "",
+    tracker.embeddingDim ? `${tracker.embeddingDim} dims` : "",
+  ]
+    .filter(Boolean)
+    .join(" | ");
+  return [
+    tracker.captionStatus
+      ? { label: "Caption status", value: tracker.captionStatus }
+      : null,
+    tracker.captionModel
+      ? { label: "Caption model", value: tracker.captionModel }
+      : null,
+    captionDate
+      ? { label: captionDateLabel, value: formatUploadedAt(captionDate) || captionDate }
+      : null,
+    imageIndexValue ? { label: "Index state", value: imageIndexValue } : null,
+    tracker.indexedAt
+      ? { label: "Indexed", value: formatUploadedAt(tracker.indexedAt) || tracker.indexedAt }
+      : null,
+    tracker.clipIndexedAt && tracker.clipIndexedAt !== tracker.indexedAt
+      ? {
+          label: "CLIP indexed",
+          value: formatUploadedAt(tracker.clipIndexedAt) || tracker.clipIndexedAt,
+        }
+      : null,
+    tracker.indexWarning ? { label: "Index warning", value: tracker.indexWarning } : null,
+    tracker.placeholderCaption ? { label: "Caption quality", value: "placeholder" } : null,
+  ].filter(Boolean);
+};
+
+export const buildMediaStateInspectorRows = (item = {}, metadata = {}) => {
+  const tracker = normalizeCaptionTracker(item, metadata);
+  const contentHash = firstString(item.contentHash, item.content_hash, metadata.content_hash);
+  const source = firstString(
+    item.origin,
+    metadata.origin,
+    item.captureSource,
+    metadata.capture_source,
+    item.relativePath,
+    metadata.relative_path,
+  );
+  const captionDate =
+    tracker.captionUpdatedAt || tracker.captionGeneratedAt || tracker.captionRecordedAt;
+  const indexState = [
+    tracker.indexStatus,
+    tracker.embeddingModel ? `model ${tracker.embeddingModel}` : "",
+    tracker.embeddingDim ? `${tracker.embeddingDim} dims` : "",
+  ]
+    .filter(Boolean)
+    .join(" | ");
+  return [
+    { label: "Source", value: source || "attachment metadata" },
+    {
+      label: "Caption",
+      value: [
+        tracker.captionStatus,
+        tracker.captionModel ? `model ${tracker.captionModel}` : "",
+        captionDate ? formatUploadedAt(captionDate) || captionDate : "",
+      ]
+        .filter(Boolean)
+        .join(" | "),
+    },
+    { label: "Index", value: indexState || tracker.indexWarning },
+    { label: "Evidence", value: contentHash ? `hash ${contentHash.slice(0, 12)}` : "" },
+    {
+      label: "Next",
+      value: tracker.indexWarning
+        ? "Check caption/index warnings before trusting retrieval."
+        : "Use details to inspect caption and retrieval metadata.",
+    },
+  ];
 };
 
 const MediaViewer = ({
@@ -162,6 +300,8 @@ const MediaViewer = ({
   const [storedCaption, setStoredCaption] = useState("");
   const [captionDraft, setCaptionDraft] = useState("");
   const [captionEditOpen, setCaptionEditOpen] = useState(false);
+  const [captionMetadata, setCaptionMetadata] = useState(null);
+  const [provenanceOpen, setProvenanceOpen] = useState(false);
   const [captionModelInfo, setCaptionModelInfo] = useState(null);
   const [captionModelInfoBusy, setCaptionModelInfoBusy] = useState(false);
   const [captionModelInfoError, setCaptionModelInfoError] = useState("");
@@ -222,6 +362,8 @@ const MediaViewer = ({
     setStoredCaption("");
     setCaptionDraft("");
     setCaptionEditOpen(false);
+    setCaptionMetadata(null);
+    setProvenanceOpen(false);
     setCaptionModelInfo(null);
     setCaptionModelInfoBusy(false);
     setCaptionModelInfoError("");
@@ -281,6 +423,14 @@ const MediaViewer = ({
   const activeIndexStatus = activeItem?.indexStatus || "";
   const activeIndexWarning = activeItem?.indexWarning || "";
   const activePlaceholderCaption = activeItem?.placeholderCaption === true;
+  const provenanceRows = useMemo(
+    () => buildMediaProvenanceRows(activeItem || {}, captionMetadata || {}),
+    [activeItem, captionMetadata],
+  );
+  const stateInspectorRows = useMemo(
+    () => buildMediaStateInspectorRows(activeItem || {}, captionMetadata || {}),
+    [activeItem, captionMetadata],
+  );
   const activeStatusDetails = [
     activeOrigin ? `origin: ${activeOrigin}` : "",
     activeIndexStatus ? `index: ${activeIndexStatus}` : "",
@@ -416,6 +566,7 @@ const MediaViewer = ({
     panStartRef.current = null;
     setMediaNaturalSize({ width: 0, height: 0 });
     setViewportBoost({ width: 1, height: 1 });
+    setProvenanceOpen(false);
   }, [activeIndex, open]);
 
   useEffect(() => {
@@ -499,6 +650,7 @@ const MediaViewer = ({
       setCaptionEditOpen(false);
       setCaptionLoading(false);
       setCaptionError("");
+      setCaptionMetadata(null);
       return;
     }
     let active = true;
@@ -508,14 +660,17 @@ const MediaViewer = ({
       .get(`/api/attachments/caption/${encodeURIComponent(activeHash)}`)
       .then((res) => {
         if (!active) return;
-        const caption = String(res.data?.caption || "").trim();
+        const payload = res.data || {};
+        const caption = String(payload.caption || "").trim();
         setStoredCaption(caption);
         setCaptionDraft(caption);
+        setCaptionMetadata(payload);
       })
       .catch(() => {
         if (!active) return;
         setStoredCaption("");
         setCaptionDraft("");
+        setCaptionMetadata(null);
       })
       .finally(() => {
         if (!active) return;
@@ -610,9 +765,14 @@ const MediaViewer = ({
       const response = await axios.post("/api/knowledge/caption-image", form, {
         headers: { "Content-Type": "multipart/form-data" },
       });
+      const generatedPayload = response.data || {};
       const caption = String(response.data?.caption || "").trim();
       const captionModel = String(response.data?.caption_model || "").trim();
       const clipModel = String(response.data?.clip?.model || "").trim();
+      setCaptionMetadata((prev) => ({
+        ...(prev || {}),
+        ...generatedPayload,
+      }));
       if (captionModel || clipModel) {
         setCaptionModelInfo((prev) => ({
           visionModel: captionModel || prev?.visionModel || "(unset)",
@@ -622,9 +782,13 @@ const MediaViewer = ({
       }
       if (activeHash && caption) {
         try {
-          await axios.put(`/api/attachments/caption/${encodeURIComponent(activeHash)}`, {
+          const saved = await axios.put(`/api/attachments/caption/${encodeURIComponent(activeHash)}`, {
             caption,
           });
+          setCaptionMetadata((prev) => ({
+            ...(prev || {}),
+            ...(saved.data || {}),
+          }));
           setStoredCaption(caption);
         } catch {
           // Keep generated caption in the editor even if metadata save fails.
@@ -653,9 +817,13 @@ const MediaViewer = ({
     try {
       setCaptionSaving(true);
       setCaptionError("");
-      await axios.put(`/api/attachments/caption/${encodeURIComponent(activeHash)}`, {
+      const saved = await axios.put(`/api/attachments/caption/${encodeURIComponent(activeHash)}`, {
         caption: nextCaption,
       });
+      setCaptionMetadata((prev) => ({
+        ...(prev || {}),
+        ...(saved.data || {}),
+      }));
       setStoredCaption(nextCaption);
       setCaptionDraft(nextCaption);
       setCaptionEditOpen(false);
@@ -677,7 +845,12 @@ const MediaViewer = ({
     try {
       setCaptionDeleting(true);
       setCaptionError("");
-      await axios.delete(`/api/attachments/caption/${encodeURIComponent(activeHash)}`);
+      const deleted = await axios.delete(`/api/attachments/caption/${encodeURIComponent(activeHash)}`);
+      setCaptionMetadata((prev) => ({
+        ...(prev || {}),
+        ...(deleted.data || {}),
+        caption: "",
+      }));
       setStoredCaption("");
       setCaptionDraft("");
       setCaptionEditOpen(false);
@@ -1075,6 +1248,25 @@ const MediaViewer = ({
                   >
                     open file
                   </button>
+                  {activeKind === "image" && (
+                    <button
+                      type="button"
+                      className="viewer-btn"
+                      onClick={() => setProvenanceOpen((prev) => !prev)}
+                      title="Show caption model, caption date, and retrieval index details."
+                      aria-expanded={provenanceOpen}
+                    >
+                      details
+                    </button>
+                  )}
+                  {activeKind === "image" && (
+                    <StateInspector
+                      title="Why this media state is shown"
+                      summary="This state comes from attachment metadata, caption records, and image retrieval index fields."
+                      rows={stateInspectorRows}
+                      ariaLabel="Explain media caption and index state"
+                    />
+                  )}
                   {activeHash && (
                     <button
                       type="button"
@@ -1224,6 +1416,28 @@ const MediaViewer = ({
                       caption model: {captionModelInfo.visionModel} | text embeddings:{" "}
                       {captionModelInfo.ragEmbeddingModel} | image embeddings:{" "}
                       {captionModelInfo.ragClipModel}
+                    </div>
+                  )}
+                </div>
+              )}
+              {provenanceOpen && activeKind === "image" && (
+                <div
+                  className="viewer-provenance-panel"
+                  role="status"
+                  aria-label="Caption and index details"
+                >
+                  {provenanceRows.length ? (
+                    <dl className="viewer-provenance-grid">
+                      {provenanceRows.map((row) => (
+                        <React.Fragment key={`${row.label}:${row.value}`}>
+                          <dt>{row.label}</dt>
+                          <dd>{row.value}</dd>
+                        </React.Fragment>
+                      ))}
+                    </dl>
+                  ) : (
+                    <div className="viewer-status-note">
+                      No caption or retrieval index details have been recorded for this image yet.
                     </div>
                   )}
                 </div>

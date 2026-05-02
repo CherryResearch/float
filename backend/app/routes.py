@@ -2,7 +2,10 @@
 import asyncio
 import copy
 import base64
+import errno
+import importlib.util
 import io
+from difflib import get_close_matches
 from collections import deque
 from fnmatch import fnmatch
 import hashlib
@@ -11,6 +14,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import time
 import shutil
 import threading
@@ -18,14 +22,24 @@ import textwrap
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Literal, Union
+from typing import Any, Dict, Iterable, List, Optional, Literal, Union
 
-import jwt
 import requests
 import socket
 from urllib.parse import quote, urlparse
 
 from app import config as app_config, hooks
+from app.agent_workflows import (
+    AgentProvenance,
+    HandoffArtifact,
+    build_agent_provenance,
+    build_handoff_artifact,
+    build_task_handoff,
+    build_workflow_metadata,
+    controls_for_status,
+    merge_agent_payload,
+    append_handoff_note,
+)
 from app import tools
 from app.agents.engine import get_engine
 from app.models import ChatRequest, ChatResponse, Attachment, ComputerConfig
@@ -60,6 +74,7 @@ from app.services.rag_provider import (
     ingest_calendar_event as _ingest_calendar_event,
     update_cached_config as _update_rag_config,
 )
+from app.services import privacy_filter_service
 from app.services.instance_sync_service import (
     InstanceSyncService,
     RemoteFloatClient,
@@ -77,6 +92,7 @@ from app.utils import (
     calendar_store,
     conversation_store,
     generate_signature,
+    history_store,
     sanitize_args,
     theme_store,
     user_settings,
@@ -89,6 +105,7 @@ from app.utils.device_visibility import (
 )
 from app.utils.attachment_media import build_attachment_media_descriptor
 from app.utils.device_registry import (
+    decode_device_token,
     delete_device,
     get_device,
     register_or_update_device,
@@ -109,17 +126,23 @@ from app.utils.sync_review_store import (
     update_review as update_sync_review,
 )
 from app.utils.sync_store import (
+    cancel_operation as sync_cancel_operation,
+    finish_operation as sync_finish_operation,
     get_cursor as sync_get_cursor,
     get_changes_since as sync_get_changes_since,
+    operations_snapshot as sync_operations_snapshot,
     record_changes as sync_record_changes,
+    start_operation as sync_start_operation,
 )
 from app.utils.workspace_registry import (
     DEFAULT_WORKSPACE_ID,
     build_synced_workspace_profile,
+    filter_workspace_ids_for_sync,
     load_workspace_state,
     normalize_workspace_ids,
     resolve_synced_workspace_location,
     summarize_workspace_profile,
+    workspace_item_exclusion_reason,
     workspace_profile_map,
 )
 from app.utils.blob_store import (
@@ -140,7 +163,6 @@ from app.utils.hardware import torch_cuda_diagnostics
 from app.utils.tokenizer import CustomTokenizer
 from app.workflow_profiles import (
     CLIENT_RESOLUTION_TOOLS,
-    approval_allows_auto,
     capture_policy_prompt,
     continue_transition_allowed,
     resolve_modules,
@@ -148,6 +170,22 @@ from app.workflow_profiles import (
     resolve_workflow_profile,
     workflow_catalog_payload,
     workflow_prompt,
+)
+from app.tool_policies import (
+    WORKFLOW_LIVE,
+    WORKFLOW_TEXT,
+    approval_allows_auto_for_tool,
+    normalize_tool_policies,
+    normalize_tool_workflow,
+    tool_allowed_in_workflow,
+    tool_auto_invokable_in_workflow,
+    tool_policy_payload,
+)
+from app.services.conversation_compaction import (
+    build_compaction,
+    build_context_budget_plan,
+    copy_compaction_lineage,
+    write_compaction,
 )
 
 try:
@@ -233,6 +271,7 @@ from app.utils.local_model_registry import (
     resolve_registered_model_path,
     upsert_local_model_entry,
 )
+from app.local_providers.base import infer_openai_compatible_auth_token
 from app.local_providers import LocalProviderManager
 from app.utils.chat_log import (
     log_chat_request,
@@ -278,6 +317,43 @@ OPENAI_MODELS_CACHE_TTL_SECONDS = 15 * 60
 _openai_models_cache: Dict[str, Dict[str, Any]] = {}
 _openai_models_cache_lock = threading.Lock()
 
+_OPENAI_NON_CHAT_MODEL_MARKERS = (
+    "embedding",
+    "embed",
+    "tts",
+    "whisper",
+    "transcribe",
+    "speech",
+    "audio",
+    "realtime",
+    "image",
+    "dall-e",
+    "moderation",
+    "computer-use",
+    "sora",
+)
+_OPENAI_LEGACY_COMPLETION_PREFIXES = (
+    "ada-",
+    "babbage-",
+    "curie-",
+    "davinci-",
+    "text-davinci-",
+)
+_OPENAI_LEGACY_COMPLETION_SUFFIXES = ("-instruct",)
+_OPENAI_MODEL_SIZE_RANK = {
+    "base": 5,
+    "chat": 4,
+    "codex": 3,
+    "pro": 2,
+    "max": 1,
+    "mini": -1,
+    "nano": -2,
+}
+SERVER_MODEL_PROBE_TIMEOUT_SECONDS = 0.8
+SERVER_MODEL_PROBE_REFRESH_TIMEOUT_SECONDS = 1.5
+SERVER_MODEL_PROBE_DEADLINE_SECONDS = 2.0
+SERVER_MODEL_PROBE_REFRESH_DEADLINE_SECONDS = 5.0
+
 
 def _openai_models_cache_key(base_url: str, api_key: str) -> str:
     digest = hashlib.sha256()
@@ -315,6 +391,239 @@ def _store_cached_openai_models(base_url: str, api_key: str, models: List[str]) 
         }
 
 
+def _openai_chat_model_allowed(model_id: str) -> bool:
+    lowered = str(model_id or "").strip().lower()
+    if not lowered:
+        return False
+    if lowered.startswith(_OPENAI_LEGACY_COMPLETION_PREFIXES):
+        return False
+    if lowered.endswith(_OPENAI_LEGACY_COMPLETION_SUFFIXES) or any(
+        f"{suffix}-" in lowered for suffix in _OPENAI_LEGACY_COMPLETION_SUFFIXES
+    ):
+        return False
+    return not any(marker in lowered for marker in _OPENAI_NON_CHAT_MODEL_MARKERS)
+
+
+def _parse_openai_model_date(model_id: str) -> int:
+    match = re.search(r"(?:^|-)(20\d{2})-(\d{2})-(\d{2})(?:$|-)", model_id)
+    if not match:
+        return 0
+    return int(f"{match.group(1)}{match.group(2)}{match.group(3)}")
+
+
+def _openai_model_sort_key(model_id: str) -> tuple[Any, ...]:
+    lowered = str(model_id or "").strip().lower()
+    match = re.match(r"^gpt-(\d+)(?:\.(\d+))?", lowered)
+    if not match:
+        return (1, lowered)
+    suffix = lowered[len(match.group(0)) :].lstrip("-")
+    size = next(
+        (part for part in suffix.split("-") if part in _OPENAI_MODEL_SIZE_RANK),
+        "base",
+    )
+    return (
+        0,
+        -(int(match.group(1)) if match.group(1) else 0),
+        -(int(match.group(2)) if match.group(2) else 0),
+        -_OPENAI_MODEL_SIZE_RANK.get(size, _OPENAI_MODEL_SIZE_RANK["base"]),
+        -_parse_openai_model_date(lowered),
+        lowered,
+    )
+
+
+def _sort_openai_model_ids(model_ids: Iterable[str]) -> List[str]:
+    return sorted(model_ids, key=_openai_model_sort_key)
+
+
+def _filter_openai_model_ids(
+    model_ids: List[str],
+    *,
+    include_non_chat: bool = False,
+) -> List[str]:
+    if include_non_chat:
+        return _sort_openai_model_ids(model_ids)
+    return _sort_openai_model_ids(
+        model_id for model_id in model_ids if _openai_chat_model_allowed(model_id)
+    )
+
+
+def _server_model_probe_targets(server_url: str) -> List[str]:
+    value = str(server_url or "").strip()
+    if not value:
+        return []
+    if "://" not in value and not value.startswith("/"):
+        value = f"http://{value}"
+    try:
+        parsed = urlparse(value)
+    except Exception:
+        return []
+    if not parsed.scheme or not parsed.netloc:
+        return []
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    path = (parsed.path or "").rstrip("/")
+    lowered = path.lower()
+    targets: List[str] = []
+    seen: set[str] = set()
+
+    def add(pathname: str) -> None:
+        normalized_path = pathname if pathname.startswith("/") else f"/{pathname}"
+        target = f"{origin}{normalized_path}"
+        if target not in seen:
+            seen.add(target)
+            targets.append(target)
+
+    endpoint_suffixes = (
+        "/chat/completions",
+        "/completions",
+        "/responses",
+    )
+    for suffix in endpoint_suffixes:
+        if lowered.endswith(suffix):
+            add(path[: -len(suffix)] + "/models")
+            break
+    if lowered.endswith("/models"):
+        add(path or "/models")
+    elif re.search(r"/v\d+$", lowered):
+        add(f"{path}/models")
+    elif path:
+        add(f"{path}/v1/models")
+        add(f"{path}/models")
+
+    add("/api/v0/models")
+    add("/api/v1/models")
+    add("/v1/models")
+    add("/models")
+    return targets
+
+
+def _server_model_probe_request(
+    endpoint: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: float = SERVER_MODEL_PROBE_TIMEOUT_SECONDS,
+) -> requests.Response:
+    # Provider inventory probes are usually local/LAN health checks. Avoid the
+    # shared retrying session so a down provider cannot stall the FastAPI loop.
+    return requests.get(endpoint, headers=headers or None, timeout=timeout)
+
+
+def _extract_model_inventory(payload: Any) -> Dict[str, Any]:
+    models: List[str] = []
+    loaded_model = ""
+
+    def append_entry(raw_entry: Any) -> None:
+        nonlocal loaded_model
+        if isinstance(raw_entry, str) and raw_entry.strip():
+            models.append(raw_entry.strip())
+            return
+        if not isinstance(raw_entry, dict):
+            return
+        value = raw_entry.get("id") or raw_entry.get("model") or raw_entry.get("name")
+        if not isinstance(value, str) or not value.strip():
+            return
+        model_id = value.strip()
+        models.append(model_id)
+        state = (
+            str(raw_entry.get("state") or raw_entry.get("status") or "").strip().lower()
+        )
+        if not loaded_model and state in {"loaded", "active", "running"}:
+            loaded_model = model_id
+
+    if isinstance(payload, dict):
+        for key in ("data", "models"):
+            raw_models = payload.get(key)
+            if isinstance(raw_models, list):
+                for item in raw_models:
+                    append_entry(item)
+        for key in ("loaded_model", "active_model", "current_model", "model"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                loaded_model = loaded_model or value.strip()
+                models.append(value.strip())
+                break
+    elif isinstance(payload, list):
+        for item in payload:
+            append_entry(item)
+
+    deduped = sorted({model for model in models if model})
+    return {"models": deduped, "loaded_model": loaded_model}
+
+
+def _probe_server_model_inventory(
+    target_url: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    refresh: bool = False,
+) -> Dict[str, Any]:
+    reachable = False
+    last_error = ""
+    checked_endpoints: List[str] = []
+    timeout_seconds = (
+        SERVER_MODEL_PROBE_REFRESH_TIMEOUT_SECONDS
+        if refresh
+        else SERVER_MODEL_PROBE_TIMEOUT_SECONDS
+    )
+    deadline_seconds = (
+        SERVER_MODEL_PROBE_REFRESH_DEADLINE_SECONDS
+        if refresh
+        else SERVER_MODEL_PROBE_DEADLINE_SECONDS
+    )
+    deadline = time.monotonic() + deadline_seconds
+    for endpoint in _server_model_probe_targets(target_url):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            last_error = "probe timed out"
+            break
+        checked_endpoints.append(endpoint)
+        try:
+            response = _server_model_probe_request(
+                endpoint,
+                headers=headers,
+                timeout=max(0.1, min(timeout_seconds, remaining)),
+            )
+        except requests.RequestException as exc:
+            last_error = str(exc)
+            continue
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        if status_code in {401, 403}:
+            return {
+                "status": "success",
+                "models": [],
+                "reachable": True,
+                "endpoint": endpoint,
+                "checked_endpoints": checked_endpoints,
+                "auth_required": True,
+            }
+        if status_code >= 400:
+            last_error = str(getattr(response, "text", "") or f"HTTP {status_code}")
+            continue
+        reachable = True
+        try:
+            payload = response.json()
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+        inventory = _extract_model_inventory(payload)
+        models = inventory.get("models", [])
+        if models:
+            return {
+                "status": "success",
+                "models": models,
+                "loaded_model": inventory.get("loaded_model") or "",
+                "reachable": True,
+                "endpoint": endpoint,
+                "checked_endpoints": checked_endpoints,
+            }
+    return {
+        "status": "success",
+        "models": [],
+        "loaded_model": "",
+        "reachable": reachable,
+        "checked_endpoints": checked_endpoints,
+        "error": last_error,
+    }
+
+
 router = APIRouter()
 llm_service = LLMService()
 livekit_service = LiveKitService(app_config.load_config())
@@ -324,6 +633,24 @@ tts_service = TTSService()
 provider_manager = LocalProviderManager(
     lambda: llm_service.config if isinstance(llm_service.config, dict) else {}
 )
+
+_COMMON_TOOL_NAME_HINTS = {
+    "memory": ["remember", "recall"],
+    "memories": ["remember", "recall"],
+    "memory.read": ["recall", "remember", "memory.save"],
+    "memory.recall": ["recall", "remember", "memory.save"],
+    "memory.search": ["recall", "remember", "memory.save"],
+    "memory.store": ["remember", "recall", "memory.save"],
+    "memory.write": ["remember", "recall", "memory.save"],
+    "memory.remember": ["remember", "recall", "memory.save"],
+    "shell": ["shell.exec"],
+    "patch": ["patch.apply"],
+    "mcp": ["mcp.call"],
+    "open.url": ["computer.navigate", "open_url"],
+    "browser.open": ["computer.navigate", "open_url"],
+    "tool": ["help", "tool_help", "tool_info"],
+    "tools": ["help", "tool_help", "tool_info"],
+}
 
 # In-memory notification buffer (recent only)
 if not hasattr(asyncio, "__float_notifications__"):
@@ -386,6 +713,44 @@ def _ensure_agent_console_state(app) -> dict:
         state.setdefault("agents", {})
         state.setdefault("resources", {})
     return state
+
+
+def _merge_console_record_field(
+    current: Optional[Dict[str, Any]],
+    update: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(update, dict):
+        return current if isinstance(current, dict) else None
+    if not isinstance(current, dict):
+        return dict(update)
+    return merge_agent_payload(current, update)
+
+
+def _console_agent_snapshot(
+    record: Dict[str, Any],
+    resources: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(record, dict):
+        return None
+    agent_id = str(record.get("id") or "").strip()
+    if not agent_id:
+        return None
+    payload: Dict[str, Any] = {
+        "id": agent_id,
+        "label": record.get("label"),
+        "status": record.get("status"),
+        "summary": record.get("summary"),
+        "updated_at": record.get("updated_at"),
+        "events": [
+            event for event in (record.get("events") or []) if isinstance(event, dict)
+        ][-_MAX_AGENT_HISTORY:],
+        "resources": resources,
+    }
+    for key in ("workflow", "provenance", "handoff", "controls"):
+        value = record.get(key)
+        if isinstance(value, dict):
+            payload[key] = value
+    return payload
 
 
 def _get_action_history_service(app):
@@ -616,6 +981,108 @@ def _capture_policy_settings() -> Dict[str, Any]:
     }
 
 
+PRIVACY_ROUTE_TOOL = "route_to_local_model"
+PRIVACY_ROUTE_MODES = {"off", "ask"}
+
+
+def _normalize_privacy_route_mode(value: Any) -> str:
+    raw = str(value or "off").strip().lower()
+    return raw if raw in PRIVACY_ROUTE_MODES else "off"
+
+
+def _privacy_route_rank(value: Any) -> int:
+    sensitivity = privacy_filter_service.normalize_sensitivity(value) or "mundane"
+    return int(privacy_filter_service.SENSITIVITY_RANK.get(sensitivity, 0))
+
+
+def _privacy_route_target_model(config_payload: Any) -> str:
+    cfg = config_payload if isinstance(config_payload, dict) else {}
+    candidates = [
+        cfg.get("local_model"),
+        cfg.get("transformer_model"),
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return ""
+
+
+def _privacy_route_check_for_message(
+    message: Any,
+    *,
+    settings_payload: Dict[str, Any] | None,
+    mode_used: str | None,
+    requested_model: str | None,
+    config_payload: Dict[str, Any] | None = None,
+) -> Optional[Dict[str, Any]]:
+    settings_data = settings_payload if isinstance(settings_payload, dict) else {}
+    if (
+        _normalize_privacy_route_mode(
+            settings_data.get("privacy_filter_route_private_mode")
+        )
+        != "ask"
+    ):
+        return None
+    source_mode = str(mode_used or "").strip().lower()
+    if source_mode == "local":
+        return None
+    text = str(message or "")
+    if not text.strip():
+        return None
+
+    classifier_settings = dict(settings_data)
+    classifier_settings["privacy_filter_mode"] = "always"
+    decision = privacy_filter_service.decide_sensitivity(
+        text,
+        settings=classifier_settings,
+        purpose="chat_route",
+    )
+    suggested = privacy_filter_service.normalize_sensitivity(
+        decision.suggested_sensitivity
+    )
+    min_sensitivity = (
+        privacy_filter_service.normalize_sensitivity(
+            settings_data.get("privacy_filter_route_min_sensitivity")
+        )
+        or "protected"
+    )
+    if (
+        decision.status != "matched"
+        or not suggested
+        or _privacy_route_rank(suggested) < _privacy_route_rank(min_sensitivity)
+    ):
+        return None
+
+    labels = ", ".join(decision.labels)
+    target_model = _privacy_route_target_model(config_payload)
+    source_model = str(requested_model or "").strip()
+    reason = (
+        f"Privacy filter detected {suggested} text"
+        + (f" ({labels})" if labels else "")
+        + ". Continue this turn locally instead of sending it to a non-local model?"
+    )
+    args = {
+        "target_mode": "local",
+        "target_model": target_model,
+        "reason": reason,
+        "sensitivity": suggested,
+        "labels": labels,
+        "source_mode": source_mode,
+        "source_model": source_model,
+    }
+    metadata = privacy_filter_service.metadata_updates(decision)
+    metadata.update(
+        {
+            "privacy_route_status": "proposed",
+            "privacy_route_tool": PRIVACY_ROUTE_TOOL,
+            "privacy_route_target_mode": "local",
+            "privacy_route_target_model": target_model,
+            "privacy_route_min_sensitivity": min_sensitivity,
+        }
+    )
+    return {"tool": {"name": PRIVACY_ROUTE_TOOL, "args": args}, "metadata": metadata}
+
+
 def _default_workflow_name() -> str:
     settings_payload = user_settings.load_settings()
     return resolve_workflow_name(settings_payload.get("default_workflow"))
@@ -699,6 +1166,84 @@ def _current_request_id() -> Optional[str]:
     return text or None
 
 
+def _utc_now_compact_iso() -> str:
+    return (
+        datetime.now(tz=timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _elapsed_ms_since(started_perf: float | None) -> Optional[int]:
+    if not isinstance(started_perf, (int, float)):
+        return None
+    return max(0, int((time.perf_counter() - float(started_perf)) * 1000))
+
+
+def _rag_query_preview(query: Any, width: int = 96) -> str:
+    text = " ".join(str(query or "").split())
+    if not text:
+        return ""
+    return textwrap.shorten(text, width=max(16, int(width or 96)), placeholder="...")
+
+
+def _rag_query_operation_id(
+    scope: str,
+    *,
+    session_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+    request_id: Optional[str] = None,
+    query: Optional[str] = None,
+) -> str:
+    normalized_scope = str(scope or "unknown").strip().lower() or "unknown"
+    parts = ["rag-query", normalized_scope]
+    if session_id:
+        parts.append(str(session_id).strip())
+    if message_id:
+        parts.append(str(message_id).strip())
+    request_key = str(request_id or _current_request_id() or "").strip()
+    if request_key:
+        parts.append(request_key)
+    else:
+        query_key = " ".join(str(query or "").split()).strip().lower()
+        if query_key:
+            parts.append(hashlib.sha1(query_key.encode("utf-8")).hexdigest()[:12])
+    return ":".join(part for part in parts if part)
+
+
+def _emit_rag_query_notification(
+    app,
+    *,
+    operation_id: str,
+    title: str,
+    body: str = "",
+    status: str = "running",
+    phase_label: str = "",
+    phase_index: Optional[int] = None,
+    phase_count: Optional[int] = None,
+    detail: str = "",
+    started_at: str = "",
+    started_perf: Optional[float] = None,
+    counts: Optional[Dict[str, Any]] = None,
+) -> None:
+    emit_operation_notification(
+        app,
+        operation_id=operation_id,
+        kind="rag_query",
+        title=title,
+        body=body,
+        status=status,
+        phase_label=phase_label,
+        phase_index=phase_index,
+        phase_count=phase_count,
+        detail=detail,
+        started_at=started_at,
+        elapsed_ms=_elapsed_ms_since(started_perf),
+        counts=counts,
+    )
+
+
 def _lookup_message_runtime_hints(
     session_id: Optional[str],
     message_id: Optional[str],
@@ -720,10 +1265,24 @@ def _lookup_message_runtime_hints(
         if isinstance(meta, dict):
             raw_model = meta.get("model")
             raw_mode = meta.get("mode")
+            live_meta = (
+                meta.get("live_stream")
+                if isinstance(meta.get("live_stream"), dict)
+                else {}
+            )
             if isinstance(raw_model, str) and raw_model.strip():
                 model_hint = raw_model.strip()
+            elif (
+                isinstance(live_meta.get("model"), str)
+                and live_meta.get("model").strip()
+            ):
+                model_hint = live_meta.get("model").strip()
             if isinstance(raw_mode, str) and raw_mode.strip():
                 mode_hint = raw_mode.strip()
+            elif (
+                isinstance(live_meta.get("mode"), str) and live_meta.get("mode").strip()
+            ):
+                mode_hint = live_meta.get("mode").strip()
         break
     return model_hint, mode_hint
 
@@ -1206,12 +1765,20 @@ async def publish_console_event(
         record["status"] = event.get("agent_status") or record.get("status")
     if isinstance(resources, dict) and agent_id in resources:
         record["resources"] = resources[agent_id]
+    for key in ("workflow", "provenance", "handoff", "controls"):
+        merged = _merge_console_record_field(record.get(key), event.get(key))
+        if isinstance(merged, dict):
+            record[key] = merged
 
     if event.get("type") == "thought":
         content = event.get("content")
         if isinstance(content, str) and content.strip():
             record["summary"] = content.strip()
     elif event.get("type") == "task":
+        detail = event.get("content") or event.get("description")
+        if isinstance(detail, str) and detail.strip():
+            record["summary"] = detail.strip()
+    elif event.get("type") == "control":
         detail = event.get("content") or event.get("description")
         if isinstance(detail, str) and detail.strip():
             record["summary"] = detail.strip()
@@ -1257,6 +1824,50 @@ async def publish_console_event(
     return event
 
 
+def _apply_conversation_privacy_filter(
+    name: str,
+    messages: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Classify saved conversation text and merge sticky privacy metadata."""
+
+    text = " ".join(
+        _conversation_message_text(message)
+        for message in messages
+        if isinstance(message, dict)
+    ).strip()
+    if not text:
+        return None
+    meta = conversation_store.get_metadata(name)
+    existing_privacy = conversation_store.normalize_conversation_privacy_mode(
+        meta.get("privacy_mode")
+    )
+    existing_sensitivity = str(
+        meta.get("sensitivity") or ""
+    ).strip().lower() or conversation_store.conversation_privacy_to_sensitivity(
+        existing_privacy
+    )
+    existing_source = str(meta.get("sensitivity_source") or "").strip().lower()
+    if not existing_source and existing_privacy in {"protected", "secret"}:
+        existing_source = "user"
+    decision = privacy_filter_service.decide_sensitivity(
+        text,
+        existing_sensitivity=existing_sensitivity,
+        existing_sensitivity_source=existing_source,
+        purpose="conversation",
+    )
+    updates = privacy_filter_service.metadata_updates(decision)
+    if decision.applied_sensitivity:
+        updates["sensitivity"] = decision.applied_sensitivity
+        updates[
+            "privacy_mode"
+        ] = conversation_store.conversation_privacy_mode_from_sensitivity(
+            decision.applied_sensitivity
+        )
+    if updates:
+        conversation_store.merge_metadata(name, updates)
+    return updates or None
+
+
 def _append_conversation_entry(session_id: str, entry: Dict[str, Any]) -> None:
     """Append a conversation entry to the on-disk history (best-effort)."""
     try:
@@ -1278,6 +1889,7 @@ def _append_conversation_entry(session_id: str, entry: Dict[str, Any]) -> None:
         if not replaced_existing:
             existing.append(entry)
         conversation_store.save_conversation(session_id, existing)
+        _apply_conversation_privacy_filter(session_id, existing)
     except Exception:
         # Persistence issues should never surface to the primary chat flow.
         pass
@@ -1327,6 +1939,7 @@ def _update_conversation_entry(
             else:
                 target[key] = value
         conversation_store.save_conversation(session_id, conv)
+        _apply_conversation_privacy_filter(session_id, conv)
     except Exception:
         pass
 
@@ -1466,6 +2079,11 @@ def _scrub_tool_placeholder_text(value: Any) -> str:
     if not isinstance(value, str):
         return ""
     scrubbed = _TOOL_PLACEHOLDER_RE.sub("\n\n", value)
+    scrubbed = re.sub(
+        r"(?im)^\s*Requested tools?.*?Awaiting approval\.\s*$",
+        "",
+        scrubbed,
+    )
     scrubbed = re.sub(r"[ \t]+\n", "\n", scrubbed)
     scrubbed = re.sub(r"\n[ \t]+", "\n", scrubbed)
     scrubbed = re.sub(r"\n{3,}", "\n\n", scrubbed)
@@ -1646,6 +2264,10 @@ def _tool_names_from_result_payload(result_value: Any) -> list[str]:
         return []
     tools = wrapped.get("tools")
     if not isinstance(tools, list):
+        menu = wrapped.get("menu")
+        if isinstance(menu, dict):
+            tools = menu.get("tools")
+    if not isinstance(tools, list):
         return []
     names: list[str] = []
     for item in tools:
@@ -1666,14 +2288,14 @@ def _tool_result_summary_excerpt(result_value: Any) -> Optional[str]:
     if not isinstance(result_value, dict):
         return None
 
-    for key in ("error", "detail", "message", "summary", "text"):
+    for key in ("failed_call", "error", "detail", "message", "summary", "text"):
         excerpt = _compact_tool_result_text(result_value.get(key))
         if excerpt:
             return excerpt
 
     wrapped = result_value.get("data")
     if isinstance(wrapped, dict):
-        for key in ("error", "detail", "message", "summary", "text"):
+        for key in ("failed_call", "error", "detail", "message", "summary", "text"):
             excerpt = _compact_tool_result_text(wrapped.get(key))
             if excerpt:
                 return excerpt
@@ -1733,6 +2355,33 @@ def _tool_prompt_args_excerpt(args_value: Any, *, max_parts: int = 4) -> Optiona
     return ", ".join(parts) if parts else None
 
 
+def _tool_recovery_hint_payload(
+    tool_name: Any,
+    args_value: Any,
+    error_value: Any,
+) -> dict[str, Any]:
+    normalized_name = (
+        _normalize_tool_name(tool_name) or str(tool_name or "").strip() or "tool"
+    )
+    args_text = _tool_prompt_args_excerpt(args_value, max_parts=3)
+    compact_error = _compact_tool_result_text(error_value) or "tool error"
+    call_text = (
+        f"{normalized_name}({args_text})" if args_text else f"{normalized_name}()"
+    )
+    recovery_args = {
+        "failed_tool_name": normalized_name,
+        "failed_error": compact_error,
+    }
+    if isinstance(args_value, dict) and args_value:
+        recovery_args["failed_args"] = args_value
+    return {
+        "failed_call": f"{call_text} -> {compact_error}",
+        "recovery_tool": "help",
+        "recovery_args": recovery_args,
+        "recovery_message": "Call help or tool_help with {} for a tool list; add failed_* only if you want this error echoed as a compact breadcrumb.",
+    }
+
+
 def _tool_prompt_result_excerpt(tool_name: str, result_value: Any) -> Optional[str]:
     normalized_name = _normalize_tool_name(tool_name)
     if normalized_name in {"tool_help", "help"} and isinstance(result_value, dict):
@@ -1741,10 +2390,22 @@ def _tool_prompt_result_excerpt(tool_name: str, result_value: Any) -> Optional[s
             if isinstance(result_value.get("data"), dict)
             else result_value
         )
+        failed_call = (
+            _compact_tool_result_text(wrapped.get("failed_call"))
+            if isinstance(wrapped, dict)
+            else None
+        )
         count_value = wrapped.get("count") if isinstance(wrapped, dict) else None
         total_count = wrapped.get("total_count") if isinstance(wrapped, dict) else None
         names = _tool_names_from_result_payload(result_value)
-        preview = _balanced_name_preview(names, limit=8)
+        query = wrapped.get("query") if isinstance(wrapped, dict) else None
+        detail = (
+            str(query.get("detail") or "").strip().lower()
+            if isinstance(query, dict)
+            else ""
+        )
+        preview_limit = len(names) if detail == "names" else 8
+        preview = _balanced_name_preview(names, limit=preview_limit)
         if preview:
             shown_count = (
                 count_value
@@ -1757,12 +2418,75 @@ def _tool_prompt_result_excerpt(tool_name: str, result_value: Any) -> Optional[s
                 else shown_count
             )
             if total_count_value > shown_count:
-                return (
+                menu_text = (
                     f"returned {shown_count} of {total_count_value} tool(s): "
                     + ", ".join(preview)
                 )
-            return f"returned {shown_count} tool(s): " + ", ".join(preview)
+            else:
+                menu_text = f"returned {shown_count} tool(s): " + ", ".join(preview)
+            if failed_call:
+                return f"{failed_call}; {menu_text}"
+            return menu_text
+        if failed_call:
+            return failed_call
     return _tool_result_summary_excerpt(result_value)
+
+
+def _tool_menu_prompt_payload(
+    tool_name: str, result_value: Any
+) -> Optional[dict[str, Any]]:
+    normalized_name = _normalize_tool_name(tool_name)
+    if normalized_name not in {"help", "tool_help", "tool_info"}:
+        return None
+    if not isinstance(result_value, dict):
+        return None
+    wrapped = (
+        result_value.get("data")
+        if isinstance(result_value.get("data"), dict)
+        else result_value
+    )
+    if not isinstance(wrapped, dict):
+        return None
+    payload: dict[str, Any] = {}
+    failed_call = _compact_tool_result_text(wrapped.get("failed_call"))
+    if failed_call:
+        payload["failed_call"] = failed_call
+    query = wrapped.get("query")
+    if isinstance(query, dict):
+        requested_tool = _normalize_tool_name(
+            query.get("tool_name") or query.get("tool")
+        )
+        if requested_tool:
+            payload["tool_name"] = requested_tool
+        detail = str(query.get("detail") or "").strip().lower()
+        if detail and detail != "rich":
+            payload["detail"] = detail
+    count_value = wrapped.get("count")
+    if isinstance(count_value, int) and count_value >= 0:
+        payload["count"] = count_value
+    total_count = wrapped.get("total_count")
+    if isinstance(total_count, int) and total_count >= 0:
+        payload["total_count"] = total_count
+    names = _tool_names_from_result_payload(result_value)
+    if names:
+        name_limit = len(names) if payload.get("detail") == "names" else 8
+        preview = names[:name_limit]
+        payload["tool_names"] = preview
+        if len(names) > len(preview):
+            payload["more_tools"] = len(names) - len(preview)
+    suites = wrapped.get("suites")
+    if isinstance(suites, list):
+        suite_names = [
+            str(item.get("name") or "").strip()
+            for item in suites
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        ]
+        if suite_names:
+            payload["tool_suites"] = suite_names[:8]
+    recovery_message = _compact_tool_result_text(wrapped.get("recovery_message"))
+    if recovery_message and "tool_names" not in payload:
+        payload["recovery_message"] = recovery_message
+    return payload or None
 
 
 def _tool_events_prompt_lines(tool_events: Any, *, max_lines: int = 6) -> list[str]:
@@ -1857,7 +2581,10 @@ def _tool_events_prompt_payload(tool_events: Any) -> list[dict[str, Any]]:
         args = tool.get("args") if isinstance(tool.get("args"), dict) else {}
         if args:
             entry["args"] = _tool_prompt_json_value(args)
-        if "result" in tool:
+        menu_payload = _tool_menu_prompt_payload(name, tool.get("result"))
+        if menu_payload is not None:
+            entry["result"] = menu_payload
+        elif "result" in tool:
             entry["result"] = _tool_prompt_json_value(tool.get("result"))
         elif tool.get("error"):
             entry["error"] = _tool_prompt_json_value(tool.get("error"))
@@ -1866,21 +2593,170 @@ def _tool_events_prompt_payload(tool_events: Any) -> list[dict[str, Any]]:
     return payload
 
 
-def _tool_events_prompt_text(tool_events: Any) -> str:
+DEFAULT_TOOL_RESULT_PROMPT_CHAR_BUDGET = 4000
+MIN_TOOL_RESULT_PROMPT_CHAR_BUDGET = 800
+
+
+def _tool_result_prompt_char_budget(
+    *,
+    model: Optional[str] = None,
+    mode: Optional[str] = None,
+    override: Optional[int] = None,
+) -> int:
+    """Return the tool-result JSON budget for continuation prompts.
+
+    The default intentionally matches the previous fixed cap. The model/mode
+    parameters keep this policy ready for later small-model vs large-model
+    tuning without changing the continuation call sites again.
+    """
+
+    if isinstance(override, int):
+        return max(MIN_TOOL_RESULT_PROMPT_CHAR_BUDGET, override)
+    _ = (model, mode)
+    return DEFAULT_TOOL_RESULT_PROMPT_CHAR_BUDGET
+
+
+def _tool_events_prompt_text(
+    tool_events: Any,
+    *,
+    model: Optional[str] = None,
+    mode: Optional[str] = None,
+    result_char_budget: Optional[int] = None,
+) -> str:
     lines = _tool_events_prompt_lines(tool_events)
     payload = _tool_events_prompt_payload(tool_events)
+    payload_budget = _tool_result_prompt_char_budget(
+        model=model,
+        mode=mode,
+        override=result_char_budget,
+    )
     sections = [
         "Use these tool results to continue your response.",
         "Reuse the actual outputs below. Do not repeat already completed tool calls unless the result is incomplete or errored.",
     ]
+    if _tool_events_are_discovery_only(tool_events):
+        sections.append(
+            "Discovery-only note: help, tool_help, and tool_info do not change durable state. "
+            "Do not say something was saved, logged, remembered, written, or added unless a non-discovery write tool succeeded. "
+            "If the user asked to save, log, remember, write, or update something and the needed schema is available, call the target tool next."
+        )
     if lines:
         sections.append("Summary:\n" + "\n".join(f"- {line}" for line in lines))
     if payload:
         raw_payload = json.dumps(payload, ensure_ascii=False, indent=2)
-        if len(raw_payload) > 12000:
-            raw_payload = raw_payload[:11997].rstrip() + "..."
+        if len(raw_payload) > payload_budget:
+            raw_payload = raw_payload[: max(0, payload_budget - 3)].rstrip() + "..."
         sections.append("Tool result data:\n```json\n" + raw_payload + "\n```")
     return "\n\n".join(section for section in sections if section)
+
+
+_DISCOVERY_TOOL_NAMES = {"help", "tool_help", "tool_info"}
+_DURABLE_WRITE_TOOL_NAMES = {
+    "remember",
+    "memory.save",
+    "write_file",
+    "compact_conversation_write",
+    "create_task",
+    "create_event",
+}
+_PERSISTENCE_INTENT_RE = re.compile(
+    r"\b(save|saving|saved|log|logging|logged|note|noted|remember|remembered|"
+    r"store|stored|write|writing|wrote|written|add|adding|added|update|updating|"
+    r"updated)\b|\b(food\s+diary|diary|journal)\b",
+    re.IGNORECASE,
+)
+_DURABLE_WRITE_CLAIM_RE = re.compile(
+    r"\b(saved|logged|remembered|stored|noted|wrote|written|added|updated)\b",
+    re.IGNORECASE,
+)
+
+
+def _tool_entry_name(entry: Any) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    return _normalize_tool_name(entry.get("name"))
+
+
+def _tool_entries(tool_events: Any) -> list[dict[str, Any]]:
+    if not isinstance(tool_events, list):
+        return []
+    return [entry for entry in tool_events if isinstance(entry, dict)]
+
+
+def _tool_events_have_durable_write(tool_events: Any) -> bool:
+    for entry in _tool_entries(tool_events):
+        name = _tool_entry_name(entry)
+        if name in _DURABLE_WRITE_TOOL_NAMES:
+            return True
+    return False
+
+
+def _tool_events_are_discovery_only(tool_events: Any) -> bool:
+    entries = _tool_entries(tool_events)
+    if not entries:
+        return False
+    names = [_tool_entry_name(entry) for entry in entries]
+    return bool(names) and all(name in _DISCOVERY_TOOL_NAMES for name in names)
+
+
+def _last_user_text_from_messages(messages: Any) -> str:
+    if not isinstance(messages, list):
+        return ""
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role") or "").strip().lower() != "user":
+            continue
+        value = message.get("content")
+        if value is None:
+            value = message.get("text")
+        if isinstance(value, str):
+            return value
+        if value is not None:
+            return str(value)
+    return ""
+
+
+def _text_has_persistence_intent(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    return bool(_PERSISTENCE_INTENT_RE.search(value))
+
+
+def _text_claims_durable_write(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    return bool(_DURABLE_WRITE_CLAIM_RE.search(value))
+
+
+def _response_needs_post_discovery_persistence_retry(
+    *,
+    messages: Any,
+    provided_tools: Any,
+    response: Any,
+) -> bool:
+    if not isinstance(response, dict):
+        return False
+    user_text = _last_user_text_from_messages(messages)
+    if not _text_has_persistence_intent(user_text):
+        return False
+    response_tools = (
+        response.get("tools_used")
+        if isinstance(response.get("tools_used"), list)
+        else []
+    )
+    if _tools_require_resolution(response_tools):
+        return False
+    combined_tools = [*_tool_entries(provided_tools), *_tool_entries(response_tools)]
+    if not combined_tools:
+        return False
+    if _tool_events_have_durable_write(combined_tools):
+        return False
+    return _tool_events_are_discovery_only(combined_tools)
+
+
+def _unfulfilled_persistence_after_discovery_text() -> str:
+    return "I found the relevant memory or file tool schema, but the durable write did not complete in this turn."
 
 
 def _tool_outcome_summary_lines(tools_used: Any, *, max_lines: int = 4) -> list[str]:
@@ -1943,12 +2819,27 @@ def _filter_turn_tool_definitions(
 ) -> list[Any]:
     if not isinstance(tool_definitions, list):
         return []
+    try:
+        settings_payload = user_settings.load_settings()
+    except Exception:
+        settings_payload = {}
     if allow_computer_capture:
-        return list(tool_definitions)
+        return [
+            tool
+            for tool in tool_definitions
+            if not isinstance(tool, dict)
+            or tool_allowed_in_workflow(
+                tool.get("name"), WORKFLOW_TEXT, settings_payload
+            )
+        ]
     filtered: list[Any] = []
     for tool in tool_definitions:
         if not isinstance(tool, dict):
             filtered.append(tool)
+            continue
+        if not tool_allowed_in_workflow(
+            tool.get("name"), WORKFLOW_TEXT, settings_payload
+        ):
             continue
         if _is_computer_capture_tool_name(tool.get("name")):
             continue
@@ -2044,6 +2935,33 @@ def _turn_tool_scope_note(*, allow_computer_capture: bool) -> str:
         "open_url, computer.*, camera.capture, or capture.* unless the user "
         "explicitly asks for browser, desktop, or camera control, or this "
         "continuation already contains those tool results."
+    )
+
+
+def _turn_tool_approval_note(approval_level: Any) -> str:
+    normalized = str(approval_level or "all").strip().lower() or "all"
+    if normalized == "auto":
+        mode_note = (
+            "Current tool approval mode is auto: when the user asks you to save, "
+            "write, remember, read, or inspect something and the needed tool is "
+            "listed as available, request the tool directly; the host will run it "
+            "without asking."
+        )
+    elif normalized == "high":
+        mode_note = (
+            "Current tool approval mode is high-risk only: low-risk tools may run "
+            "automatically and higher-risk tools may pause for review."
+        )
+    else:
+        mode_note = (
+            "Current tool approval mode requires review: tool requests may wait "
+            "for user approval before running."
+        )
+    return (
+        f"{mode_note} Approval labels such as 'confirm' or 'high' are policy "
+        "metadata for the host UI; they do not mean the tool is unavailable. "
+        "Do not say you cannot call a listed tool because of approval policy. "
+        "Request the appropriate tool and let the host enforce approval."
     )
 
 
@@ -2171,7 +3089,10 @@ async def _register_tool_proposals(
         setattr(request.app.state, "pending_tools", registry)
 
     emitted: list[dict[str, Any]] = []
-    approval_level = _approval_level_setting()
+    settings_payload = user_settings.load_settings()
+    approval_level = (
+        str(settings_payload.get("approval_level") or "all").strip().lower() or "all"
+    )
     known_signatures = _existing_tool_signatures_for_message(
         request.app, session_id, message_id
     )
@@ -2181,6 +3102,12 @@ async def _register_tool_proposals(
             continue
         tool_name = _normalize_tool_name(tool.get("name"))
         if not tool_name:
+            continue
+        if not tool_allowed_in_workflow(tool_name, WORKFLOW_TEXT, settings_payload):
+            logger.info(
+                "Suppressed tool proposal %s because it is disabled for text workflow",
+                tool_name,
+            )
             continue
         tool_args = _normalize_tool_args_for_proposal(tool_name, tool.get("args"))
         signature = _tool_signature(tool_name, tool_args)
@@ -2214,7 +3141,7 @@ async def _register_tool_proposals(
         tool_payload["name"] = tool_name
         tool_payload["args"] = tool_args
         tool_payload["status"] = "proposed"
-        if approval_allows_auto(approval_level, tool_name):
+        if approval_allows_auto_for_tool(approval_level, tool_name, settings_payload):
             tool_payload["approval"] = "auto"
         emitted.append(tool_payload)
 
@@ -2270,7 +3197,7 @@ async def _register_tool_proposals(
             request_id=proposal_id,
         )
         if (
-            approval_allows_auto(approval_level, tool_name)
+            approval_allows_auto_for_tool(approval_level, tool_name, settings_payload)
             and tool_name not in CLIENT_RESOLUTION_TOOLS
         ):
             try:
@@ -2576,9 +3503,8 @@ def _require_scope(request: Request, scope: str) -> Dict[str, Any]:
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
     token = auth.split(" ", 1)[1]
-    secret = os.getenv("DEVICE_JWT_SECRET", "dev-secret-change-me")
     try:
-        payload = jwt.decode(token, secret, algorithms=["HS256"])
+        payload = decode_device_token(token)
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
     scopes = payload.get("scopes", [])
@@ -2588,11 +3514,17 @@ def _require_scope(request: Request, scope: str) -> Dict[str, Any]:
 
 
 def _optional_device_claims(
-    request: Request, scope: str = "sync"
+    request: Request, scope: Optional[str] = "sync"
 ) -> Optional[Dict[str, Any]]:
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         return None
+    if scope is None:
+        token = auth.split(" ", 1)[1]
+        try:
+            return decode_device_token(token)
+        except Exception:
+            raise HTTPException(status_code=401, detail="Invalid token")
     return _require_scope(request, scope)
 
 
@@ -2700,6 +3632,161 @@ def _emit_tool_hook(
         logger.debug("tool hook emit failed", exc_info=True)
 
 
+def _build_provider_tool_executor(
+    app,
+    *,
+    session_id: Optional[str],
+    message_id: Optional[str],
+    workflow_name: Optional[str],
+    model: Optional[str],
+    mode: Optional[str],
+):
+    """Return a sync tool executor for provider-managed agent loops."""
+
+    settings_payload = user_settings.load_settings()
+    workflow = normalize_tool_workflow(workflow_name or WORKFLOW_TEXT)
+    approval_level = (
+        str(settings_payload.get("approval_level") or "all").strip().lower() or "all"
+    )
+    user = "openai-responses-ws"
+
+    def _denied(tool_name: str, args: Dict[str, Any], message: str) -> Dict[str, Any]:
+        result = _tool_outcome_payload("denied", message, ok=False)
+        tool_invocations_total.labels(tool_name or "tool", "forbidden").inc()
+        log_tool_event(
+            session_id,
+            tool_name or "tool",
+            "denied",
+            args=args,
+            result=result,
+            message_id=message_id,
+        )
+        _emit_tool_hook(
+            tool_name or "tool",
+            "denied",
+            args=args,
+            result=result,
+            session_id=session_id,
+            message_id=message_id,
+        )
+        return result
+
+    def _execute(call: Dict[str, Any]) -> Dict[str, Any]:
+        call_payload = call if isinstance(call, dict) else {}
+        raw_args = call_payload.get("args")
+        if isinstance(raw_args, str):
+            try:
+                raw_args = json.loads(raw_args)
+            except Exception:
+                raw_args = {}
+        if not isinstance(raw_args, dict):
+            raw_args = {}
+        tool_name = _normalize_tool_name(call_payload.get("name"))
+        call_id = str(call_payload.get("call_id") or "").strip() or None
+        if not tool_name:
+            return _denied(tool_name, raw_args, "Tool call did not include a name")
+        if workflow == WORKFLOW_LIVE:
+            allowed = tool_auto_invokable_in_workflow(
+                tool_name, WORKFLOW_LIVE, settings_payload
+            )
+        else:
+            allowed = tool_allowed_in_workflow(tool_name, workflow, settings_payload)
+        if not allowed:
+            return _denied(
+                tool_name,
+                raw_args,
+                f"{tool_name} is not enabled for {workflow} workflow",
+            )
+        if tool_name in CLIENT_RESOLUTION_TOOLS:
+            return _denied(
+                tool_name,
+                raw_args,
+                f"{tool_name} requires client-side resolution",
+            )
+        if not approval_allows_auto_for_tool(
+            approval_level, tool_name, settings_payload
+        ):
+            return _denied(
+                tool_name,
+                raw_args,
+                f"{tool_name} is not approved for automatic provider execution",
+            )
+        try:
+            _, args = normalize_and_sanitize_tool_args(tool_name, raw_args)
+            signature = generate_signature(user, tool_name, args)
+            action_context = _build_action_context(
+                session_id=session_id,
+                message_id=message_id,
+                chain_id=call_id,
+                request_id=call_id,
+                model=model,
+                mode=mode,
+                agent_label="openai_responses_ws",
+            )
+            manager = getattr(app.state, "memory_manager", None)
+            if manager is None:
+                raise RuntimeError("memory manager not available")
+            raw_result = manager.invoke_tool(
+                tool_name,
+                user=user,
+                signature=signature,
+                _action_context=action_context,
+                **args,
+            )
+            result = _tool_outcome_payload("invoked", data=raw_result, ok=True)
+            tool_invocations_total.labels(tool_name, "ok").inc()
+            log_tool_event(
+                session_id,
+                tool_name,
+                "invoked",
+                args=args,
+                result=result,
+                message_id=message_id,
+            )
+            _emit_tool_hook(
+                tool_name,
+                "invoked",
+                args=args,
+                result=result,
+                session_id=session_id,
+                message_id=message_id,
+                request_id=call_id,
+            )
+            return result
+        except ValueError as exc:
+            result = _tool_outcome_payload("error", str(exc), ok=False)
+            tool_invocations_total.labels(tool_name, "bad_request").inc()
+        except PermissionError as exc:
+            result = _tool_outcome_payload("error", str(exc), ok=False)
+            tool_invocations_total.labels(tool_name, "forbidden").inc()
+        except KeyError as exc:
+            result = _tool_outcome_payload("error", str(exc), ok=False)
+            tool_invocations_total.labels(tool_name, "not_found").inc()
+        except Exception as exc:
+            result = _tool_outcome_payload("error", str(exc), ok=False)
+            tool_invocations_total.labels(tool_name, "error").inc()
+        log_tool_event(
+            session_id,
+            tool_name,
+            "error",
+            args=raw_args,
+            result=result,
+            message_id=message_id,
+        )
+        _emit_tool_hook(
+            tool_name,
+            "error",
+            args=raw_args,
+            result=result,
+            session_id=session_id,
+            message_id=message_id,
+            request_id=call_id,
+        )
+        return result
+
+    return _execute
+
+
 # Lightweight API health for /api prefix
 @router.get("/health")
 async def api_health():
@@ -2745,9 +3832,29 @@ async def celery_status():
     Uses a short timeout to avoid blocking the API when the broker is down.
     """
     try:
-        from app.tasks import celery_app  # lazy import
+        from app.tasks import broker_url, celery_app  # lazy import
     except Exception:
         return {"online": False, "workers": [], "details": {}}
+
+    broker_value = str(broker_url or "").strip().lower()
+    if (
+        broker_value.startswith(("redis://", "rediss://"))
+        and importlib.util.find_spec("redis") is None
+    ):
+        return {
+            "online": False,
+            "workers": [],
+            "details": {},
+            "error": "python redis package not installed",
+        }
+    broker_error = _celery_broker_unreachable_error(broker_value)
+    if broker_error:
+        return {
+            "online": False,
+            "workers": [],
+            "details": {},
+            "error": broker_error,
+        }
 
     status: Dict[str, Any] = {"online": False, "workers": [], "details": {}}
     try:
@@ -2775,6 +3882,8 @@ async def celery_status():
                 active = insp.active() or {}
                 scheduled = insp.scheduled() or {}
                 reserved = insp.reserved() or {}
+                stats = insp.stats() or {}
+                queues = insp.active_queues() or {}
 
                 def _lens(d):
                     return (
@@ -2783,10 +3892,58 @@ async def celery_status():
                         else {}
                     )
 
+                def _queue_names(d):
+                    if not isinstance(d, dict):
+                        return {}
+                    names: dict[str, list[str]] = {}
+                    for worker, items in d.items():
+                        if not isinstance(items, list):
+                            continue
+                        worker_names: list[str] = []
+                        for item in items:
+                            if not isinstance(item, dict):
+                                continue
+                            name = str(item.get("name") or "").strip()
+                            if name and name not in worker_names:
+                                worker_names.append(name)
+                        names[str(worker)] = worker_names
+                    return names
+
+                def _stats_summary(d):
+                    if not isinstance(d, dict):
+                        return {}
+                    summary: dict[str, dict[str, Any]] = {}
+                    for worker, item in d.items():
+                        if not isinstance(item, dict):
+                            continue
+                        pool = item.get("pool")
+                        processes = []
+                        max_concurrency = None
+                        if isinstance(pool, dict):
+                            raw_processes = pool.get("processes")
+                            if isinstance(raw_processes, list):
+                                processes = [proc for proc in raw_processes if proc]
+                            raw_max = (
+                                pool.get("max-concurrency")
+                                or pool.get("max_concurrency")
+                                or item.get("pool", {}).get("max-concurrency")
+                            )
+                            if isinstance(raw_max, (int, float)):
+                                max_concurrency = int(raw_max)
+                        summary[str(worker)] = {
+                            "pid": item.get("pid"),
+                            "uptime": item.get("uptime"),
+                            "process_count": len(processes),
+                            "max_concurrency": max_concurrency,
+                        }
+                    return summary
+
                 status["details"] = {
                     "active": _lens(active),
                     "scheduled": _lens(scheduled),
                     "reserved": _lens(reserved),
+                    "queues": _queue_names(queues),
+                    "stats": _stats_summary(stats),
                 }
             except Exception:
                 pass
@@ -2844,6 +4001,290 @@ def _task_summary(t: dict, *, state: str | None = None) -> dict:
     }
 
 
+def _celery_broker_unreachable_error(broker_url: str) -> str | None:
+    text = str(broker_url or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = urlparse(text)
+    except Exception:
+        return None
+    scheme = str(parsed.scheme or "").strip().lower()
+    default_port = {
+        "redis": 6379,
+        "rediss": 6379,
+        "amqp": 5672,
+        "amqps": 5671,
+    }.get(scheme)
+    host = parsed.hostname
+    port = parsed.port or default_port
+    if not host or not port:
+        return None
+    try:
+        with socket.create_connection((host, int(port)), timeout=0.35):
+            return None
+    except OSError:
+        return f"broker unreachable ({host}:{port})"
+
+
+def _humanize_worker_label(worker: str) -> str:
+    name = str(worker or "").strip()
+    if not name:
+        return "worker"
+    short = name.split("@", 1)[0].strip() or name
+    return f"worker {short}"
+
+
+def _task_state_label(count: int, singular: str, plural: str | None = None) -> str:
+    word = singular if count == 1 else (plural or f"{singular}s")
+    return f"{count} {word}"
+
+
+def _celery_agent_status(
+    *,
+    online: bool,
+    active_count: int,
+    reserved_count: int,
+    scheduled_count: int,
+    timeout: bool = False,
+) -> str:
+    if not online:
+        return "error" if timeout else "stopped"
+    if active_count > 0:
+        return "active"
+    if reserved_count > 0 or scheduled_count > 0:
+        return "queued"
+    return "idle"
+
+
+def _format_worker_uptime(value: Any) -> str | None:
+    if not isinstance(value, (int, float)):
+        return None
+    total_seconds = int(max(0, float(value)))
+    if total_seconds < 60:
+        return f"{total_seconds}s uptime"
+    minutes, seconds = divmod(total_seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m uptime"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {minutes}m uptime"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h uptime"
+
+
+def _build_celery_console_agents(
+    celery_snapshot: dict[str, Any] | None,
+    task_snapshot: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    snapshot = celery_snapshot if isinstance(celery_snapshot, dict) else {}
+    task_data = task_snapshot if isinstance(task_snapshot, dict) else {}
+    details = (
+        snapshot.get("details") if isinstance(snapshot.get("details"), dict) else {}
+    )
+    active_counts = (
+        details.get("active") if isinstance(details.get("active"), dict) else {}
+    )
+    scheduled_counts = (
+        details.get("scheduled") if isinstance(details.get("scheduled"), dict) else {}
+    )
+    reserved_counts = (
+        details.get("reserved") if isinstance(details.get("reserved"), dict) else {}
+    )
+    stats_by_worker = (
+        details.get("stats") if isinstance(details.get("stats"), dict) else {}
+    )
+    queues_by_worker = (
+        details.get("queues") if isinstance(details.get("queues"), dict) else {}
+    )
+    tasks = task_data.get("tasks") if isinstance(task_data.get("tasks"), list) else []
+    snapshot_ts = float(time.time())
+
+    tasks_by_worker: dict[str, list[dict[str, Any]]] = {}
+    for row in tasks:
+        if not isinstance(row, dict):
+            continue
+        worker = str(row.get("worker") or "").strip()
+        if not worker:
+            continue
+        tasks_by_worker.setdefault(worker, []).append(row)
+
+    worker_names: list[str] = []
+    for value in (
+        snapshot.get("workers") if isinstance(snapshot.get("workers"), list) else []
+    ):
+        worker = str(value or "").strip()
+        if worker and worker not in worker_names:
+            worker_names.append(worker)
+    for source in (
+        active_counts,
+        scheduled_counts,
+        reserved_counts,
+        stats_by_worker,
+        queues_by_worker,
+        tasks_by_worker,
+    ):
+        for worker in source.keys():
+            label = str(worker or "").strip()
+            if label and label not in worker_names:
+                worker_names.append(label)
+
+    total_active = sum(int(value or 0) for value in active_counts.values())
+    total_reserved = sum(int(value or 0) for value in reserved_counts.values())
+    total_scheduled = sum(int(value or 0) for value in scheduled_counts.values())
+    online = bool(snapshot.get("online"))
+    timeout = bool(snapshot.get("timeout"))
+    error_text = str(snapshot.get("error") or "").strip()
+
+    if online:
+        queue_parts = [
+            _task_state_label(len(worker_names), "worker"),
+            _task_state_label(total_active, "active task"),
+            _task_state_label(total_reserved, "reserved task"),
+            _task_state_label(total_scheduled, "scheduled task"),
+        ]
+        queue_summary = ", ".join(queue_parts)
+    elif timeout:
+        queue_summary = "Background probe timed out."
+    elif error_text:
+        queue_summary = f"Background offline. {error_text}."
+    else:
+        queue_summary = "Background offline. No Celery workers responded."
+
+    system_status = _celery_agent_status(
+        online=online,
+        active_count=total_active,
+        reserved_count=total_reserved,
+        scheduled_count=total_scheduled,
+        timeout=timeout,
+    )
+    system_events: list[dict[str, Any]] = [
+        {
+            "type": "task",
+            "status": system_status,
+            "agent_status": system_status,
+            "timestamp": snapshot_ts,
+            "content": queue_summary,
+            "online": online,
+            "worker_count": len(worker_names),
+            "active_count": total_active,
+            "reserved_count": total_reserved,
+            "scheduled_count": total_scheduled,
+        }
+    ]
+    agents: list[dict[str, Any]] = [
+        {
+            "id": "system:celery",
+            "label": "background",
+            "status": system_status,
+            "summary": queue_summary,
+            "updated_at": snapshot_ts,
+            "events": system_events,
+            "resources": {
+                "updated_at": snapshot_ts,
+                "worker_count": len(worker_names),
+                "active_count": total_active,
+                "reserved_count": total_reserved,
+                "scheduled_count": total_scheduled,
+                "online": online,
+            },
+        }
+    ]
+
+    if not online:
+        return agents
+
+    for worker in worker_names:
+        active_count = int(active_counts.get(worker) or 0)
+        reserved_count = int(reserved_counts.get(worker) or 0)
+        scheduled_count = int(scheduled_counts.get(worker) or 0)
+        worker_status = _celery_agent_status(
+            online=True,
+            active_count=active_count,
+            reserved_count=reserved_count,
+            scheduled_count=scheduled_count,
+        )
+        stats = (
+            stats_by_worker.get(worker)
+            if isinstance(stats_by_worker.get(worker), dict)
+            else {}
+        )
+        queue_names = queues_by_worker.get(worker)
+        resolved_queue_names = (
+            [name for name in queue_names if isinstance(name, str) and name.strip()]
+            if isinstance(queue_names, list)
+            else []
+        )
+        summary_parts = []
+        if active_count:
+            summary_parts.append(_task_state_label(active_count, "active task"))
+        if reserved_count:
+            summary_parts.append(_task_state_label(reserved_count, "reserved task"))
+        if scheduled_count:
+            summary_parts.append(_task_state_label(scheduled_count, "scheduled task"))
+        if not summary_parts:
+            summary_parts.append("idle")
+        uptime_label = _format_worker_uptime(stats.get("uptime"))
+        if uptime_label:
+            summary_parts.append(uptime_label)
+        if resolved_queue_names:
+            summary_parts.append(f"queues: {', '.join(resolved_queue_names[:2])}")
+        worker_summary = ", ".join(summary_parts)
+        worker_events: list[dict[str, Any]] = [
+            {
+                "type": "task",
+                "status": worker_status,
+                "agent_status": worker_status,
+                "timestamp": snapshot_ts,
+                "worker": worker,
+                "content": worker_summary,
+            }
+        ]
+        for row in tasks_by_worker.get(worker, [])[:8]:
+            task_state = str(row.get("state") or "").strip().lower() or "queued"
+            task_name = str(row.get("name") or row.get("id") or "task").strip()
+            task_id = str(row.get("id") or "").strip()
+            task_label = task_name
+            if task_id:
+                task_label = f"{task_name} ({task_id[:8]})"
+            worker_events.append(
+                {
+                    "type": "task",
+                    "id": task_id or None,
+                    "task_id": task_id or None,
+                    "status": task_state,
+                    "agent_status": worker_status,
+                    "timestamp": snapshot_ts,
+                    "worker": worker,
+                    "content": task_label,
+                    "name": task_name,
+                }
+            )
+        agents.append(
+            {
+                "id": f"worker:{worker}",
+                "label": _humanize_worker_label(worker),
+                "status": worker_status,
+                "summary": worker_summary,
+                "updated_at": snapshot_ts,
+                "events": worker_events,
+                "resources": {
+                    "updated_at": snapshot_ts,
+                    "worker": worker,
+                    "pid": stats.get("pid"),
+                    "uptime_seconds": stats.get("uptime"),
+                    "process_count": stats.get("process_count"),
+                    "max_concurrency": stats.get("max_concurrency"),
+                    "queues": resolved_queue_names,
+                    "active_count": active_count,
+                    "reserved_count": reserved_count,
+                    "scheduled_count": scheduled_count,
+                },
+            }
+        )
+    return agents
+
+
 @router.get("/celery/tasks")
 async def celery_tasks(state: Optional[str] = "active", limit: int = 50) -> dict:
     """List Celery tasks by state: active, scheduled, reserved, or all.
@@ -2851,9 +4292,27 @@ async def celery_tasks(state: Optional[str] = "active", limit: int = 50) -> dict
     Returns a compact list of entries: [{worker, id, name, args_hash, eta, time_start, state}]
     """
     try:
-        from app.tasks import celery_app  # lazy import
+        from app.tasks import broker_url, celery_app  # lazy import
     except Exception:
         return {"tasks": [], "state": state or "active"}
+
+    broker_value = str(broker_url or "").strip().lower()
+    if (
+        broker_value.startswith(("redis://", "rediss://"))
+        and importlib.util.find_spec("redis") is None
+    ):
+        return {
+            "tasks": [],
+            "state": state or "active",
+            "error": "python redis package not installed",
+        }
+    broker_error = _celery_broker_unreachable_error(broker_value)
+    if broker_error:
+        return {
+            "tasks": [],
+            "state": state or "active",
+            "error": broker_error,
+        }
 
     def _collect() -> list[dict]:
         insp = celery_app.control.inspect(timeout=0.5)
@@ -3478,12 +4937,43 @@ async def clear_context(context_id: str):
 
 class BranchRequest(BaseModel):
     new_id: str
+    parent_message_id: Optional[str] = None
 
 
 @router.post("/context/{context_id}/branch")
 async def branch_context(context_id: str, payload: BranchRequest):
     """Branch an existing context to a new ID."""
     ctx = llm_service.branch_context(context_id, payload.new_id)
+    workflow_name = _default_workflow_name()
+    workflow_meta = build_workflow_metadata(resolve_workflow_profile(workflow_name))
+    inherited_snapshots = copy_compaction_lineage(
+        context_id,
+        payload.new_id,
+        parent_message_id=payload.parent_message_id or "",
+    )
+    conversation_store.merge_metadata(
+        payload.new_id,
+        {
+            "workflow_profile": workflow_name,
+            "workflow": workflow_meta,
+            "provenance": build_agent_provenance(
+                kind="fork",
+                parent_session_id=context_id,
+                parent_message_id=payload.parent_message_id,
+                branch_session_id=payload.new_id,
+                label=f"Forked from {context_id}",
+            ),
+            "context_snapshots": inherited_snapshots,
+            "active_context_snapshot_id": (
+                inherited_snapshots[-1].get("id") if inherited_snapshots else None
+            ),
+            "context_snapshot_source": {
+                "conversation_id": context_id,
+                "parent_message_id": payload.parent_message_id,
+                "inherited_count": len(inherited_snapshots),
+            },
+        },
+    )
     return {"status": "success", "context": ctx.to_dict()}
 
 
@@ -3527,9 +5017,16 @@ def _normalize_local_provider_mode(value: Any) -> str:
 
 def _normalize_stream_backend(value: Any) -> str:
     raw = str(value or "").strip().lower()
-    if raw in {"api", "livekit"}:
+    if raw in {"api", "livekit", "local"}:
         return raw
     return "api"
+
+
+def _normalize_live_agent_mode(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"api", "local", "server"}:
+        return raw
+    return "local"
 
 
 def _default_local_provider_port(provider: str) -> int:
@@ -3909,6 +5406,30 @@ async def provider_models(
             snapshot.get("runtime") if isinstance(snapshot.get("runtime"), dict) else {}
         ),
     }
+
+
+@router.get("/llm/server/models")
+async def server_models(
+    request: Request,
+    server_url: Optional[str] = Query(default=None),
+    refresh: bool = Query(default=False),
+):
+    """Probe an OpenAI-compatible server URL for its model inventory."""
+
+    cfg = request.app.state.config
+    target_url = str(server_url or cfg.get("server_url") or "").strip()
+    if not target_url:
+        raise HTTPException(status_code=400, detail="server_url is required")
+    headers: Dict[str, str] = {}
+    token = infer_openai_compatible_auth_token(cfg, target_url)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return await asyncio.to_thread(
+        _probe_server_model_inventory,
+        target_url,
+        headers=headers,
+        refresh=refresh,
+    )
 
 
 @router.post("/llm/provider/start")
@@ -4334,12 +5855,8 @@ async def capture_promote(
     )
     content_hash = asset_info["content_hash"]
     url = f"/api/attachments/{content_hash}/{filename}"
-    uploaded_at = (
-        datetime.now(tz=timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+    indexed_at = _utc_now_compact_iso()
+    uploaded_at = indexed_at
     _write_attachment_meta(
         content_hash,
         {
@@ -4595,6 +6112,11 @@ async def chat(request: Request, chat_request: ChatRequest):
             return _message_mentions_visual_context(message)
 
         retrieval_request_event = None
+        rag_progress_operation_id = ""
+        rag_progress_started_at = ""
+        rag_progress_started_perf: float | None = None
+        rag_progress_preview = _rag_query_preview(chat_request.message)
+        rag_progress_failed = False
         if chat_request.use_rag is not False:
             try:
                 service = _get_rag_service()
@@ -4606,6 +6128,32 @@ async def chat(request: Request, chat_request: ChatRequest):
                     metadata={"channel": "chat"},
                 )
                 hooks.emit(hooks.BEFORE_RETRIEVAL_EVENT, retrieval_request_event)
+                rag_progress_operation_id = _rag_query_operation_id(
+                    "chat",
+                    session_id=session_id,
+                    message_id=message_id,
+                    request_id=_current_request_id(),
+                    query=chat_request.message,
+                )
+                rag_progress_started_at = _utc_now_compact_iso()
+                rag_progress_started_perf = time.perf_counter()
+                _emit_rag_query_notification(
+                    request.app,
+                    operation_id=rag_progress_operation_id,
+                    title="Retrieving chat context",
+                    body=rag_progress_preview,
+                    status="running",
+                    phase_label="Searching saved context",
+                    phase_index=1,
+                    phase_count=3,
+                    detail="Searching memory and knowledge before the model call.",
+                    started_at=rag_progress_started_at,
+                    started_perf=rag_progress_started_perf,
+                    counts={
+                        "requested_top_k": rag_top_k,
+                        "clip_top_k": rag_query_clip_top_k,
+                    },
+                )
 
                 external_llm = str(getattr(llm_service, "mode", "api")).lower() == "api"
                 memory_manager = getattr(request.app.state, "memory_manager", None)
@@ -4695,12 +6243,56 @@ async def chat(request: Request, chat_request: ChatRequest):
                     cloned["metadata"] = meta
                     return cloned
 
+                workspace_recall_profiles = load_workspace_state(
+                    user_settings.load_settings()
+                )[0]
+
+                def _workspace_recall_candidates(
+                    meta: Dict[str, Any],
+                    canonical_item: Optional[Dict[str, Any]] = None,
+                    memory_key: Optional[str] = None,
+                ) -> list[str]:
+                    values: list[Any] = [
+                        memory_key,
+                        meta.get("source"),
+                        meta.get("root_source"),
+                        meta.get("source_path"),
+                        meta.get("relative_path"),
+                        meta.get("content_hash"),
+                        meta.get("filename"),
+                        meta.get("key"),
+                        meta.get("title"),
+                    ]
+                    if isinstance(canonical_item, dict):
+                        values.extend(
+                            [
+                                canonical_item.get("source_sync_relative_path"),
+                                canonical_item.get("source_path"),
+                                canonical_item.get("source"),
+                                canonical_item.get("root_source"),
+                                canonical_item.get("key"),
+                                canonical_item.get("title"),
+                            ]
+                        )
+                    normalized: list[str] = []
+                    seen: set[str] = set()
+                    for value in values:
+                        text = str(value or "").strip().replace("\\", "/")
+                        if not text:
+                            continue
+                        lowered = text.lower()
+                        if lowered in seen:
+                            continue
+                        seen.add(lowered)
+                        normalized.append(text)
+                    return normalized
+
                 def _blocked(meta: Dict[str, Any]) -> bool:
                     if not isinstance(meta, dict):
                         return False
                     if meta.get("rag_excluded") or meta.get("excluded"):
                         return True
-                    _memory_key, canonical_item = _canonical_memory_item(meta)
+                    memory_key, canonical_item = _canonical_memory_item(meta)
                     if canonical_item is not None:
                         if canonical_item.get("rag_excluded"):
                             return True
@@ -4722,6 +6314,21 @@ async def chat(request: Request, chat_request: ChatRequest):
                             return True
                         if external_llm and lvl == "protected":
                             return True
+                        if (
+                            workspace_item_exclusion_reason(
+                                namespace=canonical_item.get("source_sync_namespace")
+                                or meta.get("source_sync_namespace"),
+                                values=_workspace_recall_candidates(
+                                    meta,
+                                    canonical_item=canonical_item,
+                                    memory_key=memory_key,
+                                ),
+                                profiles=workspace_recall_profiles,
+                                purpose="default_recall",
+                            )
+                            is not None
+                        ):
+                            return True
                         return False
                     if _is_external_knowledge_source(meta):
                         return True
@@ -4729,6 +6336,16 @@ async def chat(request: Request, chat_request: ChatRequest):
                     if lvl == "secret":
                         return True
                     if external_llm and lvl == "protected":
+                        return True
+                    if (
+                        workspace_item_exclusion_reason(
+                            namespace=meta.get("source_sync_namespace"),
+                            values=_workspace_recall_candidates(meta),
+                            profiles=workspace_recall_profiles,
+                            purpose="default_recall",
+                        )
+                        is not None
+                    ):
                         return True
                     return False
 
@@ -4946,6 +6563,26 @@ async def chat(request: Request, chat_request: ChatRequest):
                             }
                         )
 
+                if rag_progress_operation_id:
+                    _emit_rag_query_notification(
+                        request.app,
+                        operation_id=rag_progress_operation_id,
+                        title="Retrieving chat context",
+                        body=rag_progress_preview,
+                        status="running",
+                        phase_label="Preparing retrieved context",
+                        phase_index=2,
+                        phase_count=3,
+                        detail="Reranking and deduplicating retrieved context items.",
+                        started_at=rag_progress_started_at,
+                        started_perf=rag_progress_started_perf,
+                        counts={
+                            "text_matches": len(text_matches),
+                            "clip_matches": len(clip_matches),
+                            "clip_requested": clip_requested,
+                        },
+                    )
+
                 def _rag_match_key(match: Dict[str, Any]) -> str:
                     if not isinstance(match, dict):
                         return ""
@@ -5080,9 +6717,39 @@ async def chat(request: Request, chat_request: ChatRequest):
                 rag_matches = combined[:rag_top_k]
             except HTTPException:
                 rag_matches = []
+                if rag_progress_operation_id:
+                    rag_progress_failed = True
+                    _emit_rag_query_notification(
+                        request.app,
+                        operation_id=rag_progress_operation_id,
+                        title="Retrieving chat context",
+                        body=rag_progress_preview,
+                        status="error",
+                        phase_label="Chat retrieval failed",
+                        phase_index=3,
+                        phase_count=3,
+                        detail="Continuing without retrieved context.",
+                        started_at=rag_progress_started_at,
+                        started_perf=rag_progress_started_perf,
+                    )
             except Exception as exc:
                 logger.warning("RAG query failed: %s", exc)
                 rag_matches = []
+                if rag_progress_operation_id:
+                    rag_progress_failed = True
+                    _emit_rag_query_notification(
+                        request.app,
+                        operation_id=rag_progress_operation_id,
+                        title="Retrieving chat context",
+                        body=rag_progress_preview,
+                        status="error",
+                        phase_label="Chat retrieval failed",
+                        phase_index=3,
+                        phase_count=3,
+                        detail="Continuing without retrieved context.",
+                        started_at=rag_progress_started_at,
+                        started_perf=rag_progress_started_perf,
+                    )
         if retrieval_request_event is not None:
             hooks.emit(
                 hooks.AFTER_RETRIEVAL_EVENT,
@@ -5092,6 +6759,28 @@ async def chat(request: Request, chat_request: ChatRequest):
                     matches=list(rag_matches),
                     metadata={"channel": "chat"},
                 ),
+            )
+        if rag_progress_operation_id and not rag_progress_failed:
+            _emit_rag_query_notification(
+                request.app,
+                operation_id=rag_progress_operation_id,
+                title="Retrieving chat context",
+                body=rag_progress_preview,
+                status="complete",
+                phase_label="Chat retrieval finished",
+                phase_index=3,
+                phase_count=3,
+                detail=(
+                    "Retrieved context is ready for the model."
+                    if rag_matches
+                    else "No retrieved context was added for this turn."
+                ),
+                started_at=rag_progress_started_at,
+                started_perf=rag_progress_started_perf,
+                counts={
+                    "returned_matches": len(rag_matches),
+                    "injected_matches": len(rag_matches),
+                },
             )
         if rag_matches:
             rag_lines: List[str] = []
@@ -5212,6 +6901,61 @@ async def chat(request: Request, chat_request: ChatRequest):
         }
         _append_conversation_entry(session_name, assistant_placeholder)
 
+        settings_payload = user_settings.load_settings()
+        privacy_route = _privacy_route_check_for_message(
+            chat_request.message,
+            settings_payload=settings_payload,
+            mode_used=mode_used,
+            requested_model=chat_request.model,
+            config_payload=request.app.state.config,
+        )
+        if privacy_route:
+            tools_used_response = await _register_tool_proposals(
+                request,
+                tools=[privacy_route["tool"]],
+                session_id=session_name,
+                message_id=message_id,
+                model=chat_request.model,
+                mode=mode_used,
+                default_agent=message_id or session_name,
+            )
+            if tools_used_response:
+                text = _pending_tool_placeholder_text(tools_used_response)
+                metadata_update = dict(assistant_placeholder.get("metadata") or {})
+                route_metadata = privacy_route.get("metadata")
+                if isinstance(route_metadata, dict):
+                    metadata_update.update(route_metadata)
+                metadata_update.update(
+                    {
+                        "status": "pending",
+                        "tool_response_pending": True,
+                        "privacy_route_pending": True,
+                        "session_name": session_name,
+                        "session_id": session_id,
+                        "message_id": message_id,
+                        "mode": mode_used,
+                    }
+                )
+                _append_user_turn_to_context()
+                llm_service.set_context(context, session_name)
+                _update_conversation_entry(
+                    session_name,
+                    message_id,
+                    {
+                        "text": text,
+                        "metadata": metadata_update,
+                        "updated_at": time.time(),
+                        "iso_timestamp": iso_timestamp,
+                    },
+                )
+                return ChatResponse(
+                    message=text,
+                    thought="",
+                    tools_used=tools_used_response,
+                    metadata=metadata_update,
+                    context=ContextSchema(**context.to_dict()),
+                )
+
         provider_target: Optional[Dict[str, Any]] = None
         effective_mode = mode_used
         effective_model = chat_request.model
@@ -5268,6 +7012,12 @@ async def chat(request: Request, chat_request: ChatRequest):
             "turn_scope",
             _turn_tool_scope_note(allow_computer_capture=computer_capture_turn),
             metadata={"turn_scope": True},
+        )
+        _add_turn_system_message(
+            generation_ctx,
+            "tool_approval",
+            _turn_tool_approval_note(_approval_level_setting()),
+            metadata={"tool_approval": True},
         )
         _add_turn_system_message(
             generation_ctx,
@@ -5531,6 +7281,14 @@ async def chat(request: Request, chat_request: ChatRequest):
                     workflow_name=workflow_config["name"],
                 )
                 generate_kwargs["capture_raw_api"] = True
+                generate_kwargs["tool_executor"] = _build_provider_tool_executor(
+                    request.app,
+                    session_id=session_name,
+                    message_id=message_id,
+                    workflow_name=workflow_config["name"],
+                    model=effective_model,
+                    mode=effective_mode,
+                )
             response = await asyncio.to_thread(
                 llm_service.generate,
                 chat_request.message,
@@ -6353,6 +8111,12 @@ async def chat_continue(request: Request, payload: ChatContinueRequest):
     )
     _add_turn_system_message(
         generation_ctx,
+        "tool_approval",
+        _turn_tool_approval_note(_approval_level_setting()),
+        metadata={"tool_approval": True},
+    )
+    _add_turn_system_message(
+        generation_ctx,
         "workflow",
         workflow_prompt(
             workflow_config["name"],
@@ -6395,7 +8159,11 @@ async def chat_continue(request: Request, payload: ChatContinueRequest):
         normalized["status"] = status_key
         normalized["result"] = result
         normalized_tool_events.append(normalized)
-    tool_prompt_text = _tool_events_prompt_text(normalized_tool_events)
+    tool_prompt_text = _tool_events_prompt_text(
+        normalized_tool_events,
+        model=effective_model,
+        mode=effective_mode,
+    )
 
     if tool_prompt_text:
         _add_turn_system_message(
@@ -6408,7 +8176,9 @@ async def chat_continue(request: Request, payload: ChatContinueRequest):
     _add_turn_system_message(
         generation_ctx,
         "continuation",
-        "Continue your response to the user's last message. Do not repeat completed tool requests or mention this instruction.",
+        "Continue your response to the user's last message. Do not repeat completed tool requests or mention this instruction. "
+        "If the supplied tool result was discovery or schema and it reveals the needed save, write, read, recall, or memory tool, call that target tool next when enough arguments can be inferred. "
+        "Do not stop after discovery by saying you cannot confirm persistence.",
         metadata={"continuation": True},
     )
 
@@ -6445,6 +8215,14 @@ async def chat_continue(request: Request, payload: ChatContinueRequest):
                 workflow_name=workflow_config["name"],
             )
             generate_kwargs["capture_raw_api"] = True
+            generate_kwargs["tool_executor"] = _build_provider_tool_executor(
+                request.app,
+                session_id=session_name,
+                message_id=payload.message_id,
+                workflow_name=workflow_config["name"],
+                model=effective_model,
+                mode=effective_mode,
+            )
         response = await asyncio.to_thread(
             llm_service.generate,
             [],
@@ -6765,6 +8543,51 @@ async def chat_continue(request: Request, payload: ChatContinueRequest):
             retry_meta["unresolved_tool_loop"] = True
             response["metadata"] = retry_meta
 
+    post_discovery_retry_applied = False
+    if _response_needs_post_discovery_persistence_retry(
+        messages=generation_ctx.messages,
+        provided_tools=payload.tools or [],
+        response=response,
+    ):
+        try:
+            action_ctx = ServiceContext(
+                system_prompt=generation_ctx.system_prompt,
+                messages=list(generation_ctx.messages),
+                tools=list(generation_ctx.tools),
+                metadata=dict(generation_ctx.metadata),
+            )
+            _add_turn_system_message(
+                action_ctx,
+                "post_discovery_action",
+                "The previous steps only discovered tool names or schemas; no durable state was changed. "
+                "The user's request asks for persistence. Call a real durable write tool next, such as remember, memory.save, or write_file, using arguments inferred from the user's message and the discovered schema. "
+                "Do not answer with saved/logged/remembered wording unless that write tool succeeds.",
+                metadata={"post_discovery_action": True},
+            )
+            retry_prev_mode = getattr(llm_service, "mode", mode_used)
+            llm_service.mode = effective_mode
+            try:
+                retry_response = await asyncio.to_thread(
+                    llm_service.generate,
+                    [],
+                    session_id=session_name,
+                    model=effective_model,
+                    attachments=recalled_image_attachments,
+                    response_format=response_format,
+                    context=action_ctx,
+                    **generate_kwargs,
+                )
+            finally:
+                llm_service.mode = retry_prev_mode
+            if isinstance(retry_response, dict):
+                retry_meta = dict(retry_response.get("metadata") or {})
+                retry_meta["post_discovery_persistence_retry"] = True
+                retry_response["metadata"] = retry_meta
+                response = retry_response
+                post_discovery_retry_applied = True
+        except Exception:
+            logger.debug("post-discovery persistence retry failed", exc_info=True)
+
     response_tools_used = (
         response.get("tools_used")
         if isinstance(response.get("tools_used"), list)
@@ -6775,6 +8598,14 @@ async def chat_continue(request: Request, payload: ChatContinueRequest):
     )
     repeated_tool_requests = _response_repeats_provided_tools(response_tools_used)
     has_unresolved_response_tools = _tools_require_resolution(response_tools_used)
+    unfulfilled_persistence_after_discovery = (
+        _response_needs_post_discovery_persistence_retry(
+            messages=generation_ctx.messages,
+            provided_tools=payload.tools or [],
+            response=response,
+        )
+        and _text_claims_durable_write(response.get("text") or "")
+    )
     if repeated_tool_requests:
         repeated_names = sorted(
             {
@@ -6791,6 +8622,13 @@ async def chat_continue(request: Request, payload: ChatContinueRequest):
         response["tools_used"] = []
         response_tools_used = []
         has_unresolved_response_tools = False
+    if unfulfilled_persistence_after_discovery:
+        response["text"] = _unfulfilled_persistence_after_discovery_text()
+        response_meta = dict(response_meta)
+        response_meta["unfulfilled_persistence_after_discovery"] = True
+        if post_discovery_retry_applied:
+            response_meta["post_discovery_persistence_retry"] = True
+        response["metadata"] = response_meta
     if has_unresolved_response_tools and not response_meta.get("unresolved_tool_loop"):
         text = _pending_tool_placeholder_text(response_tools_used)
         response["text"] = text
@@ -7129,13 +8967,33 @@ def _memory_allowed_for_rag(
     *,
     allow_protected: bool = False,
     allow_secret: bool = False,
+    memory_key: str = "",
+    settings: Optional[Dict[str, Any]] = None,
+    workspace_profiles: Optional[List[Dict[str, Any]]] = None,
 ) -> bool:
     lvl = str(item.get("sensitivity", "mundane")).lower()
     if lvl == "secret":
         return bool(allow_secret)
     if lvl == "protected":
         return bool(allow_protected)
-    return True
+    return (
+        workspace_item_exclusion_reason(
+            namespace=item.get("source_sync_namespace"),
+            values=[
+                memory_key,
+                item.get("source_sync_relative_path"),
+                item.get("source_path"),
+                item.get("source"),
+                item.get("root_source"),
+                item.get("title"),
+                item.get("key"),
+            ],
+            profiles=workspace_profiles,
+            settings=settings,
+            purpose="default_recall",
+        )
+        is None
+    )
 
 
 def _vectorize_memory_key(
@@ -7149,8 +9007,15 @@ def _vectorize_memory_key(
     item = mgr.get_item(key, touch=False)
     if item is None:
         return None
+    settings = user_settings.load_settings()
+    workspace_profiles = load_workspace_state(settings)[0]
     if not _memory_allowed_for_rag(
-        item, allow_protected=allow_protected, allow_secret=allow_secret
+        item,
+        allow_protected=allow_protected,
+        allow_secret=allow_secret,
+        memory_key=key,
+        settings=settings,
+        workspace_profiles=workspace_profiles,
     ):
         return None
     value_text = _memory_value_to_text(item.get("value"))
@@ -7189,6 +9054,9 @@ def _vectorize_memory_key(
     }
     if item.get("rag_excluded") is not None:
         meta["rag_excluded"] = bool(item.get("rag_excluded"))
+    for field, value in dict(item).items():
+        if field == "sensitivity_source" or str(field).startswith("privacy_filter_"):
+            meta[field] = value
     doc_id = service.ingest_text(text, meta)
     if doc_id:
         mgr.update_item_fields(
@@ -7279,6 +9147,11 @@ async def memory_graph(
     return {"graph": graph}
 
 
+@router.post("/memory/search")
+async def memory_search(request: Request, payload: MemorySearchRequest):
+    return await _memory_search_impl(request, payload)
+
+
 @router.get("/memory/{key}")
 async def memory_get(
     request: Request,
@@ -7318,6 +9191,27 @@ async def memory_upsert(request: Request, key: str, payload: MemoryItemUpsert):
         extra_kwargs["pinned"] = payload.pinned
     if "importance_floor" in fields_set:
         extra_kwargs["importance_floor"] = payload.importance_floor
+    explicit_sensitivity = (
+        payload.sensitivity
+        if "sensitivity" in fields_set and payload.sensitivity is not None
+        else None
+    )
+    privacy_decision = privacy_filter_service.decide_sensitivity(
+        _memory_value_to_text(payload.value),
+        explicit_sensitivity=explicit_sensitivity,
+        existing_sensitivity=existing.get("sensitivity")
+        if isinstance(existing, dict)
+        else None,
+        existing_sensitivity_source=existing.get("sensitivity_source")
+        if isinstance(existing, dict)
+        else None,
+        purpose="memory",
+    )
+    effective_sensitivity = (
+        privacy_decision.applied_sensitivity
+        if privacy_decision.applied_sensitivity is not None
+        else payload.sensitivity
+    )
     item = mgr.upsert_item(
         key,
         payload.value,
@@ -7325,7 +9219,7 @@ async def memory_upsert(request: Request, key: str, payload: MemoryItemUpsert):
         payload.evergreen,
         payload.end_time,
         payload.archived,
-        payload.sensitivity,
+        effective_sensitivity,
         payload.hint,
         lifecycle=payload.lifecycle,
         grounded_at=payload.grounded_at,
@@ -7334,6 +9228,9 @@ async def memory_upsert(request: Request, key: str, payload: MemoryItemUpsert):
         decay_at=payload.decay_at,
         **extra_kwargs,
     )
+    privacy_updates = privacy_filter_service.metadata_updates(privacy_decision)
+    if privacy_updates:
+        item = mgr.update_item_fields(key, privacy_updates) or item
     if "rag_excluded" in fields_set:
         mgr.update_item_fields(key, {"rag_excluded": bool(payload.rag_excluded)})
         item = mgr.get_item(key, include_pruned=True, touch=False) or item
@@ -7358,7 +9255,11 @@ async def memory_upsert(request: Request, key: str, payload: MemoryItemUpsert):
         )
     except Exception:
         pass
-    return {"key": key, **item}
+    response = {"key": key, **item}
+    privacy_notice = privacy_filter_service.notice(privacy_decision)
+    if privacy_notice:
+        response["privacy_filter_notice"] = privacy_notice
+    return response
 
 
 @router.post("/memory/{key}/rename")
@@ -7457,6 +9358,8 @@ async def memory_rag_rehydrate(request: Request, payload: MemoryRagRehydrate):
     This is a non-Celery fallback so local dev runs can still populate RAG.
     """
     mgr = request.app.state.memory_manager
+    settings = user_settings.load_settings()
+    workspace_profiles = load_workspace_state(settings)[0]
     keys = mgr.list_items(include_pruned=payload.include_archived)
     max_items = None
     if payload.limit is not None:
@@ -7488,6 +9391,9 @@ async def memory_rag_rehydrate(request: Request, payload: MemoryRagRehydrate):
             item,
             allow_protected=payload.allow_protected,
             allow_secret=payload.allow_secret,
+            memory_key=key,
+            settings=settings,
+            workspace_profiles=workspace_profiles,
         ):
             skipped += 1
             continue
@@ -7557,8 +9463,13 @@ async def memory_delete(request: Request, key: str):
     return {"status": "deleted"}
 
 
-@router.post("/memory/search")
-async def memory_search(request: Request, payload: MemorySearchRequest):
+def _normalize_memory_search_text(value: Any) -> str:
+    return re.sub(
+        r"\s+", " ", re.sub(r"[_/\\-]+", " ", str(value or "").lower())
+    ).strip()
+
+
+async def _memory_search_impl(request: Request, payload: MemorySearchRequest):
     query = (payload.query or "").strip()
     if not query:
         raise HTTPException(status_code=400, detail="Query is required")
@@ -7570,7 +9481,7 @@ async def memory_search(request: Request, payload: MemorySearchRequest):
         limit = max(1, min(int(limit), 200))
     except Exception:
         limit = 10
-    q_lower = query.lower()
+    q_lower = _normalize_memory_search_text(query)
     results: list[dict[str, Any]] = []
     for key, item in mgr.iter_items(touch=False):
         if not item:
@@ -7583,7 +9494,19 @@ async def memory_search(request: Request, payload: MemorySearchRequest):
                 text = json.dumps(value, ensure_ascii=False)
             except Exception:
                 text = str(value)
-        if q_lower in text.lower():
+        search_text = _normalize_memory_search_text(
+            " ".join(
+                part
+                for part in (
+                    key,
+                    item.get("title"),
+                    item.get("hint"),
+                    text,
+                )
+                if part
+            )
+        )
+        if q_lower in search_text:
             snippet = text if len(text) <= 240 else text[:237] + "..."
             results.append(
                 {
@@ -7649,13 +9572,38 @@ async def get_tools(request: Request):
 
 
 @router.get("/tools/specs")
-async def get_tool_specs(request: Request):
+async def get_tool_specs(request: Request, workflow: Optional[str] = None):
     """Return UI-facing tool schemas for the currently-registered tools."""
     try:
         from app.tool_specs import get_tool_specs as _get_specs
 
         tools_list = request.app.state.memory_manager.list_tools()
-        return {"tools": _get_specs(list(tools_list) if tools_list else [])}
+        settings_payload = user_settings.load_settings()
+        workflow_name = normalize_tool_workflow(workflow) if workflow else ""
+        out: list[dict[str, Any]] = []
+        for raw_spec in _get_specs(list(tools_list) if tools_list else []):
+            if not isinstance(raw_spec, dict):
+                continue
+            name = str(raw_spec.get("name") or "").strip()
+            if not name:
+                continue
+            if workflow_name == WORKFLOW_LIVE:
+                if not tool_auto_invokable_in_workflow(
+                    name, WORKFLOW_LIVE, settings_payload
+                ):
+                    continue
+            elif workflow_name:
+                if not tool_allowed_in_workflow(name, workflow_name, settings_payload):
+                    continue
+            spec = copy.deepcopy(raw_spec)
+            policy = tool_policy_payload(name, settings_payload)
+            spec["policy"] = policy
+            metadata = (
+                spec.get("metadata") if isinstance(spec.get("metadata"), dict) else {}
+            )
+            spec["metadata"] = {**metadata, "policy": policy}
+            out.append(spec)
+        return {"tools": out}
     except Exception:
         # Never hard fail tool discovery; the UI can fall back to raw JSON.
         return {"tools": []}
@@ -7681,6 +9629,7 @@ class ToolInvoke(BaseModel):
     chain_id: Optional[str] = None
     session_id: Optional[str] = None
     message_id: Optional[str] = None
+    workflow: Optional[str] = None
 
 
 class ToolProposal(BaseModel):
@@ -7724,12 +9673,84 @@ class ToolSchedule(BaseModel):
     chain_id: Optional[str] = None
 
 
+def _suggest_tool_names(tool_name: str, limit: int = 4) -> list[str]:
+    requested = _normalize_tool_name(tool_name)
+    available = sorted(str(name) for name in tools.BUILTIN_TOOLS.keys())
+    suggestions: list[str] = []
+    for hint in _COMMON_TOOL_NAME_HINTS.get(requested, []):
+        if hint in available and hint not in suggestions:
+            suggestions.append(hint)
+    for match in get_close_matches(requested, available, n=limit, cutoff=0.55):
+        if match not in suggestions:
+            suggestions.append(match)
+    if requested:
+        for name in available:
+            normalized = name.lower()
+            if requested in normalized or normalized in requested:
+                if name not in suggestions:
+                    suggestions.append(name)
+            if len(suggestions) >= limit:
+                break
+    return suggestions[:limit]
+
+
+def _suggest_memory_key_from_args(raw_args: Any) -> str:
+    if not isinstance(raw_args, dict):
+        return "memory-note"
+    for key in ("key", "value", "text", "content", "note", "body"):
+        value = raw_args.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        words = re.findall(r"[A-Za-z0-9]+", value.lower())
+        if words:
+            return "-".join(words[:3])
+    return "memory-note"
+
+
+def _tool_invoke_error_detail(
+    tool_name: str,
+    raw_args: Any,
+    error_message: str,
+) -> str:
+    message = str(error_message or "Tool invocation failed.").strip()
+    normalized = _normalize_tool_name(tool_name)
+    if normalized == "remember" and "Missing required argument(s)" in message and "key" in message:
+        suggested_key = _suggest_memory_key_from_args(raw_args)
+        return (
+            f"{message}. Retry `remember` with a `key`, for example "
+            f"`{suggested_key}`, and the same value."
+        )
+    return message
+
+
 @router.post("/tools/invoke")
 async def invoke_tool(request: Request, payload: ToolInvoke):
     """Invoke a previously registered tool."""
     user = request.headers.get("X-User", "anonymous")
     raw_args = payload.args or {}
     tool_name = _normalize_tool_name(payload.name)
+    if tool_name not in tools.BUILTIN_TOOLS:
+        suggestions = _suggest_tool_names(tool_name)
+        suffix = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+        raise HTTPException(
+            status_code=404,
+            detail=f"Tool `{tool_name or payload.name}` is not registered.{suffix}",
+        )
+    workflow_name = normalize_tool_workflow(payload.workflow or WORKFLOW_TEXT)
+    settings_payload = user_settings.load_settings()
+    if workflow_name == WORKFLOW_LIVE:
+        if not tool_auto_invokable_in_workflow(
+            tool_name, WORKFLOW_LIVE, settings_payload
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail=f"{tool_name} is not enabled for automatic live workflow invocation",
+            )
+    elif not tool_allowed_in_workflow(tool_name, workflow_name, settings_payload):
+        raise HTTPException(
+            status_code=403,
+            detail=f"{tool_name} is not enabled for {workflow_name} workflow",
+        )
     model_hint, mode_hint = _lookup_message_runtime_hints(
         payload.session_id,
         payload.message_id or payload.chain_id,
@@ -7780,7 +9801,10 @@ async def invoke_tool(request: Request, payload: ToolInvoke):
             session_id=payload.session_id,
             message_id=payload.message_id or payload.chain_id,
         )
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(
+            status_code=400,
+            detail=_tool_invoke_error_detail(tool_name, raw_args, str(e)),
+        )
     except PermissionError:
         tool_invocations_total.labels(tool_name, "forbidden").inc()
         log_tool_event(
@@ -7814,7 +9838,9 @@ async def invoke_tool(request: Request, payload: ToolInvoke):
             session_id=payload.session_id,
             message_id=payload.message_id or payload.chain_id,
         )
-        raise HTTPException(status_code=404, detail="Tool not registered")
+        suggestions = _suggest_tool_names(tool_name)
+        suffix = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+        raise HTTPException(status_code=404, detail=f"Tool not registered.{suffix}")
     except Exception as e:  # pragma: no cover - runtime errors
         tool_invocations_total.labels(tool_name, "error").inc()
         log_tool_event(
@@ -8056,7 +10082,15 @@ async def decide_tool(request: Request, payload: ToolDecision):
     except ValueError as exc:
         rec["status"] = "error"
         error_text = str(exc)
-        error_result = _tool_outcome_payload("error", error_text)
+        error_result = _tool_outcome_payload(
+            "error",
+            error_text,
+            data=_tool_recovery_hint_payload(
+                rec["name"],
+                raw_args if isinstance(raw_args, dict) else {},
+                error_text,
+            ),
+        )
         try:
             await publish_console_event(
                 request.app,
@@ -8698,8 +10732,111 @@ async def schedule_tool(request: Request, payload: ToolSchedule) -> dict:
 
 
 class ConversationPayload(BaseModel):
-    name: str
+    name: str = ""
     messages: list[dict[str, Any]]
+    client_window: Optional[Dict[str, Any]] = None
+    allow_partial_overwrite: bool = False
+
+
+class ConversationCompactionPayload(BaseModel):
+    conversation_id: str
+    keep_last: int = 40
+    max_summary_chars: int = 6000
+    summary_mode: str = "deterministic"
+    summary_workflow: str = "conversation_handoff"
+    summary_format_notes: str = ""
+    summary_model: str = ""
+    target_conversation_id: str = ""
+    replace: bool = False
+    context_window_tokens: Optional[int] = None
+    reserve_output_tokens: int = 2048
+    reserve_tool_tokens: int = 2500
+    reserve_retrieval_tokens: int = 2500
+    reserve_system_tokens: int = 1500
+    soft_trigger_ratio: float = 0.75
+    hard_trigger_ratio: float = 0.9
+
+
+def _stable_conversation_entry(value: Any) -> str:
+    try:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=str,
+        )
+    except Exception:
+        return repr(value)
+
+
+def _conversation_tail_overlap(
+    existing: List[Dict[str, Any]],
+    incoming: List[Dict[str, Any]],
+) -> int:
+    """Return the largest suffix/prefix overlap between saved and incoming turns."""
+
+    if not existing or not incoming:
+        return 0
+    existing_keys = [_stable_conversation_entry(item) for item in existing]
+    incoming_keys = [_stable_conversation_entry(item) for item in incoming]
+    max_overlap = min(len(existing_keys), len(incoming_keys))
+    for overlap in range(max_overlap, 0, -1):
+        if existing_keys[-overlap:] == incoming_keys[:overlap]:
+            return overlap
+    return 0
+
+
+def _payload_marks_client_window(payload: ConversationPayload) -> bool:
+    window = payload.client_window if isinstance(payload.client_window, dict) else {}
+    if window.get("truncated"):
+        return True
+    for message in payload.messages:
+        if not isinstance(message, dict):
+            continue
+        metadata = message.get("metadata")
+        if isinstance(metadata, dict) and isinstance(metadata.get("client_trim"), dict):
+            return True
+    return False
+
+
+def _conversation_compaction_llm_summarizer(request: Dict[str, Any]) -> Any:
+    if not isinstance(request, dict):
+        request = {"prompt": str(request or "")}
+    return llm_service.generate(
+        request.get("prompt") or "",
+        session_id=str(request.get("session_id") or "conversation-compaction"),
+        context=request.get("context"),
+        model=request.get("model"),
+    )
+
+
+def _conversation_compaction_budget_plan(
+    payload: ConversationCompactionPayload,
+    *,
+    use_default_context_window: bool = False,
+) -> Optional[Dict[str, Any]]:
+    context_window_tokens = payload.context_window_tokens
+    if context_window_tokens is None and not use_default_context_window:
+        return None
+    messages = conversation_store.load_conversation(payload.conversation_id)
+    if not isinstance(messages, list) or not messages:
+        raise FileNotFoundError(
+            f"Conversation not found or empty: {payload.conversation_id}"
+        )
+    return build_context_budget_plan(
+        messages,
+        conversation_id=payload.conversation_id,
+        context_window_tokens=(
+            context_window_tokens if context_window_tokens is not None else 24000
+        ),
+        reserve_output_tokens=payload.reserve_output_tokens,
+        reserve_tool_tokens=payload.reserve_tool_tokens,
+        reserve_retrieval_tokens=payload.reserve_retrieval_tokens,
+        reserve_system_tokens=payload.reserve_system_tokens,
+        soft_trigger_ratio=payload.soft_trigger_ratio,
+        hard_trigger_ratio=payload.hard_trigger_ratio,
+    )
 
 
 @router.get("/conversations")
@@ -8850,12 +10987,40 @@ async def export_all_conversations(
 
 class RenamePayload(BaseModel):
     new_name: str
+    privacy_mode: Optional[str] = None
+    sensitivity: Optional[str] = None
 
 
 @router.post("/conversations/{name:path}/rename")
 async def rename_conversation(name: str, payload: RenamePayload):
-    conversation_store.rename_conversation(name, payload.new_name)
-    return {"status": "renamed"}
+    target_name = str(payload.new_name or "").strip() or name
+    if target_name != name:
+        conversation_store.rename_conversation(name, target_name)
+    updates: Dict[str, Any] = {}
+    if payload.privacy_mode is not None or payload.sensitivity is not None:
+        privacy_mode = conversation_store.normalize_conversation_privacy_mode(
+            payload.privacy_mode
+            or conversation_store.conversation_privacy_mode_from_sensitivity(
+                payload.sensitivity
+            )
+        )
+        sensitivity = str(payload.sensitivity or "").strip().lower()
+        if not sensitivity:
+            sensitivity = conversation_store.conversation_privacy_to_sensitivity(
+                privacy_mode
+            )
+        updates = {
+            "privacy_mode": privacy_mode,
+            "sensitivity": sensitivity,
+            "sensitivity_source": "user",
+        }
+        conversation_store.merge_metadata(target_name, updates)
+    meta = conversation_store.get_metadata(target_name)
+    return {
+        "status": "renamed" if target_name != name else "updated",
+        "name": target_name,
+        "metadata": meta,
+    }
 
 
 @router.delete("/conversations/{name:path}")
@@ -8930,11 +11095,26 @@ _TOOL_DISCOVERY_PROMPT_HINT = (
     "If you need to discover or verify available tools, use tool_help to list them "
     "and tool_info to inspect one tool's purpose, arguments, and limits. "
     "Do that before claiming a capability is unavailable. "
+    "When you just need the tool menu, call help or tool_help with `{}` and stop there; "
+    "do not invent `tool_name` or `failed_*` fields for ordinary discovery. "
+    "The default menu is curated and may group dotted suites; use detail='brief' "
+    "or pass a family name when you need descriptions or exact suite members. "
+    "If a previous tool call failed because the name or args were wrong, you can pass "
+    "`failed_tool_name`, `failed_args`, and `failed_error` into help, tool_help, or tool_info "
+    "to get a compact recovery breadcrumb with the menu. "
+    "After discovery or schema lookup shows the needed tool is available, use that tool next "
+    "instead of stopping at a capability summary. "
+    "When the user asks to save, log, note, remember, write, read, or update something, "
+    "use remember, recall, write_file, read_file, or list_dir when they are listed and "
+    "the needed arguments can be inferred. "
+    "Do not invent memory.* aliases; if one fails, follow the suggested exact tool name. "
+    "For diary, journal, or food diary requests, use the closest durable memory or file tool "
+    "when no dedicated diary tool is listed; do not claim the missing dedicated tool blocks the task. "
     "For reminders, tasks, events, or scheduled follow-ups, inspect/use create_task. "
     "For local workspace browsing or edits, inspect/use list_dir, read_file, and write_file. "
     "For browser or desktop control, inspect/use computer.observe, computer.act, computer.navigate, "
     "computer.windows.list, computer.windows.focus, computer.app.launch, and treat open_url as a legacy alias. "
-    "For shell commands, patches, or MCP access, inspect/use shell.exec, patch.apply, and mcp.call. "
+    "For shell commands, patches, or MCP access, inspect shell.exec, patch.apply, and mcp.call before use. "
     "For local files, use list_dir to discover paths first and keep read_file "
     "requests narrowly chunked. "
     "Check runtime and sandbox metadata before assuming Python, REPL, shell, network, or filesystem access. "
@@ -8944,14 +11124,16 @@ _TOOL_DISCOVERY_PROMPT_HINT = (
 
 _JSON_TOOL_CALL_PROMPT_HINT = (
     "Tool call syntax for this turn: emit direct JSON only in the form "
-    '{"tool":"tool_help","args":{}}. '
+    '{"tool":"<exact_tool_name>","args":{...}}; for example, '
+    '{"tool":"tool_help","args":{}} or {"tool":"list_dir","args":{"path":"."}}. '
     "Use exact tool identifiers and valid JSON only. "
     "Do not wrap JSON calls in Harmony markers."
 )
 
 _HARMONY_TOOL_CALL_PROMPT_HINT = (
     "Tool call syntax for this turn: emit Harmony tool calls only in the form "
-    "<|channel|>commentary to=tool_help <|constrain|>json <|message|>{}. "
+    "<|channel|>commentary to=<exact_tool_name> <|constrain|>json <|message|>{...}; "
+    "for example, <|channel|>commentary to=tool_help <|constrain|>json <|message|>{}. "
     "Use exact tool identifiers and valid JSON in the message body only. "
     "Do not prepend standalone JSON tool calls outside the Harmony wrapper."
 )
@@ -8964,7 +11146,11 @@ _TOOL_CALL_PROMPT_HINTS = (
 def _ensure_tool_discovery_hint(prompt: str) -> str:
     base = (prompt or "").strip()
     lowered = base.lower()
-    if "tool_help" in lowered and "tool_info" in lowered:
+    if (
+        "tool_help" in lowered
+        and "tool_info" in lowered
+        and ("with `{}`" in base or "with {}" in lowered)
+    ):
         return base
     if not base:
         return _TOOL_DISCOVERY_PROMPT_HINT
@@ -9572,16 +11758,135 @@ async def get_conversation(name: str):
     return {"messages": conversation_store.load_conversation(name)}
 
 
+@router.post("/conversations/compact/preview")
+async def preview_conversation_compaction(payload: ConversationCompactionPayload):
+    try:
+        budget_plan = _conversation_compaction_budget_plan(payload)
+        return build_compaction(
+            payload.conversation_id,
+            keep_last=payload.keep_last,
+            max_summary_chars=payload.max_summary_chars,
+            summary_mode=payload.summary_mode,
+            summary_workflow=payload.summary_workflow,
+            summary_format_notes=payload.summary_format_notes,
+            summary_model=payload.summary_model,
+            context_budget_plan=budget_plan,
+            llm_summarizer=(
+                _conversation_compaction_llm_summarizer
+                if str(payload.summary_mode or "").strip().lower() == "llm"
+                else None
+            ),
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/conversations/compact/plan")
+async def plan_conversation_compaction(payload: ConversationCompactionPayload):
+    try:
+        plan = _conversation_compaction_budget_plan(
+            payload,
+            use_default_context_window=True,
+        )
+        if not isinstance(plan, dict):
+            raise ValueError("Unable to build compaction plan")
+        plan["recommended_preview_payload"] = {
+            "conversation_id": payload.conversation_id,
+            "keep_last": plan.get("recommended_keep_last"),
+            "max_summary_chars": plan.get("recommended_summary_chars"),
+            "summary_mode": payload.summary_mode,
+            "summary_workflow": payload.summary_workflow,
+        }
+        return plan
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/conversations/compact/write")
+async def write_conversation_compaction(payload: ConversationCompactionPayload):
+    if payload.replace:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Replacing a source conversation requires the gated "
+                "compact_conversation_write tool approval path."
+            ),
+        )
+    try:
+        budget_plan = _conversation_compaction_budget_plan(payload)
+        return write_compaction(
+            payload.conversation_id,
+            keep_last=payload.keep_last,
+            max_summary_chars=payload.max_summary_chars,
+            summary_mode=payload.summary_mode,
+            summary_workflow=payload.summary_workflow,
+            summary_format_notes=payload.summary_format_notes,
+            summary_model=payload.summary_model,
+            target_conversation_id=payload.target_conversation_id,
+            replace=payload.replace,
+            context_budget_plan=budget_plan,
+            llm_summarizer=(
+                _conversation_compaction_llm_summarizer
+                if str(payload.summary_mode or "").strip().lower() == "llm"
+                else None
+            ),
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/conversations/{name:path}")
 async def save_conversation(name: str, payload: ConversationPayload):
-    conversation_store.save_conversation(name, payload.messages)
+    messages_to_save = payload.messages
+    partial_merge: Optional[Dict[str, Any]] = None
+    if not payload.allow_partial_overwrite:
+        existing = conversation_store.load_conversation(name)
+        if (
+            isinstance(existing, list)
+            and len(existing) > len(payload.messages)
+            and payload.messages
+        ):
+            overlap = _conversation_tail_overlap(existing, payload.messages)
+            if overlap > 0 and len(existing) > overlap:
+                appended = payload.messages[overlap:]
+                messages_to_save = [*existing, *appended]
+                partial_merge = {
+                    "status": "merged_partial" if appended else "skipped_partial",
+                    "existing_messages": len(existing),
+                    "incoming_messages": len(payload.messages),
+                    "overlap_messages": overlap,
+                    "appended_messages": len(appended),
+                    "preserved_messages": len(existing) - overlap,
+                }
+            elif _payload_marks_client_window(payload):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Refusing to overwrite a longer saved conversation with "
+                        "a partial client window. Reload the full conversation or "
+                        "set allow_partial_overwrite=true intentionally."
+                    ),
+                )
+    conversation_store.save_conversation(name, messages_to_save)
+    privacy_updates = _apply_conversation_privacy_filter(name, messages_to_save)
     display_name = (payload.name or "").strip()
     if display_name:
         try:
             conversation_store.set_display_name(name, display_name)
         except Exception:
             pass
-    return {"status": "saved"}
+    if partial_merge:
+        return partial_merge
+    response: Dict[str, Any] = {"status": "saved"}
+    if privacy_updates:
+        response["privacy_filter"] = privacy_updates
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -9849,6 +12154,23 @@ def _normalize_sync_scopes(value: Any) -> List[str]:
     return normalized
 
 
+def _registered_device_scopes(record: Dict[str, Any]) -> List[str]:
+    capabilities = record.get("capabilities") if isinstance(record, dict) else {}
+    if not isinstance(capabilities, dict):
+        return []
+    requested = _normalize_sync_scopes(capabilities.get("requested_scopes"))
+    if requested:
+        return requested
+    allowed = [
+        scope for scope in SYNC_DEVICE_SCOPE_ORDER if bool(capabilities.get(scope))
+    ]
+    if allowed:
+        return allowed
+    if capabilities.get("instance_sync") or capabilities.get("paired_via_offer"):
+        return ["sync"]
+    return []
+
+
 def _coerce_saved_peer(entry: Any, index: int = 0) -> Optional[Dict[str, Any]]:
     if not isinstance(entry, dict):
         return None
@@ -9904,6 +12226,121 @@ def _load_saved_peers() -> List[Dict[str, Any]]:
         if normalized is not None:
             peers.append(normalized)
     return peers
+
+
+def _sync_ownership_summary(
+    settings: Dict[str, Any],
+    access: Dict[str, Any],
+    saved_peers: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    remote_url = str(settings.get("sync_remote_url") or "").strip()
+    default_peer = next(
+        (
+            peer
+            for peer in saved_peers
+            if str(peer.get("remote_url") or "").strip() == remote_url
+        ),
+        None,
+    )
+    visibility = access.get("visibility") if isinstance(access, dict) else {}
+    visibility = visibility if isinstance(visibility, dict) else {}
+    lan_enabled = bool(
+        visibility.get("lan_enabled") or settings.get("sync_visible_on_lan")
+    )
+    online_supported = bool(visibility.get("online_supported"))
+    online_requested = bool(settings.get("sync_visible_online"))
+    auto_accept_push = bool(settings.get("sync_auto_accept_push"))
+    if remote_url:
+        outbound_mode = "saved_peer" if default_peer else "manual_url"
+    else:
+        outbound_mode = "none"
+    return {
+        "private_network_only": True,
+        "inbound_visibility": {
+            "lan_enabled": lan_enabled,
+            "online_requested": online_requested,
+            "online_supported": online_supported,
+        },
+        "outbound_target": {
+            "mode": outbound_mode,
+            "remote_url": remote_url,
+            "peer_id": str(default_peer.get("id") or "").strip()
+            if isinstance(default_peer, dict)
+            else "",
+            "peer_label": str(default_peer.get("label") or "").strip()
+            if isinstance(default_peer, dict)
+            else "",
+        },
+        "push_review_mode": "auto_accept" if auto_accept_push else "review_required",
+        "saved_peer_count": len(saved_peers),
+        "unfinished_notice": (
+            "Automatic stop-kill safeguards are future work. Stop records cancel "
+            "intent and aborts the current local request where possible, but it "
+            "does not kill remote work that another device already accepted."
+        ),
+    }
+
+
+def _sync_operation_remote_label(paired_device: Optional[Dict[str, Any]]) -> str:
+    pair = _coerce_saved_peer(paired_device or {}) or {}
+    return str(
+        pair.get("label")
+        or pair.get("remote_device_name")
+        or pair.get("remote_device_id")
+        or ""
+    ).strip()
+
+
+def _begin_sync_operation(
+    *,
+    kind: str,
+    remote_url: str,
+    operation_id: Optional[str] = None,
+    operation_owner: Optional[str] = None,
+    paired_device: Optional[Dict[str, Any]] = None,
+    sections: Optional[List[str]] = None,
+    workspace_mode: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    try:
+        return sync_start_operation(
+            kind=kind,
+            operation_id=operation_id,
+            owner=operation_owner,
+            remote_url=remote_url,
+            remote_label=_sync_operation_remote_label(paired_device),
+            sections=sections or [],
+            workspace_mode=workspace_mode or "",
+            request_id=_current_request_id(),
+            metadata=metadata,
+        )
+    except Exception:
+        logger.debug("Failed to record sync operation start", exc_info=True)
+        return None
+
+
+def _finish_sync_operation(
+    operation: Optional[Dict[str, Any]],
+    *,
+    status: str,
+    error: Optional[str] = None,
+    result: Optional[Dict[str, Any]] = None,
+) -> None:
+    op_id = str((operation or {}).get("id") or "").strip()
+    if not op_id:
+        return
+    try:
+        sync_finish_operation(op_id, status=status, error=error, result=result)
+    except Exception:
+        logger.debug("Failed to record sync operation finish", exc_info=True)
+
+
+def _sync_operations_overview() -> Dict[str, Any]:
+    try:
+        return sync_operations_snapshot()
+    except Exception:
+        logger.debug("Failed to read sync operation telemetry", exc_info=True)
+        return {"active_operation": None, "last_attempt": None, "recent": []}
 
 
 def _workspace_state_summary(
@@ -9995,6 +12432,23 @@ def _filter_recursive_workspace_ids(
     return filtered, ignored
 
 
+def _ignored_local_workspace_detail(
+    recursive_ignored_ids: List[str], privacy_ignored_ids: List[str]
+) -> str:
+    if recursive_ignored_ids and privacy_ignored_ids:
+        return (
+            "All selected local workspaces were ignored to avoid syncing a "
+            "workspace back to its source device or because of workspace privacy "
+            "settings."
+        )
+    if recursive_ignored_ids:
+        return (
+            "All selected local workspaces were ignored to avoid syncing a "
+            "workspace back to its source device."
+        )
+    return "All selected local workspaces were ignored by workspace privacy settings."
+
+
 def _normalize_workspace_mode(value: Any) -> str:
     return "import" if str(value or "").strip().lower() == "import" else "merge"
 
@@ -10011,17 +12465,13 @@ def _upsert_workspace_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
         if existing_id == str(profile.get("id") or "").strip():
             next_profiles.append(profile)
             replaced = True
-        elif existing_id != DEFAULT_WORKSPACE_ID:
+        else:
             next_profiles.append(existing)
     if not replaced and str(profile.get("id") or "").strip():
         next_profiles.append(profile)
     user_settings.save_settings(
         {
-            "workspace_profiles": [
-                item
-                for item in next_profiles
-                if str(item.get("id") or "").strip() != DEFAULT_WORKSPACE_ID
-            ],
+            "workspace_profiles": next_profiles,
             "active_workspace_id": active_workspace_id,
             "sync_selected_workspace_ids": selected_workspace_ids,
         }
@@ -10049,16 +12499,24 @@ def _persist_saved_peer_state(
         "last_used_at": now,
     }
     updated = False
+    update_default_remote = False
+    settings = user_settings.load_settings()
+    current_default_remote = str(settings.get("sync_remote_url") or "").strip()
     next_peers: List[Dict[str, Any]] = []
     for peer in peers:
         if str(peer.get("id") or "").strip() == peer_id:
             next_peers.append({**peer, **next_peer})
+            if current_default_remote == str(peer.get("remote_url") or "").strip():
+                update_default_remote = True
             updated = True
         else:
             next_peers.append(peer)
     if not updated:
         return None
-    user_settings.save_settings({"sync_saved_peers": next_peers})
+    updates: Dict[str, Any] = {"sync_saved_peers": next_peers}
+    if update_default_remote:
+        updates["sync_remote_url"] = next_peer["remote_url"]
+    user_settings.save_settings(updates)
     return next_peer
 
 
@@ -10110,9 +12568,7 @@ def _summarize_inbound_device(device_id: str, record: Dict[str, Any]) -> Dict[st
         if isinstance(capabilities.get("requested_scopes"), list)
         else []
     )
-    legacy_browser = not _device_has_sync_capabilities(
-        record
-    ) and _looks_like_legacy_browser_name(name)
+    legacy_browser = _looks_like_legacy_browser_name(name)
     status = "legacy_browser_record" if legacy_browser else "trusted_device"
     status_label = "Legacy browser record" if legacy_browser else "Trusted device"
     last_seen = float(record.get("last_seen") or 0)
@@ -10124,7 +12580,7 @@ def _summarize_inbound_device(device_id: str, record: Dict[str, Any]) -> Dict[st
     ):
         status = "connected_device"
         status_label = "Connected device"
-    if capabilities.get("paired_via_offer"):
+    if capabilities.get("paired_via_offer") and not legacy_browser:
         status = "paired_device"
         status_label = "Paired device"
     return {
@@ -10215,12 +12671,20 @@ def _peer_connectivity_status(remote_url: str) -> Dict[str, Any]:
         if isinstance(overview.get("sync_defaults"), dict)
         else {}
     )
+    public_key = str(current.get("public_key") or "").strip()
     return {
         "reachable": True,
         "instance_base": urls["instance_base"],
         "display_name": str(current.get("display_name") or "").strip(),
         "hostname": str(current.get("hostname") or "").strip(),
+        "public_key": public_key,
         "source_namespace": str(current.get("source_namespace") or "").strip(),
+        "identity": {
+            "public_key": public_key,
+            "display_name": str(current.get("display_name") or "").strip(),
+            "hostname": str(current.get("hostname") or "").strip(),
+            "source_namespace": str(current.get("source_namespace") or "").strip(),
+        },
         "visible_on_lan": bool(
             (device_access.get("visibility") or {}).get("lan_enabled")
             or sync_defaults.get("visible_on_lan")
@@ -10236,7 +12700,156 @@ def _peer_connectivity_status(remote_url: str) -> Dict[str, Any]:
             if isinstance(overview.get("workspaces"), dict)
             else _workspace_state_summary({})
         ),
+        "inbound_devices": (
+            overview.get("inbound_devices")
+            if isinstance(overview.get("inbound_devices"), list)
+            else []
+        ),
     }
+
+
+def _remote_identity_from_overview(overview: Dict[str, Any]) -> Dict[str, str]:
+    current = (
+        overview.get("current_device")
+        if isinstance(overview.get("current_device"), dict)
+        else {}
+    )
+    return {
+        "public_key": str(current.get("public_key") or "").strip(),
+        "display_name": str(current.get("display_name") or "").strip(),
+        "hostname": str(current.get("hostname") or "").strip(),
+        "source_namespace": str(current.get("source_namespace") or "").strip(),
+    }
+
+
+def _annotate_peer_identity(
+    status: Dict[str, Any],
+    pairing: Optional[Dict[str, Any]],
+    *,
+    strict: bool = False,
+) -> Dict[str, Any]:
+    pair = _coerce_saved_peer(pairing or {}) if isinstance(pairing, dict) else None
+    identity = (
+        status.get("identity") if isinstance(status.get("identity"), dict) else {}
+    )
+    observed_key = str(
+        identity.get("public_key") or status.get("public_key") or ""
+    ).strip()
+    expected_key = str((pair or {}).get("remote_public_key") or "").strip()
+    annotated = {
+        **status,
+        "identity": {
+            **identity,
+            "public_key": observed_key,
+        },
+        "identity_verified": False,
+        "identity_state": "unpaired",
+        "identity_warning": "",
+    }
+    if pair is None:
+        return annotated
+    if not expected_key:
+        remote_device_id = str(pair.get("remote_device_id") or "").strip()
+        local_public_key = str(pair.get("public_key") or "").strip()
+        expected_label = str(pair.get("label") or "").strip().lower()
+        observed_labels = {
+            str(identity.get("display_name") or status.get("display_name") or "")
+            .strip()
+            .lower(),
+            str(identity.get("hostname") or status.get("hostname") or "")
+            .strip()
+            .lower(),
+            str(
+                identity.get("source_namespace") or status.get("source_namespace") or ""
+            )
+            .strip()
+            .lower(),
+        }
+        label_matches = not expected_label or expected_label in observed_labels
+        inbound_devices = (
+            status.get("inbound_devices")
+            if isinstance(status.get("inbound_devices"), list)
+            else []
+        )
+        for device in inbound_devices:
+            if not isinstance(device, dict):
+                continue
+            if str(device.get("id") or "").strip() != remote_device_id:
+                continue
+            if not label_matches:
+                annotated["identity_state"] = "label_mismatch"
+                annotated[
+                    "identity_warning"
+                ] = "The remote recognized this saved pair's local device, but its advertised identity label does not match the saved peer. Pair it as a separate Float instance."
+                return annotated
+            if local_public_key and secrets.compare_digest(
+                str(device.get("public_key") or "").strip(), local_public_key
+            ):
+                annotated["identity_verified"] = bool(observed_key)
+                annotated["identity_state"] = (
+                    "verified" if observed_key else "missing_remote_identity"
+                )
+                annotated["identity_anchor_source"] = "remote_registered_device"
+                if not observed_key:
+                    annotated[
+                        "identity_warning"
+                    ] = "The remote recognized this saved pair, but did not report its own stable device identity."
+                    if strict:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=annotated["identity_warning"],
+                        )
+                return annotated
+        annotated["identity_state"] = "unanchored"
+        annotated[
+            "identity_warning"
+        ] = "This saved peer does not have a stable remote identity yet. Refresh trust or pair again before treating a moved URL as the same device."
+        return annotated
+    if not observed_key:
+        annotated["identity_state"] = "missing_remote_identity"
+        annotated[
+            "identity_warning"
+        ] = "The remote responded, but it did not report a stable device identity."
+        if strict:
+            raise HTTPException(
+                status_code=409,
+                detail=annotated["identity_warning"],
+            )
+        return annotated
+    if secrets.compare_digest(expected_key, observed_key):
+        annotated["identity_verified"] = True
+        annotated["identity_state"] = "verified"
+        return annotated
+    annotated["identity_state"] = "mismatch"
+    annotated[
+        "identity_warning"
+    ] = "The remote URL responded, but its stable device identity does not match this saved pair. Pair it as a separate Float instance."
+    if strict:
+        raise HTTPException(
+            status_code=409,
+            detail=annotated["identity_warning"],
+        )
+    return annotated
+
+
+def _annotate_peer_identity_from_overview(
+    overview: Dict[str, Any],
+    pairing: Optional[Dict[str, Any]],
+    *,
+    strict: bool = False,
+) -> Dict[str, Any]:
+    return _annotate_peer_identity(
+        {
+            "identity": _remote_identity_from_overview(overview),
+            "inbound_devices": (
+                overview.get("inbound_devices")
+                if isinstance(overview.get("inbound_devices"), list)
+                else []
+            ),
+        },
+        pairing,
+        strict=strict,
+    )
 
 
 def _log_remote_sync_failure(
@@ -10292,16 +12905,34 @@ class DeviceTokenRequest(BaseModel):
     device_id: str
     scopes: Optional[list[str]] = None
     ttl_seconds: Optional[int] = 3600
+    public_key: Optional[str] = None
 
 
 @router.post("/devices/token")
-async def devices_token(payload: DeviceTokenRequest):
-    if not get_device(payload.device_id):
+async def devices_token(payload: DeviceTokenRequest, request: Request):
+    record = get_device(payload.device_id)
+    if not record:
         raise HTTPException(status_code=404, detail="Device not found")
+    claims = _optional_device_claims(request, scope=None)
+    if claims is not None:
+        if str(claims.get("sub") or "").strip() != str(payload.device_id).strip():
+            raise HTTPException(
+                status_code=403, detail="Device token can only refresh itself"
+            )
+    else:
+        expected_key = str(record.get("public_key") or "").strip()
+        supplied_key = str(payload.public_key or "").strip()
+        if not expected_key or not secrets.compare_digest(expected_key, supplied_key):
+            raise HTTPException(
+                status_code=403, detail="Device proof required for token issuance"
+            )
+    requested_scopes = _normalize_sync_scopes(payload.scopes) or ["sync"]
+    allowed_scopes = _registered_device_scopes(record)
+    scopes = [scope for scope in requested_scopes if scope in allowed_scopes]
+    if not scopes:
+        raise HTTPException(status_code=403, detail="Requested scopes are not allowed")
     touch_device(payload.device_id)
-    token = issue_device_token(
-        payload.device_id, payload.scopes, payload.ttl_seconds or 3600
-    )
+    token = issue_device_token(payload.device_id, scopes, payload.ttl_seconds or 3600)
     return {"token": token}
 
 
@@ -10402,6 +13033,10 @@ class PairDeviceSyncPayload(BaseModel):
 
 class SyncPeerStatusPayload(BaseModel):
     remote_url: str
+    paired_device: Optional[Dict[str, Any]] = None
+    update_saved_peer: bool = False
+    operation_id: Optional[str] = None
+    operation_owner: Optional[str] = None
 
 
 class PairDeviceRevokePayload(BaseModel):
@@ -10616,9 +13251,73 @@ async def sync_pair(payload: PairDevicePayload, request: Request):
 
 @router.post("/sync/peer/status")
 async def sync_peer_status(payload: SyncPeerStatusPayload):
+    operation = _begin_sync_operation(
+        kind="check",
+        remote_url=payload.remote_url,
+        operation_id=payload.operation_id,
+        operation_owner=payload.operation_owner,
+        paired_device=payload.paired_device,
+        sections=[],
+        workspace_mode="",
+        metadata={"update_saved_peer": bool(payload.update_saved_peer)},
+    )
     try:
-        return _peer_connectivity_status(payload.remote_url)
+        status = _peer_connectivity_status(payload.remote_url)
+        pairing = _coerce_saved_peer(payload.paired_device or {})
+        status = _annotate_peer_identity(status, pairing)
+        if payload.update_saved_peer:
+            if pairing is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Saved peer payload is required to update a moved URL.",
+                )
+            if not status.get("identity_verified"):
+                raise HTTPException(
+                    status_code=409,
+                    detail=status.get("identity_warning")
+                    or "Remote identity was not verified.",
+                )
+            next_pair = {
+                **pairing,
+                "remote_url": status["instance_base"],
+                "remote_public_key": (
+                    (status.get("identity") or {}).get("public_key")
+                    or pairing.get("remote_public_key")
+                    or ""
+                ),
+                "remote_device_name": status.get("display_name")
+                or status.get("hostname")
+                or pairing.get("remote_device_name")
+                or "",
+            }
+            persisted = _persist_saved_peer_state(
+                next_pair,
+                remote_label=next_pair.get("remote_device_name"),
+            )
+            if persisted:
+                status["paired_device"] = persisted
+                settings = user_settings.load_settings()
+                if (
+                    str(settings.get("sync_remote_url") or "").strip()
+                    == str(pairing.get("remote_url") or "").strip()
+                ):
+                    user_settings.save_settings(
+                        {"sync_remote_url": persisted["remote_url"]}
+                    )
+        _finish_sync_operation(
+            operation,
+            status="completed",
+            result={
+                "reachable": bool(status.get("reachable")),
+                "identity_verified": bool(status.get("identity_verified")),
+            },
+        )
+        return status
+    except HTTPException as exc:
+        _finish_sync_operation(operation, status="failed", error=str(exc.detail))
+        raise
     except requests.RequestException as exc:
+        _finish_sync_operation(operation, status="failed", error=str(exc))
         _log_remote_sync_failure(
             "sync_peer_status",
             remote_url=payload.remote_url,
@@ -10628,6 +13327,7 @@ async def sync_peer_status(payload: SyncPeerStatusPayload):
             status_code=502, detail=f"Remote status check failed: {exc}"
         )
     except ValueError as exc:
+        _finish_sync_operation(operation, status="failed", error=str(exc))
         raise HTTPException(status_code=400, detail=str(exc))
 
 
@@ -10644,7 +13344,24 @@ async def sync_pair_update(payload: PairDeviceSyncPayload):
         or socket.gethostname(),
     )
     try:
+        remote_overview = remote.get_sync_overview()
+        identity_status = _annotate_peer_identity_from_overview(
+            remote_overview,
+            pairing,
+            strict=True,
+        )
         updated_pair = remote.sync_device_registration()
+        remote_identity = identity_status.get("identity") or {}
+        if remote_identity.get("public_key"):
+            updated_pair["remote_public_key"] = str(
+                remote_identity.get("public_key") or ""
+            ).strip()
+        if remote_identity.get("display_name") or remote_identity.get("hostname"):
+            updated_pair["remote_device_name"] = str(
+                remote_identity.get("display_name")
+                or remote_identity.get("hostname")
+                or ""
+            ).strip()
     except requests.RequestException as exc:
         _log_remote_sync_failure(
             "sync_pair_update",
@@ -10773,6 +13490,8 @@ class SyncPlanRequest(BaseModel):
     workspace_mode: str = "merge"
     local_target_workspace_id: Optional[str] = None
     remote_target_workspace_id: Optional[str] = None
+    operation_id: Optional[str] = None
+    operation_owner: Optional[str] = None
 
 
 class SyncApplyRequest(BaseModel):
@@ -10788,6 +13507,8 @@ class SyncApplyRequest(BaseModel):
     workspace_mode: str = "merge"
     local_target_workspace_id: Optional[str] = None
     remote_target_workspace_id: Optional[str] = None
+    operation_id: Optional[str] = None
+    operation_owner: Optional[str] = None
 
 
 def _sync_service() -> InstanceSyncService:
@@ -10810,6 +13531,18 @@ def _sync_section_applied(section_result: Any) -> int:
         return 0
 
 
+def _reload_memory_manager_from_store(request: Request) -> None:
+    state = getattr(getattr(request, "app", None), "state", None)
+    mgr = getattr(state, "memory_manager", None)
+    reload_store = getattr(mgr, "_load_persisted_store", None)
+    if not callable(reload_store):
+        return
+    try:
+        reload_store()
+    except Exception:
+        logger.debug("Failed to reload memory manager after sync", exc_info=True)
+
+
 async def _refresh_sync_result_indexes(result: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(result, dict):
         return {}
@@ -10826,8 +13559,16 @@ async def _refresh_sync_result_indexes(result: Dict[str, Any]) -> Dict[str, Any]
             refresh["knowledge"] = {"error": str(exc)}
     if _sync_section_applied(section_results.get("attachments")):
         try:
+            attachment_result = section_results.get("attachments")
+            applied_ids = []
+            if isinstance(attachment_result, dict):
+                applied_ids = [
+                    str(item or "").strip()
+                    for item in attachment_result.get("applied_ids") or []
+                    if str(item or "").strip()
+                ]
             refresh["attachments"] = await attachments_rag_rehydrate(
-                AttachmentsRagRehydrate()
+                AttachmentsRagRehydrate(content_hashes=applied_ids or None)
             )
         except Exception as exc:
             refresh["attachments"] = {"error": str(exc)}
@@ -10890,6 +13631,8 @@ async def _apply_sync_ingest(
         source_label=payload.source_label,
         target_namespace=payload.target_namespace,
     )
+    if _sync_section_applied((merged.get("sections") or {}).get("memories")):
+        _reload_memory_manager_from_store(request)
     await _refresh_sync_result_indexes(merged)
     after_snapshot = service.build_snapshot(sections) if sections else None
     if sections:
@@ -10946,6 +13689,7 @@ async def sync_overview(request: Request):
     )
     workspace_state = _workspace_state_summary(settings)
     access = advertised_device_access(request)
+    saved_peers = _load_saved_peers()
     display_name = str(settings.get("device_display_name") or "").strip()
     inbound_devices = [
         _summarize_inbound_device(str(device_id), record)
@@ -10985,8 +13729,10 @@ async def sync_overview(request: Request):
             "source_namespace": str(
                 settings.get("sync_source_namespace") or ""
             ).strip(),
-            "saved_peers": _load_saved_peers(),
+            "saved_peers": saved_peers,
         },
+        "egress_summary": _sync_ownership_summary(settings, access, saved_peers),
+        "sync_operations": _sync_operations_overview(),
         "workspaces": workspace_state,
         "inbound_devices": trusted_devices,
         "legacy_inbound_devices": legacy_inbound_devices,
@@ -10995,12 +13741,25 @@ async def sync_overview(request: Request):
             "recent": sync_reviews["recent"],
         },
         "device_counts": {
-            "paired": len(_load_saved_peers()),
+            "paired": len(saved_peers),
             "trusted": len(trusted_devices),
             "legacy": len(legacy_inbound_devices),
             "pending_push_reviews": sync_reviews["counts"]["pending"],
         },
     }
+
+
+@router.post("/sync/operations/{operation_id}/cancel")
+async def sync_operation_cancel(operation_id: str):
+    try:
+        operation = sync_cancel_operation(operation_id)
+    except Exception as exc:
+        logger.debug("Failed to mark sync operation cancellation", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to record sync cancellation: {exc}",
+        )
+    return {"status": "cancel_requested", "operation": operation}
 
 
 @router.post("/sync/manifest")
@@ -11137,6 +13896,19 @@ async def sync_review_reject(review_id: str, payload: SyncReviewDecisionPayload)
 @router.post("/sync/plan")
 async def sync_plan(payload: SyncPlanRequest):
     service = _sync_service()
+    operation = _begin_sync_operation(
+        kind="preview",
+        remote_url=payload.remote_url,
+        operation_id=payload.operation_id,
+        operation_owner=payload.operation_owner,
+        paired_device=payload.paired_device,
+        sections=service.normalize_sections(payload.sections),
+        workspace_mode=payload.workspace_mode,
+        metadata={
+            "local_workspace_ids": payload.local_workspace_ids or [],
+            "remote_workspace_ids": payload.remote_workspace_ids or [],
+        },
+    )
     try:
         settings = user_settings.load_settings()
         local_workspace_state = _workspace_state_summary(settings)
@@ -11154,10 +13926,19 @@ async def sync_plan(payload: SyncPlanRequest):
         ) = _filter_recursive_workspace_ids(
             local_profiles, local_workspace_ids, pairing
         )
+        local_sync_filter = filter_workspace_ids_for_sync(
+            local_workspace_ids, local_profiles
+        )
+        local_workspace_ids = list(local_sync_filter["workspace_ids"])
+        privacy_ignored_local_workspace_ids = list(
+            local_sync_filter["privacy_ignored_workspace_ids"]
+        )
         if not local_workspace_ids:
             raise HTTPException(
                 status_code=400,
-                detail="All selected local workspaces were ignored to avoid syncing a workspace back to its source device.",
+                detail=_ignored_local_workspace_detail(
+                    ignored_local_workspace_ids, privacy_ignored_local_workspace_ids
+                ),
             )
         remote = RemoteFloatClient(
             payload.remote_url,
@@ -11166,24 +13947,43 @@ async def sync_plan(payload: SyncPlanRequest):
             or socket.gethostname(),
         )
         remote_overview = remote.get_sync_overview()
+        identity_status = _annotate_peer_identity_from_overview(
+            remote_overview,
+            pairing,
+            strict=True,
+        )
         remote_workspace_state = (
             remote_overview.get("workspaces")
             if isinstance(remote_overview.get("workspaces"), dict)
             else _workspace_state_summary({})
         )
-        remote_workspace_ids = [
-            str(item).strip()
-            for item in (
-                payload.remote_workspace_ids
-                or (pairing or {}).get("remote_workspace_ids")
-                or remote_workspace_state.get("selected_workspace_ids")
-                or [
-                    remote_workspace_state.get("active_workspace_id")
-                    or DEFAULT_WORKSPACE_ID
-                ]
+        remote_profiles = (
+            remote_workspace_state.get("profiles")
+            if isinstance(remote_workspace_state.get("profiles"), list)
+            else []
+        )
+        remote_workspace_ids = normalize_workspace_ids(
+            payload.remote_workspace_ids
+            or (pairing or {}).get("remote_workspace_ids")
+            or remote_workspace_state.get("selected_workspace_ids")
+            or [
+                remote_workspace_state.get("active_workspace_id")
+                or DEFAULT_WORKSPACE_ID
+            ],
+            remote_profiles,
+        ) or [remote_workspace_state.get("active_workspace_id") or DEFAULT_WORKSPACE_ID]
+        remote_sync_filter = filter_workspace_ids_for_sync(
+            remote_workspace_ids, remote_profiles
+        )
+        remote_workspace_ids = list(remote_sync_filter["workspace_ids"])
+        privacy_ignored_remote_workspace_ids = list(
+            remote_sync_filter["privacy_ignored_workspace_ids"]
+        )
+        if not remote_workspace_ids:
+            raise HTTPException(
+                status_code=400,
+                detail="All selected remote workspaces were ignored by workspace privacy settings.",
             )
-            if str(item or "").strip()
-        ]
         workspace_mode = _normalize_workspace_mode(
             payload.workspace_mode or (pairing or {}).get("workspace_mode")
         )
@@ -11293,6 +14093,12 @@ async def sync_plan(payload: SyncPlanRequest):
         if pairing is not None:
             pair_state.update(
                 {
+                    "remote_url": remote.instance_base,
+                    "remote_public_key": (
+                        (identity_status.get("identity") or {}).get("public_key")
+                        or pairing.get("remote_public_key")
+                        or ""
+                    ),
                     "local_workspace_ids": local_workspace_ids,
                     "remote_workspace_ids": remote_workspace_ids,
                     "workspace_mode": workspace_mode,
@@ -11305,7 +14111,7 @@ async def sync_plan(payload: SyncPlanRequest):
             remote_label=remote_instance.get("display_name")
             or remote_instance.get("hostname"),
         )
-        return {
+        response_payload = {
             "link_to_source": payload.link_to_source,
             "workspace_mode": workspace_mode,
             "local": local_instance,
@@ -11324,18 +14130,34 @@ async def sync_plan(payload: SyncPlanRequest):
                     "selected_workspace_ids": local_workspace_ids,
                     "target_workspace_id": local_target_workspace_id,
                     "ignored_workspace_ids": ignored_local_workspace_ids,
+                    "privacy_ignored_workspace_ids": privacy_ignored_local_workspace_ids,
                 },
                 "remote": {
                     **remote_workspace_state,
                     "selected_workspace_ids": remote_workspace_ids,
                     "target_workspace_id": remote_target_workspace_id,
+                    "privacy_ignored_workspace_ids": privacy_ignored_remote_workspace_ids,
                 },
             },
             "sections": pull_comparison,
             "pull_sections": pull_comparison,
             "push_sections": push_comparison,
         }
+        _finish_sync_operation(
+            operation,
+            status="completed",
+            result={
+                "workspace_mode": workspace_mode,
+                "pull_sections": len(pull_comparison),
+                "push_sections": len(push_comparison),
+            },
+        )
+        return response_payload
+    except HTTPException as exc:
+        _finish_sync_operation(operation, status="failed", error=str(exc.detail))
+        raise
     except requests.RequestException as exc:
+        _finish_sync_operation(operation, status="failed", error=str(exc))
         _log_remote_sync_failure(
             "sync_plan",
             remote_url=payload.remote_url,
@@ -11352,6 +14174,7 @@ async def sync_plan(payload: SyncPlanRequest):
         )
         raise HTTPException(status_code=502, detail=f"Remote sync probe failed: {exc}")
     except ValueError as exc:
+        _finish_sync_operation(operation, status="failed", error=str(exc))
         raise HTTPException(status_code=400, detail=str(exc))
 
 
@@ -11361,6 +14184,16 @@ async def sync_apply(request: Request, payload: SyncApplyRequest):
     sections = service.normalize_sections(payload.sections)
     item_selections = service.normalize_item_selections(
         sections, payload.item_selections
+    )
+    operation = _begin_sync_operation(
+        kind=payload.direction,
+        remote_url=payload.remote_url,
+        operation_id=payload.operation_id,
+        operation_owner=payload.operation_owner,
+        paired_device=payload.paired_device,
+        sections=sections,
+        workspace_mode=payload.workspace_mode,
+        metadata={"item_selection_sections": sorted(item_selections.keys())},
     )
     try:
         settings = user_settings.load_settings()
@@ -11379,10 +14212,19 @@ async def sync_apply(request: Request, payload: SyncApplyRequest):
         ) = _filter_recursive_workspace_ids(
             local_profiles, local_workspace_ids, pairing
         )
+        local_sync_filter = filter_workspace_ids_for_sync(
+            local_workspace_ids, local_profiles
+        )
+        local_workspace_ids = list(local_sync_filter["workspace_ids"])
+        privacy_ignored_local_workspace_ids = list(
+            local_sync_filter["privacy_ignored_workspace_ids"]
+        )
         if not local_workspace_ids:
             raise HTTPException(
                 status_code=400,
-                detail="All selected local workspaces were ignored to avoid syncing a workspace back to its source device.",
+                detail=_ignored_local_workspace_detail(
+                    ignored_local_workspace_ids, privacy_ignored_local_workspace_ids
+                ),
             )
         remote = RemoteFloatClient(
             payload.remote_url,
@@ -11391,24 +14233,43 @@ async def sync_apply(request: Request, payload: SyncApplyRequest):
             or socket.gethostname(),
         )
         remote_overview = remote.get_sync_overview()
+        identity_status = _annotate_peer_identity_from_overview(
+            remote_overview,
+            pairing,
+            strict=True,
+        )
         remote_workspace_state = (
             remote_overview.get("workspaces")
             if isinstance(remote_overview.get("workspaces"), dict)
             else _workspace_state_summary({})
         )
-        remote_workspace_ids = [
-            str(item).strip()
-            for item in (
-                payload.remote_workspace_ids
-                or (pairing or {}).get("remote_workspace_ids")
-                or remote_workspace_state.get("selected_workspace_ids")
-                or [
-                    remote_workspace_state.get("active_workspace_id")
-                    or DEFAULT_WORKSPACE_ID
-                ]
+        remote_profiles = (
+            remote_workspace_state.get("profiles")
+            if isinstance(remote_workspace_state.get("profiles"), list)
+            else []
+        )
+        remote_workspace_ids = normalize_workspace_ids(
+            payload.remote_workspace_ids
+            or (pairing or {}).get("remote_workspace_ids")
+            or remote_workspace_state.get("selected_workspace_ids")
+            or [
+                remote_workspace_state.get("active_workspace_id")
+                or DEFAULT_WORKSPACE_ID
+            ],
+            remote_profiles,
+        ) or [remote_workspace_state.get("active_workspace_id") or DEFAULT_WORKSPACE_ID]
+        remote_sync_filter = filter_workspace_ids_for_sync(
+            remote_workspace_ids, remote_profiles
+        )
+        remote_workspace_ids = list(remote_sync_filter["workspace_ids"])
+        privacy_ignored_remote_workspace_ids = list(
+            remote_sync_filter["privacy_ignored_workspace_ids"]
+        )
+        if not remote_workspace_ids:
+            raise HTTPException(
+                status_code=400,
+                detail="All selected remote workspaces were ignored by workspace privacy settings.",
             )
-            if str(item or "").strip()
-        ]
         workspace_mode = _normalize_workspace_mode(
             payload.workspace_mode or (pairing or {}).get("workspace_mode")
         )
@@ -11480,6 +14341,12 @@ async def sync_apply(request: Request, payload: SyncApplyRequest):
             if pairing is not None:
                 pair_state.update(
                     {
+                        "remote_url": remote.instance_base,
+                        "remote_public_key": (
+                            (identity_status.get("identity") or {}).get("public_key")
+                            or pairing.get("remote_public_key")
+                            or ""
+                        ),
                         "local_workspace_ids": local_workspace_ids,
                         "remote_workspace_ids": remote_workspace_ids,
                         "workspace_mode": workspace_mode,
@@ -11491,17 +14358,30 @@ async def sync_apply(request: Request, payload: SyncApplyRequest):
                 pair_state,
                 remote_label=remote_result.get("source_label"),
             )
-            return {
+            response_payload = {
                 "direction": "push",
                 "sections": sections,
                 "remote": remote.instance_base,
                 "paired_device": persisted_pair or pair_state,
                 "ignored_local_workspace_ids": ignored_local_workspace_ids,
+                "privacy_ignored_local_workspace_ids": privacy_ignored_local_workspace_ids,
+                "privacy_ignored_remote_workspace_ids": privacy_ignored_remote_workspace_ids,
                 "workspace_mode": workspace_mode,
                 "effective_namespace": remote_result.get("effective_namespace"),
                 "item_selections": item_selections,
                 "result": remote_result,
             }
+            _finish_sync_operation(
+                operation,
+                status="completed",
+                result={
+                    "direction": "push",
+                    "remote": remote.instance_base,
+                    "workspace_mode": workspace_mode,
+                    "remote_status": str(remote_result.get("status") or "").strip(),
+                },
+            )
+            return response_payload
         before_snapshot = (
             service.build_snapshot(sections, workspace_ids=local_workspace_ids)
             if sections
@@ -11525,6 +14405,12 @@ async def sync_apply(request: Request, payload: SyncApplyRequest):
         if pairing is not None:
             pair_state.update(
                 {
+                    "remote_url": remote.instance_base,
+                    "remote_public_key": (
+                        (identity_status.get("identity") or {}).get("public_key")
+                        or pairing.get("remote_public_key")
+                        or ""
+                    ),
                     "local_workspace_ids": local_workspace_ids,
                     "remote_workspace_ids": remote_workspace_ids,
                     "workspace_mode": workspace_mode,
@@ -11545,6 +14431,8 @@ async def sync_apply(request: Request, payload: SyncApplyRequest):
             or remote_identity.get("hostname"),
             target_namespace=pull_target_namespace or None,
         )
+        if _sync_section_applied((local_result.get("sections") or {}).get("memories")):
+            _reload_memory_manager_from_store(request)
         await _refresh_sync_result_indexes(local_result)
         if (
             workspace_mode == "import"
@@ -11615,18 +14503,34 @@ async def sync_apply(request: Request, payload: SyncApplyRequest):
                 "sections": sections,
             },
         )
-        return {
+        response_payload = {
             "direction": "pull",
             "sections": sections,
             "remote": remote.instance_base,
             "paired_device": persisted_pair or pair_state,
             "ignored_local_workspace_ids": ignored_local_workspace_ids,
+            "privacy_ignored_local_workspace_ids": privacy_ignored_local_workspace_ids,
+            "privacy_ignored_remote_workspace_ids": privacy_ignored_remote_workspace_ids,
             "workspace_mode": workspace_mode,
             "effective_namespace": local_result.get("effective_namespace"),
             "item_selections": item_selections,
             "result": local_result,
         }
+        _finish_sync_operation(
+            operation,
+            status="completed",
+            result={
+                "direction": "pull",
+                "remote": remote.instance_base,
+                "workspace_mode": workspace_mode,
+            },
+        )
+        return response_payload
+    except HTTPException as exc:
+        _finish_sync_operation(operation, status="failed", error=str(exc.detail))
+        raise
     except requests.RequestException as exc:
+        _finish_sync_operation(operation, status="failed", error=str(exc))
         _log_remote_sync_failure(
             f"sync_apply_{payload.direction}",
             remote_url=payload.remote_url,
@@ -11645,6 +14549,7 @@ async def sync_apply(request: Request, payload: SyncApplyRequest):
         )
         raise HTTPException(status_code=502, detail=f"Remote sync failed: {exc}")
     except ValueError as exc:
+        _finish_sync_operation(operation, status="failed", error=str(exc))
         raise HTTPException(status_code=400, detail=str(exc))
 
 
@@ -11790,6 +14695,12 @@ class UserSettingsPayload(BaseModel):
     capture_default_sensitivity: str = "personal"
     capture_allow_model_raw_image_access: bool = True
     capture_allow_summary_fallback: bool = True
+    privacy_filter_mode: str = "off"
+    privacy_filter_model: str = "openai/privacy-filter"
+    privacy_filter_min_score: float = 0.5
+    privacy_filter_max_chars: int = 60000
+    privacy_filter_route_private_mode: str = "off"
+    privacy_filter_route_min_sensitivity: str = "protected"
     default_workflow: str = "default"
     enabled_workflow_modules: List[str] = []
     push_enabled: bool = False
@@ -11805,6 +14716,7 @@ class UserSettingsPayload(BaseModel):
     conversation_folders: Dict[str, Dict[str, Any]] = {}
     tool_display_mode: str = "console"
     tool_link_behavior: str = "console"
+    tool_policies: Dict[str, Dict[str, Any]] = {}
     live_transcript_enabled: bool = True
     live_camera_default_enabled: bool = False
     device_display_name: str = ""
@@ -11883,12 +14795,18 @@ async def get_user_settings(request: Request):
             "system_prompt",
             app_config.load_config().get("system_prompt", ""),
         )
+    settings_payload["tool_policies"] = normalize_tool_policies(
+        settings_payload.get("tool_policies")
+    )
     return UserSettingsPayload(**settings_payload)
 
 
 @router.post("/user-settings", response_model=StatusResponse)
 async def update_user_settings(payload: UserSettingsPayload):
-    user_settings.save_settings(payload.model_dump(exclude_unset=True))
+    data = payload.model_dump(exclude_unset=True)
+    if "tool_policies" in data:
+        data["tool_policies"] = normalize_tool_policies(data.get("tool_policies"))
+    user_settings.save_settings(data)
     return StatusResponse(status="saved")
 
 
@@ -11920,7 +14838,7 @@ async def delete_theme(theme_id: str):
 
 @router.post("/history", response_model=StatusResponse)
 async def save_history(payload: HistoryPayload):
-    conversation_store.save_conversation(
+    history_store.save_history(
         payload.session_id, [item.model_dump() for item in payload.history]
     )
     settings = user_settings.load_settings()
@@ -11937,7 +14855,23 @@ async def save_history(payload: HistoryPayload):
 
 @router.get("/history/{session_id}", response_model=HistoryPayload)
 async def get_history(session_id: str):
-    history = conversation_store.load_conversation(session_id)
+    history = history_store.load_history(session_id)
+    if not history:
+        fallback = conversation_store.load_conversation(session_id)
+        history = []
+        for entry in fallback:
+            if not isinstance(entry, dict):
+                continue
+            role = str(entry.get("role") or "").strip().lower()
+            if role == "assistant":
+                role = "ai"
+            if role not in {"user", "ai"}:
+                continue
+            text = entry.get("text") or entry.get("content") or ""
+            text = str(text)
+            if not text.strip():
+                continue
+            history.append({"role": role, "text": text})
     return HistoryPayload(sessionId=session_id, history=history)
 
 
@@ -12805,6 +15739,46 @@ def _attachment_status_defaults(
     }
 
 
+def _attachment_caption_tracker_fields(
+    metadata: Dict[str, Any],
+    *,
+    content_type: str,
+) -> Dict[str, Any]:
+    meta = dict(metadata) if isinstance(metadata, dict) else {}
+    defaults = _attachment_status_defaults(meta, content_type=content_type)
+    caption_updated_at = str(meta.get("caption_updated_at") or "").strip()
+    caption_generated_at = str(meta.get("caption_generated_at") or "").strip()
+    indexed_at = str(meta.get("indexed_at") or "").strip()
+    clip_indexed_at = str(meta.get("clip_indexed_at") or "").strip()
+    embedding_dim = meta.get("clip_embedding_dim")
+    try:
+        embedding_dim = int(embedding_dim) if embedding_dim is not None else None
+    except Exception:
+        embedding_dim = None
+    caption_recorded_at = (
+        caption_updated_at
+        or caption_generated_at
+        or indexed_at
+        or str(meta.get("uploaded_at") or "").strip()
+    )
+    return {
+        "caption_model": str(meta.get("caption_model") or "").strip(),
+        "caption_status": defaults["caption_status"],
+        "caption_updated_at": caption_updated_at,
+        "caption_generated_at": caption_generated_at,
+        "caption_recorded_at": caption_recorded_at,
+        "index_status": defaults["index_status"],
+        "indexed_at": indexed_at,
+        "index_warning": str(meta.get("index_warning") or "").strip(),
+        "embedding_model": str(
+            meta.get("clip_embedding_model") or meta.get("embedding_model") or ""
+        ).strip(),
+        "embedding_dim": embedding_dim,
+        "clip_indexed_at": clip_indexed_at,
+        "placeholder_caption": defaults["placeholder_caption"],
+    }
+
+
 def _iter_attachment_hashes() -> List[str]:
     return sorted(
         hash_value for hash_value in iter_stored_attachment_hashes() if hash_value
@@ -12819,6 +15793,7 @@ def _caption_and_index_image_bytes(
     url: str | None = None,
     content_hash: str | None = None,
     caption_override: str | None = None,
+    progress_callback: Any = None,
 ) -> Dict[str, Any]:
     """Caption + index an image into both text and CLIP knowledge stores.
 
@@ -12837,15 +15812,12 @@ def _caption_and_index_image_bytes(
     if not blob_hash:
         blob_hash = put_blob(data)
     attachment_url = url or f"/api/attachments/{blob_hash}/{safe_name}"
-    uploaded_at = (
-        datetime.now(tz=timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+    indexed_at = _utc_now_compact_iso()
+    uploaded_at = indexed_at
+    existing_caption_meta: Dict[str, Any] = {}
     try:
-        existing_meta = _read_attachment_meta(blob_hash)
-        merged_meta = dict(existing_meta)
+        existing_caption_meta = _read_attachment_meta(blob_hash)
+        merged_meta = dict(existing_caption_meta)
         merged_meta.update(
             {
                 "filename": safe_name,
@@ -12863,30 +15835,76 @@ def _caption_and_index_image_bytes(
     except Exception:
         pass
 
-    manual_caption = _sanitize_attachment_caption(caption_override or "")
-    if not manual_caption:
+    def _emit_progress(**payload: Any) -> None:
+        if not callable(progress_callback):
+            return
         try:
-            existing_caption_meta = _read_attachment_meta(blob_hash)
-            if (
-                str(existing_caption_meta.get("caption_status") or "").strip().lower()
-                == "manual"
-            ):
-                manual_caption = _sanitize_attachment_caption(
-                    existing_caption_meta.get("caption") or ""
-                )
+            progress_callback(dict(payload))
         except Exception:
-            manual_caption = ""
+            logger.debug("Attachment progress callback failed", exc_info=True)
+
+    manual_caption = _sanitize_attachment_caption(caption_override or "")
+    preserved_caption = ""
+    preserved_caption_model = ""
+    if not manual_caption:
+        existing_caption = _sanitize_attachment_caption(
+            existing_caption_meta.get("caption") or ""
+        )
+        existing_caption_status = (
+            str(existing_caption_meta.get("caption_status") or "").strip().lower()
+        )
+        existing_placeholder = bool(
+            existing_caption_meta.get("placeholder_caption")
+        ) or is_placeholder_caption(existing_caption)
+        if existing_caption_status == "manual":
+            manual_caption = existing_caption
+        elif existing_caption and not existing_placeholder:
+            preserved_caption = existing_caption
+            preserved_caption_model = (
+                str(existing_caption_meta.get("caption_model") or "").strip()
+                or "stored-caption"
+            )
     if manual_caption:
+        _emit_progress(
+            status="running",
+            phase_label="Using manual caption",
+            phase_index=2,
+            phase_count=4,
+            detail="Manual caption is taking precedence over auto captioning.",
+        )
         caption = manual_caption
         placeholder = False
         caption_model = "manual-caption"
+    elif preserved_caption:
+        _emit_progress(
+            status="running",
+            phase_label="Reusing stored caption",
+            phase_index=2,
+            phase_count=4,
+            detail="Existing non-placeholder caption was preserved.",
+        )
+        caption = preserved_caption
+        placeholder = False
+        caption_model = preserved_caption_model
     else:
+        _emit_progress(
+            status="running",
+            phase_label="Generating image caption",
+            phase_index=2,
+            phase_count=4,
+            detail="Running the caption step for the uploaded image.",
+        )
         caption, placeholder, caption_model = _generate_image_caption(
             data,
             content_hash=blob_hash,
         )
 
     source = f"image:{blob_hash}"
+    source_namespace = _coerce_relative_files_path(
+        str(existing_caption_meta.get("source_sync_namespace") or "")
+    )
+    if source_namespace:
+        source = f"{source_namespace}/{source}"
     caption_metadata = {
         "kind": "image_caption",
         "type": "image_caption",
@@ -12898,6 +15916,22 @@ def _caption_and_index_image_bytes(
         "content_hash": blob_hash,
         "url": attachment_url,
     }
+    for key in (
+        "source_sync_namespace",
+        "source_sync_label",
+        "source_sync_original_relative_path",
+        "relative_path",
+    ):
+        value = existing_caption_meta.get(key)
+        if value:
+            caption_metadata[key] = value
+    _emit_progress(
+        status="running",
+        phase_label="Writing caption text index",
+        phase_index=3,
+        phase_count=4,
+        detail="Saving the caption into the text knowledge store.",
+    )
     doc_id = service.ingest_text(caption, caption_metadata)
 
     clip_service = _get_clip_rag_service(raise_http=False)
@@ -12916,6 +15950,13 @@ def _caption_and_index_image_bytes(
     }
     try:
         if clip_service:
+            _emit_progress(
+                status="running",
+                phase_label="Writing image embedding index",
+                phase_index=4,
+                phase_count=4,
+                detail="Saving the image embedding for retrieval.",
+            )
             from app.services.clip_embeddings import embed_clip_image_bytes
 
             clip_embedding = embed_clip_image_bytes(
@@ -12946,6 +15987,12 @@ def _caption_and_index_image_bytes(
     try:
         existing_meta = _read_attachment_meta(blob_hash)
         merged_meta = dict(existing_meta)
+        existing_caption_updated_at = str(
+            merged_meta.get("caption_updated_at") or ""
+        ).strip()
+        existing_caption_generated_at = str(
+            merged_meta.get("caption_generated_at") or ""
+        ).strip()
         merged_meta.update(
             {
                 "filename": safe_name,
@@ -12963,17 +16010,53 @@ def _caption_and_index_image_bytes(
                     else "generated"
                 ),
                 "index_status": "indexed",
-                "indexed_at": uploaded_at,
+                "indexed_at": indexed_at,
+                "clip_embedding_model": f"clip:{clip_model}" if clip_model else "",
+                "clip_embedding_dim": clip_info.get("dim"),
             }
         )
+        if caption_model == "manual-caption":
+            merged_meta["caption_updated_at"] = (
+                existing_caption_updated_at or indexed_at
+            )
+            merged_meta.pop("caption_generated_at", None)
+        elif preserved_caption:
+            if existing_caption_updated_at:
+                merged_meta["caption_updated_at"] = existing_caption_updated_at
+            if existing_caption_generated_at:
+                merged_meta["caption_generated_at"] = existing_caption_generated_at
+            if not existing_caption_updated_at and not existing_caption_generated_at:
+                merged_meta["caption_generated_at"] = indexed_at
+        else:
+            merged_meta["caption_generated_at"] = indexed_at
+            merged_meta.pop("caption_updated_at", None)
         clip_error = clip_info.get("error")
         if isinstance(clip_error, str) and clip_error:
             merged_meta["index_warning"] = clip_error
+            merged_meta.pop("clip_indexed_at", None)
         else:
             merged_meta.pop("index_warning", None)
+            if clip_info.get("saved"):
+                merged_meta["clip_indexed_at"] = indexed_at
         _write_attachment_meta(blob_hash, merged_meta)
     except Exception:
         logger.debug("Failed to update attachment index metadata", exc_info=True)
+
+    complete_detail = "Caption and index data are ready."
+    clip_error = clip_info.get("error")
+    if isinstance(clip_error, str) and clip_error:
+        complete_detail = "Caption saved with an index warning."
+    _emit_progress(
+        status="complete",
+        phase_label="Attachment indexing finished",
+        phase_index=4,
+        phase_count=4,
+        detail=complete_detail,
+        counts={
+            "clip_saved": bool(clip_info.get("saved")),
+            "embedding_dim": clip_info.get("dim"),
+        },
+    )
 
     return {
         "id": doc_id,
@@ -13127,7 +16210,7 @@ async def knowledge_caption_image_preview(file: UploadFile = UploadFileType(...)
 
 
 @router.get("/knowledge/query")
-async def knowledge_query(q: str, k: int = 5, mode: str = "text"):
+async def knowledge_query(request: Request, q: str, k: int = 5, mode: str = "text"):
     """Query the knowledge base.
 
     Modes:
@@ -13135,116 +16218,223 @@ async def knowledge_query(q: str, k: int = 5, mode: str = "text"):
     - clip: query the CLIP image index (returns caption docs with CLIP scores)
     - hybrid: prefer CLIP image matches, then fill with text matches
     """
-    service = _get_rag_service()
     mode_norm = (mode or "text").strip().lower()
+    operation_id = _rag_query_operation_id(
+        "knowledge",
+        request_id=_current_request_id(),
+        query=q,
+    )
+    started_at = _utc_now_compact_iso()
+    started_perf = time.perf_counter()
+    query_preview = _rag_query_preview(q)
+    _emit_rag_query_notification(
+        request.app,
+        operation_id=operation_id,
+        title="Searching knowledge",
+        body=query_preview,
+        status="running",
+        phase_label="Searching knowledge stores",
+        phase_index=1,
+        phase_count=3,
+        detail="Running canonical, vector, and optional image retrieval.",
+        started_at=started_at,
+        started_perf=started_perf,
+        counts={"requested_top_k": max(0, int(k)), "mode": mode_norm},
+    )
+    service = _get_rag_service()
     warnings: list[str] = []
-
+    matches_canonical: list[Dict[str, Any]] = []
     matches_text: list[Dict[str, Any]] = []
-    if mode_norm in {"text", "hybrid"}:
-        matches_text = service.query(q, top_k=k) or []
-
     matches_clip: list[Dict[str, Any]] = []
-    if mode_norm in {"clip", "hybrid"}:
-        clip_service = _get_clip_rag_service(raise_http=False)
-        if not clip_service:
-            warnings.append("clip_index_unavailable")
-        else:
-            # If open_clip isn't installed, the clip service falls back to hash embeddings.
-            if (
-                str(getattr(clip_service, "embedding_model", ""))
-                .lower()
-                .startswith("clip:")
-                and getattr(clip_service, "_embedding_encoder", None) is None
-            ):
-                warnings.append("clip_embeddings_unavailable")
-            raw_clip = clip_service.query(q, top_k=k) or []
-            for match in raw_clip:
-                if not isinstance(match, dict):
-                    continue
-                meta = (
-                    match.get("metadata")
-                    if isinstance(match.get("metadata"), dict)
-                    else {}
-                )
-                caption_id = meta.get("caption_doc_id") or match.get("id")
-                trace = None
-                if caption_id:
-                    try:
-                        trace = service.trace(str(caption_id))
-                    except Exception:
-                        trace = None
-                trace_meta = (
-                    trace.get("metadata")
-                    if isinstance(trace, dict)
-                    and isinstance(trace.get("metadata"), dict)
-                    else {}
-                )
-                merged_meta = dict(trace_meta)
-                for key in (
-                    "source",
-                    "filename",
-                    "content_hash",
-                    "content_type",
-                    "url",
-                ):
-                    if key in meta and key not in merged_meta:
-                        merged_meta[key] = meta[key]
-                merged_meta["retrieved_via"] = "clip"
-                matches_clip.append(
-                    {
-                        "id": str(caption_id or match.get("id") or ""),
-                        "text": (trace.get("text") if isinstance(trace, dict) else None)
-                        or match.get("text", ""),
-                        "metadata": merged_meta,
-                        "score": match.get("score"),
-                    }
-                )
+    try:
+        if mode_norm in {"text", "hybrid"}:
+            search_canonical = getattr(service, "search_canonical", None)
+            if callable(search_canonical):
+                matches_canonical = search_canonical(q, top_k=k) or []
+            matches_text = service.query(q, top_k=k) or []
 
-    if mode_norm == "clip":
-        matches = matches_clip
-    elif mode_norm == "hybrid":
-        seen: set[str] = set()
-        merged: list[Dict[str, Any]] = []
-        for match in matches_clip:
-            match_id = str(match.get("id") or "")
-            if match_id:
-                seen.add(match_id)
-            merged.append(match)
-        for match in matches_text:
+        if mode_norm in {"clip", "hybrid"}:
+            clip_service = _get_clip_rag_service(raise_http=False)
+            if not clip_service:
+                warnings.append("clip_index_unavailable")
+            else:
+                # If open_clip isn't installed, the clip service falls back to hash embeddings.
+                if (
+                    str(getattr(clip_service, "embedding_model", ""))
+                    .lower()
+                    .startswith("clip:")
+                    and getattr(clip_service, "_embedding_encoder", None) is None
+                ):
+                    warnings.append("clip_embeddings_unavailable")
+                raw_clip = clip_service.query(q, top_k=k) or []
+                for match in raw_clip:
+                    if not isinstance(match, dict):
+                        continue
+                    meta = (
+                        match.get("metadata")
+                        if isinstance(match.get("metadata"), dict)
+                        else {}
+                    )
+                    caption_id = meta.get("caption_doc_id") or match.get("id")
+                    trace = None
+                    if caption_id:
+                        try:
+                            trace = service.trace(str(caption_id))
+                        except Exception:
+                            trace = None
+                    trace_meta = (
+                        trace.get("metadata")
+                        if isinstance(trace, dict)
+                        and isinstance(trace.get("metadata"), dict)
+                        else {}
+                    )
+                    merged_meta = dict(trace_meta)
+                    for key in (
+                        "source",
+                        "filename",
+                        "content_hash",
+                        "content_type",
+                        "url",
+                    ):
+                        if key in meta and key not in merged_meta:
+                            merged_meta[key] = meta[key]
+                    merged_meta["retrieved_via"] = "clip"
+                    matches_clip.append(
+                        {
+                            "id": str(caption_id or match.get("id") or ""),
+                            "text": (
+                                trace.get("text") if isinstance(trace, dict) else None
+                            )
+                            or match.get("text", ""),
+                            "metadata": merged_meta,
+                            "score": match.get("score"),
+                        }
+                    )
+
+        _emit_rag_query_notification(
+            request.app,
+            operation_id=operation_id,
+            title="Searching knowledge",
+            body=query_preview,
+            status="running",
+            phase_label="Preparing retrieved matches",
+            phase_index=2,
+            phase_count=3,
+            detail="Merging canonical, vector, and optional image retrieval results.",
+            started_at=started_at,
+            started_perf=started_perf,
+            counts={
+                "canonical_matches": len(matches_canonical),
+                "text_matches": len(matches_text),
+                "clip_matches": len(matches_clip),
+                "warnings": len(warnings),
+            },
+        )
+
+        if mode_norm == "clip":
+            matches = matches_clip
+        elif mode_norm == "hybrid":
+            seen: set[str] = set()
+            merged: list[Dict[str, Any]] = []
+            for bucket in (matches_canonical, matches_clip, matches_text):
+                for match in bucket:
+                    if not isinstance(match, dict):
+                        continue
+                    match_id = str(match.get("id") or "")
+                    if match_id and match_id in seen:
+                        continue
+                    if match_id:
+                        seen.add(match_id)
+                    merged.append(match)
+            matches = merged[: max(0, int(k))]
+        elif mode_norm == "text":
+            seen: set[str] = set()
+            merged: list[Dict[str, Any]] = []
+            for bucket in (matches_canonical, matches_text):
+                for match in bucket:
+                    if not isinstance(match, dict):
+                        continue
+                    match_id = str(match.get("id") or "")
+                    if match_id and match_id in seen:
+                        continue
+                    if match_id:
+                        seen.add(match_id)
+                    merged.append(match)
+            matches = merged[: max(0, int(k))]
+        else:
+            matches = matches_text
+        sanitized_matches: list[Dict[str, Any]] = []
+        for match in matches:
             if not isinstance(match, dict):
                 continue
-            match_id = str(match.get("id") or "")
-            if match_id and match_id in seen:
-                continue
-            merged.append(match)
-        matches = merged[: max(0, int(k))]
-    else:
-        matches = matches_text
-    sanitized_matches: list[Dict[str, Any]] = []
-    for match in matches:
-        if not isinstance(match, dict):
-            continue
-        metadata = (
-            match.get("metadata") if isinstance(match.get("metadata"), dict) else {}
+            metadata = (
+                match.get("metadata") if isinstance(match.get("metadata"), dict) else {}
+            )
+            safe_meta = _sanitize_knowledge_metadata_for_api(metadata)
+            safe_source = _sanitize_knowledge_source_for_api(
+                match.get("source"), safe_meta
+            )
+            payload = dict(match)
+            payload["metadata"] = safe_meta
+            if safe_source:
+                payload["source"] = safe_source
+            sanitized_matches.append(payload)
+        _emit_rag_query_notification(
+            request.app,
+            operation_id=operation_id,
+            title="Searching knowledge",
+            body=query_preview,
+            status="complete",
+            phase_label="RAG query finished",
+            phase_index=3,
+            phase_count=3,
+            detail="Retrieved matches are ready.",
+            started_at=started_at,
+            started_perf=started_perf,
+            counts={
+                "returned_matches": len(sanitized_matches),
+                "canonical_matches": len(matches_canonical),
+                "text_matches": len(matches_text),
+                "clip_matches": len(matches_clip),
+                "warnings": len(warnings),
+            },
         )
-        safe_meta = _sanitize_knowledge_metadata_for_api(metadata)
-        safe_source = _sanitize_knowledge_source_for_api(match.get("source"), safe_meta)
-        payload = dict(match)
-        payload["metadata"] = safe_meta
-        if safe_source:
-            payload["source"] = safe_source
-        sanitized_matches.append(payload)
-    return {
-        "mode": mode_norm,
-        "warnings": warnings,
-        "matches": sanitized_matches,
-        "ids": [m.get("id") for m in sanitized_matches if isinstance(m, dict)],
-        "documents": [m.get("text") for m in sanitized_matches if isinstance(m, dict)],
-        "metadatas": [
-            m.get("metadata") for m in sanitized_matches if isinstance(m, dict)
-        ],
-        "scores": [m.get("score") for m in sanitized_matches if isinstance(m, dict)],
-    }
+        return {
+            "mode": mode_norm,
+            "warnings": warnings,
+            "matches": sanitized_matches,
+            "ids": [m.get("id") for m in sanitized_matches if isinstance(m, dict)],
+            "documents": [
+                m.get("text") for m in sanitized_matches if isinstance(m, dict)
+            ],
+            "metadatas": [
+                m.get("metadata") for m in sanitized_matches if isinstance(m, dict)
+            ],
+            "scores": [
+                m.get("score") for m in sanitized_matches if isinstance(m, dict)
+            ],
+        }
+    except Exception:
+        _emit_rag_query_notification(
+            request.app,
+            operation_id=operation_id,
+            title="Searching knowledge",
+            body=query_preview,
+            status="error",
+            phase_label="RAG query failed",
+            phase_index=3,
+            phase_count=3,
+            detail="Knowledge retrieval failed before results could be prepared.",
+            started_at=started_at,
+            started_perf=started_perf,
+            counts={
+                "canonical_matches": len(matches_canonical),
+                "text_matches": len(matches_text),
+                "clip_matches": len(matches_clip),
+                "warnings": len(warnings),
+            },
+        )
+        raise
 
 
 @router.get("/knowledge/trace/{doc_id}")
@@ -13873,23 +17063,60 @@ class AttachmentInfo(BaseModel):
     url: str
 
 
+def _attachment_operation_id(content_hash: str) -> str:
+    normalized = _normalize_attachment_hash(content_hash)
+    return f"attachment-index:{normalized}"
+
+
 def _index_uploaded_attachment(
+    app,
     data: bytes,
     *,
     filename: str,
     content_type: str,
     url: str,
     content_hash: str,
+    started_at: str = "",
 ) -> None:
     """Best-effort: index uploaded attachments into knowledge for retrieval."""
+    operation_id = _attachment_operation_id(content_hash)
+    phase_count = 4
+
+    def _notify(payload: Dict[str, Any]) -> None:
+        emit_operation_notification(
+            app,
+            operation_id=operation_id,
+            kind="attachment_index",
+            title="Indexing image attachment",
+            body=filename,
+            status=str(payload.get("status") or "running"),
+            phase_label=str(payload.get("phase_label") or ""),
+            phase_index=payload.get("phase_index"),
+            phase_count=payload.get("phase_count") or phase_count,
+            detail=str(payload.get("detail") or ""),
+            started_at=started_at,
+            counts=payload.get("counts"),
+        )
+
     try:
         if (content_type or "").lower().startswith("image/"):
+            _notify(
+                {
+                    "status": "running",
+                    "phase_label": "Preparing caption and index work",
+                    "phase_index": 1,
+                    "phase_count": phase_count,
+                    "detail": "Starting the background image caption and retrieval pass.",
+                    "counts": {"bytes": len(data)},
+                }
+            )
             _caption_and_index_image_bytes(
                 data,
                 filename=filename,
                 content_type=(content_type or "").lower(),
                 url=url,
                 content_hash=content_hash,
+                progress_callback=_notify,
             )
     except Exception:
         try:
@@ -13900,11 +17127,24 @@ def _index_uploaded_attachment(
             _write_attachment_meta(content_hash, metadata)
         except Exception:
             pass
+        _notify(
+            {
+                "status": "error",
+                "phase_label": "Attachment indexing failed",
+                "phase_index": phase_count,
+                "phase_count": phase_count,
+                "detail": (
+                    "The background caption/index pass failed. Check logs or "
+                    "attachment metadata."
+                ),
+            }
+        )
         logger.debug("Attachment knowledge indexing failed", exc_info=True)
 
 
 @router.post("/attachments/upload")
 async def attachments_upload(
+    request: Request,
     background_tasks: BackgroundTasks,
     file: UploadFile = UploadFileType(...),
     origin: str = Form(default="upload"),
@@ -13963,13 +17203,31 @@ async def attachments_upload(
             ),
         },
     )
+    if str(file.content_type or "").lower().startswith("image/"):
+        emit_operation_notification(
+            request.app,
+            operation_id=_attachment_operation_id(h),
+            kind="attachment_index",
+            title="Indexing image attachment",
+            body=filename,
+            status="queued",
+            phase_label="Queued for captioning and retrieval indexing",
+            detail=(
+                "Background work will generate a caption and refresh image "
+                "retrieval data."
+            ),
+            started_at=uploaded_at,
+            counts={"bytes": len(data)},
+        )
     background_tasks.add_task(
         _index_uploaded_attachment,
+        request.app,
         data,
         filename=filename,
         content_type=str(file.content_type or ""),
         url=url,
         content_hash=h,
+        started_at=uploaded_at,
     )
     return {
         "content_hash": h,
@@ -14038,9 +17296,7 @@ async def attachments_list():
                 ).strip(),
                 "capture_source": meta.get("capture_source") or "",
                 "caption": _sanitize_attachment_caption(meta.get("caption") or ""),
-                "caption_model": str(meta.get("caption_model") or "").strip(),
-                "index_warning": str(meta.get("index_warning") or "").strip(),
-                **_attachment_status_defaults(
+                **_attachment_caption_tracker_fields(
                     meta,
                     content_type=str(content_type or ""),
                 ),
@@ -14056,6 +17312,7 @@ async def attachments_list():
 class AttachmentsRagRehydrate(BaseModel):
     limit: Optional[int] = None
     dry_run: bool = False
+    content_hashes: Optional[List[str]] = None
 
 
 @router.post("/attachments/rag/rehydrate")
@@ -14067,9 +17324,16 @@ async def attachments_rag_rehydrate(payload: AttachmentsRagRehydrate):
             max_items = max(0, int(payload.limit))
         except Exception:
             max_items = None
+    allowed_hashes = {
+        _normalize_attachment_hash(item)
+        for item in payload.content_hashes or []
+        if _normalize_attachment_hash(item)
+    }
     scanned = 0
     updated = 0
     for name in _iter_attachment_hashes():
+        if allowed_hashes and _normalize_attachment_hash(name) not in allowed_hashes:
+            continue
         meta = _read_attachment_meta(name)
         filename = meta.get("filename") or name
         target = _resolve_attachment_target(name, filename=filename)
@@ -14129,10 +17393,12 @@ async def attachment_caption_get(content_hash: str):
         raise HTTPException(status_code=404, detail="Attachment not found")
     metadata = _read_attachment_meta(normalized_hash)
     caption = _sanitize_attachment_caption(metadata.get("caption") or "")
+    content_type = str(metadata.get("content_type") or "").strip()
     return {
         "content_hash": normalized_hash,
         "caption": caption,
         "exists": bool(caption),
+        **_attachment_caption_tracker_fields(metadata, content_type=content_type),
     }
 
 
@@ -14146,12 +17412,8 @@ async def attachment_caption_put(content_hash: str, payload: AttachmentCaptionPa
         raise HTTPException(status_code=400, detail="caption is required")
     metadata = _read_attachment_meta(normalized_hash)
     metadata["caption"] = caption
-    metadata["caption_updated_at"] = (
-        datetime.now(tz=timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+    metadata["caption_updated_at"] = _utc_now_compact_iso()
+    metadata["caption_model"] = "manual-caption"
     metadata["caption_status"] = "manual"
     metadata["index_status"] = "indexing"
     metadata["placeholder_caption"] = False
@@ -14166,7 +17428,14 @@ async def attachment_caption_put(content_hash: str, payload: AttachmentCaptionPa
             normalized_hash,
             exc_info=True,
         )
-    return {"status": "saved", "content_hash": normalized_hash, "caption": caption}
+    metadata = _read_attachment_meta(normalized_hash)
+    content_type = str(metadata.get("content_type") or "").strip()
+    return {
+        "status": "saved",
+        "content_hash": normalized_hash,
+        "caption": caption,
+        **_attachment_caption_tracker_fields(metadata, content_type=content_type),
+    }
 
 
 @router.delete("/attachments/caption/{content_hash}")
@@ -14178,6 +17447,11 @@ async def attachment_caption_delete(content_hash: str):
     had_caption = bool(_sanitize_attachment_caption(metadata.get("caption") or ""))
     metadata.pop("caption", None)
     metadata.pop("caption_updated_at", None)
+    metadata.pop("caption_generated_at", None)
+    metadata.pop("caption_model", None)
+    metadata.pop("clip_embedding_model", None)
+    metadata.pop("clip_embedding_dim", None)
+    metadata.pop("clip_indexed_at", None)
     metadata["caption_status"] = "pending"
     metadata["index_status"] = "indexing"
     metadata["placeholder_caption"] = False
@@ -14197,6 +17471,10 @@ async def attachment_caption_delete(content_hash: str):
         "status": "deleted",
         "content_hash": normalized_hash,
         "deleted": had_caption,
+        **_attachment_caption_tracker_fields(
+            _read_attachment_meta(normalized_hash),
+            content_type=str(metadata.get("content_type") or "").strip(),
+        ),
     }
 
 
@@ -14437,6 +17715,9 @@ class SettingsRequest(BaseModel):
     stream_backend: Optional[str] = None
     realtime_model: Optional[str] = None
     realtime_voice: Optional[str] = None
+    live_agent_mode: Optional[str] = None
+    live_agent_model: Optional[str] = None
+    live_multimodal_model: Optional[str] = None
     realtime_base_url: Optional[str] = None
     realtime_connect_url: Optional[str] = None
     vision_model: Optional[str] = None
@@ -14590,6 +17871,9 @@ async def get_settings(request: Request):
         "stream_backend": cfg.get("stream_backend", "api"),
         "realtime_model": cfg.get("realtime_model", DEFAULT_REALTIME_MODEL),
         "realtime_voice": cfg.get("realtime_voice", DEFAULT_REALTIME_VOICE),
+        "live_agent_mode": cfg.get("live_agent_mode", "local"),
+        "live_agent_model": cfg.get("live_agent_model", ""),
+        "live_multimodal_model": cfg.get("live_multimodal_model", ""),
         "realtime_base_url": cfg.get("realtime_base_url", DEFAULT_REALTIME_SESSION_URL),
         "realtime_connect_url": cfg.get(
             "realtime_connect_url", DEFAULT_REALTIME_CONNECT_URL
@@ -14909,6 +18193,26 @@ async def update_settings(request: Request, settings: SettingsRequest):
         else:
             safe_unset("OPENAI_REALTIME_VOICE")
             cfg["realtime_voice"] = DEFAULT_REALTIME_VOICE
+    if settings.live_agent_mode is not None:
+        value = _normalize_live_agent_mode(settings.live_agent_mode)
+        safe_set("FLOAT_LIVE_AGENT_MODE", value)
+        cfg["live_agent_mode"] = value
+    if settings.live_agent_model is not None:
+        value = str(settings.live_agent_model or "").strip()
+        if value:
+            safe_set("FLOAT_LIVE_AGENT_MODEL", value)
+            cfg["live_agent_model"] = value
+        else:
+            safe_unset("FLOAT_LIVE_AGENT_MODEL")
+            cfg["live_agent_model"] = ""
+    if settings.live_multimodal_model is not None:
+        value = str(settings.live_multimodal_model or "").strip()
+        if value:
+            safe_set("FLOAT_LIVE_MULTIMODAL_MODEL", value)
+            cfg["live_multimodal_model"] = value
+        else:
+            safe_unset("FLOAT_LIVE_MULTIMODAL_MODEL")
+            cfg["live_multimodal_model"] = ""
     if settings.realtime_base_url is not None:
         value = str(settings.realtime_base_url or "").strip()
         if value:
@@ -15868,6 +19172,47 @@ def emit_notification(
         logger.exception("notify push failed")
 
 
+def emit_operation_notification(
+    app,
+    *,
+    operation_id: str,
+    kind: str,
+    title: str,
+    body: str = "",
+    status: str = "running",
+    phase_label: str = "",
+    phase_index: Optional[int] = None,
+    phase_count: Optional[int] = None,
+    detail: str = "",
+    started_at: str = "",
+    elapsed_ms: Optional[int] = None,
+    counts: Optional[Dict[str, Any]] = None,
+) -> None:
+    data: Dict[str, Any] = {
+        "operation_id": str(operation_id or "").strip(),
+        "kind": str(kind or "").strip(),
+        "status": str(status or "running").strip().lower() or "running",
+        "phase_label": str(phase_label or "").strip(),
+        "detail": str(detail or "").strip(),
+        "started_at": str(started_at or "").strip(),
+    }
+    if phase_index is not None:
+        data["phase_index"] = int(phase_index)
+    if phase_count is not None:
+        data["phase_count"] = int(phase_count)
+    if elapsed_ms is not None:
+        data["elapsed_ms"] = max(0, int(elapsed_ms))
+    if isinstance(counts, dict) and counts:
+        data["counts"] = dict(counts)
+    emit_notification(
+        app,
+        title=title,
+        body=body,
+        category="operation_progress",
+        data=data,
+    )
+
+
 @router.post("/notify")
 async def create_notification(request: Request, payload: NotificationPayload):
     emit_notification(
@@ -16355,6 +19700,126 @@ async def reveal_model_directory(
     return {"path": str(open_target), "opened": opened}
 
 
+def _provider_display_name(provider: str) -> str:
+    normalized = str(provider or "").strip().lower()
+    if normalized == "lmstudio":
+        return "LM Studio"
+    if normalized == "ollama":
+        return "Ollama"
+    if normalized == "custom-openai-compatible":
+        return "custom OpenAI-compatible server"
+    return normalized or "provider"
+
+
+def _local_model_delete_lock_detail(model_name: str) -> Optional[str]:
+    try:
+        runtime = llm_service.local_runtime_status()
+    except Exception:
+        return None
+    if not isinstance(runtime, dict):
+        return None
+    active_names = {
+        str(runtime.get("model") or "").strip(),
+        str(runtime.get("effective_model_id") or "").strip(),
+    }
+    active_names.discard("")
+    if model_name not in active_names:
+        return None
+    loaded = bool(runtime.get("loaded"))
+    load_state = str(runtime.get("load_state") or "").strip().lower()
+    if not loaded and load_state not in {"loading", "ready", "error"}:
+        return None
+    return (
+        f"Direct local runtime still has '{model_name}' loaded. "
+        "Use unload in the local runtime panel first, then try deleting it again."
+    )
+
+
+def _provider_model_delete_lock_details(model_name: str) -> List[str]:
+    details: List[str] = []
+    lock_hints = provider_manager.describe_model_locks(
+        model_name,
+        providers=["lmstudio"],
+    )
+    for hint in lock_hints:
+        if not isinstance(hint, dict):
+            continue
+        provider_label = _provider_display_name(str(hint.get("provider") or ""))
+        loaded_model = str(hint.get("loaded_model") or model_name).strip() or model_name
+        base_url = str(hint.get("base_url") or "").strip()
+        location = f" at {base_url}" if base_url else ""
+        if bool(hint.get("server_owned_by_float")):
+            details.append(
+                f"{provider_label} still reports '{loaded_model}' as loaded{location}. "
+                "Use unload or stop in Float before deleting the files."
+            )
+        else:
+            details.append(
+                f"{provider_label} is reachable{location} and still reports "
+                f"'{loaded_model}' as loaded outside Float. "
+                "Stop that server directly or switch this lane to External HTTP only "
+                "before deleting the files."
+            )
+    return details
+
+
+def _build_model_delete_lock_parts(model_name: str) -> List[str]:
+    details: List[str] = []
+    local_detail = _local_model_delete_lock_detail(model_name)
+    if local_detail:
+        details.append(local_detail)
+    details.extend(_provider_model_delete_lock_details(model_name))
+    if not details:
+        details.append(
+            "Another process still has this model directory open. Close file explorers, "
+            "terminals, or model runtimes that may be using it, then try again."
+        )
+    return details
+
+
+def _build_model_delete_lock_message(model_name: str) -> str:
+    details = _build_model_delete_lock_parts(model_name)
+    return (
+        f"Couldn't delete model '{model_name}' because one or more files are still in use. "
+        + " ".join(details)
+    )
+
+
+def _build_model_delete_lock_detail(model_name: str) -> Dict[str, Any]:
+    details = _build_model_delete_lock_parts(model_name)
+    message = (
+        f"Couldn't delete model '{model_name}' because one or more files are still in use. "
+        + " ".join(details)
+    )
+    rows: List[Dict[str, str]] = [
+        {"label": "Source", "value": "model delete guard"},
+        {"label": "Model", "value": model_name},
+    ]
+    for index, detail in enumerate(details, start=1):
+        rows.append({"label": f"Evidence {index}", "value": detail})
+    rows.append(
+        {
+            "label": "Next",
+            "value": (
+                "Unload or stop the runtime that owns this model, then retry delete. "
+                "For externally managed providers, switch the lane to External HTTP only "
+                "before removing files."
+            ),
+        }
+    )
+    return {
+        "message": message,
+        "state_explanation": {
+            "title": "Why this model cannot be deleted",
+            "summary": (
+                "Float refused the delete because runtime ownership checks still show "
+                "the model or its directory in use."
+            ),
+            "rows": rows,
+        },
+    }
+
+
 @router.delete("/models/{model_name}")
 async def delete_model(
     request: Request, model_name: str, path: Optional[str] = None
@@ -16370,7 +19835,20 @@ async def delete_model(
     for models_dir in dirs:
         target = models_dir / model_name
         if target.exists():
-            shutil.rmtree(target)
+            try:
+                shutil.rmtree(target)
+            except PermissionError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=_build_model_delete_lock_detail(model_name),
+                ) from exc
+            except OSError as exc:
+                if getattr(exc, "errno", None) in {errno.EACCES, errno.EPERM}:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=_build_model_delete_lock_detail(model_name),
+                    ) from exc
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
             return {"status": "deleted"}
     raise HTTPException(status_code=404, detail="Model not found")
 
@@ -16430,7 +19908,7 @@ async def get_response_completions(request: Request, response_id: str):
 
 
 @router.get("/openai/models")
-async def openai_models(request: Request):
+async def openai_models(request: Request, include_non_chat: bool = False):
     """List models available to the configured API key (OpenAI-compatible)."""
     cfg = request.app.state.config
     api_key = cfg.get("api_key")
@@ -16439,7 +19917,11 @@ async def openai_models(request: Request):
     base = _responses_api_base(cfg.get("api_url"))
     cached_models = _get_cached_openai_models(base, api_key)
     if cached_models is not None:
-        return {"models": cached_models}
+        return {
+            "models": _filter_openai_model_ids(
+                cached_models, include_non_chat=include_non_chat
+            )
+        }
     headers = {"Authorization": f"Bearer {api_key}"}
     url = f"{base.rstrip('/')}/models"
     resp = http_session.get(url, headers=headers, timeout=10)
@@ -16459,11 +19941,332 @@ async def openai_models(request: Request):
         }
     )
     _store_cached_openai_models(base, api_key, model_ids)
-    return {"models": model_ids}
+    return {
+        "models": _filter_openai_model_ids(model_ids, include_non_chat=include_non_chat)
+    }
 
 
 # ---------------------------------------------------------------------------
 # Multi-step task orchestration
+
+
+class ReflectionTaskCreate(BaseModel):
+    title: Optional[str] = None
+    question: str
+    source_thread_id: Optional[str] = None
+    cluster_id: Optional[str] = None
+    source: str = "user"
+    patience: int = 1
+    memory_keys: List[str] = Field(default_factory=list)
+    event_id: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    run_now: bool = False
+
+
+class ReflectionTaskRunRequest(BaseModel):
+    force: bool = False
+
+
+class ReflectionTickRequest(BaseModel):
+    mode: str = "manual"
+    force: bool = False
+    seed: Optional[int] = None
+
+
+def _get_reflection_service(app):
+    service = getattr(app.state, "reflection_service", None)
+    if service is not None:
+        return service
+    from app.services.reflection_service import ReflectionService
+
+    config_payload = getattr(app.state, "config", None)
+    service = ReflectionService(
+        config_payload if isinstance(config_payload, dict) else {}
+    )
+    app.state.reflection_service = service
+    try:
+        from app.tools.reflections import set_reflection_service
+
+        set_reflection_service(service)
+    except Exception:
+        pass
+    return service
+
+
+def _reflection_workflow_payload() -> Dict[str, Any]:
+    return build_workflow_metadata(resolve_workflow_profile("background_reflection"))
+
+
+def _reflection_provenance(task: Dict[str, Any]) -> Dict[str, Any]:
+    return build_agent_provenance(
+        kind="background_reflection",
+        parent_session_id=task.get("source_thread_id") or None,
+        source_event_id=task.get("event_id") or None,
+        task_id=task.get("id"),
+        label=task.get("title") or "Reflection task",
+    )
+
+
+def _reflection_handoff(task: Dict[str, Any]) -> Dict[str, Any]:
+    return build_handoff_artifact(
+        summary=str(task.get("question") or task.get("title") or "Reflection task")
+    )
+
+
+def _reflection_routine_enabled(app) -> bool:
+    config_payload = getattr(app.state, "config", None)
+    if not isinstance(config_payload, dict):
+        return False
+    value = config_payload.get("reflection_scheduler_enabled")
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _reflection_conversation_name(task: Dict[str, Any], run: Dict[str, Any]) -> str:
+    raw = str(task.get("title") or task.get("question") or "reflection")
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip("-._").lower()
+    slug = slug[:56] or "reflection"
+    timestamp = int(float(run.get("created_at") or time.time()))
+    return f"reflections/{timestamp}-{slug}"
+
+
+def _save_reflection_conversation(
+    task: Dict[str, Any], run: Dict[str, Any]
+) -> Optional[str]:
+    note = str(run.get("compact_note") or run.get("output") or "").strip()
+    if not note:
+        return None
+    name = _reflection_conversation_name(task, run)
+    messages = [
+        {
+            "role": "user",
+            "content": task.get("question") or task.get("title") or "Reflection",
+        },
+        {
+            "role": "ai",
+            "content": note,
+            "metadata": {
+                "reflection": True,
+                "task_id": task.get("id"),
+                "run_id": run.get("id"),
+            },
+        },
+    ]
+    try:
+        conversation_store.save_conversation(name, messages)
+        conversation_store.merge_metadata(
+            name,
+            {
+                "display_name": f"Reflection: {task.get('title') or task.get('id')}",
+                "workflow": "background_reflection",
+                "workflow_profile": _reflection_workflow_payload(),
+                "provenance": _reflection_provenance(task),
+                "handoff": _reflection_handoff(task),
+                "reflection": {"task_id": task.get("id"), "run_id": run.get("id")},
+            },
+        )
+    except Exception:
+        return None
+    return name
+
+
+async def _publish_reflection_event(
+    app,
+    task: Dict[str, Any],
+    *,
+    status: str,
+    content: str,
+    event_type: str = "task",
+    run: Optional[Dict[str, Any]] = None,
+) -> None:
+    task_id = str(task.get("id") or "")
+    if not task_id:
+        return
+    agent_status = "complete" if status in {"resolved", "complete"} else status
+    if status in {"cooling", "waiting"}:
+        agent_status = "queued"
+    if status in {"archived", "error"}:
+        agent_status = "error" if status == "error" else "complete"
+    await publish_console_event(
+        app,
+        {
+            "type": event_type,
+            "id": (run or {}).get("id") or task_id,
+            "task_id": task_id,
+            "status": status,
+            "agent_status": agent_status,
+            "agent_id": f"reflection:{task_id}",
+            "agent_label": "Reflection worker",
+            "content": content,
+            "workflow": _reflection_workflow_payload(),
+            "provenance": _reflection_provenance(task),
+            "handoff": _reflection_handoff(task),
+            "controls": controls_for_status(agent_status),
+            "metadata": {
+                "reflection": True,
+                "priority": task.get("priority"),
+                "run_count": task.get("run_count"),
+                "patience": task.get("patience"),
+                "should_surface_to_user": (run or {}).get("should_surface_to_user"),
+                "reflection_conversation": (run or {}).get("reflection_conversation"),
+            },
+        },
+        default_agent=f"reflection:{task_id}",
+    )
+
+
+@router.post("/reflections/tasks")
+async def create_reflection_task(request: Request, payload: ReflectionTaskCreate):
+    service = _get_reflection_service(request.app)
+    task = await asyncio.to_thread(
+        service.create_task,
+        title=payload.title or "",
+        question=payload.question,
+        source_thread_id=payload.source_thread_id or "",
+        cluster_id=payload.cluster_id or "",
+        source=payload.source,
+        patience=payload.patience,
+        memory_keys=payload.memory_keys,
+        event_id=payload.event_id or "",
+        metadata=payload.metadata,
+    )
+    await _publish_reflection_event(
+        request.app,
+        task,
+        status="queued",
+        content=f"Queued reflection: {task.get('title')}",
+    )
+    if not payload.run_now:
+        return {"status": "created", "task": task}
+    return await run_reflection_task(
+        str(task.get("id")),
+        request,
+        payload=ReflectionTaskRunRequest(force=True),
+    )
+
+
+@router.get("/reflections/tasks")
+async def list_reflection_tasks(
+    request: Request,
+    status: str = "",
+    limit: int = Query(default=50, ge=1, le=200),
+    include_runs: bool = False,
+):
+    service = _get_reflection_service(request.app)
+    tasks = await asyncio.to_thread(
+        service.list_tasks,
+        status=status,
+        limit=limit,
+        include_runs=include_runs,
+    )
+    return {"tasks": tasks, "count": len(tasks)}
+
+
+@router.get("/reflections/tasks/{task_id}")
+async def get_reflection_task(task_id: str, request: Request):
+    service = _get_reflection_service(request.app)
+    task = await asyncio.to_thread(service.get_task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Reflection task not found")
+    runs = await asyncio.to_thread(service.list_runs, task_id, limit=50)
+    return {"task": task, "runs": runs}
+
+
+@router.post("/reflections/tasks/{task_id}/run")
+async def run_reflection_task(
+    task_id: str,
+    request: Request,
+    payload: Optional[ReflectionTaskRunRequest] = Body(default=None),
+    force: bool = False,
+):
+    run_force = bool(force or (payload.force if payload else False))
+    service = _get_reflection_service(request.app)
+    task = await asyncio.to_thread(service.get_task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Reflection task not found")
+    await _publish_reflection_event(
+        request.app,
+        task,
+        status="active",
+        content=f"Running reflection: {task.get('title')}",
+    )
+    try:
+        result = await asyncio.to_thread(service.run_task, task_id, force=run_force)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Reflection task not found")
+    except Exception as exc:
+        await _publish_reflection_event(
+            request.app,
+            task,
+            status="error",
+            content=f"Reflection failed: {exc}",
+        )
+        raise HTTPException(status_code=500, detail=str(exc))
+    updated_task = result.get("task") if isinstance(result.get("task"), dict) else task
+    run = result.get("run") if isinstance(result.get("run"), dict) else None
+    if run and run.get("should_surface_to_user"):
+        conversation_name = await asyncio.to_thread(
+            _save_reflection_conversation, updated_task, run
+        )
+        if conversation_name:
+            run["reflection_conversation"] = conversation_name
+            result["run"] = run
+        await _publish_reflection_event(
+            request.app,
+            updated_task,
+            status=str(updated_task.get("status") or "complete"),
+            content=str(run.get("compact_note") or run.get("output") or ""),
+            event_type="thought",
+            run=run,
+        )
+    else:
+        await _publish_reflection_event(
+            request.app,
+            updated_task,
+            status=str(updated_task.get("status") or "complete"),
+            content=f"Reflection saved: {updated_task.get('title')}",
+            run=run,
+        )
+    return result
+
+
+@router.post("/reflections/tick")
+async def run_reflection_tick(request: Request, payload: ReflectionTickRequest):
+    normalized_mode = str(payload.mode or "manual").strip().lower() or "manual"
+    if (
+        normalized_mode not in {"manual", "tool", "user"}
+        and not payload.force
+        and not _reflection_routine_enabled(request.app)
+    ):
+        return {
+            "tick": {
+                "mode": normalized_mode,
+                "status": "disabled",
+                "candidate_count": 0,
+                "task_id": None,
+                "error": "Routine reflection scheduler is disabled.",
+                "metadata": {"env": "FLOAT_REFLECTION_SCHEDULER_ENABLED"},
+            }
+        }
+    service = _get_reflection_service(request.app)
+    tick = await asyncio.to_thread(
+        service.scheduler_tick,
+        mode=normalized_mode,
+        force=payload.force,
+        seed=payload.seed,
+    )
+    task_id = tick.get("task_id")
+    if task_id:
+        task = await asyncio.to_thread(service.get_task, str(task_id))
+        if isinstance(task, dict):
+            await _publish_reflection_event(
+                request.app,
+                task,
+                status=str(tick.get("status") or "complete"),
+                content=f"Reflection tick {tick.get('status')}: {task.get('title')}",
+            )
+    return {"tick": tick}
 
 
 class TaskStep(BaseModel):
@@ -16474,6 +20277,98 @@ class TaskStep(BaseModel):
 
 class TaskPlan(BaseModel):
     steps: list[TaskStep]
+    workflow: Optional[str] = None
+    handoff: Optional[HandoffArtifact] = None
+    provenance: Optional[AgentProvenance] = None
+
+
+def _task_plan_payload(plan: TaskPlan) -> list[dict[str, Any]]:
+    return [
+        {
+            "agent": step.agent,
+            "args": step.args or [],
+            "kwargs": step.kwargs or {},
+        }
+        for step in plan.steps
+    ]
+
+
+def _task_plan_console_context(steps: list[dict[str, Any]]) -> dict[str, str]:
+    context: dict[str, str] = {}
+    for step in steps:
+        kwargs = step.get("kwargs") if isinstance(step.get("kwargs"), dict) else {}
+        for key in ("session_id", "message_id", "chain_id"):
+            if context.get(key):
+                continue
+            value = kwargs.get(key)
+            if isinstance(value, str) and value.strip():
+                context[key] = value.strip()
+    return context
+
+
+def _task_plan_workflow_metadata(plan: TaskPlan) -> Dict[str, Any]:
+    workflow_name = resolve_workflow_name(plan.workflow or _default_workflow_name())
+    return build_workflow_metadata(resolve_workflow_profile(workflow_name))
+
+
+def _task_plan_handoff_payload(
+    plan: TaskPlan,
+    steps: list[dict[str, Any]],
+    context: dict[str, str],
+) -> Dict[str, Any]:
+    if plan.handoff is not None:
+        return plan.handoff.model_dump(exclude_none=True)
+    recent_turn_ids = [
+        value
+        for value in (context.get("message_id"), context.get("chain_id"))
+        if isinstance(value, str) and value.strip()
+    ]
+    return build_task_handoff(steps, recent_turn_ids=recent_turn_ids)
+
+
+def _task_plan_provenance_payload(
+    plan: TaskPlan,
+    context: dict[str, str],
+    *,
+    task_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    if plan.provenance is not None:
+        payload = plan.provenance.model_dump(exclude_none=True)
+        if task_id and not payload.get("task_id"):
+            payload["task_id"] = task_id
+        return payload
+    return build_agent_provenance(
+        kind="task_chain",
+        parent_session_id=context.get("session_id"),
+        parent_message_id=context.get("message_id"),
+        task_id=task_id,
+        label="Delegated task chain",
+    )
+
+
+def _task_chain_summary(steps: list[dict[str, Any]]) -> str:
+    names = [
+        str(step.get("agent") or "").strip()
+        for step in steps
+        if str(step.get("agent") or "").strip()
+    ]
+    if not names:
+        return "Queued task chain"
+    label = " -> ".join(names[:4])
+    if len(names) > 4:
+        label = f"{label} -> +{len(names) - 4} more"
+    return f"Queued {len(names)}-step task chain: {label}"
+
+
+def _task_console_status(state: str) -> str:
+    normalized = str(state or "").strip().lower()
+    if normalized in {"success", "complete", "completed"}:
+        return "complete"
+    if normalized in {"failure", "failed", "revoked"}:
+        return "error"
+    if normalized in {"pending", "received"}:
+        return "queued"
+    return "active"
 
 
 class ActionRevertRequest(BaseModel):
@@ -16547,31 +20442,63 @@ async def get_agent_console(request: Request) -> dict:
     """Return a snapshot of the in-memory agent console state."""
     state = _ensure_agent_console_state(request.app)
     resources = state.get("resources") if isinstance(state, dict) else {}
-    agents = []
+    agent_records: dict[str, dict[str, Any]] = {}
     for record in state.get("agents", {}).values():
         if not isinstance(record, dict):
             continue
-        events = [
-            event for event in record.get("events", []) if isinstance(event, dict)
-        ]
         agent_id = record.get("id")
         resource_payload = (
             resources.get(agent_id)
             if isinstance(resources, dict) and agent_id in resources
             else None
         )
-        agents.append(
-            {
-                "id": record.get("id"),
-                "label": record.get("label"),
-                "status": record.get("status"),
-                "summary": record.get("summary"),
-                "updated_at": record.get("updated_at"),
-                "events": events[-_MAX_AGENT_HISTORY:],
-                "resources": resource_payload,
-            }
+        snapshot = _console_agent_snapshot(record, resource_payload)
+        if snapshot is None:
+            continue
+        agent_records[str(snapshot.get("id"))] = snapshot
+
+    try:
+        celery_snapshot, celery_task_snapshot = await asyncio.gather(
+            celery_status(),
+            celery_tasks(state="all", limit=40),
         )
-    agents.sort(key=lambda item: item.get("updated_at") or 0, reverse=True)
+    except Exception:
+        celery_snapshot, celery_task_snapshot = {}, {"tasks": [], "state": "all"}
+
+    for synthetic in _build_celery_console_agents(
+        celery_snapshot, celery_task_snapshot
+    ):
+        synthetic_id = str(synthetic.get("id") or "").strip()
+        if not synthetic_id:
+            continue
+        existing = agent_records.get(synthetic_id)
+        if existing is None:
+            agent_records[synthetic_id] = synthetic
+            continue
+        merged_events = [
+            event
+            for event in (existing.get("events") or [])
+            + (synthetic.get("events") or [])
+            if isinstance(event, dict)
+        ]
+        agent_records[synthetic_id] = {
+            **existing,
+            "label": synthetic.get("label") or existing.get("label"),
+            "status": synthetic.get("status") or existing.get("status"),
+            "summary": synthetic.get("summary") or existing.get("summary"),
+            "updated_at": max(
+                float(existing.get("updated_at") or 0),
+                float(synthetic.get("updated_at") or 0),
+            ),
+            "events": merged_events[-_MAX_AGENT_HISTORY:],
+            "resources": synthetic.get("resources") or existing.get("resources"),
+        }
+
+    agents = sorted(
+        agent_records.values(),
+        key=lambda item: item.get("updated_at") or 0,
+        reverse=True,
+    )
     actions: List[Dict[str, Any]] = []
     action_history = _get_action_history_service(request.app)
     if action_history is not None:
@@ -16620,29 +20547,281 @@ async def get_agent_resource(agent_id: str, request: Request) -> dict:
     return {"resource": resource}
 
 
-@router.post("/tasks/")
-async def start_task(plan: TaskPlan):
-    """Start a multi-step task using ``MultiAgentEngine``."""
-    result = engine.plan_and_execute(
-        [
-            {
-                "agent": step.agent,
-                "args": step.args or [],
-                "kwargs": step.kwargs or {},
-            }
-            for step in plan.steps
-        ]
+class AgentConsoleControlPayload(BaseModel):
+    note: Optional[str] = None
+    workflow: Optional[str] = None
+    mode: Optional[str] = None
+    model: Optional[str] = None
+
+
+def _console_agent_record(app, agent_id: str) -> Optional[Dict[str, Any]]:
+    state = _ensure_agent_console_state(app)
+    agents = state.get("agents") if isinstance(state, dict) else {}
+    record = agents.get(agent_id) if isinstance(agents, dict) else None
+    return record if isinstance(record, dict) else None
+
+
+def _console_agent_task_id(
+    agent_id: str, record: Optional[Dict[str, Any]]
+) -> Optional[str]:
+    provenance = record.get("provenance") if isinstance(record, dict) else None
+    if isinstance(provenance, dict):
+        task_id = str(provenance.get("task_id") or "").strip()
+        if task_id:
+            return task_id
+    if str(agent_id or "").startswith("task:"):
+        task_id = str(agent_id).split(":", 1)[1].strip()
+        return task_id or None
+    return None
+
+
+async def _console_stop_task(task_id: str) -> None:
+    try:
+        from app.tasks import celery_app
+    except Exception:
+        return
+    await asyncio.to_thread(celery_app.control.revoke, task_id, terminate=True)
+
+
+async def _apply_agent_console_control(
+    request: Request,
+    agent_id: str,
+    action: str,
+    payload: Optional[AgentConsoleControlPayload] = None,
+) -> Dict[str, Any]:
+    record = _console_agent_record(request.app, agent_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    controls = (
+        record.get("controls") if isinstance(record.get("controls"), dict) else {}
     )
-    return {"task_id": result.id}
+    available = (
+        controls.get("available") if isinstance(controls.get("available"), list) else []
+    )
+    normalized_action = str(action or "").strip().lower()
+    if normalized_action not in available:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{normalized_action} is not available for this agent",
+        )
+
+    current_status = str(record.get("status") or "active").strip().lower() or "active"
+    next_status = current_status
+    note = str(payload.note or "").strip() if payload is not None else ""
+    workflow_target = str(payload.workflow or "").strip() if payload is not None else ""
+    mode_target = str(payload.mode or "").strip() if payload is not None else ""
+    model_target = str(payload.model or "").strip() if payload is not None else ""
+    handoff = record.get("handoff") if isinstance(record.get("handoff"), dict) else None
+    if normalized_action == "pause":
+        next_status = "paused"
+        message = "Paused delegated run in the console."
+    elif normalized_action == "resume":
+        next_status = "active"
+        message = "Resumed delegated run in the console."
+    elif normalized_action == "redirect":
+        message = "Redirect requested for delegated run."
+        if note:
+            handoff = append_handoff_note(
+                handoff,
+                f"Redirect: {note}",
+                fallback_summary=str(
+                    record.get("summary") or "Redirect requested."
+                ).strip(),
+            )
+    elif normalized_action == "stop":
+        task_id = _console_agent_task_id(agent_id, record)
+        if task_id:
+            await _console_stop_task(task_id)
+            message = "Stop requested; Celery revoke sent."
+        else:
+            message = "Stopped delegated run in the console."
+        next_status = "stopped"
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported agent control")
+
+    updated_controls = controls_for_status(
+        next_status,
+        existing=merge_agent_payload(
+            controls,
+            {
+                "redirect_note": note or controls.get("redirect_note"),
+                "redirect_workflow": workflow_target
+                or controls.get("redirect_workflow"),
+                "redirect_mode": mode_target or controls.get("redirect_mode"),
+                "redirect_model": model_target or controls.get("redirect_model"),
+            },
+        ),
+    )
+    event = await publish_console_event(
+        request.app,
+        {
+            "type": "control",
+            "control_action": normalized_action,
+            "status": "applied",
+            "agent_id": agent_id,
+            "agent_label": record.get("label") or agent_id,
+            "agent_status": next_status,
+            "content": message,
+            "workflow": record.get("workflow")
+            if isinstance(record.get("workflow"), dict)
+            else None,
+            "provenance": record.get("provenance")
+            if isinstance(record.get("provenance"), dict)
+            else None,
+            "handoff": handoff,
+            "controls": updated_controls,
+            "note": note or None,
+            "redirect_workflow": workflow_target or None,
+            "redirect_mode": mode_target or None,
+            "redirect_model": model_target or None,
+        },
+        default_agent=agent_id,
+    )
+    refreshed = _console_agent_record(request.app, agent_id)
+    resources = (
+        _ensure_agent_console_state(request.app).get("resources", {}).get(agent_id)
+        if isinstance(_ensure_agent_console_state(request.app).get("resources"), dict)
+        else None
+    )
+    snapshot = _console_agent_snapshot(refreshed or {}, resources)
+    return {"status": "ok", "event": event, "agent": snapshot}
+
+
+@router.post("/agents/console/{agent_id}/pause")
+async def pause_console_agent(
+    agent_id: str,
+    request: Request,
+    payload: AgentConsoleControlPayload = Body(
+        default_factory=AgentConsoleControlPayload
+    ),
+) -> dict:
+    return await _apply_agent_console_control(request, agent_id, "pause", payload)
+
+
+@router.post("/agents/console/{agent_id}/resume")
+async def resume_console_agent(
+    agent_id: str,
+    request: Request,
+    payload: AgentConsoleControlPayload = Body(
+        default_factory=AgentConsoleControlPayload
+    ),
+) -> dict:
+    return await _apply_agent_console_control(request, agent_id, "resume", payload)
+
+
+@router.post("/agents/console/{agent_id}/stop")
+async def stop_console_agent(
+    agent_id: str,
+    request: Request,
+    payload: AgentConsoleControlPayload = Body(
+        default_factory=AgentConsoleControlPayload
+    ),
+) -> dict:
+    return await _apply_agent_console_control(request, agent_id, "stop", payload)
+
+
+@router.post("/agents/console/{agent_id}/redirect")
+async def redirect_console_agent(
+    agent_id: str,
+    request: Request,
+    payload: AgentConsoleControlPayload,
+) -> dict:
+    return await _apply_agent_console_control(request, agent_id, "redirect", payload)
+
+
+@router.post("/tasks/")
+async def start_task(request: Request, plan: TaskPlan):
+    """Start a multi-step task using ``MultiAgentEngine``."""
+    steps = _task_plan_payload(plan)
+    result = await asyncio.to_thread(engine.plan_and_execute, steps)
+    task_id = str(result.id)
+    context = _task_plan_console_context(steps)
+    workflow_meta = _task_plan_workflow_metadata(plan)
+    provenance = _task_plan_provenance_payload(plan, context, task_id=task_id)
+    handoff = _task_plan_handoff_payload(plan, steps, context)
+    controls = controls_for_status("queued")
+    await publish_console_event(
+        request.app,
+        {
+            "type": "task",
+            "id": task_id,
+            "task_id": task_id,
+            "status": "queued",
+            "agent_status": "queued",
+            "agent_id": f"task:{task_id}",
+            "agent_label": "Celery task chain",
+            "content": _task_chain_summary(steps),
+            "steps": [step.get("agent") for step in steps],
+            "workflow": workflow_meta,
+            "provenance": provenance,
+            "handoff": handoff,
+            "controls": controls,
+            **context,
+        },
+        default_agent=f"task:{task_id}",
+    )
+    return {"task_id": task_id}
 
 
 @router.get("/tasks/{task_id}")
-async def get_task_status(task_id: str):
+async def get_task_status(task_id: str, request: Request):
     """Return the status and result of a previously started task."""
-    res: AsyncResult = engine.result(task_id)
-    data = {"state": res.state}
-    if res.ready():
-        data["result"] = res.result
+
+    def _read_task_status() -> dict[str, Any]:
+        res: AsyncResult = engine.result(task_id)
+        payload: dict[str, Any] = {"state": res.state}
+        if res.ready():
+            payload["result"] = res.result
+        return payload
+
+    data = await asyncio.to_thread(_read_task_status)
+    state = str(data.get("state") or "UNKNOWN")
+    console_state = _ensure_agent_console_state(request.app)
+    existing_record = (
+        console_state.get("agents", {}).get(f"task:{task_id}")
+        if isinstance(console_state.get("agents"), dict)
+        else None
+    )
+    existing_controls = (
+        existing_record.get("controls") if isinstance(existing_record, dict) else None
+    )
+    console_status = _task_console_status(state)
+    if (
+        isinstance(existing_record, dict)
+        and str(existing_record.get("status") or "").strip().lower() == "paused"
+        and console_status in {"active", "queued"}
+    ):
+        console_status = "paused"
+    await publish_console_event(
+        request.app,
+        {
+            "type": "task",
+            "id": task_id,
+            "task_id": task_id,
+            "status": state.lower(),
+            "agent_status": console_status,
+            "agent_id": f"task:{task_id}",
+            "agent_label": "Celery task chain",
+            "content": f"Task chain state: {state}",
+            "result_ready": "result" in data,
+            "workflow": existing_record.get("workflow")
+            if isinstance(existing_record, dict)
+            else None,
+            "provenance": existing_record.get("provenance")
+            if isinstance(existing_record, dict)
+            else None,
+            "handoff": existing_record.get("handoff")
+            if isinstance(existing_record, dict)
+            else None,
+            "controls": controls_for_status(
+                console_status,
+                existing=existing_controls
+                if isinstance(existing_controls, dict)
+                else None,
+            ),
+        },
+        default_agent=f"task:{task_id}",
+    )
     return data
 
 
@@ -16686,6 +20865,48 @@ async def voice_tts(request: Request, payload: VoiceTtsRequest):
     }
 
 
+@router.post("/voice/transcribe")
+async def voice_transcribe(request: Request, file: UploadFile = UploadFileType(...)):
+    """Transcribe a short uploaded recording for the normal chat mic button."""
+    cfg = request.app.state.config if request else app_config.load_config()
+    api_key = str(cfg.get("api_key") or "").strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Speech-to-text needs an OpenAI API key or a configured STT provider.",
+        )
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="No audio data was received.")
+    model = str(cfg.get("stt_model") or "whisper-1").strip() or "whisper-1"
+    filename = str(file.filename or "recording.webm").strip() or "recording.webm"
+    content_type = str(file.content_type or "audio/webm").strip() or "audio/webm"
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            files={"file": (filename, data, content_type)},
+            data={"model": model},
+            timeout=60,
+        )
+        if response.status_code >= 400:
+            try:
+                detail = response.json().get("error", {}).get("message")
+            except Exception:
+                detail = response.text
+            raise HTTPException(
+                status_code=502,
+                detail=str(detail or "Speech-to-text provider rejected the audio."),
+            )
+        payload = response.json()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    text = str(payload.get("text") or "").strip()
+    return {"text": text, "model": model, "provider": "openai"}
+
+
 @router.post("/voice/connect")
 async def voice_connect(request: Request, payload: VoiceConnect):
     """Return connection details for the configured streaming backend."""
@@ -16704,6 +20925,11 @@ async def voice_stream(request: Request, file: UploadFile = UploadFileType(...))
         raise HTTPException(
             status_code=501,
             detail="Realtime API handles streaming directly; voice uploads disabled in light mode",
+        )
+    if getattr(svc, "mode", "") != "livekit":
+        raise HTTPException(
+            status_code=501,
+            detail="Voice uploads are only implemented for LiveKit mode right now",
         )
     data = await file.read()
     task = process_livekit_audio.delay(data)

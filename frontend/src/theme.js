@@ -1,4 +1,5 @@
 import ash from "./themes/ash";
+import blossom from "./themes/blossom";
 import cappucino from "./themes/cappucino";
 import midnightPlum from "./themes/midnightPlum";
 import sunsetCitrus from "./themes/sunsetCitrus";
@@ -18,6 +19,7 @@ export const THEME_SLOT_KEYS = [
 
 export const VISUAL_THEME_OPTIONS = [
   { value: "spring", label: "Spring" },
+  { value: "blossom", label: "Blossom" },
   { value: "ash", label: "Ash" },
   { value: "cappucino", label: "Cappucino" },
   { value: "sunset-citrus", label: "Sunset Citrus" },
@@ -26,6 +28,7 @@ export const VISUAL_THEME_OPTIONS = [
 
 const builtInThemes = {
   spring,
+  blossom,
   ash,
   cappucino,
   "sunset-citrus": sunsetCitrus,

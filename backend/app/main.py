@@ -241,6 +241,9 @@ try:
     action_history_service = services.ActionHistoryService(config)
     logger.info("ActionHistoryService initialized.")
 
+    reflection_service = services.ReflectionService(config)
+    logger.info("ReflectionService initialized.")
+
     computer_service = services.ComputerService(config)
     services.set_computer_service(computer_service)
     logger.info("ComputerService initialized.")
@@ -249,6 +252,7 @@ try:
     app.state.rag_handler = rag_handler
     app.state.livekit_service = livekit_service
     app.state.action_history_service = action_history_service
+    app.state.reflection_service = reflection_service
     app.state.computer_service = computer_service
     # Broadcast stream so multiple consumers (main UI, dev panel, etc.) all see events.
     app.state.thought_broker = EventBroker(max_history=750, subscriber_queue_size=300)
@@ -277,6 +281,15 @@ try:
 
         _set_action_history(action_history_service)
         logger.info("Action history tools bound to ActionHistoryService")
+    except Exception:
+        pass
+    try:
+        from app.tools.reflections import (
+            set_reflection_service as _set_reflection_service,  # type: ignore
+        )
+
+        _set_reflection_service(reflection_service)
+        logger.info("Reflection tools bound to ReflectionService")
     except Exception:
         pass
     try:

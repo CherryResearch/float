@@ -33,8 +33,13 @@ def test_list_addons_reads_repo_and_local_roots(tmp_path, monkeypatch):
     addons = workflow_profiles.list_addons()
 
     assert [item["id"] for item in addons] == ["local-addon", "repo-addon"]
-    assert next(item for item in addons if item["id"] == "repo-addon")["source"] == "repo"
-    assert next(item for item in addons if item["id"] == "local-addon")["source"] == "local"
+    assert (
+        next(item for item in addons if item["id"] == "repo-addon")["source"] == "repo"
+    )
+    assert (
+        next(item for item in addons if item["id"] == "local-addon")["source"]
+        == "local"
+    )
 
 
 def test_list_addons_prefers_local_override_for_duplicate_ids(tmp_path, monkeypatch):
@@ -67,3 +72,13 @@ def test_list_addons_prefers_local_override_for_duplicate_ids(tmp_path, monkeypa
             "source": "local",
         }
     ]
+
+
+def test_builtin_workflows_expose_role_metadata():
+    from app import workflow_profiles
+
+    workflow = workflow_profiles.resolve_workflow_profile("architect_planner")
+
+    assert workflow["role"] == "architect"
+    assert workflow["latency_tier"] == "deliberate"
+    assert workflow["delegation_mode"] == "delegate"

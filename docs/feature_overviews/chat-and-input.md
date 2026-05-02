@@ -7,7 +7,7 @@ A small set of inline commands shapes that flexibility. Typing `%{toolname}` (e.
 | Trigger | Behavior |
 | --- | --- |
 | `%{toolname}` (for example `%remember ...`) | Flag the line as a tool call and append the rest of the prompt as the payload; the suggestion list stays sorted alphabetically so Tab cycles predictably before you finish typing arguments. |
-| `./` / memory search and `//` / file search | Inline lookups for managed files or stored memories. Matching results appear as link-like tokens so you can click them to insert structured context, and Tab jumps through matches in lexicographic order. |
+| `./` / file search and `//` / memory search | Inline lookups for managed files or stored memories. Matching results appear as link-like tokens so you can click them to insert structured context, and Tab jumps through matches in lexicographic order. |
 | `.//` | Run a blended search across both files and memories when a single lookup should pull from either source without switching commands. |
 
 Inline tokens stay linked until you delete the trailing space or explicitly backspace through the highlighted text, which unlinks it so you can edit the raw words again.

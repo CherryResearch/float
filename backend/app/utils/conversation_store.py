@@ -89,10 +89,34 @@ else:
 CONV_DIR.mkdir(parents=True, exist_ok=True)
 
 SESSION_RE = re.compile(r"^sess-(\d+)$")
+CONVERSATION_PRIVACY_TO_SENSITIVITY = {
+    "default": "personal",
+    "protected": "protected",
+    "secret": "secret",
+}
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def normalize_conversation_privacy_mode(value: Any) -> str:
+    mode = str(value or "").strip().lower()
+    return mode if mode in CONVERSATION_PRIVACY_TO_SENSITIVITY else "default"
+
+
+def conversation_privacy_to_sensitivity(value: Any) -> str:
+    mode = normalize_conversation_privacy_mode(value)
+    return CONVERSATION_PRIVACY_TO_SENSITIVITY[mode]
+
+
+def conversation_privacy_mode_from_sensitivity(value: Any) -> str:
+    level = str(value or "").strip().lower()
+    if level in {"protected", "secret"}:
+        return level
+    if level in {"mundane", "public", "personal"}:
+        return "default"
+    return "default"
 
 
 def _humanize_session_name(name: str) -> str:
@@ -127,6 +151,28 @@ def _path(name: str) -> Path:
 def _meta_path(name: str) -> Path:
     normalized = _normalize_name(name)
     return CONV_DIR / f"{normalized}.meta.json"
+
+
+def _safe_snapshot_id(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value or "").strip())
+    cleaned = cleaned.strip("-.")
+    return cleaned or str(uuid4())
+
+
+def _context_snapshot_dir(name: str) -> Path:
+    normalized = _normalize_name(name) or "conversation"
+    return CONV_DIR / ".context_snapshots" / normalized
+
+
+def _context_snapshot_path(name: str, snapshot_id: str) -> Path:
+    return _context_snapshot_dir(name) / f"{_safe_snapshot_id(snapshot_id)}.json"
+
+
+def _snapshot_relative_name(path: Path) -> str:
+    try:
+        return path.relative_to(CONV_DIR).as_posix()
+    except Exception:
+        return path.as_posix()
 
 
 def _iter_conversation_files() -> List[Path]:
@@ -306,6 +352,25 @@ def set_display_name(
     _write_meta(name, meta)
 
 
+def merge_metadata(name: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge arbitrary metadata into the sidecar file for ``name``."""
+
+    def _merge(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
+        merged = dict(dst)
+        for key, value in src.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = _merge(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
+    meta = _ensure_metadata(name)
+    if isinstance(updates, dict):
+        meta = _merge(meta, updates)
+        _write_meta(name, meta)
+    return meta
+
+
 def list_conversations(
     include_metadata: bool = False,
 ) -> List[Union[str, Dict[str, Any]]]:
@@ -357,6 +422,19 @@ def list_conversations(
                 "display_name": meta.get("display_name") or name,
                 "auto_title_applied": bool(meta.get("auto_title_applied")),
                 "manual_title": bool(meta.get("manual_title")),
+                "workflow": meta.get("workflow"),
+                "workflow_profile": meta.get("workflow_profile"),
+                "provenance": meta.get("provenance"),
+                "handoff": meta.get("handoff"),
+                "sensitivity": str(meta.get("sensitivity") or "").strip().lower(),
+                "privacy_mode": normalize_conversation_privacy_mode(
+                    meta.get("privacy_mode")
+                    or conversation_privacy_mode_from_sensitivity(
+                        meta.get("sensitivity")
+                    )
+                ),
+                "context_snapshots": meta.get("context_snapshots") or [],
+                "active_context_snapshot_id": meta.get("active_context_snapshot_id"),
                 "path": name,
             }
         )
@@ -410,6 +488,97 @@ def save_conversation(name: str, messages: List[Dict[str, Any]]) -> None:
     _write_meta(name, meta)
 
 
+def _build_context_snapshot_ref(
+    name: str,
+    snapshot: Dict[str, Any],
+    path: Path,
+) -> Dict[str, Any]:
+    return {
+        "id": str(snapshot.get("id") or snapshot.get("snapshot_id") or "").strip(),
+        "created_at": snapshot.get("created_at"),
+        "conversation_id": name,
+        "source_conversation_id": snapshot.get("source_conversation_id"),
+        "target_conversation_id": snapshot.get("target_conversation_id"),
+        "marker_message_id": snapshot.get("marker_message_id"),
+        "source_message_count": snapshot.get("source_message_count"),
+        "retained_start_index": snapshot.get("retained_start_index"),
+        "retained_end_index": snapshot.get("retained_end_index"),
+        "summary_method": snapshot.get("summary_method"),
+        "summary_workflow": snapshot.get("summary_workflow"),
+        "budget_status": snapshot.get("budget_status"),
+        "path": _snapshot_relative_name(path),
+    }
+
+
+def list_context_snapshot_refs(name: str) -> List[Dict[str, Any]]:
+    meta = _ensure_metadata(name)
+    refs = meta.get("context_snapshots")
+    if isinstance(refs, list):
+        return [ref for ref in refs if isinstance(ref, dict)]
+    return []
+
+
+def load_context_snapshot(name: str, snapshot_id: str) -> Dict[str, Any]:
+    fp = _context_snapshot_path(name, snapshot_id)
+    if not fp.exists():
+        return {}
+    try:
+        with fp.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_context_snapshot(
+    name: str,
+    snapshot: Dict[str, Any],
+    *,
+    max_refs: int = 50,
+) -> Dict[str, Any]:
+    payload = dict(snapshot) if isinstance(snapshot, dict) else {}
+    snapshot_id = _safe_snapshot_id(
+        str(payload.get("id") or payload.get("snapshot_id") or uuid4())
+    )
+    payload["id"] = snapshot_id
+    payload["snapshot_id"] = snapshot_id
+    payload["conversation_id"] = name
+    payload.setdefault("created_at", _now_iso())
+    fp = _context_snapshot_path(name, snapshot_id)
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    with fp.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    meta = _ensure_metadata(name)
+    refs = [
+        ref
+        for ref in list_context_snapshot_refs(name)
+        if str(ref.get("id") or "").strip() != snapshot_id
+    ]
+    refs.append(_build_context_snapshot_ref(name, payload, fp))
+    refs.sort(key=lambda item: str(item.get("created_at") or ""))
+    meta["context_snapshots"] = refs[-max_refs:]
+    meta["active_context_snapshot_id"] = snapshot_id
+    _write_meta(name, meta)
+    return payload
+
+
+def copy_context_snapshot(
+    source_name: str,
+    target_name: str,
+    snapshot_id: str,
+) -> Dict[str, Any]:
+    snapshot = load_context_snapshot(source_name, snapshot_id)
+    if not snapshot:
+        return {}
+    copied = dict(snapshot)
+    copied["conversation_id"] = target_name
+    copied["copied_from"] = {
+        "conversation_id": source_name,
+        "snapshot_id": str(snapshot_id or "").strip(),
+    }
+    return save_context_snapshot(target_name, copied)
+
+
 def delete_conversation(name: str) -> None:
     fp = _path(name)
     if fp.exists():
@@ -428,6 +597,8 @@ def rename_conversation(old: str, new: str) -> None:
     new_p = _path(new)
     old_meta = _meta_path(old)
     new_meta = _meta_path(new)
+    old_snapshots = _context_snapshot_dir(old)
+    new_snapshots = _context_snapshot_dir(new)
     new_p.parent.mkdir(parents=True, exist_ok=True)
     if old_p.exists():
         old_p.rename(new_p)
@@ -435,6 +606,39 @@ def rename_conversation(old: str, new: str) -> None:
     new_meta.parent.mkdir(parents=True, exist_ok=True)
     if old_meta.exists():
         old_meta.rename(new_meta)
+    if old_snapshots.exists():
+        new_snapshots.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if new_snapshots.exists():
+                shutil.rmtree(new_snapshots)
+            old_snapshots.rename(new_snapshots)
+        except Exception:
+            pass
+    if isinstance(meta_payload, dict):
+        refs = meta_payload.get("context_snapshots")
+        if isinstance(refs, list):
+            updated_refs: List[Dict[str, Any]] = []
+            old_snapshot_prefix = (
+                _context_snapshot_dir(old).relative_to(CONV_DIR).as_posix()
+            )
+            new_snapshot_prefix = (
+                _context_snapshot_dir(new).relative_to(CONV_DIR).as_posix()
+            )
+            for item in refs:
+                if not isinstance(item, dict):
+                    continue
+                ref = dict(item)
+                raw_path = str(ref.get("path") or "").strip()
+                if raw_path.startswith(old_snapshot_prefix):
+                    ref["path"] = raw_path.replace(
+                        old_snapshot_prefix,
+                        new_snapshot_prefix,
+                        1,
+                    )
+                ref["conversation_id"] = new
+                updated_refs.append(ref)
+            meta_payload["context_snapshots"] = updated_refs
+        _write_meta(new, meta_payload)
     if meta_payload and old_base == new_base:
         display_name = meta_payload.get("display_name") or new_base
         auto_generated = meta_payload.get("auto_title_applied")

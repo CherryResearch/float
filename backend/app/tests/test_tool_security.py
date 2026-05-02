@@ -150,6 +150,50 @@ def test_list_dir_workspace_only_normalizes_prefix(mem_mgr, tmp_path, monkeypatc
     assert any(item["path"] == "nested/hello.txt" for item in result["entries"])
 
 
+def test_list_dir_normalizes_exact_data_prefix(mem_mgr, tmp_path, monkeypatch):
+    monkeypatch.setenv("FLOAT_DATA_DIR", str(tmp_path))
+    mem_mgr.register_tool("list_dir", local_files.list_dir)
+    target = tmp_path / "workspace" / "note.txt"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("hi")
+    args = {
+        "path": "data",
+        "workspace_only": False,
+        "recursive": False,
+        "include_hidden": False,
+        "max_entries": 100,
+    }
+    sig = generate_signature("bob", "list_dir", args)
+    result = mem_mgr.invoke_tool("list_dir", user="bob", signature=sig, **args)
+    assert result["path"] == "."
+    assert any(
+        item["path"] == "workspace" and item["type"] == "directory"
+        for item in result["entries"]
+    )
+
+
+def test_list_dir_workspace_only_normalizes_exact_workspace_prefix(
+    mem_mgr, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("FLOAT_DATA_DIR", str(tmp_path))
+    mem_mgr.register_tool("list_dir", local_files.list_dir)
+    target = tmp_path / "workspace" / "note.txt"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("hi")
+    args = {
+        "path": "workspace",
+        "workspace_only": True,
+        "recursive": False,
+        "include_hidden": False,
+        "max_entries": 100,
+    }
+    sig = generate_signature("bob", "list_dir", args)
+    result = mem_mgr.invoke_tool("list_dir", user="bob", signature=sig, **args)
+    assert result["scope"] == "workspace"
+    assert result["path"] == "."
+    assert any(item["path"] == "note.txt" for item in result["entries"])
+
+
 def test_write_file_restricted_to_workspace(mem_mgr, tmp_path, monkeypatch):
     monkeypatch.setenv("FLOAT_DATA_DIR", str(tmp_path))
     mem_mgr.register_tool("write_file", local_files.write_file)

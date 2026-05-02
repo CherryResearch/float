@@ -4,6 +4,7 @@ import {
   Routes,
   Route,
   useLocation,
+  useNavigate,
   Link,
 } from "react-router-dom";
 import Chat from "./Chat";
@@ -22,16 +23,22 @@ import Notifications from "./Notifications";
 import ErrorBoundary from "./ErrorBoundary";
 import NotFound from "./NotFound";
 import axios from "axios";
+import { getConversationTrimMeta } from "../utils/proxy";
 import {
   buildToolContinuationSignature,
   hasMatchingToolContinuationSignature,
 } from "../utils/toolContinuations";
+import { normalizeToolReviewTarget } from "../utils/toolReviewActions";
 import { mergeContinuationText } from "../utils/continuationText";
 import { resolveRequestModelForMode } from "../utils/modelUtils";
 import {
   handleUnifiedPress,
   supportsHoverInteractions,
 } from "../utils/pointerInteractions";
+import {
+  CHAT_WINDOW_STORAGE_KEY,
+  parseStoredChatWindowWidth,
+} from "../utils/chatWindowSizing";
 
 const MAX_AGENT_EVENTS = 20;
 const EMPTY_GLOBAL_STATE = Object.freeze({});
@@ -42,6 +49,110 @@ const looksLikeUuid = (value) =>
 
 const looksLikeSessionId = (value) =>
   typeof value === "string" && /^sess-\d+$/.test(value);
+
+const defaultSessionDisplayName = (id) => {
+  const match = /^sess-(\d+)$/.exec(String(id || ""));
+  if (!match) return String(id || "conversation");
+  const date = new Date(Number.parseInt(match[1], 10));
+  if (Number.isNaN(date.getTime())) return String(id || "conversation");
+  const pad = (value) => String(value).padStart(2, "0");
+  return `New Chat ${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(
+    date.getDate(),
+  )} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+};
+
+const getConversationStorageKey = (entry) => {
+  if (!entry || typeof entry !== "object") return "";
+  return String(
+    entry.path ||
+      entry.name ||
+      entry.storageKey ||
+      entry.provenance?.branch_session_id ||
+      "",
+  ).trim();
+};
+
+export const buildSubchatLinksByMessage = (conversations, parentSessionId) => {
+  const parent = String(parentSessionId || "").trim();
+  if (!parent || !Array.isArray(conversations)) return {};
+  const grouped = {};
+  conversations.forEach((entry) => {
+    if (!entry || typeof entry !== "object") return;
+    const provenance =
+      entry.provenance && typeof entry.provenance === "object"
+        ? entry.provenance
+        : null;
+    if (!provenance) return;
+    const kind = String(provenance.kind || "").trim().toLowerCase();
+    if (kind !== "subchat" && kind !== "fork") return;
+    const parentSession = String(provenance.parent_session_id || "").trim();
+    const parentMessage = String(provenance.parent_message_id || "").trim();
+    if (parentSession !== parent || !parentMessage) return;
+    const storageKey = getConversationStorageKey(entry);
+    const branchSession = String(provenance.branch_session_id || "").trim();
+    const conversationId = storageKey || branchSession;
+    if (!conversationId) return;
+    const label =
+      String(entry.display_name || "").trim() ||
+      String(provenance.label || "").trim() ||
+      defaultSessionDisplayName(conversationId);
+    const link = {
+      id: conversationId,
+      conversationId,
+      label,
+      kind,
+      messageCount:
+        typeof entry.message_count === "number" ? entry.message_count : null,
+      updatedAt: entry.updated_at || entry.created_at || null,
+    };
+    if (!grouped[parentMessage]) grouped[parentMessage] = [];
+    if (
+      !grouped[parentMessage].some(
+        (existing) => existing.conversationId === conversationId,
+      )
+    ) {
+      grouped[parentMessage].push(link);
+    }
+  });
+  Object.keys(grouped).forEach((messageId) => {
+    grouped[messageId].sort((a, b) => {
+      const aTime = a.updatedAt ? new Date(a.updatedAt).getTime() : 0;
+      const bTime = b.updatedAt ? new Date(b.updatedAt).getTime() : 0;
+      return bTime - aTime;
+    });
+  });
+  return grouped;
+};
+
+export const buildParentConversationLink = (conversations, sessionId) => {
+  const childSession = String(sessionId || "").trim();
+  if (!childSession || !Array.isArray(conversations)) return null;
+  const entriesByKey = new Map();
+  conversations.forEach((entry) => {
+    const key = getConversationStorageKey(entry);
+    if (key) entriesByKey.set(key, entry);
+  });
+  const activeEntry = entriesByKey.get(childSession);
+  const provenance =
+    activeEntry?.provenance && typeof activeEntry.provenance === "object"
+      ? activeEntry.provenance
+      : null;
+  if (!provenance) return null;
+  const kind = String(provenance.kind || "").trim().toLowerCase();
+  if (kind !== "subchat" && kind !== "fork") return null;
+  const parentSessionId = String(provenance.parent_session_id || "").trim();
+  if (!parentSessionId) return null;
+  const parentEntry = entriesByKey.get(parentSessionId);
+  const label =
+    String(parentEntry?.display_name || "").trim() ||
+    defaultSessionDisplayName(parentSessionId);
+  return {
+    conversationId: parentSessionId,
+    label,
+    kind,
+    parentMessageId: String(provenance.parent_message_id || "").trim() || null,
+  };
+};
 
 const humanizeAgentLabel = (raw, agentId) => {
   const explicit = raw.agent_label || raw.agent_name || raw.name || raw.title;
@@ -149,6 +260,54 @@ const truncateStreamFragment = (value, maxLength = 160) => {
   return `${clipped}...`;
 };
 
+const normalizeEventScopeValue = (value) => {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed || null;
+};
+
+const collectEventMessageScopeIds = (event) => {
+  const ids = [];
+  [event?.message_id, event?.chain_id].forEach((value) => {
+    const normalized = normalizeEventScopeValue(value);
+    if (normalized && !ids.includes(normalized)) {
+      ids.push(normalized);
+    }
+  });
+  return ids;
+};
+
+export const eventsShareMessageScope = (left, right, { type = null } = {}) => {
+  if (!left || !right) return false;
+  if (type && (left.type !== type || right.type !== type)) {
+    return false;
+  }
+  const leftSession = normalizeEventScopeValue(left.session_id);
+  const rightSession = normalizeEventScopeValue(right.session_id);
+  if (leftSession && rightSession && leftSession !== rightSession) {
+    return false;
+  }
+  const leftAgent = normalizeEventScopeValue(left.agent_id);
+  const rightAgent = normalizeEventScopeValue(right.agent_id);
+  if (leftAgent && rightAgent && leftAgent !== rightAgent) {
+    return false;
+  }
+  const leftIds = collectEventMessageScopeIds(left);
+  const rightIds = collectEventMessageScopeIds(right);
+  if (leftIds.length && rightIds.length) {
+    return leftIds.some((id) => rightIds.includes(id));
+  }
+  if (leftIds.length || rightIds.length) {
+    return false;
+  }
+  return Boolean(leftAgent && rightAgent && leftAgent === rightAgent);
+};
+
+const eventToolScopeKey = (event) =>
+  normalizeEventScopeValue(event?.session_id) ||
+  normalizeEventScopeValue(event?.agent_id) ||
+  "global";
+
 const HARMONY_TAG_RE = /<\|[^|>]+?\|>/g;
 
 const stripHarmonyEnvelope = (value) => {
@@ -230,18 +389,20 @@ const toolSignature = (event) => {
   if (toolId !== null && typeof toolId !== "undefined" && String(toolId).trim()) {
     return `id:${String(toolId)}`;
   }
+  const scope = eventToolScopeKey(event);
   const chain = event.chain_id || event.message_id || "global";
   const name = event.name || "tool";
   const argsSig = stableJsonStringify(event.args || {});
-  return `sig:${chain}:${name}:${argsSig}`;
+  return `sig:${scope}:${chain}:${name}:${argsSig}`;
 };
 
 const toolLooseSignature = (event) => {
   if (!event || event.type !== "tool") return null;
+  const scope = eventToolScopeKey(event);
   const chain = event.chain_id || event.message_id || "global";
   const name = event.name || "tool";
   const argsSig = stableJsonStringify(event.args || {});
-  return `sig:${chain}:${name}:${argsSig}`;
+  return `sig:${scope}:${chain}:${name}:${argsSig}`;
 };
 
 const mergeToolEvent = (existing, incoming) => {
@@ -267,17 +428,12 @@ const mergeToolEvent = (existing, incoming) => {
   return merged;
 };
 
-const appendAgentEvent = (events, event) => {
+export const appendAgentEvent = (events, event) => {
   const list = Array.isArray(events) ? [...events] : [];
   if (!event) return list;
   if (event.type === "content") {
     const last = list[list.length - 1];
-    const sameMessage =
-      last &&
-      last.type === "content" &&
-      ((last.message_id && last.message_id === event.message_id) ||
-        (last.chain_id && last.chain_id === event.chain_id) ||
-        (!last.message_id && !event.message_id && last.agent_id === event.agent_id));
+    const sameMessage = eventsShareMessageScope(last, event, { type: "content" });
     if (sameMessage) {
       const combined = `${last.content || ""}${event.content || ""}`;
       list[list.length - 1] = {
@@ -292,12 +448,7 @@ const appendAgentEvent = (events, event) => {
   }
   if (event.type === "thought") {
     const last = list[list.length - 1];
-    const sameMessage =
-      last &&
-      last.type === "thought" &&
-      ((last.message_id && last.message_id === event.message_id) ||
-        (last.chain_id && last.chain_id === event.chain_id) ||
-        (!last.message_id && !event.message_id && last.agent_id === event.agent_id));
+    const sameMessage = eventsShareMessageScope(last, event, { type: "thought" });
     if (sameMessage) {
       const combined = collapseTokenizedLines(
         `${last.content || ""}${event.content || ""}`,
@@ -314,12 +465,7 @@ const appendAgentEvent = (events, event) => {
   }
   if (event.type === "stream") {
     const last = list[list.length - 1];
-    const sameMessage =
-      last &&
-      last.type === "stream" &&
-      ((last.message_id && last.message_id === event.message_id) ||
-        (last.chain_id && last.chain_id === event.chain_id) ||
-        (!last.message_id && !event.message_id && last.agent_id === event.agent_id));
+    const sameMessage = eventsShareMessageScope(last, event, { type: "stream" });
     const name = typeof event.name === "string" ? event.name.trim() : "";
     const callIndex =
       typeof event.call_index === "number" && Number.isFinite(event.call_index)
@@ -428,6 +574,22 @@ const reduceAgentState = (prev, event) => {
     status: event.agent_status || existing.status,
     summary,
     updatedAt,
+    workflow:
+      event.workflow && typeof event.workflow === "object"
+        ? { ...(existing.workflow || {}), ...event.workflow }
+        : existing.workflow || null,
+    provenance:
+      event.provenance && typeof event.provenance === "object"
+        ? { ...(existing.provenance || {}), ...event.provenance }
+        : existing.provenance || null,
+    handoff:
+      event.handoff && typeof event.handoff === "object"
+        ? { ...(existing.handoff || {}), ...event.handoff }
+        : existing.handoff || null,
+    controls:
+      event.controls && typeof event.controls === "object"
+        ? { ...(existing.controls || {}), ...event.controls }
+        : existing.controls || null,
     events,
   };
   return {
@@ -467,7 +629,13 @@ const buildAgentStateFromSnapshot = (agents, { includeContent = false } = {}) =>
       status: agent.status || agent.agent_status || "idle",
       summary: agent.summary || agent.last_thought || "",
       updatedAt: lastEventTs || Date.now() / 1000,
+      sessionId: agent.session_id || agent.sessionId || null,
+      conversationId: agent.conversation_id || agent.conversationId || agent.session_id || agent.sessionId || null,
       resources: agent.resources || agent.resource || null,
+      workflow: agent.workflow || null,
+      provenance: agent.provenance || null,
+      handoff: agent.handoff || null,
+      controls: agent.controls || null,
       events,
     };
     order.push(id);
@@ -568,10 +736,13 @@ const AppContent = () => {
       ? globalContext.setState
       : NOOP_SET_STATE;
   const location = useLocation();
+  const navigate = useNavigate();
   const [consoleEvents, setConsoleEvents] = useState([]);
   const [agentState, setAgentState] = useState({ byId: {}, order: [] });
   const [actionHistory, setActionHistory] = useState([]);
   const [syncReviews, setSyncReviews] = useState({ pending: [], recent: [] });
+  const [subchatLinksByMessage, setSubchatLinksByMessage] = useState({});
+  const [parentConversationLink, setParentConversationLink] = useState(null);
   const [agentsLoading, setAgentsLoading] = useState(false);
   const [streamThoughts, setStreamThoughts] = useState(true);
   const [consoleFocus, setConsoleFocus] = useState(null);
@@ -620,6 +791,15 @@ const AppContent = () => {
     };
     loadWidth("sidebarWidthLeft", "--sidebar-width-left");
     loadWidth("sidebarWidthRight", "--sidebar-width-right");
+    try {
+      const parsed = parseStoredChatWindowWidth(
+        localStorage.getItem(CHAT_WINDOW_STORAGE_KEY),
+        window.innerWidth,
+      );
+      if (parsed !== null) {
+        root.style.setProperty("--center-rail-width", `${parsed}px`);
+      }
+    } catch {}
   }, []);
 
   useEffect(() => {
@@ -746,6 +926,66 @@ const AppContent = () => {
     [state.sessionId],
   );
 
+  const refreshSubchatLinks = useCallback(async () => {
+    const sessionId = String(state.sessionId || "").trim();
+    if (!sessionId) {
+      setSubchatLinksByMessage({});
+      setParentConversationLink(null);
+      return;
+    }
+    try {
+      const res = await axios.get("/api/conversations", {
+        params: { detailed: true },
+      });
+      const conversations = Array.isArray(res?.data?.conversations)
+        ? res.data.conversations
+        : [];
+      setSubchatLinksByMessage(
+        buildSubchatLinksByMessage(conversations, sessionId),
+      );
+      setParentConversationLink(
+        buildParentConversationLink(conversations, sessionId),
+      );
+    } catch (err) {
+      console.error("Failed to load subchat links", err);
+    }
+  }, [state.sessionId]);
+
+  const openConversationById = useCallback(
+    async (conversationId, displayName = "") => {
+      const id = String(conversationId || "").trim();
+      if (!id) return;
+      const nextSessionName =
+        String(displayName || "").trim() || defaultSessionDisplayName(id);
+      try {
+        const res = await axios.get(`/api/conversations/${encodeURIComponent(id)}`);
+        const loadedMessages = Array.isArray(res?.data?.messages)
+          ? res.data.messages
+          : [];
+        const conversationTrimMeta = getConversationTrimMeta(res.data);
+        if (typeof sessionStorage !== "undefined") {
+          try {
+            sessionStorage.setItem(
+              `float:conv-loaded:${id}`,
+              JSON.stringify(loadedMessages),
+            );
+          } catch {}
+        }
+        setState((prev) => ({
+          ...prev,
+          conversation: loadedMessages,
+          conversationTrimMeta,
+          sessionId: id,
+          sessionName: nextSessionName,
+        }));
+        navigate("/");
+      } catch (err) {
+        console.error("Failed to load conversation", err);
+      }
+    },
+    [navigate, setState],
+  );
+
   const fetchAgentSnapshot = useCallback(async () => {
     if (!backendReady) return;
     setAgentsLoading(true);
@@ -757,12 +997,13 @@ const AppContent = () => {
       setAgentState(snapshot);
       setActionHistory(buildActionHistoryFromSnapshot(res.data?.actions || []));
       setSyncReviews(buildSyncReviewsFromSnapshot(res.data?.sync_reviews));
+      void refreshSubchatLinks();
     } catch (err) {
       console.error("Failed to load agent console snapshot", err);
     } finally {
       setAgentsLoading(false);
     }
-  }, [backendReady]);
+  }, [backendReady, refreshSubchatLinks]);
 
   const toggleLeft = () => {
     setLeftOpen((o) => {
@@ -838,10 +1079,44 @@ const AppContent = () => {
     [isMobileLayout],
   );
 
+  const openToolReviewFromNotification = useCallback(
+    (target) => {
+      const normalized = normalizeToolReviewTarget(target || {});
+      const shouldNavigate = target?.navigate !== false;
+      const chainId = normalized.chainId || normalized.messageId || "";
+      if (chainId) {
+        setActiveMessageId(chainId);
+      }
+      focusConsoleOnTarget({
+        chainId,
+        messageId: normalized.messageId || chainId,
+        toolId: normalized.selectedToolId || normalized.toolId,
+        agentId: normalized.agentId || normalized.chainId || normalized.sessionId,
+      });
+      if (!shouldNavigate) return;
+      if (normalized.actionUrl) {
+        navigate(normalized.actionUrl);
+      } else if (location.pathname !== "/") {
+        navigate("/");
+      }
+    },
+    [focusConsoleOnTarget, location.pathname, navigate],
+  );
+
   useEffect(() => {
     if (!backendReady) return;
     fetchAgentSnapshot();
   }, [backendReady, fetchAgentSnapshot]);
+
+  useEffect(() => {
+    if (!backendReady) return;
+    void refreshSubchatLinks();
+  }, [
+    backendReady,
+    refreshSubchatLinks,
+    state.conversation?.length,
+    state.sessionId,
+  ]);
 
   useEffect(() => {
     let cancelled = false;
@@ -890,11 +1165,7 @@ const AppContent = () => {
             if (isContent && typeof event.content === "string" && event.content) {
               const last = next[next.length - 1];
               const sameStream =
-                last &&
-                last.type === "content" &&
-                (last.message_id === event.message_id ||
-                  last.chain_id === event.chain_id) &&
-                last.agent_id === event.agent_id;
+                eventsShareMessageScope(last, event, { type: "content" });
               if (sameStream) {
                 const combined = `${last.content || ""}${event.content}`;
                 next[next.length - 1] = {
@@ -1254,26 +1525,35 @@ const AppContent = () => {
                         if (idx >= 0) mergedTools[idx] = { ...mergedTools[idx], ...tool };
                         else mergedTools.push(tool);
                       });
+                      const nextMetadata = {
+                        ...(updated[mIdx]?.metadata || {}),
+                        ...(md || {}),
+                        tool_continued: true,
+                        ...(toolContinueSignature && !md?.tool_continue_signature
+                          ? { tool_continue_signature: toolContinueSignature }
+                          : {}),
+                        ...(semanticToolContinueSignature &&
+                        !md?.tool_continue_semantic_signature
+                          ? {
+                              tool_continue_semantic_signature:
+                                semanticToolContinueSignature,
+                            }
+                          : {}),
+                      };
+                      if (
+                        returnedTools.length === 0 &&
+                        !Object.prototype.hasOwnProperty.call(md || {}, "inline_tool_payload") &&
+                        !Object.prototype.hasOwnProperty.call(md || {}, "inline_tool_payloads")
+                      ) {
+                        delete nextMetadata.inline_tool_payload;
+                        delete nextMetadata.inline_tool_payloads;
+                      }
                       const updatedEntry = {
                         ...updated[mIdx],
                         ...(joined ? { text: joined } : {}),
                         timestamp: new Date().toISOString(),
                         ...(mergedTools.length ? { tools: mergedTools } : {}),
-                        metadata: {
-                          ...(updated[mIdx]?.metadata || {}),
-                          ...(md || {}),
-                          tool_continued: true,
-                          ...(toolContinueSignature && !md?.tool_continue_signature
-                            ? { tool_continue_signature: toolContinueSignature }
-                            : {}),
-                          ...(semanticToolContinueSignature &&
-                          !md?.tool_continue_semantic_signature
-                            ? {
-                                tool_continue_semantic_signature:
-                                  semanticToolContinueSignature,
-                              }
-                            : {}),
-                        },
+                        metadata: nextMetadata,
                       };
                       if (typeof continuationThought === "string" && continuationThought.trim()) {
                         const trimmed = continuationThought.trim();
@@ -1537,7 +1817,11 @@ const AppContent = () => {
   }, [isMobileLayout, leftOpen, rightOpen]);
 
   return (
-    <div className="app-container">
+    <div
+      className="app-container"
+      data-left-open={leftOpen ? "true" : "false"}
+      data-right-open={rightOpen ? "true" : "false"}
+    >
       <TopBar />
       <HistorySidebar onToggle={toggleLeft} collapsed={!leftOpen} />
       {!leftOpen && (
@@ -1579,6 +1863,9 @@ const AppContent = () => {
                     activeMessageId={activeMessageId}
                     setActiveMessageId={setActiveMessageId}
                     onOpenConsole={focusConsoleOnTarget}
+                    onOpenConversation={openConversationById}
+                    parentConversationLink={parentConversationLink}
+                    subchatLinksByMessage={subchatLinksByMessage}
                   />
                 }
               />
@@ -1610,6 +1897,7 @@ const AppContent = () => {
         onStreamToggle={() => setStreamThoughts((s) => !s)}
         agents={agentList}
         onSelectMessage={setActiveMessageId}
+        onOpenConversation={openConversationById}
         isCalendar={isCalendarView}
         events={filteredCalendarEvents}
         backendReady={backendReady}
@@ -1675,7 +1963,7 @@ const AppContent = () => {
         </button>
       )}
       <DownloadTray />
-      <Notifications />
+      <Notifications onOpenToolReview={openToolReviewFromNotification} />
     </div>
   );
 };
@@ -1695,6 +1983,5 @@ export {
   toolSignature,
   toolLooseSignature,
   mergeToolEvent,
-  appendAgentEvent,
   reduceAgentState,
 };

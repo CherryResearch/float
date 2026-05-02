@@ -31,6 +31,29 @@ const buildOverview = () => ({
     source_namespace: "Studio",
     saved_peers: [],
   },
+  egress_summary: {
+    private_network_only: true,
+    inbound_visibility: {
+      lan_enabled: true,
+      online_requested: false,
+      online_supported: false,
+    },
+    outbound_target: {
+      mode: "none",
+      remote_url: "",
+      peer_id: "",
+      peer_label: "",
+    },
+    push_review_mode: "review_required",
+    saved_peer_count: 0,
+    unfinished_notice:
+      "Automatic stop-kill safeguards are future work. Stop records cancel intent and aborts the current local request where possible, but it does not kill remote work that another device already accepted.",
+  },
+  sync_operations: {
+    active_operation: null,
+    last_attempt: null,
+    recent: [],
+  },
   workspaces: {
     profiles: [
       {
@@ -377,9 +400,309 @@ describe("KnowledgeSyncTab", () => {
     fireEvent.click(screen.getByRole("button", { name: /stop preview/i }));
 
     await waitFor(() => {
+      expect(
+        axios.post.mock.calls.some(([url]) =>
+          String(url).startsWith("/api/sync/operations/preview-"),
+        ),
+      ).toBe(true);
       expect(screen.getByText(/Sync preview cancelled\./i)).toBeInTheDocument();
       expect(screen.getByText(/Preview stopped\./i)).toBeInTheDocument();
       expect(screen.queryByRole("button", { name: /stop preview/i })).not.toBeInTheDocument();
     });
+  });
+
+  it("surfaces the most recent completed sync near the top of the tab", async () => {
+    axios.get.mockImplementation((url) => {
+      if (url === "/api/sync/overview") {
+        return Promise.resolve({ data: buildOverview() });
+      }
+      if (url === "/api/user-settings") {
+        return Promise.resolve({ data: { device_display_name: "Studio" } });
+      }
+      if (url === "/api/actions") {
+        return Promise.resolve({
+          data: {
+            actions: [
+              {
+                id: "sync-1",
+                kind: "sync",
+                name: "sync_pull",
+                summary: "Sync pull from http://peer.float:5000",
+                item_count: 3,
+                created_at_ts: 1770000000,
+              },
+            ],
+          },
+        });
+      }
+      return Promise.reject(new Error(`Unexpected GET ${url}`));
+    });
+
+    render(<KnowledgeSyncTab />);
+
+    expect(
+      await screen.findByText(
+        /Last completed sync: Sync pull from http:\/\/peer\.float:5000, 3 changed items at /i,
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("shows explicit sync ownership and unfinished egress notes", async () => {
+    const overview = buildOverview();
+    overview.sync_defaults.remote_url = "http://pear.float:5000";
+    overview.sync_defaults.saved_peers = [
+      {
+        id: "peer-pear",
+        label: "Pear",
+        remote_url: "http://pear.float:5000",
+        scopes: ["sync"],
+        remote_device_id: "remote-device-1",
+      },
+    ];
+    overview.egress_summary = {
+      private_network_only: true,
+      inbound_visibility: {
+        lan_enabled: true,
+        online_requested: false,
+        online_supported: false,
+      },
+      outbound_target: {
+        mode: "saved_peer",
+        remote_url: "http://pear.float:5000",
+        peer_id: "peer-pear",
+        peer_label: "Pear",
+      },
+      push_review_mode: "review_required",
+      saved_peer_count: 1,
+      unfinished_notice:
+        "Automatic stop-kill safeguards are future work. Stop records cancel intent and aborts the current local request where possible, but it does not kill remote work that another device already accepted.",
+    };
+    overview.sync_operations = {
+      active_operation: {
+        id: "preview-1",
+        kind: "preview",
+        status: "running",
+        started_at: 1770000000,
+        remote_label: "Pear",
+        remote_url: "http://pear.float:5000",
+        sections: ["conversations"],
+        workspace_mode: "merge",
+        owner: "Studio",
+        cancel_requested: false,
+      },
+      last_attempt: {
+        id: "pull-1",
+        kind: "pull",
+        status: "completed",
+        started_at: 1769999900,
+        finished_at: 1770000000,
+        remote_label: "Pear",
+        remote_url: "http://pear.float:5000",
+        sections: ["conversations"],
+        workspace_mode: "merge",
+        owner: "Studio",
+        cancel_requested: false,
+      },
+      recent: [],
+    };
+    axios.get.mockImplementation((url) => {
+      if (url === "/api/sync/overview") {
+        return Promise.resolve({ data: overview });
+      }
+      if (url === "/api/user-settings") {
+        return Promise.resolve({ data: { device_display_name: "Studio" } });
+      }
+      if (url === "/api/actions") {
+        return Promise.resolve({ data: { actions: [] } });
+      }
+      return Promise.reject(new Error(`Unexpected GET ${url}`));
+    });
+
+    render(<KnowledgeSyncTab />);
+
+    expect(await screen.findByText("Sync ownership")).toBeInTheDocument();
+    expect(screen.getByText("Pear at http://pear.float:5000")).toBeInTheDocument();
+    expect(screen.getAllByText("Review required").length).toBeGreaterThan(0);
+    expect(
+      screen.getByText(/Unfinished: Automatic stop-kill safeguards are future work\./i),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Private reachable addresses only")).toBeInTheDocument();
+    expect(screen.getByText(/Preview - Running - Pear/i)).toBeInTheDocument();
+    expect(screen.getByText(/Pull - Completed - Pear/i)).toBeInTheDocument();
+    expect(screen.getByText("Running")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /explain sync ownership state/i }));
+    const inspector = screen.getByRole("dialog", { name: /why this sync state is shown/i });
+    expect(inspector).toBeInTheDocument();
+    expect(screen.getByText("/api/sync/overview")).toBeInTheDocument();
+    expect(within(inspector).getByText(/Stop records cancel intent/i)).toBeInTheDocument();
+  });
+
+  it("moves browser-shaped trusted-device records into the legacy cleanup bucket", async () => {
+    const overview = buildOverview();
+    overview.inbound_devices = [
+      {
+        id: "trusted-1",
+        name: "Pear Laptop",
+        status: "trusted_device",
+        status_label: "Trusted device",
+        created_at: 1770000000,
+        last_seen: 1770000060,
+        capabilities: { requested_scopes: ["sync"] },
+      },
+      {
+        id: "legacy-ua-1",
+        name: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        status: "trusted_device",
+        status_label: "Trusted device",
+        created_at: 1770000000,
+        last_seen: 1770000060,
+        capabilities: { requested_scopes: ["sync", "stream"] },
+      },
+    ];
+    axios.get.mockImplementation((url) => {
+      if (url === "/api/sync/overview") {
+        return Promise.resolve({ data: overview });
+      }
+      if (url === "/api/user-settings") {
+        return Promise.resolve({ data: { device_display_name: "Studio" } });
+      }
+      if (url === "/api/actions") {
+        return Promise.resolve({ data: { actions: [] } });
+      }
+      return Promise.reject(new Error(`Unexpected GET ${url}`));
+    });
+
+    render(<KnowledgeSyncTab />);
+
+    expect(await screen.findByText("Legacy browser records")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Prune 1/i })).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "Revoke" })).toHaveLength(1);
+    expect(screen.getByText("Pear Laptop")).toBeInTheDocument();
+  });
+
+  it("persists workspace privacy settings and private rules", async () => {
+    const overview = buildOverview();
+    overview.workspaces.profiles.push({
+      id: "journal",
+      name: "Journal",
+      slug: "journal",
+      namespace: "journal",
+      root_path: "data/files/workspace/journal",
+      kind: "local",
+      privacy_mode: "default",
+      private_patterns: [],
+    });
+    axios.get.mockImplementation((url) => {
+      if (url === "/api/sync/overview") {
+        return Promise.resolve({ data: overview });
+      }
+      if (url === "/api/user-settings") {
+        return Promise.resolve({ data: { device_display_name: "Studio" } });
+      }
+      if (url === "/api/actions") {
+        return Promise.resolve({ data: { actions: [] } });
+      }
+      return Promise.reject(new Error(`Unexpected GET ${url}`));
+    });
+    axios.post.mockImplementation((url, payload) => {
+      if (url === "/api/user-settings") {
+        expect(payload).toMatchObject({
+          active_workspace_id: "root",
+          workspace_profiles: expect.arrayContaining([
+            expect.objectContaining({
+              id: "root",
+              privacy_mode: "secret",
+              private_patterns: ["notes/private/*", "*.pem"],
+            }),
+            expect.objectContaining({
+              id: "journal",
+              privacy_mode: "default",
+            }),
+          ]),
+        });
+        return Promise.resolve({ data: { status: "saved" } });
+      }
+      return Promise.reject(new Error(`Unexpected POST ${url}`));
+    });
+
+    render(<KnowledgeSyncTab />);
+
+    fireEvent.change(await screen.findByLabelText(/Workspace privacy for Main workspace/i), {
+      target: { value: "secret" },
+    });
+    fireEvent.change(screen.getByLabelText(/Private match rules for Main workspace/i), {
+      target: { value: "notes/private/*\n*.pem" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /save device settings/i }));
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith(
+        "/api/user-settings",
+        expect.objectContaining({
+          workspace_profiles: expect.arrayContaining([
+            expect.objectContaining({
+              id: "root",
+              privacy_mode: "secret",
+              private_patterns: ["notes/private/*", "*.pem"],
+            }),
+          ]),
+        }),
+      );
+    });
+    expect(await screen.findByText(/Device and sync defaults saved\./i)).toBeInTheDocument();
+  });
+
+  it("requires a remote check before previewing a saved pair at a changed address", async () => {
+    const overview = buildOverview();
+    overview.sync_defaults.saved_peers = [
+      {
+        id: "peer-pear",
+        label: "Pear",
+        remote_url: "http://pear.local:59185",
+        scopes: ["sync"],
+        remote_device_id: "remote-device-1",
+        remote_public_key: "pk-pear",
+        remote_device_name: "Pear",
+      },
+    ];
+    axios.get.mockImplementation((url) => {
+      if (url === "/api/sync/overview") {
+        return Promise.resolve({ data: overview });
+      }
+      if (url === "/api/user-settings") {
+        return Promise.resolve({ data: { device_display_name: "Studio" } });
+      }
+      if (url === "/api/actions") {
+        return Promise.resolve({ data: { actions: [] } });
+      }
+      return Promise.reject(new Error(`Unexpected GET ${url}`));
+    });
+    axios.post.mockImplementation((url) => {
+      if (url === "/api/user-settings") {
+        return Promise.resolve({ data: { status: "saved" } });
+      }
+      if (url === "/api/sync/plan") {
+        return Promise.reject(new Error("Preview should wait for fingerprint check"));
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    render(<KnowledgeSyncTab />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /pear/i }));
+    fireEvent.change(screen.getByLabelText("Remote Float URL"), {
+      target: { value: "http://pear.local:61234" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /preview sync/i }));
+
+    expect(
+      await screen.findByText(/Check remote before previewing from a changed address/i),
+    ).toBeInTheDocument();
+    expect(axios.post).not.toHaveBeenCalledWith(
+      "/api/sync/plan",
+      expect.anything(),
+      expect.anything(),
+    );
   });
 });

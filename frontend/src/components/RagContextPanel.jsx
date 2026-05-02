@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import StateInspector from "./StateInspector";
 
 /**
  * Normalize rag matches to a predictable shape so they can be rendered safely.
@@ -55,7 +56,7 @@ export const normalizeRagMatches = (rawMatches) => {
     .filter(Boolean);
 };
 
-const RagContextPanel = ({ matches, defaultOpen = false }) => {
+const RagContextPanel = ({ matches, defaultOpen = false, onToggle = null }) => {
   const normalized = useMemo(
     () => normalizeRagMatches(matches),
     [matches],
@@ -67,7 +68,14 @@ const RagContextPanel = ({ matches, defaultOpen = false }) => {
 
   if (normalized.length === 0) return null;
 
-  const toggleExpanded = () => setExpanded((value) => !value);
+  const toggleExpanded = () =>
+    setExpanded((value) => {
+      const next = !value;
+      if (typeof onToggle === "function") {
+        onToggle(next);
+      }
+      return next;
+    });
 
   return (
     <div className={`rag-context ${expanded ? "open" : ""}`}>
@@ -110,6 +118,20 @@ const RagContextPanel = ({ matches, defaultOpen = false }) => {
               null;
             const eventId =
               (match.metadata && match.metadata.event_id) || null;
+            const inspectorRows = [
+              { label: "Source", value: match.source || `doc-${idx + 1}` },
+              {
+                label: "Reason",
+                value:
+                  similarity !== null
+                    ? `retrieved by similarity ${similarity.toFixed(2)}`
+                    : "retrieved by chat context search",
+              },
+              { label: "Embedding", value: embeddingModel },
+              { label: "Memory key", value: memoryKey },
+              { label: "Evidence", value: match.id ? `id ${match.id}` : "" },
+              { label: "Next", value: "Open in Knowledge to inspect or edit this source." },
+            ];
             const openKnowledge = () => {
               if (memoryKey) {
                 navigate(`/knowledge?tab=memory&key=${encodeURIComponent(memoryKey)}`);
@@ -173,6 +195,12 @@ const RagContextPanel = ({ matches, defaultOpen = false }) => {
                       view
                     </button>
                   )}
+                  <StateInspector
+                    title="Why this context was attached"
+                    summary="Float added this source from the retrieval pass for this chat turn."
+                    rows={inspectorRows}
+                    ariaLabel={`Explain retrieved context ${idx + 1}`}
+                  />
                 </div>
                 {snippet && <p className="rag-snippet">{snippet}</p>}
               </li>
