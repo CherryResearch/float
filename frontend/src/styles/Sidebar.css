@@ -2869,6 +2869,7 @@ body.dark-mode .action-row {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  container-type: inline-size;
   transition: box-shadow 120ms ease, transform 120ms ease;
 }
 
@@ -3011,6 +3012,7 @@ body.dark-mode .agent-card {
   flex-direction: column;
   gap: 2px;
   min-width: 0;
+  max-width: 100%;
 }
 
 .agent-card-meta h3 {
@@ -3061,24 +3063,22 @@ body.dark-mode .agent-card {
 }
 
 .agent-card.compact .agent-card-title-note {
-  position: absolute;
-  left: 0;
-  right: -7rem;
-  top: calc(100% + 5px);
-  z-index: 8;
-  display: none;
-  max-height: 2.2rem;
-  padding: 6px 8px;
-  border-radius: 8px;
-  border: 1px solid color-mix(in oklab, var(--glass-border) 80%, transparent);
-  background: color-mix(in oklab, var(--glass-tint-strong, var(--glass-tint)) 94%, transparent);
-  box-shadow: var(--shadow-sm);
-  pointer-events: none;
+  position: static;
+  display: -webkit-box;
+  max-height: none;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  pointer-events: auto;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  white-space: normal;
 }
 
 .agent-card.compact:hover .agent-card-title-note,
 .agent-card.compact:focus-within .agent-card-title-note {
-  display: block;
+  display: -webkit-box;
 }
 
 .agent-status-dot {
@@ -3332,6 +3332,13 @@ body.dark-mode .agent-card {
   scrollbar-width: none;
 }
 
+.agent-activity.agent-activity-tool .agent-activity-meta {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  gap: 6px;
+  overflow: visible;
+}
+
 .agent-activity-meta::-webkit-scrollbar {
   display: none;
 }
@@ -3350,6 +3357,8 @@ body.dark-mode .agent-card {
 
 .agent-activity-type {
   font-weight: 600;
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .agent-activity-name {
@@ -3370,6 +3379,18 @@ body.dark-mode .agent-card {
   font: inherit;
   cursor: pointer;
   text-align: left;
+  min-width: 0;
+  max-width: min(16rem, 100%);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-activity.agent-activity-tool .agent-activity-name-button {
+  width: 100%;
+  max-width: none;
+  font-size: 0.82rem;
+  font-weight: 700;
 }
 
 .agent-activity-name-button:hover {
@@ -3475,6 +3496,12 @@ body.dark-mode .agent-card {
   box-shadow: var(--shadow-sm);
 }
 
+.agent-activity.agent-activity-tool .agent-activity-toggle {
+  margin-left: 0;
+  width: 20px;
+  height: 20px;
+}
+
 .agent-activity-toggle:focus-visible {
   outline: 2px solid color-mix(in oklab, var(--color-accent) 55%, transparent);
   outline-offset: 2px;
@@ -3483,6 +3510,123 @@ body.dark-mode .agent-card {
 .agent-activity-chevron {
   font-size: 0.75rem;
   line-height: 1;
+}
+
+.agent-tool-batch-stack {
+  display: grid;
+  gap: 6px;
+}
+
+.agent-tool-batch-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 7px;
+  padding: 8px 9px;
+  border: 1px solid color-mix(in oklab, var(--color-mint-green) 44%, var(--glass-border) 56%);
+  border-radius: var(--radius-sm);
+  background: color-mix(in oklab, var(--color-mint-green) 8%, var(--glass-tint) 92%);
+}
+
+.agent-tool-batch-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.agent-tool-batch-kicker,
+.agent-tool-batch-label {
+  flex: 0 0 auto;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.agent-tool-batch-kicker {
+  color: var(--color-text-muted);
+}
+
+.agent-tool-batch-label {
+  color: var(--color-text);
+}
+
+.agent-tool-batch-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.agent-tool-activity-region {
+  display: grid;
+  gap: 8px;
+}
+
+.agent-tool-activity-region.has-pending-batch {
+  position: relative;
+  padding-left: 18px;
+}
+
+.agent-tool-activity-region.has-pending-batch::before {
+  content: "";
+  position: absolute;
+  left: 5px;
+  top: 2px;
+  bottom: 2px;
+  width: 4px;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--color-mint-green) 86%, var(--color-accent) 14%);
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--glass-border) 64%, transparent);
+}
+
+.agent-tool-chat-group {
+  position: relative;
+  padding-left: 0;
+}
+
+.agent-tool-chat-group > .agent-chat-group-line {
+  display: none;
+}
+
+.agent-tool-chat-group-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.agent-tool-chat-summary-card {
+  position: relative;
+  min-height: 58px;
+  padding-left: 22px;
+  border-color: color-mix(in oklab, var(--agent-chat-color, var(--color-lavender)) 42%, var(--glass-border) 58%);
+}
+
+.agent-tool-chat-summary-card .agent-chat-group-line {
+  left: 10px;
+  top: 10px;
+  bottom: 10px;
+  display: block;
+}
+
+.agent-tool-chat-summary-copy {
+  min-width: 0;
+}
+
+.agent-tool-chat-summary-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.agent-tool-chat-summary-header strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .agent-activity-preview {
@@ -3516,54 +3660,6 @@ body.dark-mode .agent-card {
   box-shadow:
     0 0 0 1px color-mix(in oklab, var(--agent-chat-color, var(--color-lavender)) 55%, transparent),
     0 0 12px color-mix(in oklab, var(--agent-chat-color, var(--color-lavender)) 35%, transparent);
-}
-
-.agent-tool-chat-group {
-  position: relative;
-  padding-left: 20px;
-}
-
-.agent-tool-chat-group > .agent-chat-group-line {
-  left: 6px;
-  top: 2px;
-  bottom: 2px;
-}
-
-.agent-tool-chat-group-stack {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.agent-tool-chat-summary-card {
-  position: relative;
-  min-height: 58px;
-  padding-left: 22px;
-  border-color: color-mix(in oklab, var(--agent-chat-color, var(--color-lavender)) 42%, var(--glass-border) 58%);
-}
-
-.agent-tool-chat-summary-card .agent-chat-group-line {
-  left: 10px;
-  top: 10px;
-  bottom: 10px;
-}
-
-.agent-tool-chat-summary-copy {
-  min-width: 0;
-}
-
-.agent-tool-chat-summary-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-}
-
-.agent-tool-chat-summary-header strong {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .agent-tool-chat-summary-preview {
@@ -5015,6 +5111,86 @@ body.dark-mode .task-composer-nudges button {
 .agent-runtime-panel,
 .agent-runtime-panel * {
   overflow-wrap: anywhere;
+}
+
+.agent-card .agent-activity-meta,
+.agent-card .agent-activity-meta *,
+.agent-card .agent-tool-actions,
+.agent-card .agent-tool-actions *,
+.agent-card .agent-tool-batch-actions,
+.agent-card .agent-tool-batch-actions * {
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+.agent-card .agent-activity-meta time,
+.agent-card .agent-tool-status-code,
+.agent-card .agent-history-toggle,
+.agent-card .agent-activity-toggle,
+.agent-card .tool-action-btn {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+@container (max-width: 230px) {
+  .agent-card-header {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .agent-card-actions {
+    justify-items: start;
+  }
+
+  .agent-card-submeta,
+  .agent-card-controls,
+  .agent-tool-batch-controls,
+  .agent-tool-actions {
+    justify-content: flex-start;
+  }
+
+  .agent-card-controls,
+  .agent-tool-batch-controls,
+  .agent-tool-actions {
+    flex-wrap: wrap;
+  }
+
+  .agent-tool-activity-region.has-pending-batch {
+    padding-left: 12px;
+  }
+
+  .agent-tool-activity-region.has-pending-batch::before {
+    left: 2px;
+    width: 3px;
+  }
+
+  .agent-tool-batch-actions,
+  .agent-activity {
+    padding-inline: 7px;
+  }
+
+  .agent-activity.agent-activity-tool .agent-activity-meta {
+    grid-template-columns: minmax(0, 1fr) auto auto;
+  }
+
+  .agent-activity.agent-activity-tool .agent-tool-status-code {
+    max-width: 5.6rem;
+    overflow: hidden;
+  }
+
+  .agent-activity.agent-activity-tool .agent-activity-meta time {
+    display: none;
+  }
+
+  .agent-card .tool-action-btn {
+    padding-inline: 7px;
+    font-size: 0.62rem;
+  }
+
+  .agent-activity-body .tool-payload.compact .tool-kv-row {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
 }
 
 @media (max-width: 900px) {

@@ -1162,6 +1162,111 @@ describe("AgentConsole", () => {
     });
   });
 
+  it("accepts and continues a pending tool batch from the console", async () => {
+    const now = Date.now() / 1000;
+    const tools = [
+      {
+        id: "proposal-1",
+        name: "search_web",
+        args: { query: "float privacy first" },
+        status: "proposed",
+      },
+      {
+        id: "proposal-2",
+        name: "recall",
+        args: { query: "user profile preferences" },
+        status: "proposed",
+      },
+    ];
+    const agents = [
+      {
+        id: "agent-batch",
+        label: "search_web + recall",
+        status: "pending",
+        updatedAt: now,
+        events: tools.map((tool, index) => ({
+          ...tool,
+          type: "tool",
+          timestamp: now + index,
+          chain_id: "msg-batch-1",
+          message_id: "msg-batch-1",
+          session_id: "sess-123",
+        })),
+      },
+    ];
+
+    axios.post.mockImplementation((url, payload) => {
+      if (url === "/api/tools/decision") {
+        return Promise.resolve({
+          data: {
+            status: "invoked",
+            result: {
+              status: "invoked",
+              ok: true,
+              message: `Ran ${payload.name}.`,
+              data: { name: payload.name },
+            },
+          },
+        });
+      }
+      if (url === "/api/chat/continue") {
+        return Promise.resolve({
+          data: { message: "continued", metadata: {} },
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled
+        onStreamToggle={() => {}}
+        agents={agents}
+        onSelectMessage={() => {}}
+        backendReady
+        onRefreshAgents={() => {}}
+      />,
+      {
+        stateOverrides: {
+          conversation: [
+            {
+              id: "msg-batch-1",
+              role: "ai",
+              text: "Need tools.",
+              metadata: { tool_response_pending: true },
+              tools,
+            },
+          ],
+        },
+      },
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /expand agent card/i }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: /continue the assistant response/i }),
+    );
+
+    await waitFor(() => {
+      const decisions = axios.post.mock.calls.filter(([url]) => url === "/api/tools/decision");
+      expect(decisions).toHaveLength(2);
+    });
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith(
+        "/api/chat/continue",
+        expect.objectContaining({
+          session_id: "sess-123",
+          message_id: "msg-batch-1",
+          tools: [
+            expect.objectContaining({ id: "proposal-1", name: "search_web", status: "invoked" }),
+            expect.objectContaining({ id: "proposal-2", name: "recall", status: "invoked" }),
+          ],
+        }),
+      );
+    });
+  });
+
   it("handles tool review notification actions through the console controls", async () => {
     const now = Date.now() / 1000;
     const agents = [
@@ -3045,6 +3150,54 @@ describe("AgentConsole", () => {
     expect(
       within(failedToolRow).getByRole("button", { name: /edit & retry/i }),
     ).toBeInTheDocument();
+  });
+
+  it("uses real tool names and source order for synthetic conversation tool batches", async () => {
+    renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled={false}
+        onStreamToggle={() => {}}
+        agents={[]}
+        onSelectMessage={() => {}}
+        backendReady
+        onRefreshAgents={() => {}}
+      />,
+      {
+        stateOverrides: {
+          toolDisplayMode: "both",
+          conversation: [
+            {
+              role: "ai",
+              id: "ai-tool-order",
+              text: "",
+              timestamp: "2026-04-22T16:17:00Z",
+              tools: [
+                {
+                  tool: "search_web",
+                  args: { query: "Float project privacy-first" },
+                  status: "proposed",
+                },
+                {
+                  name: "recall",
+                  args: { query: "user profile preferences Float" },
+                  status: "proposed",
+                },
+              ],
+            },
+          ],
+        },
+      },
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "search_web + recall" }),
+    ).toBeInTheDocument();
+    const visibleToolNames = Array.from(
+      document.querySelectorAll(".agent-activity-name-button"),
+    ).map((node) => node.textContent);
+    expect(visibleToolNames.slice(0, 2)).toEqual(["search_web", "recall"]);
   });
 
   it("keeps tool rows visible in auto mode", async () => {
