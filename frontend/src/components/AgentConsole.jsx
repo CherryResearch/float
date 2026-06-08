@@ -163,23 +163,6 @@ const formatTimestamp = (timestamp) => {
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 };
 
-const resolveToolDisplayName = (tool, fallback = "tool") => {
-  if (!tool || typeof tool !== "object") return fallback;
-  const candidates = [
-    tool.name,
-    tool.tool,
-    tool.tool_name,
-    tool.function?.name,
-    tool.call?.name,
-  ];
-  const name = candidates
-    .map((value) => (typeof value === "string" ? value.trim() : ""))
-    .find(Boolean);
-  return name || fallback;
-};
-
-const toolRequestId = (tool) => String(tool?.id ?? tool?.request_id ?? "").trim();
-
 const formatReviewTimestamp = (timestamp) => {
   if (!timestamp) return "";
   const numeric = Number(timestamp);
@@ -664,9 +647,34 @@ const getEffectiveToolStatus = (tool) => {
   return getToolResultStatus(tool.result) || status;
 };
 
-const isToolAwaitingReview = (tool) => {
-  const status = getEffectiveToolStatus(tool);
-  return !status || status === "proposed" || status === "pending";
+const buildToolStateInspectorRows = (entry, context = {}) => {
+  if (!entry || entry.type !== "tool") return [];
+  const status = context.status || getEffectiveToolStatus(entry) || normalizeToolStatus(entry.status);
+  const requestId = String(entry.id || entry.request_id || "").trim();
+  const chainId = String(context.chainIdentifier || entry.chain_id || entry.message_id || "").trim();
+  const sessionId = String(entry.session_id || context.sessionId || "").trim();
+  const owner = String(context.agentId || entry.agent_id || entry.agent || "").trim();
+  const isPending = status === "proposed" || status === "pending" || !status;
+  return [
+    { label: "Source", value: context.sourceLabel || "tool event" },
+    { label: "Status", value: status || "pending" },
+    { label: "Owner", value: owner || sessionId || "current console" },
+    { label: "Request", value: requestId || chainId || "local fallback" },
+    {
+      label: "Evidence",
+      value: entry.synthetic
+        ? "saved conversation tool state"
+        : requestId
+          ? "backend Agent Console event"
+          : "live console activity",
+    },
+    {
+      label: "Next",
+      value: isPending
+        ? "Approve, edit, or deny this tool."
+        : "Open the activity to inspect arguments and result.",
+    },
+  ];
 };
 
 const getBrowserSessionToolContext = (entry) => {
@@ -741,16 +749,10 @@ const mergeToolUpdate = (tools, update) => {
   return list;
 };
 
-const mergeToolUpdates = (tools, updates) =>
-  (Array.isArray(updates) ? updates : []).reduce(
-    (current, update) => mergeToolUpdate(current, update),
-    Array.isArray(tools) ? tools : [],
-  );
-
 
 const summarizeToolBatchLabel = (tools) => {
   const names = (Array.isArray(tools) ? tools : [])
-    .map((tool) => resolveToolDisplayName(tool, ""))
+    .map((tool) => (typeof tool?.name === "string" ? tool.name.trim() : ""))
     .filter(Boolean);
   if (!names.length) return "tool activity";
   if (names.length === 1) return names[0];
@@ -1813,7 +1815,7 @@ const AgentConsole = ({
             String(tool?.id || tool?.request_id || "").trim()
             || `conversation-tool:${messageId}:${index}`,
           request_id: String(tool?.request_id || tool?.id || "").trim() || undefined,
-          name: resolveToolDisplayName(tool),
+          name: String(tool?.name || "tool").trim() || "tool",
           args: normalizedArgs,
           ...(typeof fallbackResult !== "undefined" ? { result: fallbackResult } : {}),
           status,
@@ -1948,8 +1950,6 @@ const AgentConsole = ({
     pendingSyncReviews.length > 0 || recentSyncReviews.length > 0;
   const toolContinueLocksRef = React.useRef(new Set());
   const autoToolResolveLocksRef = React.useRef(new Set());
-  const toolResolutionUpdatesRef = React.useRef(new Map());
-  const [toolBatchPendingKey, setToolBatchPendingKey] = React.useState("");
 
   const formatBytes = React.useCallback((value) => {
     if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
@@ -3693,18 +3693,10 @@ const AgentConsole = ({
     ) => {
       if (!sessionId || !messageId) return;
       const force = options.force === true;
-      const toolsOverride = Array.isArray(options.tools) ? options.tools.filter(Boolean) : null;
       const messageEntry = conversationById.get(messageId);
       const baseTools = Array.isArray(messageEntry?.tools) ? [...messageEntry.tools] : [];
-      const messageKey = String(messageId);
-      let accumulatedUpdates =
-        toolResolutionUpdatesRef.current.get(messageKey) || [];
+      const mergedTools = mergeToolUpdate(baseTools, toolUpdate);
       if (toolUpdate) {
-        accumulatedUpdates = mergeToolUpdate(accumulatedUpdates, toolUpdate);
-        toolResolutionUpdatesRef.current.set(messageKey, accumulatedUpdates);
-      }
-      const mergedTools = toolsOverride || mergeToolUpdates(baseTools, accumulatedUpdates);
-      if (toolUpdate || toolsOverride) {
         setState((prev) => {
           const updated = Array.isArray(prev.conversation)
             ? [...prev.conversation]
@@ -3748,7 +3740,6 @@ const AgentConsole = ({
           ...thinkingPayload,
           tools: batch,
         });
-        toolResolutionUpdatesRef.current.delete(messageKey);
         const continuation = res.data?.message || "";
         const md = res.data?.metadata || {};
         if (continuation) {
@@ -4152,318 +4143,6 @@ const AgentConsole = ({
       runBrowserSessionAction,
     ],
   );
-
-  const buildBatchToolUpdate = React.useCallback((entry, status, result, nameOverride, argsOverride) => {
-    const name = resolveToolDisplayName(
-      { ...entry, name: nameOverride || entry?.name },
-      entry?.name || "tool",
-    );
-    return {
-      id: entry?.id || entry?.request_id,
-      request_id: entry?.request_id || entry?.id,
-      name,
-      args: argsOverride ?? entry?.args ?? {},
-      ...(typeof result !== "undefined" ? { result } : {}),
-      status: status || "invoked",
-    };
-  }, []);
-
-  const resolveBatchToolDecision = React.useCallback(
-    async (entry, decision) => {
-      const normalizedDecision = decision === "deny" ? "deny" : "accept";
-      const requestId = toolRequestId(entry);
-      const toolName = resolveToolDisplayName(entry);
-      const sessionForEntry = entry?.session_id || state.sessionId || null;
-      const messageForEntry = entry?.message_id || entry?.chain_id || null;
-      const targetChain = entry?.chain_id || entry?.message_id || messageForEntry || sessionForEntry;
-      const args = entry?.args || {};
-      const decisionPayload = {
-        request_id: requestId || entry?.id,
-        decision: normalizedDecision,
-        name: toolName,
-        session_id: sessionForEntry,
-        message_id: messageForEntry,
-        chain_id: targetChain || messageForEntry || sessionForEntry || null,
-      };
-      if (entry?.args && typeof entry.args === "object") {
-        decisionPayload.args = args;
-      }
-
-      if (normalizedDecision === "deny") {
-        if (requestId) {
-          const resp = await axios.post("/api/tools/decision", decisionPayload);
-          const status = String(resp?.data?.status || "denied").toLowerCase();
-          const result =
-            typeof resp?.data?.result !== "undefined"
-              ? resp.data.result
-              : fallbackResultForStatus(status);
-          return buildBatchToolUpdate(entry, status || "denied", result);
-        }
-        if (entry?.synthetic === true) {
-          return buildBatchToolUpdate(
-            entry,
-            "denied",
-            buildToolOutcomeResult("denied", "Dismissed by user."),
-          );
-        }
-        return null;
-      }
-
-      if (entry?.manual_fill_required === true && !requestId) return null;
-
-      if (requestId && CLIENT_RESOLUTION_TOOLS.has(toolName)) {
-        const resp = await resolveClientTool(entry);
-        const status = String(resp?.status || "").toLowerCase();
-        const result =
-          typeof resp?.result !== "undefined" ? resp.result : fallbackResultForStatus(status);
-        return buildBatchToolUpdate(entry, status || "invoked", result);
-      }
-
-      if (requestId) {
-        const resp = await axios.post("/api/tools/decision", decisionPayload);
-        const status = String(resp?.data?.status || "").toLowerCase();
-        const result =
-          typeof resp?.data?.result !== "undefined"
-            ? resp.data.result
-            : fallbackResultForStatus(status);
-        return buildBatchToolUpdate(entry, status || "invoked", result);
-      }
-
-      try {
-        const resp = await axios.post("/api/tools/invoke", {
-          name: toolName,
-          args,
-          chain_id: targetChain,
-          session_id: sessionForEntry,
-          message_id: messageForEntry || targetChain,
-        });
-        return buildBatchToolUpdate(
-          entry,
-          "invoked",
-          typeof resp?.data?.result !== "undefined" ? resp.data.result : undefined,
-        );
-      } catch (err) {
-        const detail =
-          err?.response?.data?.detail ||
-          err?.response?.data?.message ||
-          err?.message ||
-          "Tool invoke failed.";
-        const statusCode = err?.response?.status;
-        const safeDetail = statusCode && statusCode >= 500 ? "Tool error." : detail;
-        return buildBatchToolUpdate(
-          entry,
-          "error",
-          buildToolOutcomeResult("error", safeDetail),
-        );
-      }
-    },
-    [buildBatchToolUpdate, resolveClientTool, state.sessionId],
-  );
-
-  const runToolReviewBatch = React.useCallback(
-    async (batch, decision, options = {}) => {
-      const entries = Array.isArray(batch?.entries)
-        ? batch.entries.filter((entry) => entry?.type === "tool" && isToolAwaitingReview(entry))
-        : [];
-      const messageId = batch?.messageId || entries[0]?.message_id || entries[0]?.chain_id || null;
-      const sessionId = batch?.sessionId || entries[0]?.session_id || state.sessionId || null;
-      if (!entries.length || !messageId || !sessionId) return;
-      const pendingKey = `${decision}:${sessionId}:${messageId}`;
-      setToolBatchPendingKey(pendingKey);
-      try {
-        const updates = [];
-        for (const entry of entries) {
-          const update = await resolveBatchToolDecision(entry, decision);
-          if (update) updates.push(update);
-        }
-        const messageEntry = conversationById.get(messageId);
-        const sourceTools =
-          Array.isArray(messageEntry?.tools) && messageEntry.tools.length
-            ? messageEntry.tools
-            : entries;
-        const mergedTools = mergeToolUpdates(sourceTools, updates);
-        await maybeContinueBatch(
-          {
-            sessionId,
-            messageId,
-            toolUpdate: null,
-          },
-          batch?.continueTarget || null,
-          {
-            force: options.force === true,
-            tools: mergedTools,
-          },
-        );
-      } catch (err) {
-        console.error("Tool batch action failed", err);
-      } finally {
-        setToolBatchPendingKey((current) => (current === pendingKey ? "" : current));
-      }
-    },
-    [
-      conversationById,
-      maybeContinueBatch,
-      resolveBatchToolDecision,
-      state.sessionId,
-    ],
-  );
-
-  const openFirstBatchToolEditor = React.useCallback(
-    (batch) => {
-      const entries = Array.isArray(batch?.entries)
-        ? batch.entries.filter((entry) => entry?.type === "tool" && isToolAwaitingReview(entry))
-        : [];
-      const entry = entries[0];
-      if (!entry) return;
-      const base =
-        state.selectedCalendarDate instanceof Date
-          ? new Date(state.selectedCalendarDate)
-          : new Date();
-      setToolEditorState({
-        tool: {
-          name: resolveToolDisplayName(entry),
-          args: entry.args || {},
-          id: entry.id,
-          status: entry.status,
-        },
-        schedulePrefill: {
-          start_time: Math.floor(base.getTime() / 1000),
-          timezone: preferredTimezone,
-          title: `Schedule tool: ${resolveToolDisplayName(entry)}`,
-        },
-        onSubmit: async ({ args, name, continueTarget }) => {
-          const editedEntry = {
-            ...entry,
-            name: (name || entry.name || "").trim() || entry.name,
-            args: args || {},
-          };
-          const update = await resolveBatchToolDecision(editedEntry, "accept");
-          if (!update) return;
-          await maybeContinueBatch(
-            {
-              sessionId: batch?.sessionId || entry.session_id || state.sessionId || null,
-              messageId: batch?.messageId || entry.message_id || entry.chain_id || null,
-              toolUpdate: update,
-            },
-            continueTarget || batch?.continueTarget || null,
-          );
-        },
-      });
-    },
-    [
-      maybeContinueBatch,
-      preferredTimezone,
-      resolveBatchToolDecision,
-      state.selectedCalendarDate,
-      state.sessionId,
-    ],
-  );
-
-  const buildPendingToolBatches = React.useCallback(
-    (entries) => {
-      const groups = new Map();
-      (Array.isArray(entries) ? entries : []).forEach((entry) => {
-        if (!entry || entry.type !== "tool" || !isToolAwaitingReview(entry)) return;
-        const messageId = entry.message_id || entry.chain_id || null;
-        const sessionId = entry.session_id || state.sessionId || null;
-        if (!messageId || !sessionId) return;
-        const key = `${sessionId}:${messageId}`;
-        const group = groups.get(key) || {
-          key,
-          sessionId,
-          messageId,
-          entries: [],
-          continueTarget: null,
-        };
-        group.entries.push(entry);
-        groups.set(key, group);
-      });
-      return Array.from(groups.values()).filter((group) => group.entries.length > 1);
-    },
-    [state.sessionId],
-  );
-
-  const renderToolBatchActions = (batch) => {
-    if (!batch?.entries?.length) return null;
-    const busyPrefix = `${batch.sessionId}:${batch.messageId}`;
-    const busy = toolBatchPendingKey.endsWith(`:${busyPrefix}`);
-    const hasBlockedAccept = batch.entries.some(
-      (entry) => entry?.manual_fill_required === true && !toolRequestId(entry),
-    );
-    const label = summarizeToolBatchLabel(batch.entries);
-    const toolIds = batch.entries.map(toolRequestId).filter(Boolean);
-    return (
-      <div
-        key={`tool-batch-actions:${batch.key}`}
-        className="agent-tool-batch-actions"
-        data-chain-id={batch.messageId ? String(batch.messageId) : undefined}
-        data-tool-ids={toolIds.join(" ")}
-      >
-        <div className="agent-tool-batch-header">
-          <span className="agent-tool-batch-kicker">batch</span>
-          <span className="agent-tool-batch-label">{batch.entries.length} tools</span>
-        </div>
-        <div className="agent-tool-batch-controls">
-          <button
-            type="button"
-            className="tool-action-btn continue needs-tool-continue"
-            disabled={busy || hasBlockedAccept}
-            aria-label={
-              hasBlockedAccept
-                ? "One or more tools need editable arguments before the batch can run."
-                : `Approve ${label} and continue the assistant response.`
-            }
-            onClick={(event) => {
-              event.stopPropagation();
-              void runToolReviewBatch(batch, "accept", { force: true });
-            }}
-          >
-            Continue
-          </button>
-          <button
-            type="button"
-            className="tool-action-btn accept"
-            disabled={busy || hasBlockedAccept}
-            aria-label={
-              hasBlockedAccept
-                ? "One or more tools need editable arguments before the batch can run."
-                : "Approve every pending tool in this batch."
-            }
-            onClick={(event) => {
-              event.stopPropagation();
-              void runToolReviewBatch(batch, "accept");
-            }}
-          >
-            Accept
-          </button>
-          <button
-            type="button"
-            className="tool-action-btn deny"
-            disabled={busy}
-            aria-label="Deny every pending tool in this batch."
-            onClick={(event) => {
-              event.stopPropagation();
-              void runToolReviewBatch(batch, "deny");
-            }}
-          >
-            Deny
-          </button>
-          <button
-            type="button"
-            className="tool-action-btn edit"
-            disabled={busy}
-            aria-label="Edit the first pending tool in this batch."
-            onClick={(event) => {
-              event.stopPropagation();
-              openFirstBatchToolEditor(batch);
-            }}
-          >
-            Edit
-          </button>
-        </div>
-      </div>
-    );
-  };
 
   const renderToolActions = (entry) => {
       const normalizedStatus = getEffectiveToolStatus(entry);
@@ -5170,15 +4849,9 @@ const AgentConsole = ({
     const cardClass = `agent-card${activeClass}${cardHasFocus ? " focused" : ""}${
       isCompact ? " compact" : ""
     }`;
-    const orderedActivity = toolOnlyAgent
-      ? filteredActivity
-      : [...filteredActivity].reverse();
     const activityList = showAllActivity
-      ? orderedActivity
-      : toolOnlyAgent
-        ? orderedActivity.slice(0, 6)
-        : filteredActivity.slice(-6).reverse();
-    const pendingToolBatches = buildPendingToolBatches(filteredActivity);
+      ? [...filteredActivity].reverse()
+      : filteredActivity.slice(-6).reverse();
     const canExpand = filteredActivity.length > 6;
     const compactMetaNote = isCompact
       ? truncatePreviewText(
@@ -5245,7 +4918,7 @@ const AgentConsole = ({
           <div className="agent-card-meta">
             <span className="agent-status-dot" style={{ backgroundColor: tone.hue }} />
             <div className="agent-card-title-stack">
-              <h3>
+              <h3 title={displayLabel}>
                 {canOpenConversation ? (
                   <button
                     type="button"
@@ -5260,7 +4933,7 @@ const AgentConsole = ({
                 )}
               </h3>
               {compactMetaNote && (
-                <span className="agent-card-title-note">
+                <span className="agent-card-title-note" title={compactMetaNote}>
                   {compactMetaNote}
                 </span>
               )}
@@ -5363,6 +5036,7 @@ const AgentConsole = ({
                   isCompact ? " is-active" : ""
                 }`}
                 onClick={toggleCompact}
+                title={isCompact ? "Expand agent card" : "Compact agent card"}
                 aria-label={isCompact ? "Expand agent card" : "Compact agent card"}
                 disabled={!agentKeyString}
               >
@@ -5372,6 +5046,7 @@ const AgentConsole = ({
                 type="button"
                 className="agent-card-control-btn agent-card-control-symbol danger"
                 onClick={hideAgent}
+                title="Hide agent card"
                 aria-label="Hide agent card"
                 disabled={!agentKeyString}
               >
@@ -5381,7 +5056,7 @@ const AgentConsole = ({
           </div>
         </header>
         {!isCompact && lastMessage && (
-          <p className="agent-card-summary">
+          <p className="agent-card-summary" title={lastMessage}>
             {lastMessage}
           </p>
         )}
@@ -5466,17 +5141,7 @@ const AgentConsole = ({
           </div>
         )}
         {!isCompact && (
-          <div
-            className={`agent-tool-activity-region${
-              pendingToolBatches.length > 0 ? " has-pending-batch" : ""
-            }`}
-          >
-            {pendingToolBatches.length > 0 && (
-              <div className="agent-tool-batch-stack">
-                {pendingToolBatches.map((batch) => renderToolBatchActions(batch))}
-              </div>
-            )}
-            <ul className="agent-activity-list">
+          <ul className="agent-activity-list">
             {activityList.map((entry) => {
               const ts = formatTimestamp(entry.timestamp);
               const status = getEffectiveToolStatus(entry) || normalizeToolStatus(entry.status) || null;
@@ -5503,6 +5168,13 @@ const AgentConsole = ({
                 const meta = msg && typeof msg === "object" ? msg.metadata : null;
                 return formatModelSourceLabel(meta?.mode, meta?.model);
               })();
+              const toolInspectorRows = buildToolStateInspectorRows(entry, {
+                agentId: agentKeyString,
+                chainIdentifier,
+                sessionId: state.sessionId,
+                sourceLabel,
+                status,
+              });
               const collapsed =
                 chainIdentifier && Object.prototype.hasOwnProperty.call(collapsedChains, chainIdentifier)
                   ? !!collapsedChains[chainIdentifier]
@@ -5518,8 +5190,7 @@ const AgentConsole = ({
                   [chainIdentifier]: !collapsed,
                 }));
             };
-              const displayType =
-                entry.type === "tool" ? "" : entry.type === "stream" ? "response" : entry.type;
+              const displayType = entry.type === "stream" ? "response" : entry.type;
               const isStream = entry.type === "stream";
               const streamLabel = isStream ? formatStreamLabel(entry) : null;
               const responseHistory =
@@ -5537,9 +5208,7 @@ const AgentConsole = ({
             const preview = collapsed ? buildEntryPreview(entry, bodyText) : null;
             const entryNameKey = normalizePreviewText(entry.name).toLowerCase();
             const showEntryToolName =
-              entry.type === "tool"
-                ? Boolean(entry.name)
-                : entry.name && entryNameKey !== displayLabelKey;
+              entry.type === "tool" && entry.name && entryNameKey !== displayLabelKey;
             const handleActivityClick = (event) => {
               const target = event.target;
               if (
@@ -5587,7 +5256,7 @@ const AgentConsole = ({
                   }}
                 >
                   <div className="agent-activity-meta">
-                    {displayType && <span className="agent-activity-type">{displayType}</span>}
+                    <span className="agent-activity-type">{displayType}</span>
                     {showEntryToolName && (
                       <button
                         type="button"
@@ -5596,6 +5265,11 @@ const AgentConsole = ({
                           event.stopPropagation();
                           toggleCollapsed();
                         }}
+                        title={
+                          collapsed
+                            ? `Expand ${entry.name} details`
+                            : `Collapse ${entry.name} details`
+                        }
                         aria-label={
                           collapsed
                             ? `Expand ${entry.name} details`
@@ -5605,23 +5279,34 @@ const AgentConsole = ({
                         {entry.name}
                       </button>
                     )}
-                    {entry.type === "tool" ? (
-                      displayStatus && !isProposedTool ? (
+                    {displayStatus && entry.type === "tool" ? (
+                      <span
+                        className="agent-tool-status-code"
+                        data-tool-status={status}
+                        title={`Tool status: ${displayStatus}`}
+                        aria-label={`Tool status: ${displayStatus}`}
+                      >
                         <span
-                          className="agent-tool-status-code"
-                          data-tool-status={status}
-                          aria-label={`Tool status: ${displayStatus}`}
-                        >
-                          <span
-                            className="agent-tool-status-pip"
-                            aria-hidden="true"
-                            style={{ backgroundColor: toolTone?.hue }}
-                          />
-                          <span className="agent-tool-status-text">{displayStatus}</span>
-                        </span>
-                      ) : null
+                          className="agent-tool-status-pip"
+                          aria-hidden="true"
+                          style={{ backgroundColor: toolTone?.hue }}
+                        />
+                        <span className="agent-tool-status-text">{displayStatus}</span>
+                      </span>
                     ) : (
                       displayStatus && <span className="agent-activity-status">{displayStatus}</span>
+                    )}
+                    {entry.type === "tool" && (
+                      <StateInspector
+                        title="Why this tool is here"
+                        summary={
+                          isProposedTool
+                            ? "The assistant proposed this tool and the console is holding it for review."
+                            : "This console row reflects recorded tool activity for this chat turn."
+                        }
+                        rows={toolInspectorRows}
+                        ariaLabel={`Explain ${entry.name || "tool"} activity`}
+                      />
                     )}
                     {ts && <time>{ts}</time>}
                     {responseHistory && (
@@ -5643,6 +5328,7 @@ const AgentConsole = ({
                         className="agent-activity-toggle"
                         aria-expanded={!collapsed}
                         aria-label={collapsed ? "Expand activity details" : "Collapse activity details"}
+                        title={collapsed ? "Expand activity details" : "Collapse activity details"}
                         onClick={(event) => {
                           event.stopPropagation();
                           toggleCollapsed();
@@ -5653,9 +5339,9 @@ const AgentConsole = ({
                         </span>
                       </button>
                     )}
-                </div>
+                  </div>
                 {collapsed && preview?.short && (
-                  <div className="agent-activity-preview">
+                  <div className="agent-activity-preview" title={preview.full}>
                     {preview.short}
                   </div>
                 )}
@@ -5703,8 +5389,7 @@ const AgentConsole = ({
                 </li>
               );
             })}
-            </ul>
-          </div>
+          </ul>
         )}
       </article>
     );

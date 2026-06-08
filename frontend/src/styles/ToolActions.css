@@ -8,11 +8,8 @@
   text-transform: uppercase;
   background: color-mix(in oklab, var(--glass-tint) 88%, transparent);
   color: var(--color-text);
-  font-weight: 700;
   cursor: pointer;
   transition: transform 120ms ease, box-shadow 120ms ease, opacity 120ms ease;
-  white-space: nowrap;
-  overflow-wrap: normal;
 }
 
 .tool-review-btn {
@@ -20,21 +17,18 @@
 }
 
 .tool-action-btn.accept {
-  border: 1px solid color-mix(in oklab, var(--color-mint-green) 68%, var(--color-black) 32%);
-  background: color-mix(in oklab, var(--color-mint-green) 62%, var(--color-white) 38%);
-  color: color-mix(in oklab, var(--color-black) 82%, var(--color-mint-green) 18%);
+  background: color-mix(in oklab, var(--color-mint-green) 45%, transparent);
+  color: color-mix(in oklab, var(--color-black) 30%, var(--color-white) 70%);
 }
 
 .tool-action-btn.deny {
-  border: 1px solid color-mix(in oklab, var(--color-error) 62%, var(--color-black) 38%);
-  background: color-mix(in oklab, var(--color-error) 48%, var(--color-white) 52%);
-  color: color-mix(in oklab, var(--color-black) 78%, var(--color-error) 22%);
+  background: color-mix(in oklab, var(--color-error) 35%, transparent);
+  color: color-mix(in oklab, var(--color-white) 75%, var(--color-black) 25%);
 }
 
 .tool-action-btn.edit {
-  border: 1px solid color-mix(in oklab, var(--color-purple) 54%, var(--color-black) 46%);
-  background: color-mix(in oklab, var(--color-purple) 38%, var(--color-white) 62%);
-  color: color-mix(in oklab, var(--color-black) 78%, var(--color-purple) 22%);
+  background: color-mix(in oklab, var(--color-purple) 26%, transparent);
+  color: color-mix(in oklab, var(--color-white) 80%, var(--color-black) 20%);
 }
 
 .tool-action-btn.retry {
@@ -43,9 +37,8 @@
 }
 
 .tool-action-btn.continue {
-  border: 1px solid color-mix(in oklab, var(--color-lavender) 58%, var(--color-black) 42%);
-  background: color-mix(in oklab, var(--color-lavender) 48%, var(--color-white) 52%);
-  color: color-mix(in oklab, var(--color-black) 80%, var(--color-lavender) 20%);
+  background: color-mix(in oklab, var(--color-lavender) 40%, var(--glass-tint) 60%);
+  color: var(--color-text);
 }
 
 .tool-action-btn.needs-tool-continue,
@@ -55,7 +48,7 @@
 }
 
 .tool-action-btn:disabled {
-  opacity: 0.62;
+  opacity: 0.55;
   cursor: not-allowed;
 }
 
