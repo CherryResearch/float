@@ -108,29 +108,92 @@ def _extract_output_list(payload: Any) -> List[Dict[str, Any]]:
     return []
 
 
-def extract_response_text(payload: Any) -> str:
+_RESPONSE_TOOL_TEXT_PHASES = {"analysis", "commentary", "tool", "tool_call"}
+
+
+def _response_item_phase(item: Dict[str, Any]) -> str:
+    phase = item.get("phase") or item.get("channel")
+    return str(phase or "").strip().lower()
+
+
+def _response_item_text(item: Dict[str, Any]) -> str:
+    collected: List[str] = []
+    content = item.get("content")
+    if isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") in {"output_text", "text"}:
+                collected.append(str(part.get("text") or ""))
+    elif isinstance(content, str):
+        collected.append(content)
+    return "".join(collected)
+
+
+def _looks_like_direct_json_tool_call(text: str) -> bool:
+    stripped = str(text or "").strip()
+    if not stripped.startswith("{") or '"tool"' not in stripped:
+        return False
+    try:
+        payload = json.loads(stripped)
+    except Exception:
+        return False
     if not isinstance(payload, dict):
-        return ""
+        return False
+    tool_name = payload.get("tool")
+    args = payload.get("args") or payload.get("arguments") or payload.get("params")
+    return bool(tool_name and isinstance(args, dict))
+
+
+def split_response_text(payload: Any) -> Tuple[str, str]:
+    """Return (visible_text, inline_tool_text) from a Responses payload."""
+
+    if not isinstance(payload, dict):
+        return "", ""
     response = payload.get("response")
     if isinstance(response, dict):
-        nested = extract_response_text(response)
-        if nested:
-            return nested
+        nested_visible, nested_tool = split_response_text(response)
+        if nested_visible or nested_tool:
+            return nested_visible, nested_tool
+
+    visible_parts: List[str] = []
+    tool_parts: List[str] = []
+    output_items = _extract_output_list(payload)
+    for item in output_items:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("type") or "").strip().lower() == "reasoning":
+            continue
+        text = _response_item_text(item)
+        if not text:
+            continue
+        phase = _response_item_phase(item)
+        if phase in _RESPONSE_TOOL_TEXT_PHASES or _looks_like_direct_json_tool_call(
+            text
+        ):
+            tool_parts.append(text)
+        else:
+            visible_parts.append(text)
+
+    if output_items or visible_parts or tool_parts:
+        return "".join(visible_parts), "".join(tool_parts)
+
     output_text = payload.get("output_text")
     if isinstance(output_text, str) and output_text:
-        return output_text
-    collected: List[str] = []
-    for item in _extract_output_list(payload):
-        content = item.get("content")
-        if isinstance(content, list):
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                if part.get("type") in {"output_text", "text"}:
-                    collected.append(str(part.get("text") or ""))
-        elif isinstance(content, str):
-            collected.append(content)
-    return "".join(collected)
+        if _looks_like_direct_json_tool_call(output_text):
+            return "", output_text
+        return output_text, ""
+    return "", ""
+
+
+def extract_response_text(payload: Any) -> str:
+    visible_text, _tool_text = split_response_text(payload)
+    return visible_text
+
+
+def extract_response_tool_text(payload: Any) -> str:
+    _visible_text, tool_text = split_response_text(payload)
+    return tool_text
 
 
 def extract_response_function_calls(payload: Any) -> List[Dict[str, Any]]:

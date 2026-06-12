@@ -17,6 +17,18 @@ def _assert_not_running_on_event_loop():
     raise AssertionError("expected sync work to run off the asyncio event loop")
 
 
+def _enable_computer_use_module(monkeypatch, routes):
+    monkeypatch.setattr(
+        routes.user_settings,
+        "load_settings",
+        lambda: {
+            "approval_level": "all",
+            "default_workflow": "default",
+            "enabled_workflow_modules": ["computer_use"],
+        },
+    )
+
+
 def test_computer_capabilities_endpoint_reports_builtin_tools(monkeypatch, tmp_path):
     monkeypatch.setenv("FLOAT_CONV_DIR", str(tmp_path))
     conv_store = importlib.import_module("app.utils.conversation_store")
@@ -212,6 +224,7 @@ def test_chat_registers_computer_tool_with_injected_session_id(monkeypatch, tmp_
     from app.base_services import ModelContext
 
     routes.llm_service.contexts = {"default": ModelContext(system_prompt="")}
+    _enable_computer_use_module(monkeypatch, routes)
 
     def fake_generate(
         prompt,
@@ -298,6 +311,7 @@ def test_chat_computer_bootstrap_runs_off_event_loop(monkeypatch, tmp_path):
     from app.base_services import ModelContext
 
     routes.llm_service.contexts = {"default": ModelContext(system_prompt="")}
+    _enable_computer_use_module(monkeypatch, routes)
 
     monkeypatch.setattr(
         routes.llm_service,
@@ -371,7 +385,12 @@ def test_tool_decision_invokes_sync_tools_off_event_loop(monkeypatch, tmp_path):
         _assert_not_running_on_event_loop()
         return {"name": name, "ok": True}
 
-    monkeypatch.setattr(app.state.memory_manager, "invoke_tool", fake_invoke_tool)
+    monkeypatch.setattr(
+        app.state.memory_manager,
+        "invoke_tool",
+        fake_invoke_tool,
+        raising=False,
+    )
 
     client = TestClient(app)
     resp = client.post(
@@ -401,6 +420,7 @@ def test_chat_auto_approved_tool_error_is_not_reported_as_pending(
     from app.base_services import ModelContext
 
     routes.llm_service.contexts = {"default": ModelContext(system_prompt="")}
+    _enable_computer_use_module(monkeypatch, routes)
     monkeypatch.setattr(
         routes.user_settings,
         "load_settings",
@@ -429,7 +449,12 @@ def test_chat_auto_approved_tool_error_is_not_reported_as_pending(
     def fake_invoke_tool(name, *, user=None, signature=None, **kwargs):
         raise RuntimeError("Playwright sync API cannot run on the asyncio loop")
 
-    monkeypatch.setattr(app.state.memory_manager, "invoke_tool", fake_invoke_tool)
+    monkeypatch.setattr(
+        app.state.memory_manager,
+        "invoke_tool",
+        fake_invoke_tool,
+        raising=False,
+    )
 
     client = TestClient(app)
     resp = client.post(
@@ -461,6 +486,7 @@ def test_chat_adds_computer_use_session_guidance_for_desktop_requests(
     from app.base_services import ModelContext
 
     routes.llm_service.contexts = {"default": ModelContext(system_prompt="")}
+    _enable_computer_use_module(monkeypatch, routes)
     captured = {}
 
     def fake_generate(
@@ -501,11 +527,8 @@ def test_chat_adds_computer_use_session_guidance_for_desktop_requests(
     )
     assert "computer.session.start" in guidance
     assert "runtime='windows'" in guidance
-    assert "do not invent fallback session ids" in guidance.lower()
-    assert (
-        "do not claim navigation, screenshots, embeds, or picture-in-picture"
-        in guidance.lower()
-    )
+    assert "reuse the returned session_id" in guidance
+    assert "Wait for successful tool results" in guidance
 
 
 def test_workflows_catalog_lists_builtin_profiles(monkeypatch, tmp_path):
@@ -523,7 +546,7 @@ def test_workflows_catalog_lists_builtin_profiles(monkeypatch, tmp_path):
     assert any(item["id"] == "default" for item in payload["workflows"])
     assert any(item["id"] == "architect_planner" for item in payload["workflows"])
     assert any(item["id"] == "mini_execution" for item in payload["workflows"])
-    assert any(item["id"] == "camera_capture" for item in payload["modules"])
+    assert any(item["id"] == "computer_use" for item in payload["modules"])
 
 
 def test_capture_routes_round_trip(monkeypatch, tmp_path):

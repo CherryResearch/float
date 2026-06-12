@@ -43,6 +43,11 @@ def test_prompt_logging(prompt_file, model, mode, monkeypatch):  # noqa: E501
 
     monkeypatch.setattr(LLMService, "_generate_via_api", fake_generate)
     monkeypatch.setattr(LLMService, "_generate_via_local", fake_generate)
+    monkeypatch.setattr(
+        LLMService,
+        "_load_local_model",
+        lambda self, override_model_name=None: None,
+    )
 
     service = LLMService(
         mode=mode,

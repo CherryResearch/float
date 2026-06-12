@@ -3,7 +3,7 @@ import os
 from types import SimpleNamespace
 
 import pytest
-from app.base_services import LLMService, ModelContext
+from app.base_services import LLMService, ModelContext, _model_supports_native_images
 
 
 class DummyTokenizer:
@@ -78,6 +78,11 @@ class DummyProcess:
     def __init__(self):
         self.terminated = False
         self.waited = False
+
+
+def test_gemma4_server_models_are_native_image_capable():
+    assert _model_supports_native_images("google/gemma-4-12b")
+    assert _model_supports_native_images("google/gemma4-31b-qat")
 
     def terminate(self):
         self.terminated = True
@@ -910,6 +915,209 @@ def test_generate_api_inlines_native_image_parts_for_supported_models(monkeypatc
     assert result["metadata"]["vision"]["workflow"] == "caption"
     assert result["metadata"]["vision"]["native_image_input"] is True
     assert result["metadata"]["vision"]["fallback_used"] is False
+
+
+def test_generate_api_inlines_transient_camera_capture_for_responses(
+    monkeypatch, tmp_path
+):
+    from app.services.capture_service import CaptureService
+
+    captured = {}
+    service = CaptureService(data_dir=tmp_path)
+    service.metadata_root = (tmp_path / "capture-meta").resolve()
+    service.metadata_root.mkdir(parents=True, exist_ok=True)
+    capture = service.create_capture_from_bytes(
+        b"transient-camera-image",
+        filename="camera.png",
+        source="camera",
+        content_type="image/png",
+        capture_source="chat_camera",
+    )
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured["url"] = url
+        captured["payload"] = json
+        return DummyApiResponse(
+            {
+                "id": "resp_camera",
+                "model": "gpt-5.4",
+                "output_text": "vision ok",
+            }
+        )
+
+    def missing_blob(_content_hash):
+        raise FileNotFoundError("not in durable blob store")
+
+    monkeypatch.setattr("app.base_services.http_session.post", fake_post)
+    monkeypatch.setattr("app.base_services.load_blob", missing_blob)
+    monkeypatch.setattr("app.base_services.get_capture_service", lambda: service)
+
+    svc = LLMService(
+        mode="api",
+        config={
+            "api_url": "https://example.test/v1/responses",
+            "api_key": "test-key",
+            "api_model": "gpt-5.4",
+        },
+    )
+    result = svc.generate(
+        "describe the camera image",
+        attachments=[
+            {
+                "name": "camera.png",
+                "type": "image/png",
+                "url": capture["url"],
+                "content_hash": capture["content_hash"],
+                "capture_id": capture["capture_id"],
+                "origin": "captured",
+                "transient": True,
+            }
+        ],
+        vision_workflow="caption",
+    )
+
+    input_items = captured["payload"]["input"]
+    image_parts = [
+        part
+        for item in input_items
+        if isinstance(item, dict)
+        for part in (item.get("content") or [])
+        if isinstance(part, dict) and part.get("type") == "input_image"
+    ]
+    assert len(image_parts) == 1
+    assert image_parts[0]["image_url"].startswith("data:image/png;base64,")
+    assert result["metadata"]["vision"]["native_image_input"] is True
+    assert result["metadata"]["vision"]["fallback_used"] is False
+
+
+def test_generate_api_caption_fallback_resolves_transient_camera_capture(
+    monkeypatch, tmp_path
+):
+    from app.services.capture_service import CaptureService
+
+    captured = {}
+    service = CaptureService(data_dir=tmp_path)
+    service.metadata_root = (tmp_path / "capture-meta").resolve()
+    service.metadata_root.mkdir(parents=True, exist_ok=True)
+    capture = service.create_capture_from_bytes(
+        b"fallback-camera-image",
+        filename="camera.png",
+        source="camera",
+        content_type="image/png",
+        capture_source="chat_camera",
+    )
+
+    class DummyCaptioner:
+        def __init__(self, model):
+            self.model = model
+
+        def run(self, raw):
+            assert raw == b"fallback-camera-image"
+            return {"image_caption": "Transient camera caption", "placeholder": False}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured["payload"] = json
+        return DummyApiResponse(
+            {
+                "model": "text-only-model",
+                "choices": [{"message": {"content": "fallback ok"}}],
+            }
+        )
+
+    def missing_blob(_content_hash):
+        raise FileNotFoundError("not in durable blob store")
+
+    monkeypatch.setattr("app.base_services.http_session.post", fake_post)
+    monkeypatch.setattr("app.base_services.load_blob", missing_blob)
+    monkeypatch.setattr("app.base_services.get_capture_service", lambda: service)
+    monkeypatch.setattr("app.base_services.VisionCaptioner", DummyCaptioner)
+
+    svc = LLMService(
+        mode="api",
+        config={
+            "api_url": "https://example.test/v1/chat/completions",
+            "api_key": "test-key",
+            "api_model": "text-only-model",
+            "vision_model": "local-caption-model",
+        },
+    )
+    result = svc.generate(
+        "describe the camera image",
+        attachments=[
+            {
+                "name": "camera.png",
+                "type": "image/png",
+                "url": capture["url"],
+                "content_hash": capture["content_hash"],
+                "capture_id": capture["capture_id"],
+                "origin": "captured",
+                "transient": True,
+            }
+        ],
+        vision_workflow="caption",
+    )
+
+    content = captured["payload"]["messages"][-1]["content"]
+    assert any(
+        isinstance(part, dict)
+        and "Transient camera caption" in str(part.get("text", ""))
+        for part in content
+    )
+    vision_meta = result["metadata"]["vision"]
+    assert vision_meta["fallback_used"] is True
+    assert vision_meta["fallback_attachments"][0]["capture_id"] == capture["capture_id"]
+    assert vision_meta["fallback_attachments"][0]["placeholder"] is False
+
+
+def test_generate_api_blocks_supported_model_when_image_bytes_missing(monkeypatch):
+    called = {"post": False}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        called["post"] = True
+        return DummyApiResponse({"id": "resp_unexpected", "output_text": "unexpected"})
+
+    def missing_blob(_content_hash):
+        raise FileNotFoundError("not in durable blob store")
+
+    service = SimpleNamespace(
+        capture_path=lambda _capture_id: None,
+        capture_path_for_content_hash=lambda _content_hash: None,
+    )
+    monkeypatch.setattr("app.base_services.http_session.post", fake_post)
+    monkeypatch.setattr("app.base_services.load_blob", missing_blob)
+    monkeypatch.setattr("app.base_services.get_capture_service", lambda: service)
+
+    svc = LLMService(
+        mode="api",
+        config={
+            "api_url": "https://example.test/v1/responses",
+            "api_key": "test-key",
+            "api_model": "gpt-5.4",
+        },
+    )
+    result = svc.generate(
+        "describe the missing camera image",
+        attachments=[
+            {
+                "name": "camera.png",
+                "type": "image/png",
+                "url": "/api/captures/missing-capture/content",
+                "content_hash": "missing-hash",
+                "capture_id": "missing-capture",
+                "origin": "captured",
+                "transient": True,
+            }
+        ],
+        vision_workflow="caption",
+    )
+
+    assert called["post"] is False
+    assert result["tools_used"] == []
+    assert result["metadata"]["category"] == "vision_attachment_resolution_error"
+    assert result["metadata"]["vision"]["native_image_input"] is False
+    assert (
+        result["metadata"]["vision"]["fallback_attachments"][0]["placeholder"] is True
+    )
 
 
 def test_generate_api_uses_local_caption_fallback_for_non_vision_models(monkeypatch):

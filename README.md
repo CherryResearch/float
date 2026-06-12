@@ -61,7 +61,7 @@ These inline tokens remain clickable until you delete the trailing space or the 
 
 - **Python 3.11+**
 - **Node.js 16+** with npm (in WSL use NVM)
-- **Redis** (optional, for Celery/background workers)
+- **Redis server** (required for Celery/background workers; optional for backend/frontend-only local runs)
 - *Docker* (optional backend-image experiment; not the recommended alpha path)
 
 ### Dependency Management with Poetry
@@ -141,7 +141,7 @@ Routing snapshot:
 
 - Chat uses `api`, `local`, or `server` mode.
 - Text embeddings use `rag_embedding_model` (`local:*`, `api:*`, or `simple`) and do not automatically follow `server_url`.
-- TTS uses OpenAI `tts-1` / `tts-1-hd` or local `kitten` / `kokoro` style models.
+- TTS uses OpenAI `gpt-4o-mini-tts`, `tts-1`, `tts-1-hd`, or local `kitten` / `kokoro` style models.
 - Live voice uses OpenAI Realtime by default. Gemma 4 is not a supported live-voice transport in this pass; use Gemma 4 through the local or server language-model lanes instead. LiveKit remains a fallback/experimental transport, and Pipecat is still an explored pipeline option rather than the default.
 - The public capability-by-mode overview lives in `docs/feature_overviews/models-and-runtime-modes.md`; endpoint details live in `docs/api_reference.md`.
 
@@ -260,9 +260,9 @@ curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/master/install.sh | bash
 
 nvm install --lts
 
-Then install redis and postgres 
+Install Redis if you plan to run Celery/background workers. Install Postgres only for the optional Postgres backend path.
 
-sudo apt-get install redis
+sudo apt-get install redis-server
 
 pip install pipx
 You will need to open a new terminal or re-login for the PATH changes to take effect.
@@ -321,10 +321,11 @@ OpenAI Realtime optional settings:
 ```env
 OPENAI_API_KEY=your_openai_key
 FLOAT_STREAM_BACKEND=api
-OPENAI_REALTIME_MODEL=gpt-realtime
+OPENAI_REALTIME_MODEL=gpt-realtime-2
 OPENAI_REALTIME_TURN_DETECTION=server_vad
 OPENAI_REALTIME_TTL_SECONDS=600
 ```
+Settings still keeps `gpt-realtime-1.5` available as a lower text-output-cost fallback.
 
 LiveKit fallback settings:
 

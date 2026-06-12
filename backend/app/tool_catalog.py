@@ -99,6 +99,50 @@ _BUILTIN_TOOL_CATALOG: Dict[str, Dict[str, Any]] = {
         can_access=["built-in tool capability metadata and schemas"],
         cannot_access=["network, files, browser state, or user secrets"],
     ),
+    "read_capability_docs": _entry(
+        category="docs",
+        summary="Read curated Float capability docs such as packaged skills and function descriptions.",
+        description=(
+            "Lists, searches, or reads packaged capability docs from curated repo "
+            "roots so the model can inspect UI/runtime behavior without broad "
+            "workspace file access."
+        ),
+        runtime={"executor": "backend_python", "network": False, "filesystem": True},
+        sandbox={
+            "read_roots": [
+                "modules/skills/",
+                "data/modules/skills/",
+                "docs/function descriptions/",
+                "docs/feature_overviews/",
+            ]
+        },
+        limits={
+            "default_line_count": 200,
+            "max_line_count": 1000,
+            "default_max_chars": 12000,
+            "max_chars": 20000,
+            "default_limit": 20,
+            "max_limit": 100,
+        },
+        freshness={"type": "repo_docs_and_local_skill_overrides"},
+        persistence={"writes_state": False},
+        safety={"risk_level": "low", "default_approval": "auto"},
+        can_access=[
+            "packaged module skills",
+            "function-description docs",
+            "feature overview docs",
+            "optional local skill overrides under data/modules/skills",
+        ],
+        cannot_access=[
+            "arbitrary workspace files",
+            "private user data outside curated doc roots",
+            "network or browser state",
+        ],
+        limit_hints=[
+            "Use list or search to find a doc, then read one bounded excerpt.",
+            "This is the deeper docs lane when tool_help is too terse but read_file would be too broad.",
+        ],
+    ),
     "subchat": _entry(
         category="workflow",
         summary="Signal subchat return or request more time.",
@@ -126,7 +170,18 @@ _BUILTIN_TOOL_CATALOG: Dict[str, Dict[str, Any]] = {
             "strict reflection/evaluation pass immediately."
         ),
         runtime={"executor": "backend_python", "network": False, "filesystem": True},
-        limits={"default_patience": 1, "max_patience": 3, "manual_only_v0": True},
+        limits={
+            "default_patience": 1,
+            "max_legacy_patience": 3,
+            "budget_fields": [
+                "max_reasoning_turns",
+                "max_runtime_seconds",
+                "max_context_tokens",
+                "max_output_tokens",
+                "reserve_output_tokens",
+            ],
+            "manual_only_v0": True,
+        },
         freshness={"type": "live_local_state"},
         persistence={"writes_state": True, "stores_output": True},
         safety={"risk_level": "medium", "default_approval": "confirm"},
@@ -142,7 +197,8 @@ _BUILTIN_TOOL_CATALOG: Dict[str, Dict[str, Any]] = {
             "unrestricted autonomous loops",
         ],
         limit_hints=[
-            "Patience controls depth budget, not priority.",
+            "Patience controls reasoning budget, not priority.",
+            "max_reasoning_turns counts assistant reflection passes, not tool continuations.",
             "Only surfaced runs create a reflection conversation.",
         ],
     ),
@@ -265,6 +321,34 @@ _BUILTIN_TOOL_CATALOG: Dict[str, Dict[str, Any]] = {
         can_access=["browser navigation and browser screenshots"],
         cannot_access=["private accounts unless separately authenticated in-session"],
         limit_hints=["Prefer `computer.navigate` for new prompts."],
+    ),
+    "route_to_local_model": _entry(
+        category="routing",
+        summary="Request a safer local-model continuation for sensitive content.",
+        description=(
+            "Client-resolved routing hint that asks the user to move the current "
+            "turn to a local or server model before private text is sent to a "
+            "cloud/API model."
+        ),
+        runtime={
+            "executor": "client_resolution",
+            "network": False,
+            "filesystem": False,
+        },
+        freshness={"type": "current_turn"},
+        persistence={"writes_state": False},
+        safety={"risk_level": "low", "default_approval": "auto"},
+        can_access=[
+            "the requested source/target model modes and the user-visible routing reason"
+        ],
+        cannot_access=[
+            "model weights",
+            "provider secrets",
+            "conversation text beyond the explicit tool arguments",
+        ],
+        limit_hints=[
+            "This tool is not backend-auto-invoked in live mode because the client must resolve the handoff."
+        ],
     ),
     "computer.session.start": _entry(
         category="computer",
@@ -779,7 +863,9 @@ def _display_name(tool_name: str) -> str:
         "revert_actions": "Revert Actions",
         "help": "Help",
         "tool_help": "Tool Help",
+        "read_capability_docs": "Read Capability Docs",
         "open_url": "Open URL",
+        "route_to_local_model": "Route To Local Model",
         "computer.session.start": "Computer Session Start",
         "computer.session.stop": "Computer Session Stop",
         "computer.observe": "Computer Observe",

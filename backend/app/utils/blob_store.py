@@ -17,6 +17,7 @@ ASSET_ORIGIN_DIRS = {
 }
 LEGACY_FILES_RELATIVE_DIRS = {
     *ASSET_ORIGIN_DIRS.values(),
+    "captures",
     "downloaded",
     "workspace",
 }

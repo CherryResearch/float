@@ -25,11 +25,17 @@ import NotFound from "./NotFound";
 import axios from "axios";
 import { getConversationTrimMeta } from "../utils/proxy";
 import {
+  acquireToolContinuationLock,
+  buildToolContinuationLockKey,
   buildToolContinuationSignature,
   hasMatchingToolContinuationSignature,
+  releaseToolContinuationLock,
 } from "../utils/toolContinuations";
 import { normalizeToolReviewTarget } from "../utils/toolReviewActions";
-import { mergeContinuationText } from "../utils/continuationText";
+import {
+  appendToolContinuationPhase,
+  mergeContinuationText,
+} from "../utils/continuationText";
 import { resolveRequestModelForMode } from "../utils/modelUtils";
 import {
   handleUnifiedPress,
@@ -1442,6 +1448,20 @@ const AppContent = () => {
                 return;
               }
 
+              const continuationLockKey = buildToolContinuationLockKey({
+                sessionId,
+                messageId,
+                tools: toolPayload,
+              });
+              const continuationLockAcquired =
+                !continuationLockKey ||
+                acquireToolContinuationLock(continuationLockKey);
+              if (!continuationLockAcquired) {
+                readyIds.forEach((id) => autoContinuedToolIdsRef.current.add(id));
+                consumeAutoContinueBatch(messageId, readyIds);
+                return;
+              }
+
               autoContinuingMessageIdsRef.current.add(messageId);
               readyIds.forEach((id) => autoContinuedToolIdsRef.current.add(id));
               if (semanticToolContinueSignature) {
@@ -1525,9 +1545,15 @@ const AppContent = () => {
                         if (idx >= 0) mergedTools[idx] = { ...mergedTools[idx], ...tool };
                         else mergedTools.push(tool);
                       });
-                      const nextMetadata = {
+                      const nextMetadataBase = {
                         ...(updated[mIdx]?.metadata || {}),
                         ...(md || {}),
+                        ...(Object.prototype.hasOwnProperty.call(
+                          md && typeof md === "object" ? md : {},
+                          "tool_response_pending",
+                        )
+                          ? { tool_response_pending: md.tool_response_pending }
+                          : { tool_response_pending: false }),
                         tool_continued: true,
                         ...(toolContinueSignature && !md?.tool_continue_signature
                           ? { tool_continue_signature: toolContinueSignature }
@@ -1540,6 +1566,12 @@ const AppContent = () => {
                             }
                           : {}),
                       };
+                      const nextMetadata = appendToolContinuationPhase(
+                        nextMetadataBase,
+                        existingText,
+                        aiContinuation,
+                      );
+                      nextMetadata.inline_tool_continuation_pending = false;
                       if (
                         returnedTools.length === 0 &&
                         !Object.prototype.hasOwnProperty.call(md || {}, "inline_tool_payload") &&
@@ -1610,6 +1642,9 @@ const AppContent = () => {
                   readyIds.forEach((id) => autoContinuedToolIdsRef.current.delete(id));
                 })
                 .finally(() => {
+                  if (continuationLockAcquired) {
+                    releaseToolContinuationLock(continuationLockKey);
+                  }
                   autoContinuingMessageIdsRef.current.delete(messageId);
                   startAutoContinueIfReady();
                 });
@@ -1636,7 +1671,7 @@ const AppContent = () => {
             "connection error";
           setState((prev) => ({
             ...prev,
-            wsStatus: "offline",
+            wsStatus: "loading",
             wsLastError: message,
             wsLastErrorAt: Date.now(),
           }));
@@ -1650,7 +1685,7 @@ const AppContent = () => {
         const message = event?.reason || (event?.code ? `code ${event.code}` : "");
         setState((prev) => ({
           ...prev,
-          wsStatus: "offline",
+          wsStatus: "loading",
           ...(event?.wasClean
             ? {}
             : {

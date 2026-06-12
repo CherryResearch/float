@@ -128,6 +128,7 @@ body.dark-mode .collapse-btn {
   left: calc(var(--space-sm) + 6px);
   --sidebar-light-angle: 196deg;
   width: var(--sidebar-width-left, var(--sidebar-width));
+  container: history-sidebar / inline-size;
 }
 
 .left-sidebar.collapsed {
@@ -1174,6 +1175,34 @@ body.dark-mode .conversation-item.is-active {
   align-items: center;
   position: relative;
   z-index: 1;
+}
+
+@container history-sidebar (max-width: 260px) {
+  .folder-conversation {
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .folder-conversation .conversation-main {
+    width: 100%;
+    align-items: flex-start;
+    flex-wrap: nowrap;
+  }
+
+  .folder-conversation .conversation-link {
+    line-height: 1.22;
+  }
+
+  .folder-conversation .conv-actions {
+    width: 100%;
+    justify-content: space-between;
+    padding-left: 14px;
+  }
+
+  .folder-conversation .conversation-date-tag {
+    align-items: flex-start;
+    padding-left: 0;
+  }
 }
 
 .conv-menu-wrapper {
@@ -2869,6 +2898,7 @@ body.dark-mode .action-row {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  container-type: inline-size;
   transition: box-shadow 120ms ease, transform 120ms ease;
 }
 
@@ -3011,6 +3041,7 @@ body.dark-mode .agent-card {
   flex-direction: column;
   gap: 2px;
   min-width: 0;
+  max-width: 100%;
 }
 
 .agent-card-meta h3 {
@@ -3061,24 +3092,22 @@ body.dark-mode .agent-card {
 }
 
 .agent-card.compact .agent-card-title-note {
-  position: absolute;
-  left: 0;
-  right: -7rem;
-  top: calc(100% + 5px);
-  z-index: 8;
-  display: none;
-  max-height: 2.2rem;
-  padding: 6px 8px;
-  border-radius: 8px;
-  border: 1px solid color-mix(in oklab, var(--glass-border) 80%, transparent);
-  background: color-mix(in oklab, var(--glass-tint-strong, var(--glass-tint)) 94%, transparent);
-  box-shadow: var(--shadow-sm);
-  pointer-events: none;
+  position: static;
+  display: -webkit-box;
+  max-height: none;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  pointer-events: auto;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  white-space: normal;
 }
 
 .agent-card.compact:hover .agent-card-title-note,
 .agent-card.compact:focus-within .agent-card-title-note {
-  display: block;
+  display: -webkit-box;
 }
 
 .agent-status-dot {
@@ -3332,6 +3361,13 @@ body.dark-mode .agent-card {
   scrollbar-width: none;
 }
 
+.agent-activity.agent-activity-tool .agent-activity-meta {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) repeat(5, max-content);
+  gap: 6px;
+  overflow: visible;
+}
+
 .agent-activity-meta::-webkit-scrollbar {
   display: none;
 }
@@ -3350,6 +3386,8 @@ body.dark-mode .agent-card {
 
 .agent-activity-type {
   font-weight: 600;
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .agent-activity-name {
@@ -3370,6 +3408,18 @@ body.dark-mode .agent-card {
   font: inherit;
   cursor: pointer;
   text-align: left;
+  min-width: 0;
+  max-width: min(16rem, 100%);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-activity.agent-activity-tool .agent-activity-name-button {
+  width: 100%;
+  max-width: none;
+  font-size: 0.82rem;
+  font-weight: 700;
 }
 
 .agent-activity-name-button:hover {
@@ -3475,6 +3525,12 @@ body.dark-mode .agent-card {
   box-shadow: var(--shadow-sm);
 }
 
+.agent-activity.agent-activity-tool .agent-activity-toggle {
+  margin-left: 0;
+  width: 20px;
+  height: 20px;
+}
+
 .agent-activity-toggle:focus-visible {
   outline: 2px solid color-mix(in oklab, var(--color-accent) 55%, transparent);
   outline-offset: 2px;
@@ -3483,6 +3539,76 @@ body.dark-mode .agent-card {
 .agent-activity-chevron {
   font-size: 0.75rem;
   line-height: 1;
+}
+
+.agent-tool-batch-stack {
+  display: grid;
+  gap: 6px;
+}
+
+.agent-tool-batch-actions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 7px;
+  padding: 8px 9px;
+  border: 1px solid color-mix(in oklab, var(--color-mint-green) 44%, var(--glass-border) 56%);
+  border-radius: var(--radius-sm);
+  background: color-mix(in oklab, var(--color-mint-green) 8%, var(--glass-tint) 92%);
+}
+
+.agent-tool-batch-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.agent-tool-batch-kicker,
+.agent-tool-batch-label {
+  flex: 0 0 auto;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.agent-tool-batch-kicker {
+  color: var(--color-text-muted);
+}
+
+.agent-tool-batch-label {
+  color: var(--color-text);
+}
+
+.agent-tool-batch-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.agent-tool-activity-region {
+  display: grid;
+  gap: 8px;
+}
+
+.agent-tool-activity-region.has-pending-batch {
+  position: relative;
+  padding-left: 24px;
+}
+
+.agent-tool-activity-region.has-pending-batch::before {
+  content: "";
+  position: absolute;
+  left: 10px;
+  top: 2px;
+  bottom: 2px;
+  width: 4px;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--color-mint-green) 86%, var(--color-accent) 14%);
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--glass-border) 64%, transparent);
 }
 
 .agent-activity-preview {
@@ -3520,11 +3646,12 @@ body.dark-mode .agent-card {
 
 .agent-tool-chat-group {
   position: relative;
-  padding-left: 20px;
+  margin-left: 8px;
+  padding-left: 38px;
 }
 
 .agent-tool-chat-group > .agent-chat-group-line {
-  left: 6px;
+  left: 16px;
   top: 2px;
   bottom: 2px;
 }
@@ -3781,6 +3908,8 @@ body.dark-mode .agent-card {
 .agent-runtime-panel[data-collapsed="true"] .runtime-provider-actions,
 .agent-runtime-panel[data-collapsed="true"] .runtime-context-row,
 .agent-runtime-panel[data-collapsed="true"] .runtime-context-estimate,
+.agent-runtime-panel[data-collapsed="true"] .runtime-context-budget,
+.agent-runtime-panel[data-collapsed="true"] .runtime-rag-progress,
 .agent-runtime-panel[data-collapsed="true"] .runtime-stepper,
 .agent-runtime-panel[data-collapsed="true"] .runtime-meters,
 .agent-runtime-panel[data-collapsed="true"] .runtime-provider-logs-wrap {
@@ -4355,6 +4484,89 @@ body.dark-mode .agent-card {
   font-size: 0.7rem;
   color: var(--color-text-muted);
   font-variant-numeric: tabular-nums;
+}
+
+.runtime-context-budget {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in oklab, var(--glass-border) 78%, transparent);
+  background: color-mix(in oklab, var(--glass-tint) 72%, transparent);
+}
+
+.runtime-context-budget--degraded .runtime-meter-fill {
+  background: color-mix(in oklab, #fbbf24 72%, transparent);
+}
+
+.runtime-context-budget--error .runtime-meter-fill {
+  background: color-mix(in oklab, var(--color-error) 72%, transparent);
+}
+
+.runtime-context-budget-grid {
+  display: grid;
+  grid-template-columns: minmax(5.6rem, auto) minmax(0, 1fr);
+  gap: 4px 10px;
+  font-size: 0.72rem;
+  color: var(--color-text-muted);
+}
+
+.runtime-context-budget-grid span {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.runtime-context-budget-grid strong {
+  min-width: 0;
+  color: var(--color-text);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.runtime-rag-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in oklab, var(--color-lavender) 38%, var(--glass-border) 62%);
+  background: color-mix(in oklab, var(--color-lavender) 12%, transparent);
+}
+
+.runtime-rag-progress--connected {
+  border-color: color-mix(in oklab, var(--color-mint-green) 44%, transparent);
+  background: color-mix(in oklab, var(--color-mint-green) 10%, transparent);
+}
+
+.runtime-rag-progress--error {
+  border-color: color-mix(in oklab, var(--color-error) 46%, transparent);
+  background: color-mix(in oklab, var(--color-error) 12%, transparent);
+}
+
+.runtime-rag-progress-phase {
+  font-size: 0.74rem;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.runtime-rag-progress .runtime-meter-fill.is-indeterminate {
+  width: 38%;
+  animation: runtime-progress-indeterminate 1.1s ease-in-out infinite;
+}
+
+@keyframes runtime-progress-indeterminate {
+  0% {
+    transform: translateX(-110%);
+  }
+  50% {
+    transform: translateX(45%);
+  }
+  100% {
+    transform: translateX(170%);
+  }
 }
 
 .agent-tasks-panel {
@@ -5017,6 +5229,91 @@ body.dark-mode .task-composer-nudges button {
   overflow-wrap: anywhere;
 }
 
+.agent-card .agent-activity-meta,
+.agent-card .agent-activity-meta *,
+.agent-card .agent-tool-actions,
+.agent-card .agent-tool-actions *,
+.agent-card .agent-tool-batch-actions,
+.agent-card .agent-tool-batch-actions * {
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+.agent-card .agent-activity-meta time,
+.agent-card .agent-tool-status-code,
+.agent-card .agent-history-toggle,
+.agent-card .agent-activity-toggle,
+.agent-card .tool-action-btn {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+@container (max-width: 230px) {
+  .agent-card-header {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .agent-card-actions {
+    justify-items: start;
+  }
+
+  .agent-card-submeta,
+  .agent-card-controls,
+  .agent-tool-batch-controls,
+  .agent-tool-actions {
+    justify-content: flex-start;
+  }
+
+  .agent-card-controls,
+  .agent-tool-batch-controls,
+  .agent-tool-actions {
+    flex-wrap: wrap;
+  }
+
+  .agent-tool-activity-region.has-pending-batch {
+    padding-left: 16px;
+  }
+
+  .agent-tool-activity-region.has-pending-batch::before {
+    left: 5px;
+    width: 3px;
+  }
+
+  .agent-tool-chat-group {
+    margin-left: 4px;
+    padding-left: 24px;
+  }
+
+  .agent-tool-chat-group > .agent-chat-group-line {
+    left: 10px;
+    width: 3px;
+  }
+
+  .agent-tool-batch-actions,
+  .agent-activity {
+    padding-inline: 7px;
+  }
+
+  .agent-activity.agent-activity-tool .agent-activity-meta {
+    grid-template-columns: minmax(0, 1fr) repeat(4, max-content);
+  }
+
+  .agent-activity.agent-activity-tool .agent-tool-status-code {
+    max-width: 5.6rem;
+    overflow: hidden;
+  }
+
+  .agent-activity.agent-activity-tool .agent-activity-meta time {
+    display: none;
+  }
+
+  .agent-card .tool-action-btn {
+    padding-inline: 7px;
+    font-size: 0.62rem;
+  }
+}
+
 @media (max-width: 900px) {
   .sidebar {
     bottom: max(var(--space-sm), env(safe-area-inset-bottom, 0px));
@@ -5076,10 +5373,32 @@ body.dark-mode .task-composer-nudges button {
 }
 
 .agent-background-reflection-header strong {
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.agent-background-reflection-inspector {
+  flex: 0 0 auto;
+}
+
+.agent-background-reflection-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.agent-background-reflection-meta span {
+  min-width: 0;
+  max-width: 100%;
+  border-radius: 999px;
+  padding: 2px 7px;
+  background: color-mix(in oklab, var(--glass-tint) 74%, transparent);
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
+  line-height: 1.35;
 }
 
 .agent-background-reflection-header time,

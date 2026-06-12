@@ -3,7 +3,7 @@ import importlib
 from fastapi.testclient import TestClient
 
 
-def _pin_default_workflow_settings(monkeypatch, tmp_path):
+def _pin_default_workflow_settings(monkeypatch, tmp_path, enabled_modules=None):
     from app.utils import user_settings
 
     monkeypatch.setattr(
@@ -13,7 +13,10 @@ def _pin_default_workflow_settings(monkeypatch, tmp_path):
         raising=False,
     )
     user_settings.save_settings(
-        {"default_workflow": "default", "enabled_workflow_modules": []}
+        {
+            "default_workflow": "default",
+            "enabled_workflow_modules": list(enabled_modules or []),
+        }
     )
 
 
@@ -97,6 +100,90 @@ def test_chat_continue_registers_tool_proposals(monkeypatch, tmp_path):
         assert registry[proposal_id]["message_id"] == "m1"
     else:
         assert tools_used[0].get("status") == "invoked"
+
+
+def test_chat_continue_new_inline_tool_request_stays_pending(monkeypatch, tmp_path):
+    monkeypatch.setenv("FLOAT_CONV_DIR", str(tmp_path))
+    conv_store = importlib.import_module("app.utils.conversation_store")
+    importlib.reload(conv_store)
+
+    conv_store.save_conversation(
+        "sess",
+        [
+            {"id": "m1:user", "role": "user", "text": "try recalling anything"},
+            {"id": "m1", "role": "ai", "text": "[[tool_call:0]]"},
+        ],
+    )
+
+    from app import routes
+    from app.base_services import ModelContext
+    from app.utils import user_settings
+
+    routes.llm_service.contexts = {"default": ModelContext(system_prompt="")}
+    monkeypatch.setattr(
+        user_settings,
+        "USER_SETTINGS_PATH",
+        tmp_path / "user_settings.json",
+        raising=False,
+    )
+    user_settings.save_settings({"approval_level": "all"})
+
+    def fake_generate(
+        prompt,
+        session_id=None,
+        model=None,
+        attachments=None,
+        context=None,
+        **kwargs,
+    ):
+        return {
+            "text": "[[tool_call:0]]",
+            "thought": "",
+            "tools_used": [{"name": "recall", "args": {}}],
+            "metadata": {"inline_tool_payload": '{"tool":"recall","args":{}}'},
+        }
+
+    monkeypatch.setattr(routes.llm_service, "generate", fake_generate)
+
+    app = importlib.import_module("app.main").app
+    app.state.pending_tools = {}
+    client = TestClient(app)
+    resp = client.post(
+        "/chat/continue",
+        json={
+            "session_id": "sess",
+            "message_id": "m1",
+            "model": None,
+            "tools": [
+                {
+                    "id": "tool-1",
+                    "name": "recall",
+                    "args": {"key": "*"},
+                    "result": {"status": "invoked", "ok": True, "data": {}},
+                    "status": "invoked",
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload.get("message") == "Requested tool recall. Awaiting approval."
+    metadata = payload.get("metadata") or {}
+    assert metadata.get("tool_response_pending") is True
+    assert metadata.get("tool_continued") is not True
+    tools_used = payload.get("tools_used") or []
+    assert len(tools_used) == 1
+    assert tools_used[0]["name"] == "recall"
+    assert tools_used[0]["status"] == "proposed"
+
+    saved = conv_store.load_conversation("sess")
+    saved_entry = next(
+        item for item in saved if isinstance(item, dict) and item.get("id") == "m1"
+    )
+    assert saved_entry["text"] == payload["message"]
+    assert saved_entry["metadata"]["tool_response_pending"] is True
+    assert saved_entry["metadata"].get("tool_continued") is not True
 
 
 def test_chat_continue_missing_mode_defaults_to_configured_api_not_service_mode(
@@ -390,6 +477,87 @@ def test_chat_continue_ignores_repeated_tool_requests_with_text(monkeypatch, tmp
     metadata = payload.get("metadata") or {}
     assert metadata.get("tool_response_pending") is not True
     assert metadata.get("repeated_tool_requests_ignored") is True
+
+
+def test_chat_continue_drops_tool_turn_residue_from_context_and_persistence(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLOAT_CONV_DIR", str(tmp_path))
+    conv_store = importlib.import_module("app.utils.conversation_store")
+    importlib.reload(conv_store)
+
+    stale_tool_text = "[[tool_call:0]]I can't read it until the tool result arrives."
+    conv_store.save_conversation(
+        "sess",
+        [
+            {"id": "m1:user", "role": "user", "text": "read notes.txt"},
+            {"id": "m1", "role": "ai", "text": stale_tool_text},
+        ],
+    )
+
+    from app import routes
+    from app.base_services import ModelContext
+
+    routes.llm_service.contexts = {"default": ModelContext(system_prompt="")}
+    captured = {}
+
+    def fake_generate(
+        prompt,
+        session_id=None,
+        model=None,
+        attachments=None,
+        context=None,
+        **kwargs,
+    ):
+        captured["messages"] = list(context.messages)
+        return {
+            "text": "The file says: hello.",
+            "thought": "",
+            "tools_used": [],
+            "metadata": {},
+        }
+
+    monkeypatch.setattr(routes.llm_service, "generate", fake_generate)
+
+    app = importlib.import_module("app.main").app
+    app.state.pending_tools = {}
+    client = TestClient(app)
+    resp = client.post(
+        "/chat/continue",
+        json={
+            "session_id": "sess",
+            "message_id": "m1",
+            "model": None,
+            "tools": [
+                {
+                    "id": "tool-1",
+                    "name": "read_file",
+                    "args": {"path": "data/workspace/notes.txt"},
+                    "result": {"ok": True, "data": "hello"},
+                    "status": "invoked",
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["message"] == "The file says: hello."
+    context_text = "\n".join(
+        str(message.get("content") or "") for message in captured["messages"]
+    )
+    assert "I can't read it until the tool result arrives" not in context_text
+    assert "read_file" in context_text
+    assert "hello" in context_text
+
+    messages = conv_store.load_conversation("sess")
+    ai = next(m for m in messages if m.get("id") == "m1")
+    assert ai.get("text") == "The file says: hello."
+    rebuilt_context = routes.llm_service.get_context("sess")
+    rebuilt_text = "\n".join(
+        str(message.get("content") or "") for message in rebuilt_context.messages
+    )
+    assert "I can't read it until the tool result arrives" not in rebuilt_text
+    assert "The file says: hello." in rebuilt_text
 
 
 def test_chat_continue_local_provider_resolution_error_updates_message(
@@ -947,6 +1115,97 @@ def test_chat_continue_extracts_nested_attachment_value_and_sets_signature(
     assert resp.json()["metadata"]["tool_continue_signature"]
 
 
+def test_chat_continue_same_tool_signature_is_idempotent(monkeypatch, tmp_path):
+    monkeypatch.setenv("FLOAT_CONV_DIR", str(tmp_path))
+    conv_store = importlib.import_module("app.utils.conversation_store")
+    importlib.reload(conv_store)
+
+    conv_store.save_conversation(
+        "sess",
+        [
+            {"id": "m1:user", "role": "user", "text": "remember this"},
+            {
+                "id": "m1",
+                "role": "ai",
+                "text": "Requested tool remember (jaffa_cake_recipe). Awaiting approval.",
+                "metadata": {"tool_response_pending": True},
+            },
+        ],
+    )
+
+    from app import routes
+    from app.base_services import ModelContext
+
+    routes.llm_service.contexts = {"default": ModelContext(system_prompt="")}
+    calls = {"count": 0}
+
+    def fake_generate(
+        prompt,
+        session_id=None,
+        model=None,
+        attachments=None,
+        context=None,
+        **kwargs,
+    ):
+        calls["count"] += 1
+        return {
+            "text": "Saved once.",
+            "thought": "",
+            "tools_used": [],
+            "metadata": {},
+        }
+
+    monkeypatch.setattr(routes.llm_service, "generate", fake_generate)
+
+    app = importlib.import_module("app.main").app
+    app.state.pending_tools = {}
+    client = TestClient(app)
+    payload = {
+        "session_id": "sess",
+        "message_id": "m1",
+        "tools": [
+            {
+                "id": "tool-1",
+                "name": "remember",
+                "args": {"key": "jaffa_cake_recipe", "value": "Protein Jaffa Cakes"},
+                "result": {"status": "invoked", "ok": True, "data": "ok"},
+                "status": "invoked",
+            }
+        ],
+    }
+
+    first = client.post("/chat/continue", json=payload)
+    second = client.post("/chat/continue", json=payload)
+    semantic_repeat = client.post(
+        "/chat/continue",
+        json={
+            **payload,
+            "tools": [
+                {
+                    **payload["tools"][0],
+                    "id": "tool-2",
+                }
+            ],
+        },
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert semantic_repeat.status_code == 200
+    assert calls["count"] == 1
+    assert second.json()["message"] == "Saved once."
+    assert semantic_repeat.json()["message"] == "Saved once."
+    saved = conv_store.load_conversation("sess")
+    saved_entry = next(
+        item for item in saved if isinstance(item, dict) and item.get("id") == "m1"
+    )
+    assert saved_entry["text"] == "Saved once."
+    assert saved_entry["metadata"].get("tool_continued") is True
+    assert saved_entry["metadata"].get("tool_response_pending") is None
+    assert saved_entry["metadata"].get("tool_continue_signature")
+    assert saved_entry["metadata"].get("tool_continue_semantic_signature")
+
+
 def test_chat_continue_unresolved_loop_summarizes_mixed_tool_states(
     monkeypatch, tmp_path
 ):
@@ -1153,19 +1412,293 @@ def test_chat_continue_includes_structured_tool_outcome_prompt(monkeypatch, tmp_
     ]
     assert tool_messages
     tool_prompt = tool_messages[-1]
-    assert tool_prompt.startswith("Use these tool results to continue your response.")
-    assert "Discovery-only note" in tool_prompt
-    assert "do not change durable state" in tool_prompt
+    assert tool_prompt.startswith("Tool output exists for this turn.")
+    assert "Discovery found tool or schema information." in tool_prompt
+    assert "call the target tool next" in tool_prompt
     assert "Summary:" in tool_prompt
     assert "Tool result data:" in tool_prompt
     assert '"total_count": 34' in tool_prompt
     assert '"more_tools": 12' in tool_prompt
-    assert '"write_file"' not in tool_prompt
-    assert '"required_args"' not in tool_prompt
+    assert '"actionable_targets"' in tool_prompt
+    assert '"highlighted_tools"' in tool_prompt
+    assert '"name": "write_file"' in tool_prompt
+    assert '"required_args"' in tool_prompt
+    assert '"content"' in tool_prompt
+    assert '"path"' in tool_prompt
+    assert "actionable targets:" in tool_prompt
     assert "picture-in-picture" not in tool_prompt.lower()
     assert "[[tool_call:" not in " ".join(
         str(msg.get("content") or "") for msg in ctx.messages if isinstance(msg, dict)
     )
+
+
+def test_tool_events_prompt_text_preserves_exact_file_tool_schema():
+    from app import routes
+
+    payload = [
+        {
+            "name": "tool_help",
+            "status": "invoked",
+            "args": {
+                "tool_name": "write_file",
+                "detail": "rich",
+                "include_schema": True,
+            },
+            "result": {
+                "status": "invoked",
+                "ok": True,
+                "data": {
+                    "query": {
+                        "tool_name": "write_file",
+                        "detail": "rich",
+                        "include_schema": True,
+                    },
+                    "count": 1,
+                    "tools": [
+                        {
+                            "name": "write_file",
+                            "summary": "Write content to a local file.",
+                            "required_args": ["content", "path"],
+                            "arguments": [
+                                {
+                                    "name": "path",
+                                    "type": "string",
+                                    "required": True,
+                                },
+                                {
+                                    "name": "content",
+                                    "type": "string",
+                                    "required": True,
+                                },
+                            ],
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "path": {"type": "string", "title": "Path"},
+                                    "content": {
+                                        "type": "string",
+                                        "title": "Content",
+                                    },
+                                },
+                                "required": ["path", "content"],
+                            },
+                        }
+                    ],
+                },
+            },
+        }
+    ]
+
+    text = routes._tool_events_prompt_text(payload)
+
+    assert "Discovery found tool or schema information." in text
+    assert '"tool": {' in text
+    assert '"name": "write_file"' in text
+    assert '"required_args": [' in text
+    assert '"content"' in text
+    assert '"path"' in text
+    assert '"schema": {' in text
+
+
+def test_tool_events_prompt_text_preserves_exact_memory_tool_schema():
+    from app import routes
+
+    payload = [
+        {
+            "name": "tool_info",
+            "status": "invoked",
+            "args": {
+                "tool_name": "remember",
+                "detail": "rich",
+                "include_schema": True,
+            },
+            "result": {
+                "status": "invoked",
+                "ok": True,
+                "data": {
+                    "query": {
+                        "tool_name": "remember",
+                        "detail": "rich",
+                        "include_schema": True,
+                    },
+                    "count": 1,
+                    "tools": [
+                        {
+                            "name": "remember",
+                            "summary": "Store or update a memory item.",
+                            "required_args": ["key", "value"],
+                            "arguments": [
+                                {
+                                    "name": "key",
+                                    "type": "string",
+                                    "required": True,
+                                },
+                                {
+                                    "name": "value",
+                                    "type": "string|number|boolean|object|array",
+                                    "required": True,
+                                },
+                            ],
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "key": {"type": "string"},
+                                    "value": {
+                                        "type": [
+                                            "string",
+                                            "number",
+                                            "boolean",
+                                            "object",
+                                            "array",
+                                        ],
+                                    },
+                                },
+                                "required": ["key", "value"],
+                            },
+                        }
+                    ],
+                },
+            },
+        }
+    ]
+
+    text = routes._tool_events_prompt_text(payload)
+
+    assert '"tool": {' in text
+    assert '"name": "remember"' in text
+    assert '"required_args": [' in text
+    assert '"key"' in text
+    assert '"value"' in text
+    assert '"schema": {' in text
+
+
+def test_tool_events_prompt_text_highlights_actionable_tools_from_more_tools():
+    from app import routes
+
+    payload = [
+        {
+            "name": "help",
+            "status": "invoked",
+            "args": {"detail": "names", "max_tools": 3},
+            "result": {
+                "status": "invoked",
+                "ok": True,
+                "data": {
+                    "query": {"detail": "names", "max_tools": 3},
+                    "count": 3,
+                    "total_count": 20,
+                    "tools": ["help", "tool_help", "tool_info"],
+                    "more_tools": ["write_file", "remember", "recall"],
+                },
+            },
+        }
+    ]
+
+    text = routes._tool_events_prompt_text(payload)
+
+    assert "actionable targets: write_file, remember, recall" in text
+    assert '"actionable_targets"' in text
+    assert '"highlighted_tools"' in text
+    assert '"name": "write_file"' in text
+    assert '"required_args"' in text
+    assert '"content"' in text
+    assert '"path"' in text
+
+
+def test_tool_events_prompt_text_highlights_actionable_tools_from_families():
+    from app import routes
+
+    payload = [
+        {
+            "name": "help",
+            "status": "invoked",
+            "args": {"detail": "names", "max_tools": 3},
+            "result": {
+                "status": "invoked",
+                "ok": True,
+                "data": {
+                    "query": {"detail": "names", "max_tools": 3},
+                    "count": 3,
+                    "total_count": 42,
+                    "tools": ["help", "tool_help", "tool_info"],
+                    "more_tools": [
+                        "list_actions",
+                        "read_action_diff",
+                        "revert_actions",
+                    ],
+                    "families": [
+                        {"name": "files", "count": 3},
+                        {"name": "memory", "count": 3},
+                        {"name": "calendar", "count": 3},
+                    ],
+                },
+            },
+        }
+    ]
+
+    text = routes._tool_events_prompt_text(payload)
+
+    assert "actionable targets:" in text
+    assert '"actionable_targets"' in text
+    assert '"create_task"' in text
+    assert '"name": "write_file"' in text
+    assert '"content"' in text
+    assert '"path"' in text
+    assert '"name": "remember"' in text
+    assert '"key"' in text
+    assert '"value"' in text
+
+
+def test_tool_events_prompt_text_preserves_file_memory_compat_suggestions():
+    from app import routes
+
+    payload = [
+        {
+            "name": "tool_info",
+            "status": "invoked",
+            "args": {"tool_name": "writefile", "include_schema": False},
+            "result": {
+                "status": "invoked",
+                "ok": True,
+                "data": {
+                    "query": {"tool_name": "writefile"},
+                    "error": "unknown_tool",
+                    "tool_name": "writefile",
+                    "did_you_mean": ["write_file"],
+                    "menu": {"tools": ["write_file"]},
+                },
+            },
+        },
+        {
+            "name": "tool_info",
+            "status": "invoked",
+            "args": {"tool_name": "memory.read", "include_schema": False},
+            "result": {
+                "status": "invoked",
+                "ok": True,
+                "data": {
+                    "query": {"tool_name": "memory.read"},
+                    "error": "unknown_tool",
+                    "tool_name": "memory.read",
+                    "did_you_mean": ["recall", "remember", "memory.save"],
+                    "menu": {"tools": ["recall", "remember", "memory.save"]},
+                },
+            },
+        },
+    ]
+
+    text = routes._tool_events_prompt_text(payload)
+
+    assert '"did_you_mean": [' in text
+    assert '"write_file"' in text
+    assert '"remember"' in text
+    assert '"memory.save"' in text
+    assert '"required_args"' in text
+    assert '"content"' in text
+    assert '"path"' in text
+    assert '"key"' in text
+    assert '"value"' in text
 
 
 def test_tool_events_prompt_text_uses_named_budget_policy():
@@ -1200,9 +1733,7 @@ def test_tool_events_prompt_text_uses_named_budget_policy():
     assert "..." in text
 
 
-def test_chat_continue_retries_discovery_only_persistence_claim(
-    monkeypatch, tmp_path
-):
+def test_chat_continue_retries_discovery_only_persistence_claim(monkeypatch, tmp_path):
     monkeypatch.setenv("FLOAT_CONV_DIR", str(tmp_path))
     conv_store = importlib.import_module("app.utils.conversation_store")
     importlib.reload(conv_store)
@@ -1307,6 +1838,238 @@ def test_chat_continue_retries_discovery_only_persistence_claim(
     )
 
 
+def test_chat_continue_retries_discovery_only_file_persistence(monkeypatch, tmp_path):
+    monkeypatch.setenv("FLOAT_CONV_DIR", str(tmp_path))
+    conv_store = importlib.import_module("app.utils.conversation_store")
+    importlib.reload(conv_store)
+
+    conv_store.save_conversation(
+        "sess",
+        [
+            {
+                "id": "m1:user",
+                "role": "user",
+                "text": "add this to workspace/may-4-dinner.md: tofu vermicelli bowl",
+            },
+            {"id": "m1", "role": "ai", "text": "[[tool_call:0]]"},
+        ],
+    )
+
+    from app import routes
+    from app.base_services import ModelContext
+
+    routes.llm_service.contexts = {"default": ModelContext(system_prompt="")}
+    calls = []
+
+    def fake_generate(
+        prompt,
+        session_id=None,
+        model=None,
+        attachments=None,
+        context=None,
+        **kwargs,
+    ):
+        calls.append(context)
+        if len(calls) == 1:
+            return {
+                "text": "I found the file-writing schema.",
+                "thought": "",
+                "tools_used": [
+                    {
+                        "name": "tool_help",
+                        "status": "invoked",
+                        "args": {"tool_name": "write_file"},
+                        "result": {"status": "invoked", "ok": True},
+                    }
+                ],
+                "metadata": {},
+            }
+        retry_context_text = " ".join(
+            str(message.get("content") or "")
+            for message in context.messages
+            if isinstance(message, dict)
+        )
+        assert '"name": "write_file"' in retry_context_text
+        assert '"required_args"' in retry_context_text
+        assert '"content"' in retry_context_text
+        assert '"path"' in retry_context_text
+        return {
+            "text": "Added it to workspace/may-4-dinner.md.",
+            "thought": "",
+            "tools_used": [
+                {
+                    "name": "write_file",
+                    "status": "invoked",
+                    "args": {
+                        "path": "workspace/may-4-dinner.md",
+                        "content": "tofu vermicelli bowl",
+                    },
+                    "result": {"status": "invoked", "ok": True},
+                }
+            ],
+            "metadata": {},
+        }
+
+    monkeypatch.setattr(routes.llm_service, "generate", fake_generate)
+
+    app = importlib.import_module("app.main").app
+    app.state.pending_tools = {}
+    client = TestClient(app)
+    resp = client.post(
+        "/chat/continue",
+        json={
+            "session_id": "sess",
+            "message_id": "m1",
+            "model": None,
+            "tools": [
+                {
+                    "id": "tool-1",
+                    "name": "tool_help",
+                    "args": {
+                        "tool_name": "write_file",
+                        "detail": "rich",
+                        "include_schema": True,
+                    },
+                    "result": {
+                        "status": "invoked",
+                        "ok": True,
+                        "data": {
+                            "query": {
+                                "tool_name": "write_file",
+                                "detail": "rich",
+                                "include_schema": True,
+                            },
+                            "count": 1,
+                            "tools": [{"name": "write_file"}],
+                        },
+                    },
+                    "status": "invoked",
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["message"] == "Added it to workspace/may-4-dinner.md."
+    assert payload["metadata"]["post_discovery_persistence_retry"] is True
+    assert [tool["name"] for tool in payload["tools_used"]] == ["write_file"]
+    assert len(calls) == 2
+
+
+def test_chat_continue_retries_failed_file_write_after_discovery(monkeypatch, tmp_path):
+    monkeypatch.setenv("FLOAT_CONV_DIR", str(tmp_path))
+    conv_store = importlib.import_module("app.utils.conversation_store")
+    importlib.reload(conv_store)
+
+    conv_store.save_conversation(
+        "sess",
+        [
+            {
+                "id": "m1:user",
+                "role": "user",
+                "text": "write this to workspace/may-4-dinner.md: tofu vermicelli bowl",
+            },
+            {"id": "m1", "role": "ai", "text": "[[tool_call:0]]"},
+        ],
+    )
+
+    from app import routes
+    from app.base_services import ModelContext
+
+    routes.llm_service.contexts = {"default": ModelContext(system_prompt="")}
+    calls = []
+
+    def fake_generate(
+        prompt,
+        session_id=None,
+        model=None,
+        attachments=None,
+        context=None,
+        **kwargs,
+    ):
+        calls.append(context)
+        if len(calls) == 1:
+            return {
+                "text": "The write failed; I need to try again with content.",
+                "thought": "",
+                "tools_used": [
+                    {
+                        "name": "write_file",
+                        "status": "error",
+                        "args": {"path": "workspace/may-4-dinner.md"},
+                        "result": {
+                            "status": "error",
+                            "error": "missing required argument: content",
+                        },
+                    }
+                ],
+                "metadata": {},
+            }
+        return {
+            "text": "Added it to workspace/may-4-dinner.md.",
+            "thought": "",
+            "tools_used": [
+                {
+                    "name": "write_file",
+                    "status": "invoked",
+                    "args": {
+                        "path": "workspace/may-4-dinner.md",
+                        "content": "tofu vermicelli bowl",
+                    },
+                    "result": {"status": "invoked", "ok": True},
+                }
+            ],
+            "metadata": {},
+        }
+
+    monkeypatch.setattr(routes.llm_service, "generate", fake_generate)
+
+    app = importlib.import_module("app.main").app
+    app.state.pending_tools = {}
+    client = TestClient(app)
+    resp = client.post(
+        "/chat/continue",
+        json={
+            "session_id": "sess",
+            "message_id": "m1",
+            "model": None,
+            "tools": [
+                {
+                    "id": "tool-1",
+                    "name": "tool_info",
+                    "args": {
+                        "tool_name": "write_file",
+                        "detail": "rich",
+                        "include_schema": True,
+                    },
+                    "result": {
+                        "status": "invoked",
+                        "ok": True,
+                        "data": {
+                            "query": {
+                                "tool_name": "write_file",
+                                "detail": "rich",
+                                "include_schema": True,
+                            },
+                            "count": 1,
+                            "tools": [{"name": "write_file"}],
+                        },
+                    },
+                    "status": "invoked",
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["message"] == "Added it to workspace/may-4-dinner.md."
+    assert payload["metadata"]["post_discovery_persistence_retry"] is True
+    assert [tool["name"] for tool in payload["tools_used"]] == ["write_file"]
+    assert len(calls) == 2
+
+
 def test_chat_continue_strips_inline_tool_markers_from_saved_reply(
     monkeypatch, tmp_path
 ):
@@ -1379,8 +2142,7 @@ def test_chat_continue_strips_inline_tool_markers_from_saved_reply(
         item for item in saved if isinstance(item, dict) and item.get("id") == "m1"
     )
     saved_message = saved_entry.get("text")
-    assert "Checking memory now." in str(saved_message or "")
-    assert "I checked memory and found one note." in str(saved_message or "")
+    assert saved_message == "I checked memory and found one note."
     assert "[[tool_call:" not in str(saved_message or "")
     metadata = saved_entry.get("metadata") if isinstance(saved_entry, dict) else {}
     assert isinstance(metadata, dict)
@@ -1555,10 +2317,10 @@ def test_chat_continue_text_turn_filters_computer_capture_scope(monkeypatch, tmp
         if isinstance(tool, dict) and isinstance(tool.get("name"), str)
     ]
     assert tool_names == ["help", "recall"]
-    assert (
-        "Do not propose or call open_url, computer.*, camera.capture, or capture.*"
-        not in (ctx.system_prompt)
+    assert "Browser, desktop, and camera control are out of scope" not in (
+        ctx.system_prompt
     )
+    assert "open_url" not in ctx.system_prompt
     scope_messages = [
         msg
         for msg in ctx.messages
@@ -1567,9 +2329,9 @@ def test_chat_continue_text_turn_filters_computer_capture_scope(monkeypatch, tmp
         and (msg.get("metadata") or {}).get("turn_message_key") == "turn_scope"
     ]
     assert scope_messages
-    assert (
-        "Do not propose or call open_url, computer.*, camera.capture, or capture.*"
-        in str(scope_messages[-1].get("content") or "")
+    assert "Turn mode: text/knowledge." in str(scope_messages[-1].get("content") or "")
+    assert "Browser, desktop, and camera control are out of scope" in str(
+        scope_messages[-1].get("content") or ""
     )
     system_text = " ".join(
         str(msg.get("content") or "")
@@ -1589,7 +2351,7 @@ def test_chat_continue_text_turn_filters_computer_capture_scope(monkeypatch, tmp
         and (msg.get("metadata") or {}).get("turn_message_key") == "continuation"
     ]
     assert continuation_messages
-    assert "Continue your response to the user's last message." in str(
+    assert "Continue from the tool output" in str(
         continuation_messages[-1].get("content") or ""
     )
     assert not any(
@@ -1622,7 +2384,9 @@ def test_chat_continue_computer_results_keep_computer_capture_scope(
     from app import routes
     from app.base_services import ModelContext
 
-    _pin_default_workflow_settings(monkeypatch, tmp_path)
+    _pin_default_workflow_settings(
+        monkeypatch, tmp_path, enabled_modules=["computer_use"]
+    )
     tool_defs = [
         {"name": "help", "description": "help", "parameters": {}},
         {"name": "open_url", "description": "open", "parameters": {}},
@@ -1683,10 +2447,7 @@ def test_chat_continue_computer_results_keep_computer_capture_scope(
     ]
     assert "computer.observe" in tool_names
     assert "camera.capture" in tool_names
-    assert (
-        "browser, desktop, or capture tools are in scope"
-        not in ctx.system_prompt.lower()
-    )
+    assert "turn mode: computer/capture" not in ctx.system_prompt.lower()
     scope_messages = [
         msg
         for msg in ctx.messages
@@ -1695,7 +2456,7 @@ def test_chat_continue_computer_results_keep_computer_capture_scope(
         and (msg.get("metadata") or {}).get("turn_message_key") == "turn_scope"
     ]
     assert scope_messages
-    assert "Browser, desktop, and capture tools are in scope for this turn." in str(
+    assert "Turn mode: computer/capture." in str(
         scope_messages[-1].get("content") or ""
     )
     system_text = " ".join(
@@ -1707,11 +2468,7 @@ def test_chat_continue_computer_results_keep_computer_capture_scope(
         "Computer observations and camera captures are transient by default."
         in system_text
     )
-    assert (ctx.metadata.get("workflow") or {}).get("modules") == [
-        "camera_capture",
-        "computer_use",
-        "memory_promotion",
-    ]
+    assert (ctx.metadata.get("workflow") or {}).get("modules") == ["computer_use"]
 
 
 def test_turn_system_messages_dedupe_by_key():
@@ -1760,8 +2517,8 @@ def test_effective_system_prompt_appends_json_tool_call_hint():
         response_format=None,
     )
 
-    assert "call help or tool_help with `{}`" in prompt
-    assert "do not invent `tool_name` or `failed_*` fields" in prompt
+    assert "Tool discovery: use `help`, `tool_help`, or `tool_info`" in prompt
+    assert "call that target tool next" in prompt
     assert (
         'Tool call syntax for this turn: emit direct JSON only in the form {"tool":"<exact_tool_name>","args":{...}}'
         in prompt
@@ -1778,7 +2535,7 @@ def test_effective_system_prompt_appends_harmony_tool_call_hint():
         response_format="harmony",
     )
 
-    assert "call help or tool_help with `{}`" in prompt
+    assert "Tool discovery: use `help`, `tool_help`, or `tool_info`" in prompt
     assert (
         "Tool call syntax for this turn: emit Harmony tool calls only in the form "
         "<|channel|>commentary to=<exact_tool_name> <|constrain|>json <|message|>{...}; "
@@ -1791,11 +2548,100 @@ def test_effective_system_prompt_keeps_empty_menu_guidance_when_base_mentions_to
     from app import routes
 
     prompt = routes._effective_system_prompt(
-        "Use tool_help and tool_info before guessing.",
+        "Use tool_help and tool_info when tool choice or schema is unclear.",
         response_format=None,
     )
 
-    assert "call help or tool_help with `{}`" in prompt
+    assert prompt.count("Tool discovery:") == 0
+
+
+def test_effective_system_prompt_appends_available_tool_summary_before_syntax():
+    from app import routes
+
+    prompt = routes._effective_system_prompt(
+        "Base prompt with tool_help and tool_info when tool choice is unclear.",
+        response_format=None,
+        tools=[
+            {
+                "name": "help",
+                "description": "List available tools.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "remember",
+                "description": "Store durable memory.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string"},
+                        "value": {"type": "string"},
+                    },
+                    "required": ["key", "value"],
+                },
+            },
+            {
+                "name": "computer.session.start",
+                "description": "Start a computer session.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "computer.observe",
+                "description": "Observe a computer session.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "computer.act",
+                "description": "Act in a computer session.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ],
+    )
+
+    assert "**available tools this turn (brief):" in prompt
+    assert "- `help`: List available tools." in prompt
+    assert "- `remember`: Store durable memory. (required: key, value)" in prompt
+    assert (
+        "- `computer.*`: computer.session.start, computer.observe, computer.act"
+        in prompt
+    )
+    assert prompt.index("**available tools this turn") < prompt.index(
+        "Tool call syntax for this turn:"
+    )
+
+
+def test_registered_prompt_tool_definitions_prioritize_core_tools_without_context_tools():
+    from app import routes
+
+    class MemoryManager:
+        def list_tools(self):
+            return [
+                "computer.act",
+                "search_web",
+                "tool_info",
+                "help",
+                "write_file",
+                "remember",
+                "recall",
+                "read_file",
+                "list_dir",
+            ]
+
+    class State:
+        memory_manager = MemoryManager()
+
+    class App:
+        state = State()
+
+    prompt_tools = routes._registered_prompt_tool_definitions(
+        App(),
+        allow_computer_capture=False,
+    )
+    names = [routes._tool_definition_name(tool) for tool in prompt_tools]
+
+    assert names[:5] == ["remember", "recall", "write_file", "read_file", "list_dir"]
+    assert "help" in names
+    assert "tool_info" in names
+    assert "computer.act" not in names
 
 
 def test_effective_system_prompt_dedupes_existing_tool_call_hints():
@@ -1842,6 +2688,19 @@ def test_route_response_format_uses_harmony_only_for_gpt_oss():
             model_name="gpt-5.4",
         )
         is None
+    )
+
+    assert routes._config_allows_harmony_for_model(
+        {"harmony_format_mode": "auto"},
+        "openai/gpt-oss-20b",
+    )
+    assert not routes._config_allows_harmony_for_model(
+        {"harmony_format_mode": "disabled"},
+        "openai/gpt-oss-20b",
+    )
+    assert not routes._config_allows_harmony_for_model(
+        {"harmony_format_mode": "enabled"},
+        "gpt-5.4",
     )
     assert (
         routes._resolve_route_response_format(

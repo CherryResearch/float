@@ -229,7 +229,11 @@ const TopBar = () => {
         });
 
   const setBackendMode = (mode) => {
-    setState((prev) => ({ ...prev, backendMode: mode }));
+    setState((prev) => ({
+      ...prev,
+      backendMode: mode,
+      runtimeSelectionTouchedAt: Date.now(),
+    }));
     const payload = { mode };
     if (mode === "api") {
       if (state.apiModel) {
@@ -340,10 +344,50 @@ const TopBar = () => {
         aria-label={wsStatusTitle}
       >
         <span
-          className={`status-dot ${state.wsStatus === "online" ? "ok" : "err"}`}
+          className={`status-dot ${
+            state.wsStatus === "online"
+              ? "ok"
+              : state.wsStatus === "loading"
+                ? "warn"
+                : "err"
+          }`}
           aria-hidden="true"
         />
       </Link>
+      {state.backendMode === "server" && (
+        <input
+          className="server-ip-input"
+          type="text"
+          inputMode="url"
+          placeholder="server/lan url"
+          value={state.serverUrl || ""}
+          onChange={(event) =>
+            setState((prev) => ({
+              ...prev,
+              serverUrl: event.target.value,
+              runtimeSelectionTouchedAt: Date.now(),
+            }))
+          }
+          onBlur={(event) => {
+            const value = (event.currentTarget.value || "").trim();
+            if (value !== (state.serverUrl || "")) {
+              setState((prev) => ({
+                ...prev,
+                serverUrl: value,
+                runtimeSelectionTouchedAt: Date.now(),
+              }));
+            }
+            fireAndForget(axios.post("/api/settings", { server_url: value }));
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.currentTarget.blur();
+            }
+          }}
+          title="Server/LAN URL"
+          aria-label="Server/LAN URL"
+        />
+      )}
       <button
         type="button"
         className="chip backend-chip"
@@ -353,21 +397,6 @@ const TopBar = () => {
       >
         {modeDisplayLabel(state.backendMode)}
       </button>
-      {state.backendMode === "server" && (
-        <input
-          className="server-ip-input"
-          type="text"
-          inputMode="url"
-          placeholder="server/lan url"
-          value={state.serverUrl || ""}
-          onChange={(e) => setState((prev) => ({ ...prev, serverUrl: e.target.value }))}
-          onBlur={() => {
-            const value = (state.serverUrl || "").trim();
-            axios.post("/api/settings", { server_url: value }).catch(() => {});
-          }}
-          title="Server/LAN URL"
-        />
-      )}
       <select
         className="model-select"
         value={selectedModelValue}
@@ -456,18 +485,27 @@ const TopBar = () => {
   const handleModelChange = (e) => {
     const value = e.target.value;
     if (state.backendMode === "api") {
-      setState((prev) => ({ ...prev, apiModel: value }));
+      setState((prev) => ({
+        ...prev,
+        apiModel: value,
+        runtimeSelectionTouchedAt: Date.now(),
+      }));
       // Persist so Settings + background jobs remain consistent.
       fireAndForget(axios.post("/api/settings", { openai_model: value }));
     } else if (state.backendMode === "local") {
       setState((prev) => ({
         ...prev,
         localModel: value,
+        runtimeSelectionTouchedAt: Date.now(),
         ...(!isLocalRuntimeEntry(value) ? { transformerModel: value } : {}),
       }));
       fireAndForget(axios.post("/api/settings", buildLocalSettingsPayload(value)));
     } else {
-      setState((prev) => ({ ...prev, transformerModel: value }));
+      setState((prev) => ({
+        ...prev,
+        transformerModel: value,
+        runtimeSelectionTouchedAt: Date.now(),
+      }));
       fireAndForget(axios.post("/api/settings", { transformer_model: value }));
     }
   };
@@ -703,7 +741,7 @@ const TopBar = () => {
       return;
     }
     const current = resolveConcreteModelSelection(state.transformerModel);
-    if (current && serverInventoryModelSet.has(current)) {
+    if (current) {
       return;
     }
     const nextModel =

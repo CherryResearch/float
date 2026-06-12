@@ -10,9 +10,13 @@ sys.modules.setdefault(
     types.SimpleNamespace(Message=None, Role=None),
 )
 
-dotenv_stub = types.ModuleType("dotenv")
-dotenv_stub.load_dotenv = lambda *args, **kwargs: None
-sys.modules.setdefault("dotenv", dotenv_stub)
+try:
+    import dotenv as _dotenv  # noqa: F401
+except ImportError:
+    dotenv_stub = types.ModuleType("dotenv")
+    dotenv_stub.load_dotenv = lambda *args, **kwargs: None
+    dotenv_stub.dotenv_values = lambda *args, **kwargs: {}
+    sys.modules.setdefault("dotenv", dotenv_stub)
 
 
 langextract_data = types.ModuleType("langextract.data")
@@ -57,9 +61,12 @@ sys.modules.setdefault("langextract.data", langextract_data)
 
 jwt_stub = types.ModuleType("jwt")
 jwt_stub.encode = lambda *args, **kwargs: ""
+
+
 # Provide InvalidTokenError so other tests can assert on it
 class _InvalidTokenError(Exception):
     pass
+
 
 jwt_stub.InvalidTokenError = _InvalidTokenError
 sys.modules.setdefault("jwt", jwt_stub)

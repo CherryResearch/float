@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import math
@@ -43,12 +44,50 @@ def _resolve_data_dir() -> Path:
 DATA_DIR = _resolve_data_dir()
 DEFAULT_SUMMARY_PATH = DATA_DIR / "threads" / "threads_summary.json"
 LEGACY_SUMMARY_PATH = REPO_ROOT / "summary.json"
-DEFAULT_PREFERRED_K = 16
-DEFAULT_MAX_K = 30
+DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_TOPIC_SUGGESTION_PROVIDER = "local"
+DEFAULT_LOCAL_TOPIC_MODEL = "local:heuristic"
+DEFAULT_API_TOPIC_MODEL = "gpt-4o-mini"
+DEFAULT_PREFERRED_K = 8
+DEFAULT_MAX_K = 16
 DEFAULT_THREAD_SIGNAL_BLEND = 0.7
 DEFAULT_SAE_PROXY_TOPK = 20
 THREADS_SUMMARY_SCHEMA_VERSION = 2
 THREAD_OVERVIEW_SCHEMA_VERSION = 1
+API_SENSITIVE_PRIVACY_MODES = {"protected", "secret"}
+API_SENSITIVE_LEVELS = {"protected", "secret"}
+
+
+def _normalize_conversation_privacy_mode(value: Any) -> str:
+    normalizer = getattr(
+        conversation_store, "normalize_conversation_privacy_mode", None
+    )
+    if callable(normalizer):
+        return str(normalizer(value) or "default").strip().lower() or "default"
+    mode = str(value or "").strip().lower()
+    return mode if mode in {"default", "protected", "secret"} else "default"
+
+
+def _conversation_privacy_to_sensitivity(value: Any) -> str:
+    converter = getattr(conversation_store, "conversation_privacy_to_sensitivity", None)
+    if callable(converter):
+        return str(converter(value) or "").strip().lower()
+    mode = _normalize_conversation_privacy_mode(value)
+    if mode in {"protected", "secret"}:
+        return mode
+    return "personal"
+
+
+def _conversation_privacy_mode_from_sensitivity(value: Any) -> str:
+    converter = getattr(
+        conversation_store,
+        "conversation_privacy_mode_from_sensitivity",
+        None,
+    )
+    if callable(converter):
+        return str(converter(value) or "default").strip().lower() or "default"
+    level = str(value or "").strip().lower()
+    return level if level in {"protected", "secret"} else "default"
 
 
 logger = logging.getLogger(__name__)
@@ -432,6 +471,243 @@ def _normalize_thread_signal_blend(value: Any) -> float:
     return max(0.0, min(parsed, 1.0))
 
 
+def _normalize_embedding_model(value: Any) -> str:
+    model = str(value or "").strip()
+    return model or DEFAULT_EMBEDDING_MODEL
+
+
+def _normalize_topic_suggestion_provider(value: Any) -> str:
+    provider = str(value or DEFAULT_TOPIC_SUGGESTION_PROVIDER).strip().lower()
+    if provider in {"api", "openai", "cloud"}:
+        return "api"
+    return DEFAULT_TOPIC_SUGGESTION_PROVIDER
+
+
+def _normalize_topic_suggestion_model(value: Any, provider: str) -> str:
+    model = str(value or "").strip()
+    if model:
+        return model
+    if provider == "api":
+        return DEFAULT_API_TOPIC_MODEL
+    return DEFAULT_LOCAL_TOPIC_MODEL
+
+
+def _topic_label(value: Any) -> str:
+    label = str(value or "").replace("\r", " ").replace("\n", " ").strip()
+    label = re.sub(r"\s{2,}", " ", label)
+    return label[:80].strip()
+
+
+def _read_existing_conversation_metadata(name: str) -> Dict[str, Any]:
+    meta_path_fn = getattr(conversation_store, "_meta_path", None)
+    if callable(meta_path_fn):
+        try:
+            meta_path = Path(meta_path_fn(name))
+            if not meta_path.exists():
+                return {}
+        except Exception:
+            return {}
+    load_meta = getattr(conversation_store, "_load_meta", None)
+    if callable(load_meta):
+        try:
+            meta = load_meta(name)
+            return meta if isinstance(meta, dict) else {}
+        except Exception:
+            return {}
+    get_metadata = getattr(conversation_store, "get_metadata", None)
+    if callable(get_metadata) and callable(meta_path_fn):
+        try:
+            meta = get_metadata(name)
+            return meta if isinstance(meta, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _build_generation_topic_record(
+    summary: Dict[str, Any],
+    *,
+    topic_seeds: List[str],
+) -> Dict[str, Any]:
+    conversations = summary.get("conversations")
+    if not isinstance(conversations, dict):
+        conversations = {}
+
+    global_counts: dict[str, int] = {}
+    conversation_rows: list[dict[str, Any]] = []
+    for conversation, info in conversations.items():
+        if not isinstance(info, dict):
+            continue
+        topics = info.get("topics")
+        if not isinstance(topics, dict):
+            continue
+        ranked: list[tuple[str, int]] = []
+        for raw_topic, raw_count in topics.items():
+            topic = _topic_label(raw_topic)
+            if not topic:
+                continue
+            try:
+                count = int(raw_count or 0)
+            except Exception:
+                count = 0
+            if count <= 0:
+                continue
+            global_counts[topic] = int(global_counts.get(topic, 0) or 0) + count
+            ranked.append((topic, count))
+        if not ranked:
+            continue
+        max_count = max(count for _, count in ranked) or 1
+        conversation_rows.append(
+            {
+                "conversation": _normalize_conversation_reference(conversation),
+                "topics": [
+                    {
+                        "topic": topic,
+                        "score": round(float(count) / float(max_count), 4),
+                    }
+                    for topic, count in sorted(
+                        ranked,
+                        key=lambda item: (-item[1], item[0].lower()),
+                    )[:5]
+                ],
+            }
+        )
+
+    max_global = max(global_counts.values()) if global_counts else 0
+    suggested_topics = [
+        {
+            "topic": topic,
+            "score": round(float(count) / float(max_global), 4) if max_global else 0.0,
+        }
+        for topic, count in sorted(
+            global_counts.items(),
+            key=lambda item: (-item[1], item[0].lower()),
+        )[:12]
+    ]
+
+    return {
+        "suggested_topics": suggested_topics,
+        "topic_seeds": list(topic_seeds),
+        "suggested_topics_by_conversation": conversation_rows[:50],
+    }
+
+
+def _scope_conversation_privacy_state(
+    *,
+    scope_folder: Optional[str] = None,
+    scope_pairs: Optional[set[tuple[str, int]]] = None,
+) -> Dict[str, Any]:
+    names = [
+        str(name or "").strip()
+        for name in conversation_store.list_conversations()
+        if str(name or "").strip()
+    ]
+    scoped_pairs = {
+        _normalize_conversation_reference(name)
+        for name, _idx in (scope_pairs or set())
+        if _normalize_conversation_reference(name)
+    }
+    checked_count = 0
+    sensitive_count = 0
+    for name in names:
+        if scope_folder and not _in_scope_folder(name, scope_folder):
+            continue
+        normalized_name = _normalize_conversation_reference(name)
+        if scoped_pairs and normalized_name not in scoped_pairs:
+            continue
+        checked_count += 1
+        meta = _read_existing_conversation_metadata(name)
+        privacy_mode = _normalize_conversation_privacy_mode(
+            meta.get("privacy_mode")
+            or _conversation_privacy_mode_from_sensitivity(meta.get("sensitivity"))
+        )
+        sensitivity = (
+            str(
+                meta.get("sensitivity")
+                or _conversation_privacy_to_sensitivity(privacy_mode)
+                or ""
+            )
+            .strip()
+            .lower()
+        )
+        if (
+            privacy_mode in API_SENSITIVE_PRIVACY_MODES
+            or sensitivity in API_SENSITIVE_LEVELS
+        ):
+            sensitive_count += 1
+    return {
+        "checked_count": checked_count,
+        "sensitive_count": sensitive_count,
+        "has_sensitive": sensitive_count > 0,
+    }
+
+
+def _embed_texts_for_model(texts: List[str], embedding_model: Optional[str]):
+    normalized_model = _normalize_embedding_model(embedding_model)
+    if normalized_model == DEFAULT_EMBEDDING_MODEL:
+        return embed_texts(texts)
+    return embed_texts(texts, model_name=normalized_model)
+
+
+def _summarize_clusters_compat(
+    *,
+    nuggets_text: List[str],
+    labels: List[int],
+    embeddings: List[List[float]],
+    embedder: Any,
+    k: int,
+    tags: Optional[list[str]],
+    infer_topics: bool,
+    openai_key: Optional[str],
+    nug_sources: List[Path],
+    nug_speakers: List[Optional[str]],
+    nug_conversations: List[str],
+    nug_msg_indices: List[int],
+    nug_datestamps: List[str],
+    topic_suggestion_model: Optional[str],
+):
+    args = (
+        nuggets_text,
+        labels,
+        embeddings,
+        embedder,
+        k,
+        tags,
+        infer_topics,
+        openai_key,
+        nug_sources,
+        nug_speakers,
+        nug_conversations,
+        nug_msg_indices,
+        nug_datestamps,
+    )
+    try:
+        signature = inspect.signature(summarize_clusters)
+    except (TypeError, ValueError):
+        return summarize_clusters(*args, topic_suggestion_model)
+
+    params = signature.parameters
+    values = list(params.values())
+    if "topic_model" in params or any(
+        param.kind is inspect.Parameter.VAR_KEYWORD for param in values
+    ):
+        return summarize_clusters(*args, topic_model=topic_suggestion_model)
+    positional_capacity = 0
+    supports_varargs = False
+    for param in values:
+        if param.kind is inspect.Parameter.VAR_POSITIONAL:
+            supports_varargs = True
+            break
+        if param.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            positional_capacity += 1
+    if supports_varargs or positional_capacity > len(args):
+        return summarize_clusters(*args, topic_suggestion_model)
+    return summarize_clusters(*args)
+
+
 def _normalize_sae_options(value: Any) -> Dict[str, Any]:
     """Normalize experimental SAE options stored in threads UI hints."""
 
@@ -784,6 +1060,7 @@ def _generate_threads_via_float(
     infer_topics: bool,
     tags: Optional[list[str]],
     openai_key: Optional[str],
+    embedding_model: Optional[str],
     k_option: Optional[int] = None,
     preferred_k: Optional[int] = None,
     max_k: Optional[int] = None,
@@ -791,6 +1068,7 @@ def _generate_threads_via_float(
     scope_pairs: Optional[set[tuple[str, int]]] = None,
     cluster_backend: Optional[str] = None,
     cluster_device: Optional[str] = None,
+    topic_suggestion_model: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Float-native path: read conversations via conversation_store, build
     nuggets using SemanticTagsService primitives to embed, cluster, and
@@ -864,7 +1142,7 @@ def _generate_threads_via_float(
             return out
 
         # Embed text nuggets
-        embeddings, embedder = embed_texts(nuggets_text)
+        embeddings, embedder = _embed_texts_for_model(nuggets_text, embedding_model)
         # Cache for search
         _CACHE["embeddings"] = embeddings
         _CACHE["nuggets"] = [
@@ -921,20 +1199,21 @@ def _generate_threads_via_float(
                 cluster_backend=cluster_backend,
                 cluster_device=cluster_device,
             )
-        base_summary, centroids = summarize_clusters(
-            nuggets_text,
-            labels,
-            embeddings,
-            embedder,
-            k,
-            tags,
-            infer_topics,
-            openai_key,
-            nug_sources,
-            nug_speakers,
-            nug_conversations,
-            nug_msg_indices,
-            nug_datestamps,
+        base_summary, centroids = _summarize_clusters_compat(
+            nuggets_text=nuggets_text,
+            labels=labels,
+            embeddings=embeddings,
+            embedder=embedder,
+            k=k,
+            tags=tags,
+            infer_topics=infer_topics,
+            openai_key=openai_key,
+            nug_sources=nug_sources,
+            nug_speakers=nug_speakers,
+            nug_conversations=nug_conversations,
+            nug_msg_indices=nug_msg_indices,
+            nug_datestamps=nug_datestamps,
+            topic_suggestion_model=topic_suggestion_model,
         )
         _CACHE["cluster_centroids"] = centroids
 
@@ -954,6 +1233,7 @@ def generate_threads(
     infer_topics: bool = True,
     tags: Optional[list[str]] = None,
     openai_key: Optional[str] = None,
+    embedding_model: Optional[str] = None,
     k_option: Optional[int] = None,
     preferred_k: Optional[int] = DEFAULT_PREFERRED_K,
     max_k: Optional[int] = DEFAULT_MAX_K,
@@ -962,6 +1242,7 @@ def generate_threads(
     coalesce_related: bool = True,
     scope_folder: Optional[str] = None,
     scope_thread: Optional[str] = None,
+    sensitive_mode: bool = True,
     thread_signal_mode: Optional[str] = None,
     thread_signal_blend: Optional[float] = None,
     sae_model_combo: Optional[str] = None,
@@ -970,6 +1251,11 @@ def generate_threads(
     sae_options: Optional[Dict[str, Any]] = None,
     cluster_backend: Optional[str] = None,
     cluster_device: Optional[str] = None,
+    topic_suggestion_provider: Optional[str] = None,
+    topic_suggestion_model: Optional[str] = None,
+    operation_id: Optional[str] = None,
+    operation_owner: Optional[str] = None,
+    operation_source: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run semantic-tag generation against the Float conversations directory using
@@ -985,12 +1271,15 @@ def generate_threads(
     out_path = _resolve_summary_path(summary_out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Topic inference can still run without an API key using local heuristics.
-    topic_inference = bool(infer_topics)
-    if infer_topics and not openai_key:
-        logger.info(
-            "Topic inference requested without an OpenAI key; using local heuristic labels."
-        )
+    normalized_embedding_model = _normalize_embedding_model(embedding_model)
+    sensitive_mode_enabled = bool(sensitive_mode)
+    normalized_topic_provider = _normalize_topic_suggestion_provider(
+        topic_suggestion_provider
+    )
+    normalized_topic_model = _normalize_topic_suggestion_model(
+        topic_suggestion_model,
+        normalized_topic_provider,
+    )
 
     preferred_k_value = _as_int(preferred_k, min_value=2)
     max_k_value = _as_int(max_k, min_value=2)
@@ -1008,6 +1297,41 @@ def generate_threads(
         scope_thread,
         current_summary,
     )
+    scope_privacy_state = _scope_conversation_privacy_state(
+        scope_folder=normalized_scope_folder,
+        scope_pairs=scope_pairs,
+    )
+    api_blocked_by_sensitive = bool(
+        sensitive_mode_enabled
+        and normalized_topic_provider == "api"
+        and scope_privacy_state.get("has_sensitive")
+    )
+    api_key_available = bool(str(openai_key or "").strip())
+    api_blocked_reason = ""
+    if api_blocked_by_sensitive:
+        api_blocked_reason = "sensitive_conversation"
+    elif normalized_topic_provider == "api" and not api_key_available:
+        api_blocked_reason = "missing_api_key"
+    effective_topic_provider = (
+        "api"
+        if normalized_topic_provider == "api"
+        and api_key_available
+        and not api_blocked_by_sensitive
+        else "local"
+    )
+    effective_topic_model = (
+        normalized_topic_model
+        if effective_topic_provider == normalized_topic_provider
+        else DEFAULT_LOCAL_TOPIC_MODEL
+    )
+    effective_openai_key = openai_key if effective_topic_provider == "api" else None
+
+    # Topic inference can still run without an API key using local heuristics.
+    topic_inference = bool(infer_topics)
+    if infer_topics and not effective_openai_key:
+        logger.info(
+            "Topic inference requested without external labeling; using local heuristic labels."
+        )
 
     # Generate threads directly via SemanticTagsService
     float_summary = _generate_threads_via_float(
@@ -1015,7 +1339,8 @@ def generate_threads(
         out_path,
         topic_inference,
         tags,
-        openai_key,
+        effective_openai_key,
+        normalized_embedding_model,
         k_option,
         preferred_k_value,
         max_k_value,
@@ -1023,6 +1348,7 @@ def generate_threads(
         scope_pairs,
         str(clustering_state.get("backend") or "sklearn"),
         str(clustering_state.get("device") or "cpu"),
+        effective_topic_model,
     )
     if float_summary is None:
         raise RuntimeError("SemanticTagsService is required")
@@ -1061,7 +1387,10 @@ def generate_threads(
 
     if manual_threads:
         try:
-            thread_embs, _ = embed_texts(manual_threads)
+            thread_embs, _ = _embed_texts_for_model(
+                manual_threads,
+                normalized_embedding_model,
+            )
             thread_vecs = {t: v for t, v in zip(manual_threads, thread_embs)}
             _CACHE["thread_names"] = list(thread_vecs.keys())
             threads_map: Dict[str, List[Dict[str, Any]]] = {
@@ -1148,6 +1477,9 @@ def generate_threads(
     float_summary = _ensure_summary_schema(float_summary)
     metadata = float_summary.setdefault("metadata", {})
     ui_hints = metadata.setdefault("ui_hints", {})
+    manual_thread_hints = [
+        str(topic).strip() for topic in (manual_threads or []) if str(topic).strip()
+    ]
     ui_hints["k_option"] = k_option or "auto"
     ui_hints["k_selected"] = int(float_summary.get("cluster_count", 0) or 0)
     ui_hints["preferred_k"] = preferred_k_value
@@ -1155,6 +1487,57 @@ def generate_threads(
     ui_hints["coalesce_related"] = bool(coalesce_related)
     ui_hints["merged_label_count"] = int(merged_label_count)
     ui_hints["infer_topics"] = bool(topic_inference)
+    ui_hints["manual_threads"] = manual_thread_hints
+    ui_hints["topic_pass"] = "seeded" if manual_thread_hints else "main_topics"
+    ui_hints["sensitive_mode"] = sensitive_mode_enabled
+    ui_hints["external_topic_labeling"] = bool(topic_inference and effective_openai_key)
+    ui_hints["topic_suggestion_provider_requested"] = normalized_topic_provider
+    ui_hints["topic_suggestion_model_requested"] = normalized_topic_model
+    ui_hints["topic_suggestion_provider"] = effective_topic_provider
+    ui_hints["topic_suggestion_model"] = effective_topic_model
+    ui_hints["topic_suggestion_prompt"] = (
+        "backend/app/prompts/threads_topic_suggestions.txt"
+        if effective_topic_provider == "api"
+        else ""
+    )
+    ui_hints["api_topic_labeling_blocked"] = bool(api_blocked_reason)
+    ui_hints["api_topic_labeling_blocked_reason"] = api_blocked_reason
+    ui_hints["sensitive_conversation_count"] = int(
+        scope_privacy_state.get("sensitive_count", 0) or 0
+    )
+    ui_hints["privacy_checked_conversation_count"] = int(
+        scope_privacy_state.get("checked_count", 0) or 0
+    )
+    ui_hints["embedding_model_requested"] = normalized_embedding_model
+    ui_hints["embedding_model"] = str(
+        metadata.get("embedding_model") or normalized_embedding_model
+    )
+    requested_labeler = (
+        normalized_topic_model
+        if normalized_topic_model.startswith(f"{normalized_topic_provider}:")
+        else f"{normalized_topic_provider}:{normalized_topic_model}"
+    )
+    used_labeler = (
+        effective_topic_model
+        if effective_topic_model.startswith(f"{effective_topic_provider}:")
+        else f"{effective_topic_provider}:{effective_topic_model}"
+    )
+    operation_record = {
+        "id": str(operation_id or "").strip(),
+        "kind": "threads_generation",
+        "owner": str(operation_owner or "threads_service.generate_threads").strip(),
+        "source": str(
+            operation_source or ("/api/threads/generate" if operation_id else "service")
+        ).strip(),
+        "status": "complete",
+        "embedding_model": ui_hints["embedding_model"],
+        "topic_labeler_requested": requested_labeler,
+        "topic_labeler_used": used_labeler,
+        "cluster_backend": str(clustering_state.get("backend") or "sklearn"),
+        "cluster_device": str(clustering_state.get("device") or "cpu"),
+    }
+    metadata["operation"] = operation_record
+    ui_hints["operation"] = operation_record
     scope_mode = "all"
     if resolved_scope_thread:
         scope_mode = "thread"
@@ -1183,6 +1566,31 @@ def generate_threads(
     generated_at_utc = datetime.now(timezone.utc).isoformat()
     metadata["generated_at_utc"] = generated_at_utc
     ui_hints["generated_at_utc"] = generated_at_utc
+    generation_record = _build_generation_topic_record(
+        float_summary,
+        topic_seeds=manual_thread_hints,
+    )
+    generation_record.update(
+        {
+            "topic_pass": ui_hints["topic_pass"],
+            "topic_suggestion_provider_requested": normalized_topic_provider,
+            "topic_suggestion_model_requested": normalized_topic_model,
+            "topic_suggestion_provider": effective_topic_provider,
+            "topic_suggestion_model": effective_topic_model,
+            "embedding_model": ui_hints["embedding_model"],
+            "operation": operation_record,
+            "sensitive_mode": sensitive_mode_enabled,
+            "external_topic_labeling": bool(topic_inference and effective_openai_key),
+            "api_topic_labeling_blocked": bool(api_blocked_reason),
+            "api_topic_labeling_blocked_reason": api_blocked_reason,
+            "sensitive_conversation_count": int(
+                scope_privacy_state.get("sensitive_count", 0) or 0
+            ),
+        }
+    )
+    metadata["generation"] = generation_record
+    ui_hints["suggested_topics"] = generation_record["suggested_topics"]
+    ui_hints["topic_seeds"] = generation_record["topic_seeds"]
     merged_sae_options.setdefault("retrieval_mode", normalized_signal_mode)
     merged_sae_options.setdefault("retrieval_blend", normalized_signal_blend)
     if normalized_sae_combo:

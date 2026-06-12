@@ -21,6 +21,7 @@ vi.mock("../../main", () => {
         transformerModel: "gpt-oss-20b",
         staticModel: "gpt-5.4-mini",
         harmonyFormat: false,
+        harmonyFormatMode: "auto",
         serverUrl: "",
         sttModel: "whisper-1",
         ttsModel: "tts-1",
@@ -60,6 +61,7 @@ const baseState = {
   transformerModel: "gpt-oss-20b",
   staticModel: "gpt-5.4-mini",
   harmonyFormat: false,
+  harmonyFormatMode: "auto",
   serverUrl: "",
   sttModel: "whisper-1",
   ttsModel: "tts-1",
@@ -80,6 +82,7 @@ const baseState = {
 };
 
 let settingsResponse;
+let skillDocResponse;
 
 const renderWithState = (options = {}) => {
   const normalized =
@@ -109,6 +112,8 @@ describe("Settings tools browser", () => {
       model: "gpt-5.4",
       transformer_model: "gpt-oss-20b",
       static_model: "gpt-5.4-mini",
+      harmony_format: true,
+      harmony_format_mode: "auto",
       visual_theme: "spring",
       stt_model: "whisper-1",
       tts_model: "tts-1",
@@ -117,9 +122,63 @@ describe("Settings tools browser", () => {
       api_key_set: false,
       hf_token_set: false,
       devices: [],
+      background_autonomy_enabled: false,
+      background_autonomy_sandbox_processes: true,
+      background_autonomy_mode: "overnight",
+      background_autonomy_interval_seconds: 900,
+      background_autonomy_max_reflections_per_tick: 1,
+      background_autonomy_max_runtime_seconds: 1800,
+      background_autonomy_satisfied_threshold: 0.8,
+      background_autonomy_basic_tick_count: 2,
+      background_autonomy_basic_tick_seconds: 300,
+      background_autonomy_min_priority: 0.05,
+    };
+    skillDocResponse = {
+      id: "computer_use",
+      doc_id: "skills:computer_use",
+      repo_exists: true,
+      local_exists: false,
+      repo_path: "D:/notebooks/float_dev/modules/skills/computer_use.md",
+      local_path: "D:/notebooks/float_dev/data/modules/skills/computer_use.md",
+      active: {
+        id: "computer_use",
+        label: "computer use",
+        source: "repo",
+        summary: "Repo computer use summary",
+        body: "Repo computer use summary\n\n# Computer Use\n- Base guidance.",
+      },
     };
     vi.spyOn(axios, "post").mockResolvedValue({ data: {} });
-    vi.spyOn(axios, "delete").mockResolvedValue({ data: {} });
+    vi.spyOn(axios, "put").mockImplementation((url, body) => {
+      if (url === "/api/workflows/skills/computer_use") {
+        skillDocResponse = {
+          ...skillDocResponse,
+          local_exists: true,
+          active: {
+            ...skillDocResponse.active,
+            source: "local",
+            body: body?.body || "",
+          },
+        };
+        return Promise.resolve({ data: skillDocResponse });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    vi.spyOn(axios, "delete").mockImplementation((url) => {
+      if (url === "/api/workflows/skills/computer_use") {
+        skillDocResponse = {
+          ...skillDocResponse,
+          local_exists: false,
+          active: {
+            ...skillDocResponse.active,
+            source: "repo",
+            body: "Repo computer use summary\n\n# Computer Use\n- Base guidance.",
+          },
+        };
+        return Promise.resolve({ data: skillDocResponse });
+      }
+      return Promise.resolve({ data: {} });
+    });
     vi.spyOn(axios, "get").mockImplementation((url) => {
       if (url === "/api/settings") {
         return Promise.resolve({ data: settingsResponse });
@@ -173,7 +232,7 @@ describe("Settings tools browser", () => {
                 thinking_default: "auto",
                 preferred_continue: "mini_execution",
                 allow_continue_to: ["default", "mini_execution"],
-                enabled_modules: ["computer_use", "camera_capture", "memory_promotion"],
+                enabled_modules: ["computer_use"],
               },
               {
                 id: "architect_planner",
@@ -182,12 +241,7 @@ describe("Settings tools browser", () => {
                 thinking_default: "high",
                 preferred_continue: "mini_execution",
                 allow_continue_to: ["architect_planner", "default", "mini_execution"],
-                enabled_modules: [
-                  "computer_use",
-                  "camera_capture",
-                  "memory_promotion",
-                  "host_shell",
-                ],
+                enabled_modules: ["computer_use"],
               },
               {
                 id: "mini_execution",
@@ -196,37 +250,74 @@ describe("Settings tools browser", () => {
                 thinking_default: "low",
                 preferred_continue: "mini_execution",
                 allow_continue_to: ["mini_execution"],
-                enabled_modules: ["computer_use", "camera_capture"],
+                enabled_modules: ["computer_use"],
               },
             ],
             modules: [
               {
                 id: "computer_use",
                 label: "Computer Use",
-                description: "Browser and desktop observation plus direct UI actions.",
+                description:
+                  "Browser and desktop observation, camera capture, capture promotion, and approval-gated host actions.",
                 status: "live",
+                source: "base",
+                enabled: true,
+                skill_id: "computer_use",
+                doc_id: "skills:computer_use",
+                tool_names: [
+                  "computer.session.start",
+                  "computer.session.stop",
+                  "computer.observe",
+                  "computer.act",
+                  "computer.navigate",
+                  "computer.windows.list",
+                  "computer.windows.focus",
+                  "computer.app.launch",
+                  "camera.capture",
+                  "capture.list",
+                  "capture.promote",
+                  "capture.delete",
+                  "shell.exec",
+                  "patch.apply",
+                  "mcp.call",
+                ],
               },
               {
-                id: "camera_capture",
-                label: "Camera Capture",
-                description: "Still-image capture from a connected camera via the client.",
+                id: "container_orchestration",
+                label: "Container Orchestration",
+                description: "Manage local container jobs from a custom module pack.",
                 status: "experimental",
-              },
-              {
-                id: "memory_promotion",
-                label: "Memory Promotion",
-                description: "Promote transient captures into durable attachments.",
-                status: "live",
-              },
-              {
-                id: "host_shell",
-                label: "Host Shell",
-                description: "Approval-gated shell access.",
-                status: "live",
+                source: "custom",
+                enabled: false,
+                skill_id: "container_orchestration",
+                doc_id: "skills:container_orchestration",
+                tool_names: ["containers.list", "containers.start"],
               },
             ],
             addons: [],
             addons_root: "data/modules/addons",
+          },
+        });
+      }
+      if (url === "/api/workflows/skills/computer_use") {
+        return Promise.resolve({ data: skillDocResponse });
+      }
+      if (url === "/api/workflows/skills/container_orchestration") {
+        return Promise.resolve({
+          data: {
+            id: "container_orchestration",
+            doc_id: "skills:container_orchestration",
+            repo_exists: false,
+            local_exists: false,
+            local_path:
+              "D:/notebooks/float_dev/data/modules/skills/container_orchestration.md",
+            active: {
+              id: "container_orchestration",
+              label: "container orchestration",
+              source: "local",
+              summary: "",
+              body: "",
+            },
           },
         });
       }
@@ -371,6 +462,30 @@ describe("Settings tools browser", () => {
       if (url === "/api/celery/status") {
         return Promise.resolve({ data: { online: false, workers: [] } });
       }
+      if (url === "/api/background/autonomy/status") {
+        return Promise.resolve({
+          data: {
+            autonomy: {
+              enabled: false,
+              sandbox_processes: true,
+              mode: "manual",
+              configured_mode: "overnight",
+              routine_enabled: false,
+              max_runtime_seconds: 1800,
+              satisfied_threshold: 0.8,
+              basic_tick_count: 2,
+              basic_tick_seconds: 300,
+              max_reflections_per_tick: 1,
+              reflection: { candidate_count: 1 },
+              session: {
+                mode: "overnight",
+                runtime_budget_seconds: 1800,
+                stop_reason: null,
+              },
+            },
+          },
+        });
+      }
       if (url === "/api/llm/provider/status") {
         return Promise.resolve({
           data: {
@@ -471,7 +586,7 @@ describe("Settings tools browser", () => {
       stateOverrides: {
         wsStatus: "offline",
         wsLastError: "connection closed unexpectedly",
-        wsLastErrorAt: Date.now() - 5000,
+        wsLastErrorAt: Date.now() - 45000,
       },
     });
 
@@ -489,7 +604,24 @@ describe("Settings tools browser", () => {
     expect(
       screen.getByText("Background jobs will not start until a Celery worker responds."),
     ).toBeInTheDocument();
-    expect(screen.getByText("Queue unavailable")).toBeInTheDocument();
+    expect(
+      screen.getByText("Worker controls appear when the queue is reachable or tasks exist."),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps recent websocket drops in a reconnecting state", async () => {
+    renderWithState({
+      stateOverrides: {
+        wsStatus: "offline",
+        wsLastEventAt: Date.now() - 5000,
+      },
+    });
+
+    expect(
+      await screen.findByText("Reconnecting to live thought stream.", {
+        selector: ".status-note--primary",
+      }),
+    ).toBeInTheDocument();
   });
 
   it("explains when a provider server is running outside Float", async () => {
@@ -597,7 +729,7 @@ describe("Settings tools browser", () => {
 
     await waitFor(() => {
       expect(
-        screen.getByText('Showing 1 of 8 sections for "live transcript".'),
+        screen.getByText('Showing 1 of 9 sections for "live transcript".'),
       ).toBeInTheDocument();
     });
     expect(screen.getByText("Models & Retrieval")).toBeInTheDocument();
@@ -608,6 +740,114 @@ describe("Settings tools browser", () => {
     await waitFor(() => {
       expect(screen.getByText("Workspace & Tools")).toBeInTheDocument();
     });
+  });
+
+  it("shows the runtime server URL when searching for server", async () => {
+    settingsResponse = {
+      ...settingsResponse,
+      mode: "api",
+      server_url: "http://127.0.0.1:1234/v1",
+    };
+
+    renderWithState();
+
+    expect(await screen.findByText("Connections & Access")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole("searchbox", { name: /search settings/i }), {
+      target: { value: "server" },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Runtime & Provider")).toBeInTheDocument();
+    });
+    expect(screen.getByDisplayValue("http://127.0.0.1:1234/v1")).toHaveAttribute(
+      "name",
+      "server_url",
+    );
+    expect(
+      screen.queryByRole("button", { name: /edit server\/lan url/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("saves Harmony Formatting as a backend tri-state mode", async () => {
+    renderWithState();
+
+    const modeSelect = await screen.findByLabelText("Mode", {
+      selector: "#harmony-mode-select",
+    });
+    expect(modeSelect).toHaveValue("auto");
+
+    fireEvent.change(modeSelect, { target: { value: "disabled" } });
+    const saveButton = screen.getByRole("button", { name: /^save$/i });
+    await waitFor(() => expect(saveButton).not.toBeDisabled());
+    fireEvent.click(saveButton);
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith(
+        "/api/settings",
+        expect.objectContaining({
+          harmony_format_mode: "disabled",
+          harmony_format: false,
+        }),
+      );
+    });
+  });
+
+  it("hides a missing selected model when downloaded-only is enabled", async () => {
+    settingsResponse = {
+      ...settingsResponse,
+      mode: "local",
+      transformer_model: "mistral:7b",
+      tts_model: "kitten",
+      voice_model: "expr-voice-2-f",
+    };
+    const defaultGet = axios.get.getMockImplementation();
+    axios.get.mockImplementation((url, ...rest) => {
+      if (url === "/api/transformers/models") {
+        return Promise.resolve({ data: { models: ["kitten"] } });
+      }
+      if (String(url).includes("/api/models/exists/mistral%3A7b")) {
+        return Promise.resolve({ data: { exists: false } });
+      }
+      if (String(url).includes("/api/models/exists/kitten")) {
+        return Promise.resolve({ data: { exists: true } });
+      }
+      if (String(url).includes("/api/models/info/kitten")) {
+        return Promise.resolve({
+          data: {
+            repo_id: "KittenML/kitten-tts-nano-0.1",
+            downloadable: true,
+            lane: "local",
+          },
+        });
+      }
+      return defaultGet(url, ...rest);
+    });
+
+    renderWithState();
+
+    fireEvent.click(await screen.findByRole("button", { name: /^models\./i }));
+    const checkbox = await screen.findByLabelText(/downloaded only/i);
+    fireEvent.click(checkbox);
+
+    await waitFor(() => {
+      expect(screen.getAllByText("Choose a downloaded model").length).toBeGreaterThan(0);
+    });
+    const languageModelSelect = screen.getByLabelText("Language Model");
+    expect(languageModelSelect).toHaveValue("");
+    expect(
+      Array.from(document.querySelectorAll(".status-note.warn.form-note")).some((node) => {
+        const text = node.textContent || "";
+        return (
+          text.includes("Saved selection") &&
+          text.includes("mistral:7b") &&
+          text.includes("not downloaded or registered")
+        );
+      }),
+    ).toBe(true);
+    expect(
+      within(languageModelSelect).queryByRole("option", { name: /mistral:7b/i }),
+    ).not.toBeInTheDocument();
   });
 
   it("uses the in-panel section rail to scroll within settings", async () => {
@@ -706,6 +946,24 @@ describe("Settings tools browser", () => {
     });
   });
 
+  it("treats realtime whisper as an API STT model", async () => {
+    settingsResponse = {
+      ...settingsResponse,
+      stt_model: "gpt-realtime-whisper",
+    };
+
+    renderWithState();
+
+    const select = await screen.findByLabelText("STT Model");
+    const block = select.closest(".settings-model-block");
+
+    expect(within(block).getByRole("button", { name: "API" })).toHaveClass(
+      "is-active",
+    );
+    expect(select.value).toBe("gpt-realtime-whisper");
+    expect(select.querySelector('option[value="gpt-realtime-whisper"]')).not.toBeNull();
+  });
+
   it("shows a workflow inspector with profile details", async () => {
     renderWithState();
 
@@ -728,10 +986,120 @@ describe("Settings tools browser", () => {
     expect(
       screen.getByText("Can continue into Architect / Planner, Default, Mini Execution."),
     ).toBeInTheDocument();
-    expect(screen.getByTitle("Approval-gated shell access.")).toBeInTheDocument();
+    expect(
+      screen.getAllByTitle(
+        "Browser and desktop observation, camera capture, capture promotion, and approval-gated host actions.",
+      ).length,
+    ).toBeGreaterThan(0);
     expect(
       screen.getByText(/Inspect shows the current built-in profile definitions\./i),
     ).toBeInTheDocument();
+  });
+
+  it("renders compact base and custom workflow modules", async () => {
+    renderWithState();
+
+    expect(await screen.findByText("Modules")).toBeInTheDocument();
+    expect(screen.getByLabelText(/Computer Use/i)).toBeChecked();
+    expect(screen.getByLabelText(/Container Orchestration/i)).not.toBeChecked();
+    expect(screen.getByText("1/2 enabled")).toBeInTheDocument();
+    expect(screen.getByText("base")).toBeInTheDocument();
+    expect(screen.getByText("custom")).toBeInTheDocument();
+    expect(screen.getByText("15 tools")).toBeInTheDocument();
+    expect(screen.getByText("2 tools")).toBeInTheDocument();
+  });
+
+  it("edits and deletes a local module skill override", async () => {
+    renderWithState();
+
+    expect(await screen.findByText("Module skill docs")).toBeInTheDocument();
+    expect(await screen.findByDisplayValue(/Repo computer use summary/i)).toBeInTheDocument();
+    expect(screen.getByText(/Local override:/i)).toBeInTheDocument();
+    expect(screen.getByText("no")).toBeInTheDocument();
+
+    const editor = screen.getByLabelText(/skill markdown editor/i);
+    fireEvent.change(editor, {
+      target: {
+        value: "Local summary\n\n# Computer Use\n- Local override guidance.",
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /save local override/i }));
+
+    await waitFor(() => {
+      expect(axios.put).toHaveBeenCalledWith("/api/workflows/skills/computer_use", {
+        body: "Local summary\n\n# Computer Use\n- Local override guidance.",
+      });
+    });
+    expect(await screen.findByText(/local skill override saved/i)).toBeInTheDocument();
+    expect(screen.getByText("yes")).toBeInTheDocument();
+    expect(screen.getByText(/active: local/i)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /delete local override/i }));
+
+    await waitFor(() => {
+      expect(axios.delete).toHaveBeenCalledWith("/api/workflows/skills/computer_use");
+    });
+    expect(
+      await screen.findByText(/local skill override removed; base doc is active again/i),
+    ).toBeInTheDocument();
+    expect(screen.getByDisplayValue(/Repo computer use summary/i)).toBeInTheDocument();
+  });
+
+  it("exposes background autonomy budgets and queues a dry-run tick", async () => {
+    renderWithState();
+
+    expect(
+      await screen.findByRole("heading", { name: /background processing/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Container orchestration and API background-response checks/i))
+      .toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText(/enable background autonomy/i));
+    fireEvent.click(screen.getByLabelText(/sandbox background processes/i));
+    fireEvent.change(screen.getByLabelText(/background autonomy mode/i), {
+      target: { value: "extended" },
+    });
+    fireEvent.change(screen.getByLabelText(/runtime budget \(minutes\)/i), {
+      target: { value: "45" },
+    });
+    fireEvent.change(screen.getByLabelText(/satisfied threshold/i), {
+      target: { value: "0.85" },
+    });
+
+    const saveButton = screen.getByRole("button", {
+      name: /save background settings/i,
+    });
+    await waitFor(() => expect(saveButton).not.toBeDisabled());
+    fireEvent.click(saveButton);
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith(
+        "/api/settings",
+        expect.objectContaining({
+          background_autonomy_enabled: true,
+          background_autonomy_sandbox_processes: false,
+          background_autonomy_mode: "extended",
+          background_autonomy_max_runtime_seconds: 2700,
+          background_autonomy_satisfied_threshold: 0.85,
+          background_autonomy_basic_tick_count: 2,
+          background_autonomy_basic_tick_seconds: 300,
+        }),
+      );
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /dry run tick/i }));
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith(
+        "/api/background/autonomy/tick",
+        expect.objectContaining({
+          mode: "extended",
+          dry_run: true,
+          max_runtime_seconds: 2700,
+          satisfied_threshold: 0.85,
+        }),
+      );
+    });
   });
 
   it("shows tool-source status and a no-results state for unmatched filters", async () => {
@@ -774,12 +1142,10 @@ describe("Settings tools browser", () => {
     fireEvent.change(screen.getByLabelText(/default workflow profile/i), {
       target: { value: "mini_execution" },
     });
+    fireEvent.click(screen.getByLabelText(/Computer Use/i));
+    fireEvent.click(screen.getByLabelText(/Container Orchestration/i));
 
-    const cameraModuleCard = screen
-      .getByText("Camera Capture", { selector: "strong" })
-      .closest("label");
-    fireEvent.click(cameraModuleCard.querySelector('input[type="checkbox"]'));
-    fireEvent.click(screen.getByRole("button", { name: /save capture defaults/i }));
+    fireEvent.click(screen.getByRole("button", { name: /save capture & workflow settings/i }));
 
     await waitFor(() => {
       expect(axios.post).toHaveBeenCalledWith("/api/user-settings", {
@@ -788,9 +1154,10 @@ describe("Settings tools browser", () => {
         capture_allow_model_raw_image_access: false,
         capture_allow_summary_fallback: true,
         privacy_filter_mode: "off",
+        privacy_filter_model: "openai/privacy-filter",
         privacy_filter_route_private_mode: "off",
         default_workflow: "mini_execution",
-        enabled_workflow_modules: ["computer_use", "camera_capture"],
+        enabled_workflow_modules: ["container_orchestration"],
       });
     });
     expect(setState).toHaveBeenCalled();
@@ -1326,6 +1693,23 @@ describe("Settings tools browser", () => {
     ).toBeInTheDocument();
   });
 
+  it("uses model-specific TTS voice preset options", async () => {
+    settingsResponse = {
+      ...settingsResponse,
+      tts_model: "gpt-4o-mini-tts",
+      voice_model: "marin",
+    };
+
+    renderWithState();
+
+    expect(await screen.findByText("Speech")).toBeInTheDocument();
+    const optionValues = Array.from(
+      document.querySelectorAll("#voice-preset-options option"),
+    ).map((option) => option.getAttribute("value"));
+    expect(optionValues).toContain("marin");
+    expect(optionValues).toContain("cedar");
+  });
+
   it("switches live streaming between local and api lanes", async () => {
     settingsResponse = {
       ...settingsResponse,
@@ -1333,7 +1717,7 @@ describe("Settings tools browser", () => {
       live_agent_mode: "server",
       live_agent_model: "gemma-4-E4B-it",
       live_multimodal_model: "gemma-4-26B-A4B-it",
-      realtime_model: "gpt-realtime",
+      realtime_model: "gpt-realtime-2",
       realtime_voice: "cedar",
     };
 
@@ -1357,7 +1741,9 @@ describe("Settings tools browser", () => {
 
     fireEvent.click(within(block).getByRole("button", { name: "API" }));
 
-    expect(await within(block).findByDisplayValue("gpt-realtime")).toBeInTheDocument();
+    expect(await within(block).findByDisplayValue("gpt-realtime-2")).toBeInTheDocument();
+    expect(block.querySelector('option[value="gpt-realtime-mini"]')).not.toBeNull();
+    expect(block.querySelector('option[value="gpt-realtime-1.5"]')).not.toBeNull();
     expect(within(block).getByDisplayValue("cedar")).toBeInTheDocument();
     expect(within(block).queryByText("Live agent mode")).not.toBeInTheDocument();
   });

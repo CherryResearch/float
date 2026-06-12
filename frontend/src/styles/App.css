@@ -58,6 +58,19 @@ h1 {
   /* keep decorative gradients handled by body; container stays transparent */
 }
 
+body.is-layout-resizing *,
+body.is-layout-resizing *::before,
+body.is-layout-resizing *::after {
+  animation-play-state: paused !important;
+  transition-duration: 0ms !important;
+}
+
+body.is-layout-resizing :where(.chat-container, .input-box, .topbar-inner, .sidebar) {
+  backdrop-filter: saturate(115%) blur(4px);
+  -webkit-backdrop-filter: saturate(115%) blur(4px);
+  box-shadow: 0 8px 18px color-mix(in oklab, var(--theme-warm-black) 30%, transparent);
+}
+
 /* Center rail width, used for top bar content and chat input bubble */
 :root {
   /* Make chat column scale closer to sidebars on large screens while staying readable */

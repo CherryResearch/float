@@ -135,6 +135,8 @@ def test_generate_threads_writes_summary_file(monkeypatch, tmp_path):
     result = threads_service.generate_threads(
         summary_out=out_path,
         infer_topics=False,
+        operation_id="op-threads-test",
+        operation_owner="/api/threads/generate",
     )
     assert out_path.exists()
     on_disk = json.loads(out_path.read_text())
@@ -154,6 +156,11 @@ def test_generate_threads_writes_summary_file(monkeypatch, tmp_path):
         .get("enabled")
         is False
     )
+    operation = on_disk.get("metadata", {}).get("operation", {})
+    assert operation.get("id") == "op-threads-test"
+    assert operation.get("owner") == "/api/threads/generate"
+    assert operation.get("source") == "/api/threads/generate"
+    assert operation.get("topic_labeler_used") == "local:heuristic"
     assert result.get("thread_overview", {}).get("total_threads") == 1
     assert on_disk.get("schema", {}).get("threads_summary_version") == 2
 
@@ -169,6 +176,9 @@ def test_manual_thread_labels_override(monkeypatch, tmp_path):
     )
     assert "Manual" in result.get("threads", {})
     assert "auto" not in result.get("threads", {})
+    assert result.get("metadata", {}).get("ui_hints", {}).get("manual_threads") == [
+        "Manual"
+    ]
 
 
 def test_generate_threads_keeps_topic_inference_without_key(monkeypatch, tmp_path):
@@ -213,6 +223,134 @@ def test_generate_threads_keeps_topic_inference_without_key(monkeypatch, tmp_pat
         openai_key=None,
     )
     assert observed["infer_topics"] is True
+
+
+def test_generate_threads_records_embedding_model_and_sensitive_mode(
+    monkeypatch, tmp_path
+):
+    _setup_conversation(tmp_path)
+
+    observed = {}
+
+    def fake_embed_texts(texts, model_name=None):
+        observed["embedding_model"] = model_name
+        return [[1.0] for _ in texts], object()
+
+    def fake_cluster_texts(embeddings, **_kwargs):
+        return [0 for _ in embeddings], 1
+
+    def fake_summarize(
+        nuggets,
+        labels,
+        embeddings,
+        embedder,
+        k,
+        tags,
+        infer_topics_flag,
+        openai_key,
+        *rest,
+    ):
+        observed["openai_key"] = openai_key
+        return {
+            "tag_counts": {},
+            "cluster_count": 1,
+            "clusters": {},
+            "threads": {},
+            "metadata": {},
+        }, {}
+
+    monkeypatch.setattr(threads_service, "embed_texts", fake_embed_texts)
+    monkeypatch.setattr(threads_service, "cluster_texts", fake_cluster_texts)
+    monkeypatch.setattr(threads_service, "summarize_clusters", fake_summarize)
+
+    result = threads_service.generate_threads(
+        summary_out=tmp_path / "summary.json",
+        infer_topics=True,
+        openai_key="sk-test",
+        embedding_model="sentence-transformers/all-mpnet-base-v2",
+        sensitive_mode=True,
+    )
+
+    hints = result.get("metadata", {}).get("ui_hints", {})
+    assert observed["embedding_model"] == "sentence-transformers/all-mpnet-base-v2"
+    assert observed["openai_key"] is None
+    assert hints.get("embedding_model_requested") == (
+        "sentence-transformers/all-mpnet-base-v2"
+    )
+    assert hints.get("sensitive_mode") is True
+    assert hints.get("external_topic_labeling") is False
+
+
+def test_generate_threads_blocks_api_labeling_for_sensitive_scope(
+    monkeypatch, tmp_path
+):
+    _setup_conversation(tmp_path)
+    conversation_store.merge_metadata(
+        "conv1",
+        {
+            "privacy_mode": "protected",
+            "sensitivity": "protected",
+            "sensitivity_source": "user",
+        },
+    )
+
+    observed = {}
+
+    def fake_embed_texts(texts, model_name=None):
+        return [[1.0] for _ in texts], object()
+
+    def fake_cluster_texts(embeddings, **_kwargs):
+        return [0 for _ in embeddings], 1
+
+    def fake_summarize(
+        nuggets,
+        labels,
+        embeddings,
+        embedder,
+        k,
+        tags,
+        infer_topics_flag,
+        openai_key,
+        *rest,
+    ):
+        observed["openai_key"] = openai_key
+        return {
+            "tag_counts": {},
+            "cluster_count": 1,
+            "clusters": {},
+            "conversations": {
+                "conv1": {"nugget_count": 1, "topics": {"private admin": 1}}
+            },
+            "threads": {},
+            "metadata": {},
+        }, {}
+
+    monkeypatch.setattr(threads_service, "embed_texts", fake_embed_texts)
+    monkeypatch.setattr(threads_service, "cluster_texts", fake_cluster_texts)
+    monkeypatch.setattr(threads_service, "summarize_clusters", fake_summarize)
+
+    result = threads_service.generate_threads(
+        summary_out=tmp_path / "summary.json",
+        infer_topics=True,
+        openai_key="sk-test",
+        topic_suggestion_provider="api",
+        topic_suggestion_model="gpt-4o-mini",
+        sensitive_mode=True,
+    )
+
+    hints = result.get("metadata", {}).get("ui_hints", {})
+    generation = result.get("metadata", {}).get("generation", {})
+    assert observed["openai_key"] is None
+    assert hints.get("topic_suggestion_provider_requested") == "api"
+    assert hints.get("topic_suggestion_provider") == "local"
+    assert hints.get("api_topic_labeling_blocked") is True
+    assert hints.get("api_topic_labeling_blocked_reason") == "sensitive_conversation"
+    assert hints.get("sensitive_conversation_count") == 1
+    assert hints.get("external_topic_labeling") is False
+    assert generation.get("topic_seeds") == []
+    assert generation.get("suggested_topics") == [
+        {"topic": "private admin", "score": 1.0}
+    ]
 
 
 def test_generate_threads_tolerates_string_message_entries(monkeypatch, tmp_path):

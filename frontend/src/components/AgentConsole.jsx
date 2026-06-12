@@ -29,8 +29,11 @@ import {
 } from "../utils/providerRuntime";
 import { buildProviderRuntimeInspectorRows } from "../utils/stateExplanations";
 import {
+  acquireToolContinuationLock,
+  buildToolContinuationLockKey,
   buildToolContinuationSignature,
   hasMatchingToolContinuationSignature,
+  releaseToolContinuationLock,
 } from "../utils/toolContinuations";
 import {
   handleUnifiedPress,
@@ -46,7 +49,10 @@ import {
   normalizeToolReviewTarget,
   toolReviewScopeSelectors,
 } from "../utils/toolReviewActions";
-import { mergeContinuationText } from "../utils/continuationText";
+import {
+  appendToolContinuationPhase,
+  mergeContinuationText,
+} from "../utils/continuationText";
 
 const SIDEBAR_MIN_WIDTH = 220;
 const SIDEBAR_MAX_WIDTH = 760;
@@ -57,6 +63,9 @@ const LOCAL_RUNTIME_POLL_MS = 8000;
 const PROVIDER_RUNTIME_POLL_MS = 60000;
 const EMPTY_GLOBAL_STATE = Object.freeze({});
 const NOOP_SET_STATE = () => {};
+const RUNTIME_RAG_OPERATION_EVENT = "float:runtime-rag-operation";
+const RUNTIME_RAG_OPERATION_CLEAR_MS = 9000;
+const RUNTIME_RAG_OPERATION_STALE_CLEAR_MS = 45000;
 const CLIENT_RESOLUTION_TOOLS = new Set(["camera.capture"]);
 const RETRIABLE_TOOL_STATUSES = new Set([
   "error",
@@ -82,6 +91,159 @@ const TOOL_TRUST_TIERS = {
   "shell.exec": 3,
   "patch.apply": 3,
   "mcp.call": 3,
+};
+const TOKEN_ESTIMATE_KEYS = [
+  "text",
+  "content",
+  "message",
+  "summary",
+  "title",
+  "name",
+  "status",
+  "error",
+];
+const TOKEN_ESTIMATE_MAX_PART_CHARS = 4000;
+const TOKEN_ESTIMATE_MAX_MESSAGE_CHARS = 16000;
+
+const appendTokenEstimatePart = (parts, value) => {
+  if (value === null || value === undefined) return;
+  if (typeof value === "string") {
+    const text = value.replace(/\s+/g, " ").trim();
+    if (text) parts.push(text.slice(0, TOKEN_ESTIMATE_MAX_PART_CHARS));
+    return;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    parts.push(String(value));
+  }
+};
+
+const collectTokenEstimateText = (value, parts, depth = 0) => {
+  if (value === null || value === undefined || depth > 2) return;
+  if (typeof value !== "object") {
+    appendTokenEstimatePart(parts, value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.slice(0, 12).forEach((entry) =>
+      collectTokenEstimateText(entry, parts, depth + 1),
+    );
+    return;
+  }
+  TOKEN_ESTIMATE_KEYS.forEach((key) => {
+    if (Object.prototype.hasOwnProperty.call(value, key)) {
+      collectTokenEstimateText(value[key], parts, depth + 1);
+    }
+  });
+};
+
+const estimateTextTokens = (text) => {
+  const normalized = String(text || "").replace(/\s+/g, " ").trim();
+  if (!normalized) return 0;
+  return Math.max(1, Math.ceil(normalized.length / 4));
+};
+
+const estimateMessageTokens = (message) => {
+  if (!message || typeof message !== "object") return 0;
+  const parts = [];
+  appendTokenEstimatePart(parts, message.role);
+  TOKEN_ESTIMATE_KEYS.forEach((key) => {
+    if (Object.prototype.hasOwnProperty.call(message, key)) {
+      collectTokenEstimateText(message[key], parts);
+    }
+  });
+  if (Array.isArray(message.tools)) {
+    message.tools.slice(0, 12).forEach((tool) =>
+      collectTokenEstimateText(tool, parts, 1),
+    );
+  }
+  const text = parts.join("\n").slice(0, TOKEN_ESTIMATE_MAX_MESSAGE_CHARS);
+  return estimateTextTokens(text) + 6;
+};
+
+const estimateConversationTokens = (messages) => {
+  if (!Array.isArray(messages) || !messages.length) return 0;
+  return messages.reduce((total, message) => total + estimateMessageTokens(message), 0);
+};
+
+const parseOperationTimestamp = (value) => {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  const parsed = Date.parse(text);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const formatOperationElapsed = (ms) => {
+  const normalizedMs = Math.max(0, Number(ms) || 0);
+  if (normalizedMs < 1000) return `${Math.round(normalizedMs)} ms`;
+  if (normalizedMs < 10_000) return `${(normalizedMs / 1000).toFixed(1)} s`;
+  const totalSeconds = Math.floor(normalizedMs / 1000);
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+};
+
+const normalizeRuntimeRagOperation = (payload) => {
+  if (!payload || typeof payload !== "object") return null;
+  const data = payload.data && typeof payload.data === "object" ? payload.data : {};
+  const operationId = String(data.operation_id || "").trim();
+  if (!operationId.toLowerCase().startsWith("rag-query:")) return null;
+  const kind = String(data.kind || "").trim().toLowerCase();
+  if (kind !== "rag_query") return null;
+  return {
+    id: operationId,
+    title: String(payload.title || "Retrieving chat context").trim(),
+    body: String(payload.body || "").trim(),
+    status: String(data.status || "running").trim().toLowerCase() || "running",
+    phaseLabel: String(data.phase_label || "").trim(),
+    detail: String(data.detail || "").trim(),
+    phaseIndex: Number(data.phase_index),
+    phaseCount: Number(data.phase_count),
+    startedAtMs: parseOperationTimestamp(data.started_at),
+    elapsedMs: Number(data.elapsed_ms),
+    counts: data.counts && typeof data.counts === "object" ? data.counts : null,
+    updatedAtMs: Date.now(),
+  };
+};
+
+const readMessageMetadata = (message) =>
+  message && typeof message.metadata === "object" && message.metadata
+    ? message.metadata
+    : null;
+
+const summarizeConversationCompactions = (messages) => {
+  if (!Array.isArray(messages) || !messages.length) {
+    return { count: 0, summaryMessages: 0, markerMessages: 0, sourceMessages: null };
+  }
+  let summaryMessages = 0;
+  let markerMessages = 0;
+  let priorCarried = 0;
+  let sourceMessages = null;
+  messages.forEach((message) => {
+    const metadata = readMessageMetadata(message);
+    const compaction =
+      metadata && typeof metadata.conversation_compaction === "object"
+        ? metadata.conversation_compaction
+        : null;
+    if (compaction) {
+      summaryMessages += 1;
+      const prior = Number(compaction.prior_compaction_summaries_carried);
+      if (Number.isFinite(prior) && prior > priorCarried) priorCarried = prior;
+      const totalMessages = Number(compaction.total_messages);
+      if (Number.isFinite(totalMessages) && totalMessages > 0) {
+        sourceMessages = Math.max(sourceMessages || 0, totalMessages);
+      }
+    }
+    if (
+      metadata &&
+      metadata.context_compaction_marker &&
+      typeof metadata.context_compaction_marker === "object"
+    ) {
+      markerMessages += 1;
+    }
+  });
+  const count = Math.max(markerMessages, summaryMessages + priorCarried);
+  return { count, summaryMessages, markerMessages, sourceMessages };
 };
 
 const buildToolOutcomeResult = (status, message, data = null, ok = null) => {
@@ -162,6 +324,23 @@ const formatTimestamp = (timestamp) => {
   if (Number.isNaN(date.getTime())) return "";
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 };
+
+const resolveToolDisplayName = (tool, fallback = "tool") => {
+  if (!tool || typeof tool !== "object") return fallback;
+  const candidates = [
+    tool.name,
+    tool.tool,
+    tool.tool_name,
+    tool.function?.name,
+    tool.call?.name,
+  ];
+  const name = candidates
+    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .find(Boolean);
+  return name || fallback;
+};
+
+const toolRequestId = (tool) => String(tool?.id ?? tool?.request_id ?? "").trim();
 
 const formatReviewTimestamp = (timestamp) => {
   if (!timestamp) return "";
@@ -463,6 +642,131 @@ const isReflectionAgent = (agent) => {
   return kind === "background_reflection";
 };
 
+const GENERIC_REFLECTION_LABELS = new Set([
+  "reflection worker",
+  "background reflection",
+  "reflection",
+]);
+
+const isGenericReflectionLabel = (value) =>
+  GENERIC_REFLECTION_LABELS.has(String(value || "").trim().toLowerCase());
+
+const latestReflectionMetadata = (agent, events = []) => {
+  const candidates = [
+    ...(Array.isArray(events) ? events : []),
+    ...(Array.isArray(agent?.events) ? agent.events : []),
+    agent,
+  ];
+  const merged = {};
+  candidates.forEach((candidate) => {
+    const metadata =
+      candidate?.metadata && typeof candidate.metadata === "object"
+        ? candidate.metadata
+        : null;
+    if (metadata?.reflection) {
+      Object.assign(merged, metadata);
+    }
+  });
+  return Object.keys(merged).length ? merged : {};
+};
+
+const reflectionDepthBudget = (metadata = {}) => {
+  const explicit = Number(metadata.depth_budget);
+  if (Number.isFinite(explicit) && explicit > 0) return explicit;
+  const patience = Math.max(0, Math.min(3, Number(metadata.patience) || 1));
+  return { 0: 1, 1: 2, 2: 3, 3: 4 }[patience] || 2;
+};
+
+const formatReflectionPassBudget = (metadata = {}) => {
+  const budget = reflectionDepthBudget(metadata);
+  const runCount = Math.max(0, Number(metadata.run_count) || 0);
+  return `${Math.min(runCount, budget)}/${budget} passes`;
+};
+
+const formatReflectionSourceLabel = (metadata = {}) => {
+  const sourceMode = String(metadata.source_mode || "").trim().toLowerCase();
+  const sourceThread = String(metadata.source_thread_id || "").trim();
+  const memoryKeys = Array.isArray(metadata.memory_keys)
+    ? metadata.memory_keys.filter((key) => String(key || "").trim())
+    : [];
+  if (memoryKeys.length) {
+    return memoryKeys.length === 1
+      ? `memory ${String(memoryKeys[0]).trim()}`
+      : `${memoryKeys.length} memories`;
+  }
+  if (sourceMode === "current" && sourceThread) return "this chat";
+  if (sourceMode === "recent") return "recent chat";
+  if (sourceMode === "manual" || sourceMode === "user") return "manual topic";
+  if (sourceMode === "reflection") return "seeded candidate";
+  if (sourceThread) return `chat ${shortOpaqueId(sourceThread, 8)}`;
+  return sourceMode || "manual topic";
+};
+
+const formatReflectionSurfaceLabel = (metadata = {}) => {
+  if (!metadata.run_id) return "queued";
+  if (metadata.should_surface_to_user === true) return "surfaced";
+  if (metadata.should_surface_to_user === false) return "quiet note";
+  return "saved";
+};
+
+const formatReflectionScoreLabel = (metadata = {}) => {
+  const usefulness = Number(metadata.usefulness);
+  const novelty = Number(metadata.novelty);
+  if (!Number.isFinite(usefulness) && !Number.isFinite(novelty)) return "";
+  const parts = [];
+  if (Number.isFinite(usefulness)) parts.push(`use ${usefulness.toFixed(2)}`);
+  if (Number.isFinite(novelty)) parts.push(`new ${novelty.toFixed(2)}`);
+  return parts.join(" / ");
+};
+
+const cleanReflectionPreview = (value) => {
+  let text = normalizePreviewText(value);
+  if (!text) return "";
+  text = text.replace(/^Reflection saved:\s*/i, "").trim();
+  text = text.replace(/^Reflection:\s*/i, "").trim();
+  const claimMatch = text.match(/^Claim:\s*(.*?)(?:\s+Why it matters:|$)/i);
+  if (claimMatch?.[1]) {
+    return `Claim: ${claimMatch[1].trim()}`;
+  }
+  return text;
+};
+
+const reflectionEventLabel = (entry) => {
+  const status = normalizeStatusValue(entry?.status);
+  if (status && status !== "unknown") {
+    if (status === "resolved") return "saved";
+    if (status === "active") return "running";
+    return status;
+  }
+  if (entry?.type === "thought") return "note";
+  return entry?.type || "update";
+};
+
+const buildReflectionInspectorRows = (agent, metadata = {}) => {
+  const status = String(agent?.status || metadata.task_status || "").trim() || "unknown";
+  const rows = [
+    { label: "Source", value: formatReflectionSourceLabel(metadata) },
+    { label: "Status", value: status },
+    { label: "Pass budget", value: formatReflectionPassBudget(metadata) },
+    { label: "Patience", value: "reflection passes only" },
+    { label: "Surfacing", value: formatReflectionSurfaceLabel(metadata) },
+  ];
+  const score = formatReflectionScoreLabel(metadata);
+  if (score) rows.push({ label: "Scores", value: score });
+  const contextCount = Number(metadata.input_context_count);
+  if (Number.isFinite(contextCount)) {
+    rows.push({ label: "Context inputs", value: String(contextCount) });
+  }
+  rows.push({
+    label: "Next",
+    value:
+      status === "active" || status === "running"
+        ? "wait or stop from the card controls"
+        : "open the saved reflection when it surfaces",
+  });
+  return rows;
+};
+
 const THREAD_COLOR_PALETTE = ["#9B8CFF", "#B29ED9", "#6B7AD6", "#86EAA0", "#21B228"];
 
 const getThreadColor = (conversationId) => {
@@ -519,6 +823,9 @@ const resolveAgentDisplayLabel = (agent) => {
   const kind = String(provenance?.kind || "").trim().toLowerCase();
 
   if (explicit && !looksLikeUuid(explicit)) {
+    if (kind === "background_reflection" && isGenericReflectionLabel(explicit) && provenanceLabel) {
+      return provenanceLabel;
+    }
     return explicit;
   }
   if (provenanceLabel) {
@@ -647,6 +954,11 @@ const getEffectiveToolStatus = (tool) => {
   return getToolResultStatus(tool.result) || status;
 };
 
+const isToolAwaitingReview = (tool) => {
+  const status = getEffectiveToolStatus(tool);
+  return !status || status === "proposed" || status === "pending";
+};
+
 const buildToolStateInspectorRows = (entry, context = {}) => {
   if (!entry || entry.type !== "tool") return [];
   const status = context.status || getEffectiveToolStatus(entry) || normalizeToolStatus(entry.status);
@@ -749,10 +1061,16 @@ const mergeToolUpdate = (tools, update) => {
   return list;
 };
 
+const mergeToolUpdates = (tools, updates) =>
+  (Array.isArray(updates) ? updates : []).reduce(
+    (current, update) => mergeToolUpdate(current, update),
+    Array.isArray(tools) ? tools : [],
+  );
+
 
 const summarizeToolBatchLabel = (tools) => {
   const names = (Array.isArray(tools) ? tools : [])
-    .map((tool) => (typeof tool?.name === "string" ? tool.name.trim() : ""))
+    .map((tool) => resolveToolDisplayName(tool, ""))
     .filter(Boolean);
   if (!names.length) return "tool activity";
   if (names.length === 1) return names[0];
@@ -947,6 +1265,7 @@ const AgentConsole = ({
   const [providerPendingAction, setProviderPendingAction] = React.useState("");
   const [providerActionError, setProviderActionError] = React.useState("");
   const [runtimeNow, setRuntimeNow] = React.useState(() => Date.now());
+  const [runtimeRagOperation, setRuntimeRagOperation] = React.useState(null);
   const [contextDraft, setContextDraft] = React.useState("");
   const [contextDirty, setContextDirty] = React.useState(false);
   const [contextSaving, setContextSaving] = React.useState(false);
@@ -980,12 +1299,14 @@ const AgentConsole = ({
   const [browserKeyDraft, setBrowserKeyDraft] = React.useState("Enter");
   const [agentControlPendingKey, setAgentControlPendingKey] = React.useState("");
   const [agentControlFeedback, setAgentControlFeedback] = React.useState("");
+  const [toolBatchPendingKey, setToolBatchPendingKey] = React.useState("");
   const [redirectEditorAgentId, setRedirectEditorAgentId] = React.useState("");
   const [redirectNoteDraft, setRedirectNoteDraft] = React.useState("");
   const [redirectWorkflowDraft, setRedirectWorkflowDraft] = React.useState("");
   const providerActionPending = Boolean(providerPendingAction);
   const sidebarRef = React.useRef(null);
   const focusTokenRef = React.useRef(null);
+  const runtimeRagClearTimerRef = React.useRef(null);
   const lastScrollAtBottomRef = React.useRef(true);
   const scrollBodyRef = React.useRef(null);
   const contextSliderRef = React.useRef(null);
@@ -1262,10 +1583,27 @@ const AgentConsole = ({
       systemTaskCount === 1 ? "1 queue update" : `${systemTaskCount} queue updates`;
     const activeLabel =
       activeAgentCount === 1 ? "1 active" : `${activeAgentCount} active`;
+    const reflectionCount = backgroundReflectionAgents.length;
+    const reflectionLabel =
+      reflectionCount === 1 ? "1 reflection" : `${reflectionCount} reflections`;
+    const backgroundSubtitle = `${activeLabel}, ${reflectionLabel}, ${taskLabel}`;
     const backgroundDetail =
       typeof backgroundAgent?.summary === "string" && backgroundAgent.summary.trim()
         ? backgroundAgent.summary.trim()
-        : `${activeLabel}, ${taskLabel}`;
+        : backgroundSubtitle;
+    const backgroundInspector = (
+      <StateInspector
+        title="Background work"
+        summary="Reflection is bounded background thinking over selected context. Patience is the reflection pass budget; it does not count tool calls or normal chat turns."
+        rows={[
+          { label: "Prompt job", value: "scheduled chat or task run" },
+          { label: "Reflection job", value: "scored note with optional surfacing" },
+          { label: "Routine scheduler", value: "disabled unless explicitly enabled" },
+        ]}
+        label="?"
+        ariaLabel="Explain background work"
+      />
+    );
     const openBackgroundPromptComposer = () => {
       setBackgroundPromptFeedback("");
       setReflectionFeedback("");
@@ -1292,9 +1630,9 @@ const AgentConsole = ({
         );
         const reflectionTone = statusTone(agent.status);
         const label = resolveAgentDisplayLabel(agent);
-        const events = getRenderableAgentActivity(agent, { showToolEntries: false })
-          .slice(-4)
-          .reverse();
+        const allEvents = getRenderableAgentActivity(agent, { showToolEntries: false });
+        const events = allEvents.slice(-4).reverse();
+        const reflectionMeta = latestReflectionMetadata(agent, allEvents);
         const previewSource =
           [...events].find((entry) =>
             normalizePreviewText(
@@ -1312,9 +1650,14 @@ const AgentConsole = ({
           ),
           140,
         );
+        const reflectionPreview = cleanReflectionPreview(preview);
         const conversationTarget = resolveAgentConversationTarget(agent, label);
         const canOpenConversation =
           conversationTarget && typeof onOpenConversation === "function";
+        const sourceLabel = formatReflectionSourceLabel(reflectionMeta);
+        const budgetLabel = formatReflectionPassBudget(reflectionMeta);
+        const surfaceLabel = formatReflectionSurfaceLabel(reflectionMeta);
+        const scoreLabel = formatReflectionScoreLabel(reflectionMeta);
         return (
           <article
             key={reflectionKey || label}
@@ -1329,6 +1672,14 @@ const AgentConsole = ({
               />
               <strong>{label}</strong>
               <span className="agent-status-label">{reflectionTone.label}</span>
+              <StateInspector
+                title="Reflection state"
+                summary="This is a bounded reflection worker. Its patience value controls how many reflection passes this task may take."
+                rows={buildReflectionInspectorRows(agent, reflectionMeta)}
+                label="?"
+                className="agent-background-reflection-inspector"
+                ariaLabel={`Explain ${label}`}
+              />
               {agent.updatedAt ? <time>{formatTimestamp(agent.updatedAt)}</time> : null}
               {canOpenConversation ? (
                 <button
@@ -1346,9 +1697,15 @@ const AgentConsole = ({
                 </button>
               ) : null}
             </div>
-            {preview ? (
-              <p className="agent-background-reflection-preview" title={preview}>
-                {preview}
+            <div className="agent-background-reflection-meta" aria-label="reflection metadata">
+              <span title="Source context selected for this reflection">{sourceLabel}</span>
+              <span title="Patience controls reflection passes only">{budgetLabel}</span>
+              <span title="Whether this run created a surfaced reflection conversation">{surfaceLabel}</span>
+              {scoreLabel ? <span title="Evaluator usefulness and novelty">{scoreLabel}</span> : null}
+            </div>
+            {reflectionPreview ? (
+              <p className="agent-background-reflection-preview" title={reflectionPreview}>
+                {reflectionPreview}
               </p>
             ) : null}
             {events.length ? (
@@ -1360,12 +1717,13 @@ const AgentConsole = ({
                     ),
                     92,
                   );
+                  const eventLabel = reflectionEventLabel(entry);
                   return (
                     <div
                       className="agent-background-reflection-event"
                       key={activityEntryKey(agent, entry)}
                     >
-                      <span className="agent-resource-pill">{entry.type || "update"}</span>
+                      <span className="agent-resource-pill">{eventLabel}</span>
                       {eventText ? <span>{eventText}</span> : null}
                       {entry.timestamp ? <time>{formatTimestamp(entry.timestamp)}</time> : null}
                     </div>
@@ -1380,13 +1738,14 @@ const AgentConsole = ({
     return (
       <ConsoleObjectCard
         title="background"
-        subtitle={`${activeLabel}, ${taskLabel}`}
+        subtitle={backgroundSubtitle}
         preview={backgroundDetail}
         ariaLabel="background"
         className="agent-background-panel"
         collapsed={backgroundPanelCollapsed}
         onToggleCollapsed={() => setBackgroundPanelCollapsed((prev) => !prev)}
         onHide={() => setBackgroundPanelHidden(true)}
+        status={backgroundInspector}
         expandLabel="Expand background"
         collapseLabel="Collapse background"
         hideLabel="Hide background"
@@ -1421,14 +1780,14 @@ const AgentConsole = ({
                     setReflectionFeedback("");
                   }}
                 >
-                  <option value="prompt">Background prompt</option>
-                  <option value="reflect">Reflection</option>
+                  <option value="prompt">Scheduled prompt</option>
+                  <option value="reflect">Reflection pass</option>
                 </select>
               </label>
               {backgroundComposerMode === "reflect" ? (
                 <>
                   <label className="agent-background-composer-label" htmlFor="reflection-question">
-                    Reflection question
+                    Reflection focus
                   </label>
                   <textarea
                     id="reflection-question"
@@ -1440,7 +1799,7 @@ const AgentConsole = ({
                         setReflectionFeedback("");
                       }
                     }}
-                    placeholder="What should Float think through?"
+                    placeholder="Question, tension, or follow-up to think through"
                     rows={3}
                   />
                   <div className="agent-background-composer-grid">
@@ -1452,24 +1811,24 @@ const AgentConsole = ({
                         value={reflectionSourceMode}
                         onChange={(event) => setReflectionSourceMode(event.target.value)}
                       >
-                        <option value="current">Current thread</option>
-                        <option value="recent">Recent carry-over</option>
+                        <option value="current">This chat</option>
+                        <option value="recent">Latest chat</option>
                         <option value="memory">Memory key</option>
-                        <option value="manual">Manual topic</option>
+                        <option value="manual">No linked source</option>
                       </select>
                     </label>
                     <label className="agent-background-composer-label" htmlFor="reflection-patience">
-                      Patience
+                      Pass budget
                       <select
                         id="reflection-patience"
                         className="agent-background-composer-input"
                         value={reflectionPatience}
                         onChange={(event) => setReflectionPatience(event.target.value)}
                       >
-                        <option value="0">1 pass</option>
-                        <option value="1">2 passes</option>
-                        <option value="2">3 passes</option>
-                        <option value="3">4 passes</option>
+                        <option value="0">1 reflection pass</option>
+                        <option value="1">2 reflection passes</option>
+                        <option value="2">3 reflection passes</option>
+                        <option value="3">4 reflection passes</option>
                       </select>
                     </label>
                   </div>
@@ -1492,18 +1851,18 @@ const AgentConsole = ({
                         !backendReady || reflectionPending || !reflectionQuestionDraft.trim()
                       }
                       onClick={() => submitReflectionTask(true)}
-                      title="Run reflection now"
+                      title="Run one bounded reflection pass now"
                     >
-                      {reflectionPending ? "Working..." : "Run now"}
+                      {reflectionPending ? "Working..." : "Run reflection"}
                     </button>
                     <button
                       type="button"
                       className="agent-card-control-btn"
                       disabled={reflectionPending || !reflectionQuestionDraft.trim()}
                       onClick={() => submitReflectionTask(false)}
-                      title="Save reflection for later"
+                      title="Save this reflection task for a later pass"
                     >
-                      Save later
+                      Save reflection
                     </button>
                     <button
                       type="button"
@@ -1518,7 +1877,7 @@ const AgentConsole = ({
               ) : (
                 <>
                   <label className="agent-background-composer-label" htmlFor="background-agent-prompt">
-                    Prompt
+                    Scheduled prompt
                   </label>
                   <textarea
                     id="background-agent-prompt"
@@ -1530,7 +1889,7 @@ const AgentConsole = ({
                         setBackgroundPromptFeedback("");
                       }
                     }}
-                    placeholder="Describe the background agent task..."
+                    placeholder="Prompt to run as a scheduled background chat or task"
                     rows={3}
                   />
                   <div className="agent-background-composer-actions">
@@ -1572,8 +1931,8 @@ const AgentConsole = ({
                 type="button"
                 className="agent-background-compose-trigger"
                 onClick={openBackgroundPromptComposer}
-                aria-label="Start background agent"
-                title="Start background agent"
+                aria-label="Add background work"
+                title="Add background work"
               >
                 <span aria-hidden="true" className="agent-background-compose-rule">
                   --
@@ -1630,10 +1989,11 @@ const AgentConsole = ({
   }, []);
 
   const applySidebarWidth = React.useCallback(
-    (width) => {
+    (width, { persist = true } = {}) => {
       const root = typeof document !== "undefined" ? document.documentElement : null;
       if (!root) return;
       root.style.setProperty("--sidebar-width-right", `${width}px`);
+      if (!persist) return;
       try {
         localStorage.setItem("sidebarWidthRight", String(width));
       } catch {}
@@ -1691,19 +2051,40 @@ const AgentConsole = ({
       root.style.setProperty("cursor", "col-resize");
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
+      document.body.classList.add("is-layout-resizing");
       setIsResizing(true);
+      let lastWidth = startWidth;
+      let frameId = null;
+
+      const flushWidth = (persist = false) => {
+        if (frameId !== null && typeof cancelAnimationFrame === "function") {
+          cancelAnimationFrame(frameId);
+          frameId = null;
+        }
+        applySidebarWidth(lastWidth, { persist });
+      };
 
       const onMove = (moveEvent) => {
         const delta = startX - moveEvent.clientX;
-        const next = clampSidebarWidth(startWidth + delta, minWidth, maxWidth);
-        applySidebarWidth(next);
+        lastWidth = clampSidebarWidth(startWidth + delta, minWidth, maxWidth);
+        if (typeof requestAnimationFrame !== "function") {
+          applySidebarWidth(lastWidth, { persist: false });
+          return;
+        }
+        if (frameId !== null) return;
+        frameId = requestAnimationFrame(() => {
+          frameId = null;
+          applySidebarWidth(lastWidth, { persist: false });
+        });
       };
       const onUp = () => {
         window.removeEventListener("pointermove", onMove);
         window.removeEventListener("pointerup", onUp);
         window.removeEventListener("pointercancel", onUp);
+        flushWidth(true);
         document.body.style.cursor = "";
         document.body.style.userSelect = "";
+        document.body.classList.remove("is-layout-resizing");
         root.style.removeProperty("cursor");
         setIsResizing(false);
       };
@@ -1815,7 +2196,7 @@ const AgentConsole = ({
             String(tool?.id || tool?.request_id || "").trim()
             || `conversation-tool:${messageId}:${index}`,
           request_id: String(tool?.request_id || tool?.id || "").trim() || undefined,
-          name: String(tool?.name || "tool").trim() || "tool",
+          name: resolveToolDisplayName(tool),
           args: normalizedArgs,
           ...(typeof fallbackResult !== "undefined" ? { result: fallbackResult } : {}),
           status,
@@ -1949,6 +2330,7 @@ const AgentConsole = ({
   const showSyncInbox =
     pendingSyncReviews.length > 0 || recentSyncReviews.length > 0;
   const toolContinueLocksRef = React.useRef(new Set());
+  const toolResolutionUpdatesRef = React.useRef(new Map());
   const autoToolResolveLocksRef = React.useRef(new Set());
 
   const formatBytes = React.useCallback((value) => {
@@ -2012,6 +2394,80 @@ const AgentConsole = ({
     },
     [formatBytes],
   );
+  const contextBudget = React.useMemo(() => {
+    const messages = Array.isArray(state.conversation) ? state.conversation : [];
+    const loadedTokens = estimateConversationTokens(messages);
+    const effectiveTokens = loadedTokens;
+    const tokenLimit = parseContextLength(state.maxContextLength);
+    const rawTrimMeta =
+      state.conversationTrimMeta &&
+      typeof state.conversationTrimMeta === "object" &&
+      state.conversationTrimMeta.truncated
+        ? state.conversationTrimMeta
+        : null;
+    const loadedMessages = messages.length;
+    const recordedTotalMessages = Number(rawTrimMeta?.total_messages);
+    const totalMessages =
+      Number.isFinite(recordedTotalMessages) && recordedTotalMessages > loadedMessages
+        ? recordedTotalMessages
+        : loadedMessages;
+    const omittedMessages = Math.max(0, totalMessages - loadedMessages);
+    const omittedTools = Number(rawTrimMeta?.omitted_tools);
+    const compaction = summarizeConversationCompactions(messages);
+    const ratio =
+      tokenLimit && effectiveTokens
+        ? Math.min(1, Math.max(0, effectiveTokens / tokenLimit))
+        : 0;
+    const tone =
+      tokenLimit && ratio >= 0.9
+        ? "error"
+        : tokenLimit && ratio >= 0.75
+          ? "degraded"
+          : tokenLimit
+            ? "connected"
+            : "idle";
+    const totalKnown = !rawTrimMeta || omittedMessages === 0;
+    const loadedLabel = formatTokenCount(loadedTokens);
+    const currentLabel = totalKnown ? loadedLabel : `loaded ${loadedLabel}`;
+    const effectiveLabel = tokenLimit
+      ? `${formatTokenCount(effectiveTokens)} / ${formatTokenCount(tokenLimit)}`
+      : formatTokenCount(effectiveTokens);
+    const compactionLabel =
+      compaction.count === 1 ? "1 compaction" : `${compaction.count} compactions`;
+    const metaParts = [
+      `${loadedMessages}/${totalMessages} messages loaded`,
+      compaction.count > 0 ? compactionLabel : "no compactions",
+    ];
+    if (omittedTools > 0) metaParts.push(`${omittedTools} tools windowed`);
+    if (!totalKnown) metaParts.push("full token total is outside the client window");
+    return {
+      loadedTokens,
+      effectiveTokens,
+      tokenLimit,
+      ratio,
+      tone,
+      totalKnown,
+      loadedMessages,
+      totalMessages,
+      omittedMessages,
+      omittedTools: Number.isFinite(omittedTools) ? omittedTools : 0,
+      compaction,
+      currentLabel,
+      effectiveLabel,
+      capLabel: tokenLimit ? formatTokenCount(tokenLimit) : "unset",
+      metaLabel: metaParts.join(" | "),
+      pipValue: effectiveLabel,
+      tooltip: `Current loaded estimate: ${loadedLabel}${
+        tokenLimit ? ` / ${formatTokenCount(tokenLimit)} cap` : ""
+      }. ${metaParts.join(". ")}.`,
+    };
+  }, [
+    formatTokenCount,
+    parseContextLength,
+    state.conversation,
+    state.conversationTrimMeta,
+    state.maxContextLength,
+  ]);
 
   React.useEffect(() => {
     if (contextDirty) return;
@@ -2551,21 +3007,27 @@ const AgentConsole = ({
             continuation,
             updatedConversation[mIdx]?.metadata,
           );
+            const nextMetadataBase = {
+              ...(updatedConversation[mIdx]?.metadata || {}),
+              ...(md || {}),
+              ...(Object.prototype.hasOwnProperty.call(
+                md && typeof md === "object" ? md : {},
+                "tool_response_pending",
+              )
+                ? { tool_response_pending: md.tool_response_pending }
+                : { tool_response_pending: false }),
+              inline_tool_continuation_pending: false,
+              tool_continued: true,
+            };
             updatedConversation[mIdx] = {
               ...updatedConversation[mIdx],
               text: joined,
               timestamp: new Date().toISOString(),
-              metadata: {
-                ...(updatedConversation[mIdx]?.metadata || {}),
-                ...(md || {}),
-                ...(Object.prototype.hasOwnProperty.call(
-                  md && typeof md === "object" ? md : {},
-                  "tool_response_pending",
-                )
-                  ? { tool_response_pending: md.tool_response_pending }
-                  : { tool_response_pending: false }),
-                tool_continued: true,
-              },
+              metadata: appendToolContinuationPhase(
+                nextMetadataBase,
+                existingText,
+                continuation,
+              ),
             };
         }
         const hist = Array.isArray(prev.history) ? [...prev.history] : [];
@@ -2966,10 +3428,50 @@ const AgentConsole = ({
   ]);
 
   React.useEffect(() => {
+    if (collapsed) return undefined;
     const timerId = setInterval(() => {
       setRuntimeNow(Date.now());
     }, 1000);
     return () => clearInterval(timerId);
+  }, [collapsed]);
+
+  React.useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+    const clearRuntimeRagTimer = () => {
+      if (runtimeRagClearTimerRef.current) {
+        clearTimeout(runtimeRagClearTimerRef.current);
+        runtimeRagClearTimerRef.current = null;
+      }
+    };
+    const handleRuntimeRagOperation = (event) => {
+      const nextOperation = normalizeRuntimeRagOperation(event.detail);
+      if (!nextOperation) return;
+      clearRuntimeRagTimer();
+      setRuntimeRagOperation(nextOperation);
+      if (nextOperation.status === "complete" || nextOperation.status === "error") {
+        runtimeRagClearTimerRef.current = setTimeout(() => {
+          setRuntimeRagOperation((current) =>
+            current?.id === nextOperation.id ? null : current,
+          );
+          runtimeRagClearTimerRef.current = null;
+        }, RUNTIME_RAG_OPERATION_CLEAR_MS);
+      } else {
+        runtimeRagClearTimerRef.current = setTimeout(() => {
+          setRuntimeRagOperation((current) =>
+            current?.id === nextOperation.id ? null : current,
+          );
+          runtimeRagClearTimerRef.current = null;
+        }, RUNTIME_RAG_OPERATION_STALE_CLEAR_MS);
+      }
+    };
+    window.addEventListener(RUNTIME_RAG_OPERATION_EVENT, handleRuntimeRagOperation);
+    return () => {
+      window.removeEventListener(
+        RUNTIME_RAG_OPERATION_EVENT,
+        handleRuntimeRagOperation,
+      );
+      clearRuntimeRagTimer();
+    };
   }, []);
 
   React.useEffect(() => {
@@ -3693,10 +4195,18 @@ const AgentConsole = ({
     ) => {
       if (!sessionId || !messageId) return;
       const force = options.force === true;
+      const toolsOverride = Array.isArray(options.tools) ? options.tools.filter(Boolean) : null;
       const messageEntry = conversationById.get(messageId);
       const baseTools = Array.isArray(messageEntry?.tools) ? [...messageEntry.tools] : [];
-      const mergedTools = mergeToolUpdate(baseTools, toolUpdate);
+      const messageKey = String(messageId);
+      let accumulatedUpdates =
+        toolResolutionUpdatesRef.current.get(messageKey) || [];
       if (toolUpdate) {
+        accumulatedUpdates = mergeToolUpdate(accumulatedUpdates, toolUpdate);
+        toolResolutionUpdatesRef.current.set(messageKey, accumulatedUpdates);
+      }
+      const mergedTools = toolsOverride || mergeToolUpdates(baseTools, accumulatedUpdates);
+      if (toolUpdate || toolsOverride) {
         setState((prev) => {
           const updated = Array.isArray(prev.conversation)
             ? [...prev.conversation]
@@ -3725,6 +4235,14 @@ const AgentConsole = ({
         return;
       }
       if (toolContinueLocksRef.current.has(messageId)) return;
+      const continuationLockKey = buildToolContinuationLockKey({
+        sessionId,
+        messageId,
+        tools: batch,
+      });
+      const continuationLockAcquired =
+        !continuationLockKey || acquireToolContinuationLock(continuationLockKey);
+      if (!continuationLockAcquired) return;
       toolContinueLocksRef.current.add(messageId);
       try {
         const thinkingValue = state.thinkingMode || "auto";
@@ -3740,6 +4258,7 @@ const AgentConsole = ({
           ...thinkingPayload,
           tools: batch,
         });
+        toolResolutionUpdatesRef.current.delete(messageKey);
         const continuation = res.data?.message || "";
         const md = res.data?.metadata || {};
         if (continuation) {
@@ -3759,6 +4278,9 @@ const AgentConsole = ({
       } catch (err) {
         console.error("Auto-continue failed", err);
       } finally {
+        if (continuationLockAcquired) {
+          releaseToolContinuationLock(continuationLockKey);
+        }
         toolContinueLocksRef.current.delete(messageId);
       }
     },
@@ -4143,6 +4665,318 @@ const AgentConsole = ({
       runBrowserSessionAction,
     ],
   );
+
+  const buildBatchToolUpdate = React.useCallback((entry, status, result, nameOverride, argsOverride) => {
+    const name = resolveToolDisplayName(
+      { ...entry, name: nameOverride || entry?.name },
+      entry?.name || "tool",
+    );
+    return {
+      id: entry?.id || entry?.request_id,
+      request_id: entry?.request_id || entry?.id,
+      name,
+      args: argsOverride ?? entry?.args ?? {},
+      ...(typeof result !== "undefined" ? { result } : {}),
+      status: status || "invoked",
+    };
+  }, []);
+
+  const resolveBatchToolDecision = React.useCallback(
+    async (entry, decision) => {
+      const normalizedDecision = decision === "deny" ? "deny" : "accept";
+      const requestId = toolRequestId(entry);
+      const toolName = resolveToolDisplayName(entry);
+      const sessionForEntry = entry?.session_id || state.sessionId || null;
+      const messageForEntry = entry?.message_id || entry?.chain_id || null;
+      const targetChain = entry?.chain_id || entry?.message_id || messageForEntry || sessionForEntry;
+      const args = entry?.args || {};
+      const decisionPayload = {
+        request_id: requestId || entry?.id,
+        decision: normalizedDecision,
+        name: toolName,
+        session_id: sessionForEntry,
+        message_id: messageForEntry,
+        chain_id: targetChain || messageForEntry || sessionForEntry || null,
+      };
+      if (entry?.args && typeof entry.args === "object") {
+        decisionPayload.args = args;
+      }
+
+      if (normalizedDecision === "deny") {
+        if (requestId) {
+          const resp = await axios.post("/api/tools/decision", decisionPayload);
+          const status = String(resp?.data?.status || "denied").toLowerCase();
+          const result =
+            typeof resp?.data?.result !== "undefined"
+              ? resp.data.result
+              : fallbackResultForStatus(status);
+          return buildBatchToolUpdate(entry, status || "denied", result);
+        }
+        if (entry?.synthetic === true) {
+          return buildBatchToolUpdate(
+            entry,
+            "denied",
+            buildToolOutcomeResult("denied", "Dismissed by user."),
+          );
+        }
+        return null;
+      }
+
+      if (entry?.manual_fill_required === true && !requestId) return null;
+
+      if (requestId && CLIENT_RESOLUTION_TOOLS.has(toolName)) {
+        const resp = await resolveClientTool(entry);
+        const status = String(resp?.status || "").toLowerCase();
+        const result =
+          typeof resp?.result !== "undefined" ? resp.result : fallbackResultForStatus(status);
+        return buildBatchToolUpdate(entry, status || "invoked", result);
+      }
+
+      if (requestId) {
+        const resp = await axios.post("/api/tools/decision", decisionPayload);
+        const status = String(resp?.data?.status || "").toLowerCase();
+        const result =
+          typeof resp?.data?.result !== "undefined"
+            ? resp.data.result
+            : fallbackResultForStatus(status);
+        return buildBatchToolUpdate(entry, status || "invoked", result);
+      }
+
+      try {
+        const resp = await axios.post("/api/tools/invoke", {
+          name: toolName,
+          args,
+          chain_id: targetChain,
+          session_id: sessionForEntry,
+          message_id: messageForEntry || targetChain,
+        });
+        return buildBatchToolUpdate(
+          entry,
+          "invoked",
+          typeof resp?.data?.result !== "undefined" ? resp.data.result : undefined,
+        );
+      } catch (err) {
+        const detail =
+          err?.response?.data?.detail ||
+          err?.response?.data?.message ||
+          err?.message ||
+          "Tool invoke failed.";
+        const statusCode = err?.response?.status;
+        const safeDetail = statusCode && statusCode >= 500 ? "Tool error." : detail;
+        return buildBatchToolUpdate(
+          entry,
+          "error",
+          buildToolOutcomeResult("error", safeDetail),
+        );
+      }
+    },
+    [buildBatchToolUpdate, resolveClientTool, state.sessionId],
+  );
+
+  const runToolReviewBatch = React.useCallback(
+    async (batch, decision, options = {}) => {
+      const entries = Array.isArray(batch?.entries)
+        ? batch.entries.filter((entry) => entry?.type === "tool" && isToolAwaitingReview(entry))
+        : [];
+      const messageId = batch?.messageId || entries[0]?.message_id || entries[0]?.chain_id || null;
+      const sessionId = batch?.sessionId || entries[0]?.session_id || state.sessionId || null;
+      if (!entries.length || !messageId || !sessionId) return;
+      const pendingKey = `${decision}:${sessionId}:${messageId}`;
+      setToolBatchPendingKey(pendingKey);
+      try {
+        const updates = [];
+        for (const entry of entries) {
+          const update = await resolveBatchToolDecision(entry, decision);
+          if (update) updates.push(update);
+        }
+        const messageEntry = conversationById.get(messageId);
+        const sourceTools =
+          Array.isArray(messageEntry?.tools) && messageEntry.tools.length
+            ? messageEntry.tools
+            : entries;
+        const mergedTools = mergeToolUpdates(sourceTools, updates);
+        await maybeContinueBatch(
+          {
+            sessionId,
+            messageId,
+            toolUpdate: null,
+          },
+          batch?.continueTarget || null,
+          {
+            force: options.force === true,
+            tools: mergedTools,
+          },
+        );
+      } catch (err) {
+        console.error("Tool batch action failed", err);
+      } finally {
+        setToolBatchPendingKey((current) => (current === pendingKey ? "" : current));
+      }
+    },
+    [
+      conversationById,
+      maybeContinueBatch,
+      resolveBatchToolDecision,
+      state.sessionId,
+    ],
+  );
+
+  const openFirstBatchToolEditor = React.useCallback(
+    (batch) => {
+      const entries = Array.isArray(batch?.entries)
+        ? batch.entries.filter((entry) => entry?.type === "tool" && isToolAwaitingReview(entry))
+        : [];
+      const entry = entries[0];
+      if (!entry) return;
+      const base =
+        state.selectedCalendarDate instanceof Date
+          ? new Date(state.selectedCalendarDate)
+          : new Date();
+      setToolEditorState({
+        tool: {
+          name: resolveToolDisplayName(entry),
+          args: entry.args || {},
+          id: entry.id,
+          status: entry.status,
+        },
+        schedulePrefill: {
+          start_time: Math.floor(base.getTime() / 1000),
+          timezone: preferredTimezone,
+          title: `Schedule tool: ${resolveToolDisplayName(entry)}`,
+        },
+        onSubmit: async ({ args, name, continueTarget }) => {
+          const editedEntry = {
+            ...entry,
+            name: (name || entry.name || "").trim() || entry.name,
+            args: args || {},
+          };
+          const update = await resolveBatchToolDecision(editedEntry, "accept");
+          if (!update) return;
+          await maybeContinueBatch(
+            {
+              sessionId: batch?.sessionId || entry.session_id || state.sessionId || null,
+              messageId: batch?.messageId || entry.message_id || entry.chain_id || null,
+              toolUpdate: update,
+            },
+            continueTarget || batch?.continueTarget || null,
+          );
+        },
+      });
+    },
+    [
+      maybeContinueBatch,
+      preferredTimezone,
+      resolveBatchToolDecision,
+      state.selectedCalendarDate,
+      state.sessionId,
+    ],
+  );
+
+  const buildPendingToolBatches = React.useCallback(
+    (entries) => {
+      const groups = new Map();
+      (Array.isArray(entries) ? entries : []).forEach((entry) => {
+        if (!entry || entry.type !== "tool" || !isToolAwaitingReview(entry)) return;
+        const messageId = entry.message_id || entry.chain_id || null;
+        const sessionId = entry.session_id || state.sessionId || null;
+        if (!messageId || !sessionId) return;
+        const key = `${sessionId}:${messageId}`;
+        const group = groups.get(key) || {
+          key,
+          sessionId,
+          messageId,
+          entries: [],
+          continueTarget: null,
+        };
+        group.entries.push(entry);
+        groups.set(key, group);
+      });
+      return Array.from(groups.values()).filter((group) => group.entries.length > 1);
+    },
+    [state.sessionId],
+  );
+
+  const renderToolBatchActions = (batch) => {
+    if (!batch?.entries?.length) return null;
+    const busyPrefix = `${batch.sessionId}:${batch.messageId}`;
+    const busy = toolBatchPendingKey.endsWith(`:${busyPrefix}`);
+    const hasBlockedAccept = batch.entries.some(
+      (entry) => entry?.manual_fill_required === true && !toolRequestId(entry),
+    );
+    const label = summarizeToolBatchLabel(batch.entries);
+    const toolIds = batch.entries.map(toolRequestId).filter(Boolean);
+    return (
+      <div
+        key={`tool-batch-actions:${batch.key}`}
+        className="agent-tool-batch-actions"
+        data-chain-id={batch.messageId ? String(batch.messageId) : undefined}
+        data-tool-ids={toolIds.join(" ")}
+      >
+        <div className="agent-tool-batch-header">
+          <span className="agent-tool-batch-kicker">batch</span>
+          <span className="agent-tool-batch-label">{batch.entries.length} tools</span>
+        </div>
+        <div className="agent-tool-batch-controls">
+          <button
+            type="button"
+            className="tool-action-btn continue needs-tool-continue"
+            disabled={busy || hasBlockedAccept}
+            aria-label={
+              hasBlockedAccept
+                ? "One or more tools need editable arguments before the batch can run."
+                : `Approve ${label} and continue the assistant response.`
+            }
+            onClick={(event) => {
+              event.stopPropagation();
+              void runToolReviewBatch(batch, "accept", { force: true });
+            }}
+          >
+            Continue
+          </button>
+          <button
+            type="button"
+            className="tool-action-btn accept"
+            disabled={busy || hasBlockedAccept}
+            aria-label={
+              hasBlockedAccept
+                ? "One or more tools need editable arguments before the batch can run."
+                : "Approve every pending tool in this batch."
+            }
+            onClick={(event) => {
+              event.stopPropagation();
+              void runToolReviewBatch(batch, "accept");
+            }}
+          >
+            Accept
+          </button>
+          <button
+            type="button"
+            className="tool-action-btn deny"
+            disabled={busy}
+            aria-label="Deny every pending tool in this batch."
+            onClick={(event) => {
+              event.stopPropagation();
+              void runToolReviewBatch(batch, "deny");
+            }}
+          >
+            Deny
+          </button>
+          <button
+            type="button"
+            className="tool-action-btn edit"
+            disabled={busy}
+            aria-label="Edit the first pending tool in this batch."
+            onClick={(event) => {
+              event.stopPropagation();
+              openFirstBatchToolEditor(batch);
+            }}
+          >
+            Edit
+          </button>
+        </div>
+      </div>
+    );
+  };
 
   const renderToolActions = (entry) => {
       const normalizedStatus = getEffectiveToolStatus(entry);
@@ -4849,10 +5683,17 @@ const AgentConsole = ({
     const cardClass = `agent-card${activeClass}${cardHasFocus ? " focused" : ""}${
       isCompact ? " compact" : ""
     }`;
+    const orderedActivity = toolOnlyAgent
+      ? filteredActivity
+      : [...filteredActivity].reverse();
     const activityList = showAllActivity
-      ? [...filteredActivity].reverse()
-      : filteredActivity.slice(-6).reverse();
+      ? orderedActivity
+      : toolOnlyAgent
+        ? orderedActivity.slice(0, 6)
+        : filteredActivity.slice(-6).reverse();
+    const pendingToolBatches = buildPendingToolBatches(filteredActivity);
     const canExpand = filteredActivity.length > 6;
+    const renderedHistoryKeys = new Set();
     const compactMetaNote = isCompact
       ? truncatePreviewText(
           normalizePreviewText(agent.summary || provenanceLine || workflowLine || handoffLine),
@@ -5141,7 +5982,17 @@ const AgentConsole = ({
           </div>
         )}
         {!isCompact && (
-          <ul className="agent-activity-list">
+          <div
+            className={`agent-tool-activity-region${
+              pendingToolBatches.length > 0 ? " has-pending-batch" : ""
+            }`}
+          >
+            {pendingToolBatches.length > 0 && (
+              <div className="agent-tool-batch-stack">
+                {pendingToolBatches.map((batch) => renderToolBatchActions(batch))}
+              </div>
+            )}
+            <ul className="agent-activity-list">
             {activityList.map((entry) => {
               const ts = formatTimestamp(entry.timestamp);
               const status = getEffectiveToolStatus(entry) || normalizeToolStatus(entry.status) || null;
@@ -5176,7 +6027,9 @@ const AgentConsole = ({
                 status,
               });
               const collapsed =
-                chainIdentifier && Object.prototype.hasOwnProperty.call(collapsedChains, chainIdentifier)
+                entryFocused
+                  ? false
+                  : chainIdentifier && Object.prototype.hasOwnProperty.call(collapsedChains, chainIdentifier)
                   ? !!collapsedChains[chainIdentifier]
                   : isResolvedTool
                     ? true
@@ -5190,7 +6043,8 @@ const AgentConsole = ({
                   [chainIdentifier]: !collapsed,
                 }));
             };
-              const displayType = entry.type === "stream" ? "response" : entry.type;
+              const displayType =
+                entry.type === "tool" ? "" : entry.type === "stream" ? "response" : entry.type;
               const isStream = entry.type === "stream";
               const streamLabel = isStream ? formatStreamLabel(entry) : null;
               const responseHistory =
@@ -5199,6 +6053,12 @@ const AgentConsole = ({
                     String(entry.message_id || entry.chain_id || "").trim(),
                   ) || null
                   : null;
+              const showResponseHistoryToggle = Boolean(
+                responseHistory && !renderedHistoryKeys.has(responseHistory.key),
+              );
+              if (showResponseHistoryToggle) {
+                renderedHistoryKeys.add(responseHistory.key);
+              }
               const bodyText =
                 entry.type === "task"
                   ? entry.content || entry.description || "Task update"
@@ -5208,13 +6068,18 @@ const AgentConsole = ({
             const preview = collapsed ? buildEntryPreview(entry, bodyText) : null;
             const entryNameKey = normalizePreviewText(entry.name).toLowerCase();
             const showEntryToolName =
-              entry.type === "tool" && entry.name && entryNameKey !== displayLabelKey;
+              entry.type === "tool"
+                ? Boolean(entry.name)
+                : entry.name && entryNameKey !== displayLabelKey;
             const handleActivityClick = (event) => {
               const target = event.target;
+              const interactiveTarget =
+                typeof Element !== "undefined" && target instanceof Element
+                  ? target.closest(AGENT_CARD_INTERACTIVE_SELECTOR)
+                  : null;
               if (
-                typeof Element !== "undefined" &&
-                target instanceof Element &&
-                target.closest(AGENT_CARD_INTERACTIVE_SELECTOR)
+                interactiveTarget &&
+                interactiveTarget !== event.currentTarget
               ) {
                 return;
               }
@@ -5242,10 +6107,13 @@ const AgentConsole = ({
                   role={chainIdentifier ? "button" : undefined}
                   tabIndex={chainIdentifier ? 0 : undefined}
                   onKeyDown={(event) => {
+                    const interactiveTarget =
+                      typeof Element !== "undefined" && event.target instanceof Element
+                        ? event.target.closest(AGENT_CARD_INTERACTIVE_SELECTOR)
+                        : null;
                     if (
-                      typeof Element !== "undefined" &&
-                      event.target instanceof Element &&
-                      event.target.closest(AGENT_CARD_INTERACTIVE_SELECTOR)
+                      interactiveTarget &&
+                      interactiveTarget !== event.currentTarget
                     ) {
                       return;
                     }
@@ -5256,7 +6124,7 @@ const AgentConsole = ({
                   }}
                 >
                   <div className="agent-activity-meta">
-                    <span className="agent-activity-type">{displayType}</span>
+                    {displayType && <span className="agent-activity-type">{displayType}</span>}
                     {showEntryToolName && (
                       <button
                         type="button"
@@ -5309,17 +6177,19 @@ const AgentConsole = ({
                       />
                     )}
                     {ts && <time>{ts}</time>}
-                    {responseHistory && (
+                    {showResponseHistoryToggle && (
                       <button
                         type="button"
                         className="agent-card-control-btn agent-history-toggle"
                         aria-expanded={openActionHistoryKey === responseHistory.key}
+                        aria-label={`Open work history (${responseHistory.actions.length})`}
+                        title={`Open work history (${responseHistory.actions.length})`}
                         onClick={(event) => {
                           event.stopPropagation();
                           toggleActionHistory(responseHistory);
                         }}
                       >
-                        work history ({responseHistory.actions.length})
+                        history
                       </button>
                     )}
                     {chainIdentifier && (
@@ -5385,11 +6255,14 @@ const AgentConsole = ({
                   </div>
                 )}
                   {entry.type === "tool" && (!collapsed || isProposedTool) && renderToolActions(entry)}
-                  {entry.type === "tool" && responseHistory && renderActionHistoryPopover(responseHistory)}
+                  {entry.type === "tool" &&
+                    showResponseHistoryToggle &&
+                    renderActionHistoryPopover(responseHistory)}
                 </li>
               );
             })}
-          </ul>
+            </ul>
+          </div>
         )}
       </article>
     );
@@ -5837,9 +6710,151 @@ const AgentConsole = ({
     const runtime = runtimeStatus;
     const modeLabel = state.backendMode || runtime?.mode || "api";
     if (runtimePanelHidden) return null;
+    const renderContextBudgetPip = (compact = false) =>
+      renderConsolePip({
+        key: "runtime-context-budget",
+        label: "Budget",
+        value: contextBudget.pipValue,
+        title: contextBudget.tooltip,
+        tone: contextBudget.tone,
+        compact,
+      });
+    const renderContextBudgetBlock = () => (
+      <div
+        className={`runtime-context-budget runtime-context-budget--${contextBudget.tone}`}
+        title={contextBudget.tooltip}
+      >
+        <div className="runtime-meter-row">
+          <span className="runtime-meter-label">Context budget</span>
+          <span className="runtime-meter-value">{contextBudget.effectiveLabel}</span>
+        </div>
+        {contextBudget.tokenLimit ? (
+          <div className="runtime-meter-bar" aria-hidden="true">
+            <div
+              className="runtime-meter-fill"
+              style={{ width: `${(contextBudget.ratio * 100).toFixed(1)}%` }}
+            />
+          </div>
+        ) : null}
+        <div className="runtime-context-budget-grid">
+          <span>current</span>
+          <strong>{contextBudget.currentLabel}</strong>
+          <span>effective</span>
+          <strong>{formatTokenCount(contextBudget.effectiveTokens)}</strong>
+          <span>cap</span>
+          <strong>{contextBudget.capLabel}</strong>
+          <span>compacted</span>
+          <strong>{contextBudget.compaction.count}</strong>
+        </div>
+        <div className="runtime-meter-meta">{contextBudget.metaLabel}</div>
+      </div>
+    );
+    const ragOperationStatus = runtimeRagOperation?.status || "";
+    const ragOperationActive = Boolean(runtimeRagOperation?.id);
+    const ragOperationTone =
+      ragOperationStatus === "error"
+        ? "error"
+        : ragOperationStatus === "complete"
+          ? "connected"
+          : ragOperationActive
+            ? "loading"
+            : "idle";
+    const ragOperationValue = ragOperationActive
+      ? ragOperationStatus === "complete"
+        ? "complete"
+        : ragOperationStatus === "error"
+          ? "error"
+          : "retrieving"
+      : "idle";
+    const renderRagOperationPip = (compact = false) =>
+      renderConsolePip({
+        key: "runtime-rag-operation",
+        label: "Retrieval",
+        value: ragOperationValue,
+        title: runtimeRagOperation?.phaseLabel || "Chat retrieval status",
+        tone: ragOperationTone,
+        compact,
+      });
+    const renderRagOperationBlock = () => {
+      if (!runtimeRagOperation) return null;
+      const phaseIndex = Number(runtimeRagOperation.phaseIndex);
+      const phaseCount = Number(runtimeRagOperation.phaseCount);
+      const hasPhaseProgress =
+        Number.isFinite(phaseIndex) && Number.isFinite(phaseCount) && phaseCount > 0;
+      const progressRatio = hasPhaseProgress
+        ? Math.max(0, Math.min(1, phaseIndex / phaseCount))
+        : ragOperationStatus === "complete"
+          ? 1
+          : 1;
+      const elapsedMs = Number.isFinite(runtimeRagOperation.elapsedMs)
+        ? runtimeRagOperation.elapsedMs
+        : runtimeRagOperation.startedAtMs
+          ? Math.max(0, runtimeNow - runtimeRagOperation.startedAtMs)
+          : null;
+      const returnedMatches = Number(runtimeRagOperation.counts?.returned_matches);
+      const requestedTopK = Number(runtimeRagOperation.counts?.requested_top_k);
+      const clipTopK = Number(runtimeRagOperation.counts?.clip_top_k);
+      const metaParts = [];
+      if (hasPhaseProgress) {
+        metaParts.push(`Step ${Math.max(1, phaseIndex)} of ${Math.max(1, phaseCount)}`);
+      }
+      if (elapsedMs !== null) metaParts.push(formatOperationElapsed(elapsedMs));
+      if (Number.isFinite(returnedMatches)) {
+        metaParts.push(`${returnedMatches} matches`);
+      } else {
+        const requestedParts = [];
+        if (Number.isFinite(requestedTopK) && requestedTopK > 0) {
+          requestedParts.push(`${requestedTopK} text`);
+        }
+        if (Number.isFinite(clipTopK) && clipTopK > 0) {
+          requestedParts.push(`${clipTopK} vision`);
+        }
+        if (requestedParts.length) metaParts.push(`top ${requestedParts.join(" + ")}`);
+      }
+      return (
+        <div
+          className={`runtime-rag-progress runtime-rag-progress--${ragOperationTone}`}
+          role="status"
+          aria-live="polite"
+          title={runtimeRagOperation.detail || runtimeRagOperation.phaseLabel}
+        >
+          <div className="runtime-meter-row">
+            <span className="runtime-meter-label">Retrieval</span>
+            <span className="runtime-meter-value">{ragOperationValue}</span>
+          </div>
+          {runtimeRagOperation.phaseLabel ? (
+            <div className="runtime-rag-progress-phase">
+              {runtimeRagOperation.phaseLabel}
+            </div>
+          ) : null}
+          <div className="runtime-meter-bar" aria-hidden="true">
+            <div
+              className={`runtime-meter-fill${
+                !hasPhaseProgress && ragOperationStatus !== "complete"
+                  ? " is-indeterminate"
+                  : ""
+              }`}
+              style={
+                !hasPhaseProgress && ragOperationStatus !== "complete"
+                  ? undefined
+                  : { width: `${(progressRatio * 100).toFixed(1)}%` }
+              }
+            />
+          </div>
+          <div className="runtime-meter-meta">
+            {metaParts.join(" | ")}
+            {metaParts.length > 0 && runtimeRagOperation.detail ? " | " : ""}
+            {runtimeRagOperation.detail}
+          </div>
+        </div>
+      );
+    };
     if (modeLabel !== "local") {
       const apiModel = state.apiModel || "api model not selected";
       const transformerModel = state.transformerModel || "transformer model not selected";
+      const serverModel = state.transformerModel || "server default";
+      const serverUrl = state.serverUrl || "server url not set";
+      const serverMode = String(modeLabel).toLowerCase() === "server";
       const wsStatus = normalizeStatusValue(state.wsStatus);
       const wsLabel =
         wsStatus === "online"
@@ -5858,7 +6873,9 @@ const AgentConsole = ({
             : providerState.installed
               ? "installed"
               : "checking"
-        : "api mode";
+        : serverMode
+          ? "server/LAN"
+          : "api mode";
       const renderApiRuntimePips = (compact = false) => (
         <div
           className={
@@ -5868,20 +6885,27 @@ const AgentConsole = ({
           }
         >
           {renderConsolePip({
-            key: "api-model",
-            label: "API",
-            value: apiModel,
-            title: `API model: ${apiModel}`,
-            tone: apiModel === "api model not selected" ? "idle" : "connected",
+            key: serverMode ? "server-url" : "api-model",
+            label: serverMode ? "Server" : "API",
+            value: serverMode ? serverUrl : apiModel,
+            title: serverMode ? `Server URL: ${serverUrl}` : `API model: ${apiModel}`,
+            tone:
+              serverMode && serverUrl === "server url not set"
+                ? "idle"
+                : !serverMode && apiModel === "api model not selected"
+                  ? "idle"
+                  : "connected",
             compact,
           })}
           {renderConsolePip({
-            key: "transformer-model",
-            label: "Transformer",
-            value: transformerModel,
-            title: `Transformer model: ${transformerModel}`,
+            key: serverMode ? "server-model" : "transformer-model",
+            label: serverMode ? "Model" : "Transformer",
+            value: serverMode ? serverModel : transformerModel,
+            title: serverMode
+              ? `Server model: ${serverModel}`
+              : `Transformer model: ${transformerModel}`,
             tone:
-              transformerModel === "transformer model not selected"
+              (!serverMode && transformerModel === "transformer model not selected")
                 ? "idle"
                 : "connected",
             compact,
@@ -5902,14 +6926,20 @@ const AgentConsole = ({
             tone: providerState ? "connected" : "idle",
             compact,
           })}
+          {renderContextBudgetPip(compact)}
+          {renderRagOperationPip(compact)}
         </div>
       );
 
       return (
         <ConsoleObjectCard
           title="runtime"
-          subtitle="api mode"
-          preview={`API ${apiModel}; Transformer ${transformerModel}; WebSocket ${wsLabel}`}
+          subtitle={serverMode ? "server mode" : "api mode"}
+          preview={
+            serverMode
+              ? `Server ${serverUrl}; Model ${serverModel}; WebSocket ${wsLabel}; Budget ${contextBudget.pipValue}`
+              : `API ${apiModel}; Transformer ${transformerModel}; WebSocket ${wsLabel}; Budget ${contextBudget.pipValue}`
+          }
           className="agent-runtime-panel"
           collapsed={runtimePanelCollapsed}
           onToggleCollapsed={() => setRuntimePanelCollapsed((prev) => !prev)}
@@ -5921,14 +6951,18 @@ const AgentConsole = ({
           symbolButtonClassName="runtime-action-symbol"
           status={
             <div className="runtime-panel-status" title="runtime status">
-              api
+              {serverMode ? "server" : "api"}
             </div>
           }
           collapsedContent={renderApiRuntimePips(true)}
         >
           {renderApiRuntimePips(false)}
+          {renderContextBudgetBlock()}
+          {renderRagOperationBlock()}
           <div className="runtime-panel-note runtime-panel-summary" role="status">
-            API mode is using {apiModel} with {transformerModel}.
+            {serverMode
+              ? `Server mode is using ${serverModel} via ${serverUrl}.`
+              : `API mode is using ${apiModel} with ${transformerModel}.`}
           </div>
         </ConsoleObjectCard>
       );
@@ -6191,6 +7225,8 @@ const AgentConsole = ({
             tone: contextLength ? "connected" : "idle",
             compact,
           })}
+          {renderContextBudgetPip(compact)}
+          {renderRagOperationPip(compact)}
         </div>
       );
 
@@ -6274,6 +7310,8 @@ const AgentConsole = ({
               </span>
             ) : null}
           </div>
+          {renderContextBudgetBlock()}
+          {renderRagOperationBlock()}
           {providerRuntime?.model_mismatch ? (
             <div className="runtime-panel-warning" role="status">
               Loaded model {loadedModel || "unknown"} differs from preferred model{" "}
@@ -6770,6 +7808,8 @@ const AgentConsole = ({
           tone: "provider",
           compact,
         })}
+        {renderContextBudgetPip(compact)}
+        {renderRagOperationPip(compact)}
       </div>
     );
 
@@ -6849,6 +7889,8 @@ const AgentConsole = ({
               tone: "provider",
               compact: true,
             })}
+            {renderContextBudgetPip(true)}
+            {renderRagOperationPip(true)}
           </div>
         ) : null}
         {runtimePanelCollapsed ? (
@@ -6922,6 +7964,8 @@ const AgentConsole = ({
             </span>
           )}
         </div>
+        {renderContextBudgetBlock()}
+        {renderRagOperationBlock()}
         <div className="runtime-context-row" ref={contextWrapRef}>
           <span className="runtime-context-label">Context</span>
           <div

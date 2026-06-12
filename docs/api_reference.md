@@ -39,12 +39,14 @@ Chat modes are `api`, `local`, and `server`.
 | --- | --- | --- |
 | `/api/voice/connect` | `POST` | Current cloud-default live voice bootstrap. In Realtime API mode, returns browser-facing Realtime connection details. |
 | `/api/voice/stream` | `POST` | Older worker-backed voice stream path; not used when the browser streams directly to OpenAI Realtime. |
-| `/api/voice/tts` | `POST` | Text-to-speech generation. |
+| `/api/voice/tts` | `POST` | Text-to-speech generation. Accepts `text`, optional `model`, optional TTS `voice`, and `audio_format` (`mp3`, `opus`, `aac`, `flac`, `wav`, `wave`, or `pcm`). Local TTS currently returns `wav` only. |
 | `/api/stream/sessions` | `POST` | Experimental device streaming/session sketch. |
 | `/api/stream/candidates` | `POST` | Experimental ICE/signaling candidate route. |
 | `/api/stream/sessions/{session_id}` | `GET` / `DELETE` | Experimental streaming session status/end routes. |
 
 OpenAI Realtime is the current cloud-default live voice path. Gemma 4 is not a supported live voice transport in this pass; use Gemma 4 through the language-model lanes. LiveKit remains a fallback transport and Pipecat remains an explored pipeline option.
+
+OpenAI TTS uses `/v1/audio/speech` with `gpt-4o-mini-tts`, `tts-1`, or `tts-1-hd`. TTS voice presets are separate from live Realtime voices and local provider models.
 
 ## Tools, Actions, And Agent Console
 
@@ -62,6 +64,8 @@ OpenAI Realtime is the current cloud-default live voice path. Gemma 4 is not a s
 | `/api/actions/{action_id}` | `GET` | Inspect a tracked action/diff. |
 | `/api/actions/revert` | `POST` | Revert tracked write actions when conflict checks allow it. |
 | `/api/agents/console` | `GET` | Hydrate Agent Console cards after refresh/reconnect. |
+| `/api/background/autonomy/status` | `GET` | Inspect the bounded background autonomy supervisor, attention-ranked reflection candidates, heartbeat, runtime budget, satisfaction threshold, and scheduled-action counts. |
+| `/api/background/autonomy/tick` | `POST` | Run or dry-run one bounded background autonomy tick. Payloads can override `mode`, `max_reflections`, `max_runtime_seconds`, and `satisfied_threshold`; routine loop startup remains opt-in via Settings/environment config. |
 
 Current built-in tool metadata lives in `backend/app/tool_catalog.py`; current callable registration lives in `backend/app/tools/__init__.py`.
 
@@ -125,7 +129,7 @@ SQLite is the canonical knowledge/memory store. Chroma is the default retrieval 
 | `/api/conversations/import` | `POST` | Import Markdown/JSON/text/OpenAI-style export content. |
 | `/api/conversations/reveal/{name:path}` | `GET` | Reveal a saved conversation location. |
 | `/api/conversations/{name:path}/suggest-name` | `GET` | Suggest a better display name. |
-| `/api/threads/generate` | `POST` | Generate/update semantic thread summaries. |
+| `/api/threads/generate` | `POST` | Generate/update semantic thread summaries. Supports high-level topic inference, seeded `manual_threads`, `embedding_model`, selectable `topic_suggestion_provider`/`topic_suggestion_model`, and default-on `sensitive_mode` that blocks API topic labeling for protected/secret conversation scopes. |
 | `/api/threads/summary` | `GET` | Read latest thread summary. |
 | `/api/threads/search` | `POST` | Search generated thread data. |
 | `/api/threads/rename` | `POST` | Rename a generated thread. |

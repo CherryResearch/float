@@ -286,6 +286,60 @@ def finish_operation(
     return _summarize_operation(entry)
 
 
+def retire_pending_pushes_after_pull(
+    *,
+    remote_url: str,
+    pull_operation_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Mark stale pending-review pushes as superseded by a completed pull."""
+    target_remote = _clean_text(remote_url, limit=360).rstrip("/")
+    pull_id = _clean_id(pull_operation_id) if pull_operation_id else ""
+    data = _load()
+    operations = _load_operations(data)
+    now = _now()
+    retired_ids: List[str] = []
+    for op_id, entry in list(operations.items()):
+        if pull_id and op_id == pull_id:
+            continue
+        if _clean_text(entry.get("kind"), limit=40).lower() != "push":
+            continue
+        if _clean_text(entry.get("status"), limit=40).lower() != "completed":
+            continue
+        result = entry.get("result") if isinstance(entry.get("result"), dict) else {}
+        if (
+            _clean_text(result.get("remote_status"), limit=80).lower()
+            != "pending_review"
+        ):
+            continue
+        entry_remote = _clean_text(
+            result.get("remote") or entry.get("remote_url"),
+            limit=360,
+        ).rstrip("/")
+        if target_remote and entry_remote and entry_remote != target_remote:
+            continue
+        next_result = {
+            **result,
+            "remote_status": "superseded_by_pull",
+            "superseded_by_operation_id": pull_id or None,
+        }
+        operations[op_id] = {
+            **entry,
+            "status": "cancelled",
+            "updated_at": now,
+            "finished_at": entry.get("finished_at") or now,
+            "cancel_requested": False,
+            "error": "",
+            "result": next_result,
+        }
+        retired_ids.append(op_id)
+    if retired_ids:
+        data["sync_operations"] = _trim_operations(operations)
+        if pull_id:
+            data["last_sync_operation_id"] = pull_id
+        _save(data)
+    return {"count": len(retired_ids), "operation_ids": retired_ids}
+
+
 def cancel_operation(operation_id: str) -> Dict[str, Any]:
     op_id = _clean_id(operation_id)
     data = _load()

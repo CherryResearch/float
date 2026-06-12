@@ -28,12 +28,14 @@ DEFAULT_LIVE_TOOL_NAMES = {
     "list_reflections",
     "remember",
     "recall",
+    "route_to_local_model",
     "search_web",
     "capture.list",
 }
 
 LOW_APPROVAL_TOOL_NAMES = {
     *DEFAULT_LIVE_TOOL_NAMES,
+    "read_capability_docs",
     "camera.capture",
     "computer.observe",
     "computer.windows.list",
@@ -110,6 +112,13 @@ def default_tool_policy(tool_name: str) -> Dict[str, str]:
     workflow = WORKFLOW_BOTH if name in DEFAULT_LIVE_TOOL_NAMES else WORKFLOW_TEXT
     approval = APPROVAL_LOW if name in LOW_APPROVAL_TOOL_NAMES else APPROVAL_HIGH
     return {"workflow": workflow, "approval": approval}
+
+
+def tool_name_safe_for_live_transport(tool_name: str) -> bool:
+    """Return true when the tool name is safe for realtime function transport."""
+
+    name = str(tool_name or "").strip()
+    return bool(name) and all(char.isalnum() or char in {"_", "-"} for char in name)
 
 
 def normalize_tool_policy(
@@ -194,6 +203,8 @@ def tool_auto_invokable_in_workflow(
     policy = effective_tool_policy(tool_name, settings)
     if policy.get("approval") != APPROVAL_LOW:
         return False
+    if not tool_name_safe_for_live_transport(str(tool_name or "")):
+        return False
     return str(tool_name or "").strip() not in CLIENT_RESOLUTION_TOOL_NAMES
 
 
@@ -225,6 +236,8 @@ def tool_policy_payload(
         unavailable_reason = "high_approval_required"
     elif live_allowed and name in CLIENT_RESOLUTION_TOOL_NAMES:
         unavailable_reason = "client_resolution_required"
+    elif live_allowed and not tool_name_safe_for_live_transport(name):
+        unavailable_reason = "transport_unsafe_name"
     return {
         "workflow": policy["workflow"],
         "approval": policy["approval"],

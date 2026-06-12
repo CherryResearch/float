@@ -4,6 +4,7 @@ import SwapVertIcon from "@mui/icons-material/SwapVert";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import "../styles/ThreadsTab.css";
 import FilterBar from "./FilterBar";
+import StateInspector from "./StateInspector";
 import { GlobalContext } from "../main";
 import { getConversationTrimMeta } from "../utils/proxy";
 
@@ -93,6 +94,14 @@ const formatTimestampLabel = (value) => {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(new Date(ts));
+};
+
+const compactEmbeddingModelLabel = (value) => {
+  const raw = String(value || "").trim();
+  if (!raw) return "default embedding model";
+  const tail = raw.split(/[\\/]/).filter(Boolean).pop() || raw;
+  if (tail.length <= 32) return tail;
+  return `${tail.slice(0, 29)}...`;
 };
 
 const normalizeMessageRole = (message) => {
@@ -327,6 +336,52 @@ const SAE_COMBO_PRESETS = [
   "custom",
 ];
 
+const THREAD_EMBEDDING_MODEL_PRESETS = [
+  {
+    id: "sentence-transformers/all-MiniLM-L6-v2",
+    label: "MiniLM L6 (fast local)",
+  },
+  {
+    id: "sentence-transformers/all-mpnet-base-v2",
+    label: "MPNet base (stronger local)",
+  },
+  {
+    id: "google/embeddinggemma-300m",
+    label: "EmbeddingGemma 300M",
+  },
+];
+
+const THREAD_TOPIC_PROVIDER_STORAGE_KEY = "float:threads:topic-provider";
+const THREAD_LOCAL_TOPIC_MODEL_STORAGE_KEY = "float:threads:topic-model:local";
+const THREAD_API_TOPIC_MODEL_STORAGE_KEY = "float:threads:topic-model:api";
+
+const THREAD_TOPIC_SUGGESTION_PROVIDER_OPTIONS = [
+  { id: "local", label: "Local" },
+  { id: "api", label: "API" },
+];
+
+const THREAD_LOCAL_TOPIC_MODEL_PRESETS = [
+  { id: "local:heuristic", label: "Local heuristic" },
+  { id: "local:fastopic", label: "FASTopic if installed" },
+];
+
+const THREAD_API_TOPIC_MODEL_PRESETS = [
+  { id: "gpt-4o-mini", label: "gpt-4o-mini" },
+  { id: "gpt-4.1-mini", label: "gpt-4.1-mini" },
+];
+
+const getStoredThreadOption = (key, fallback, allowed = null) => {
+  if (typeof window === "undefined") return fallback;
+  try {
+    const value = String(window.localStorage.getItem(key) || "").trim();
+    if (!value) return fallback;
+    if (Array.isArray(allowed) && !allowed.includes(value)) return fallback;
+    return value;
+  } catch {
+    return fallback;
+  }
+};
+
 const normalizeThreadSignalMode = (value) => {
   const mode = String(value || "").trim().toLowerCase();
   if (mode === "sae") return "sae";
@@ -341,6 +396,13 @@ const normalizeThreadSignalBlend = (value, fallback = 0.7) => {
 };
 
 const THREAD_BUNDLE_STORAGE_KEY = "float:threads:topic-bundles";
+const RECOMMENDED_SEEDED_TOPIC_TAGS = [
+  "food",
+  "philosophy",
+  "tool use",
+  "creative projects",
+  "miscellaneous",
+];
 
 const parseCommaSeparatedTopics = (value) =>
   String(value || "")
@@ -405,13 +467,34 @@ const ThreadsTab = () => {
   const [customTags, setCustomTags] = useState("");
   const [manualThreads, setManualThreads] = useState("");
   const [kOption, setKOption] = useState("auto");
-  const [preferredK, setPreferredK] = useState("16");
-  const [maxK, setMaxK] = useState("30");
+  const [preferredK, setPreferredK] = useState("8");
+  const [maxK, setMaxK] = useState("16");
   const [coalesceRelated, setCoalesceRelated] = useState(true);
   const [scopeMode, setScopeMode] = useState("all");
   const [scopeFolder, setScopeFolder] = useState("");
   const [scopeThreadInput, setScopeThreadInput] = useState("");
-  const [topN, setTopN] = useState("5");
+  const [topN, setTopN] = useState("16");
+  const [embeddingModel, setEmbeddingModel] = useState(THREAD_EMBEDDING_MODEL_PRESETS[0].id);
+  const [sensitiveMode, setSensitiveMode] = useState(true);
+  const [topicSuggestionProvider, setTopicSuggestionProvider] = useState(() =>
+    getStoredThreadOption(
+      THREAD_TOPIC_PROVIDER_STORAGE_KEY,
+      "local",
+      THREAD_TOPIC_SUGGESTION_PROVIDER_OPTIONS.map((option) => option.id),
+    ),
+  );
+  const [localTopicSuggestionModel, setLocalTopicSuggestionModel] = useState(() =>
+    getStoredThreadOption(
+      THREAD_LOCAL_TOPIC_MODEL_STORAGE_KEY,
+      THREAD_LOCAL_TOPIC_MODEL_PRESETS[0].id,
+    ),
+  );
+  const [apiTopicSuggestionModel, setApiTopicSuggestionModel] = useState(() =>
+    getStoredThreadOption(
+      THREAD_API_TOPIC_MODEL_STORAGE_KEY,
+      THREAD_API_TOPIC_MODEL_PRESETS[0].id,
+    ),
+  );
   const [saeEnabled, setSaeEnabled] = useState(false);
   const [saeMode, setSaeMode] = useState("inspect");
   const [saeLayer, setSaeLayer] = useState("12");
@@ -437,8 +520,9 @@ const ThreadsTab = () => {
   const [renameValue, setRenameValue] = useState("");
   const [renameError, setRenameError] = useState("");
   const [topicBundles, setTopicBundles] = useState([]);
-  const [selectedBundleId, setSelectedBundleId] = useState("auto:suggested");
+  const [selectedBundleId, setSelectedBundleId] = useState("auto:seeded");
   const [bundleNameInput, setBundleNameInput] = useState("");
+  const [topicDraft, setTopicDraft] = useState("");
   const [optionsOpen, setOptionsOpen] = useState(false);
   const [topBarCollapsed, setTopBarCollapsed] = useState(false);
   const [conversationCache, setConversationCache] = useState({});
@@ -480,8 +564,8 @@ const ThreadsTab = () => {
     } else if (typeof hints.k_option === "number" && Number.isFinite(hints.k_option)) {
       setKOption(String(hints.k_option));
     }
-    setPreferredK(String(parseIntInput(hints.preferred_k, 16)));
-    setMaxK(String(parseIntInput(hints.max_k, 30)));
+    setPreferredK(String(parseIntInput(hints.preferred_k, 8)));
+    setMaxK(String(parseIntInput(hints.max_k, 16)));
     if (typeof hints.coalesce_related === "boolean") {
       setCoalesceRelated(hints.coalesce_related);
     }
@@ -496,7 +580,49 @@ const ThreadsTab = () => {
     setScopeThreadInput(
       typeof hints.scope_thread === "string" ? hints.scope_thread : "",
     );
-    setTopN(String(parseIntInput(hints.top_n, 5)));
+    if (Array.isArray(hints.manual_threads)) {
+      setManualThreads(
+        hints.manual_threads
+          .map((topic) => String(topic || "").trim())
+          .filter(Boolean)
+          .join(", "),
+      );
+    } else if (typeof hints.manual_threads === "string") {
+      setManualThreads(parseCommaSeparatedTopics(hints.manual_threads).join(", "));
+    } else {
+      setManualThreads("");
+    }
+    setTopN(String(parseIntInput(hints.top_n, 16)));
+    setEmbeddingModel(
+      typeof hints.embedding_model_requested === "string" && hints.embedding_model_requested.trim()
+        ? hints.embedding_model_requested.trim()
+        : typeof hints.embedding_model === "string" && hints.embedding_model.trim()
+          ? hints.embedding_model.trim()
+          : THREAD_EMBEDDING_MODEL_PRESETS[0].id,
+    );
+    setSensitiveMode(
+      typeof hints.sensitive_mode === "boolean" ? hints.sensitive_mode : true,
+    );
+    const hintedTopicProvider = String(
+      hints.topic_suggestion_provider_requested
+      || hints.topic_suggestion_provider
+      || "",
+    ).trim().toLowerCase();
+    if (hintedTopicProvider === "api" || hintedTopicProvider === "local") {
+      setTopicSuggestionProvider(hintedTopicProvider);
+      const hintedTopicModel = String(
+        hints.topic_suggestion_model_requested
+        || hints.topic_suggestion_model
+        || "",
+      ).trim();
+      if (hintedTopicModel) {
+        if (hintedTopicProvider === "api") {
+          setApiTopicSuggestionModel(hintedTopicModel);
+        } else {
+          setLocalTopicSuggestionModel(hintedTopicModel);
+        }
+      }
+    }
     setClusterBackend(
       typeof hints.cluster_backend_requested === "string" && hints.cluster_backend_requested.trim()
         ? hints.cluster_backend_requested.trim()
@@ -611,6 +737,26 @@ const ThreadsTab = () => {
   }, [activeThread]);
 
   useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(
+        THREAD_TOPIC_PROVIDER_STORAGE_KEY,
+        topicSuggestionProvider,
+      );
+      window.localStorage.setItem(
+        THREAD_LOCAL_TOPIC_MODEL_STORAGE_KEY,
+        localTopicSuggestionModel,
+      );
+      window.localStorage.setItem(
+        THREAD_API_TOPIC_MODEL_STORAGE_KEY,
+        apiTopicSuggestionModel,
+      );
+    } catch {
+      // Ignore local storage write failures.
+    }
+  }, [apiTopicSuggestionModel, localTopicSuggestionModel, topicSuggestionProvider]);
+
+  useEffect(() => {
     setSubthreadSearchByDepth({});
     setSubthreadsOpen(Boolean(activeThread));
   }, [activeThread]);
@@ -661,6 +807,16 @@ const ThreadsTab = () => {
     const resolvedScopeThread = String(
       overrides.scopeThread ?? scopeThreadInput ?? activeThread ?? "",
     ).trim();
+    const resolvedManualThreads =
+      Array.isArray(overrides.manualThreads)
+        ? overrides.manualThreads
+        : parseCommaSeparatedTopics(overrides.manualThreads ?? manualThreads);
+    const resolvedInferTopics =
+      typeof overrides.inferTopics === "boolean" ? overrides.inferTopics : inferTopics;
+    const resolvedKOption = overrides.kOption ?? kOption;
+    const resolvedPreferredK = overrides.preferredK ?? preferredK;
+    const resolvedMaxK = overrides.maxK ?? maxK;
+    const resolvedTopN = overrides.topN ?? topN;
     if (resolvedScopeMode === "thread" && !resolvedScopeThread) {
       setError("Select or enter a thread name to refine.");
       return false;
@@ -668,37 +824,44 @@ const ThreadsTab = () => {
     setLoading(true);
     setError("");
     try {
-      const parsedPreferredK = Number(preferredK);
-      const parsedMaxK = Number(maxK);
-      const parsedTopN = Number(topN);
+      const parsedPreferredK = Number(resolvedPreferredK);
+      const parsedMaxK = Number(resolvedMaxK);
+      const parsedTopN = Number(resolvedTopN);
       const parsedSaeLayer = Number(saeLayer);
       const parsedSaeTopK = Number(saeTopK);
       const parsedSignalBlend = normalizeThreadSignalBlend(threadSignalBlend, 0.7);
+      const normalizedTopicSuggestionProvider =
+        topicSuggestionProvider === "api" ? "api" : "local";
+      const topicSuggestionModel =
+        normalizedTopicSuggestionProvider === "api"
+          ? apiTopicSuggestionModel.trim()
+          : localTopicSuggestionModel.trim();
       const tags = customTags
         .split(",")
         .map((tag) => tag.trim())
         .filter(Boolean);
       const payload = {
-        infer_topics: inferTopics,
+        infer_topics: resolvedInferTopics,
         tags: tags.length ? tags : null,
-        k_option: kOption === "auto" ? null : Number(kOption),
+        embedding_model: embeddingModel.trim() || null,
+        sensitive_mode: sensitiveMode,
+        k_option: resolvedKOption === "auto" ? null : Number(resolvedKOption),
         preferred_k:
-          kOption === "auto" && Number.isFinite(parsedPreferredK) && parsedPreferredK >= 2
+          resolvedKOption === "auto" && Number.isFinite(parsedPreferredK) && parsedPreferredK >= 2
             ? parsedPreferredK
             : null,
         max_k:
-          kOption === "auto" && Number.isFinite(parsedMaxK) && parsedMaxK >= 2
+          resolvedKOption === "auto" && Number.isFinite(parsedMaxK) && parsedMaxK >= 2
             ? parsedMaxK
             : null,
         cluster_backend: clusterBackend,
         cluster_device: clusterDevice,
+        topic_suggestion_provider: normalizedTopicSuggestionProvider,
+        topic_suggestion_model: topicSuggestionModel || null,
         coalesce_related: coalesceRelated,
         scope_folder: resolvedScopeMode === "folder" ? scopeFolder.trim() || null : null,
         scope_thread: resolvedScopeMode === "thread" ? resolvedScopeThread : null,
-        manual_threads: manualThreads
-          .split(",")
-          .map((thread) => thread.trim())
-          .filter(Boolean),
+        manual_threads: resolvedManualThreads,
         top_n: Number.isFinite(parsedTopN) && parsedTopN > 0 ? parsedTopN : null,
         thread_signal_mode: normalizeThreadSignalMode(threadSignalMode),
         thread_signal_blend: parsedSignalBlend,
@@ -737,12 +900,15 @@ const ThreadsTab = () => {
     }
   }, [
     activeThread,
+    apiTopicSuggestionModel,
     clusterBackend,
     clusterDevice,
     coalesceRelated,
     customTags,
+    embeddingModel,
     inferTopics,
     kOption,
+    localTopicSuggestionModel,
     manualThreads,
     maxK,
     preferredK,
@@ -759,13 +925,48 @@ const ThreadsTab = () => {
     scopeFolder,
     scopeMode,
     scopeThreadInput,
+    sensitiveMode,
     threadSignalBlend,
     threadSignalMode,
+    topicSuggestionProvider,
     topN,
   ]);
 
   const generateFromModal = async () => {
     const ok = await generate();
+    if (ok) {
+      setOptionsOpen(false);
+    }
+  };
+  const inferMainTopics = async () => {
+    const ok = await generate({
+      inferTopics: true,
+      manualThreads: [],
+      kOption: "auto",
+      preferredK,
+      maxK,
+      topN,
+    });
+    if (ok) {
+      setManualThreads("");
+      setOptionsOpen(false);
+    }
+  };
+  const generateWithTopicTags = async () => {
+    let topics = parseCommaSeparatedTopics(manualThreads);
+    if (!topics.length) {
+      topics = RECOMMENDED_SEEDED_TOPIC_TAGS;
+      setManualThreads(topics.join(", "));
+      setSelectedBundleId("auto:seeded");
+    }
+    const ok = await generate({
+      inferTopics: false,
+      manualThreads: topics,
+      kOption: "auto",
+      preferredK,
+      maxK,
+      topN,
+    });
     if (ok) {
       setOptionsOpen(false);
     }
@@ -1144,6 +1345,58 @@ const ThreadsTab = () => {
   const generatedInferTopics = summary?.metadata?.ui_hints?.infer_topics;
   const generatedKMode = summary?.metadata?.ui_hints?.k_option || "auto";
   const generatedCoalesce = summary?.metadata?.ui_hints?.coalesce_related;
+  const generatedTopicPass = summary?.metadata?.ui_hints?.topic_pass || "main_topics";
+  const generatedManualThreads = Array.isArray(summary?.metadata?.ui_hints?.manual_threads)
+    ? summary.metadata.ui_hints.manual_threads
+    : [];
+  const generatedSensitiveMode =
+    typeof summary?.metadata?.ui_hints?.sensitive_mode === "boolean"
+      ? summary.metadata.ui_hints.sensitive_mode
+      : true;
+  const generatedExternalLabeling =
+    Boolean(summary?.metadata?.ui_hints?.external_topic_labeling);
+  const generatedTopicProviderRequested =
+    summary?.metadata?.ui_hints?.topic_suggestion_provider_requested
+    || summary?.metadata?.generation?.topic_suggestion_provider_requested
+    || summary?.metadata?.ui_hints?.topic_suggestion_provider
+    || "local";
+  const generatedTopicProvider =
+    summary?.metadata?.ui_hints?.topic_suggestion_provider
+    || summary?.metadata?.generation?.topic_suggestion_provider
+    || generatedTopicProviderRequested;
+  const generatedTopicModelRequested =
+    summary?.metadata?.ui_hints?.topic_suggestion_model_requested
+    || summary?.metadata?.generation?.topic_suggestion_model_requested
+    || summary?.metadata?.ui_hints?.topic_suggestion_model
+    || "";
+  const generatedTopicModel =
+    summary?.metadata?.ui_hints?.topic_suggestion_model
+    || summary?.metadata?.generation?.topic_suggestion_model
+    || generatedTopicModelRequested
+    || "local:heuristic";
+  const generatedApiLabelingBlocked = Boolean(
+    summary?.metadata?.ui_hints?.api_topic_labeling_blocked
+    || summary?.metadata?.generation?.api_topic_labeling_blocked,
+  );
+  const generatedApiLabelingBlockedReason =
+    summary?.metadata?.ui_hints?.api_topic_labeling_blocked_reason
+    || summary?.metadata?.generation?.api_topic_labeling_blocked_reason
+    || "";
+  const generatedSensitiveConversationCount = Number(
+    summary?.metadata?.ui_hints?.sensitive_conversation_count
+    || summary?.metadata?.generation?.sensitive_conversation_count
+    || 0,
+  );
+  const generatedEmbeddingModel =
+    summary?.metadata?.ui_hints?.embedding_model_requested
+    || summary?.metadata?.ui_hints?.embedding_model
+    || summary?.metadata?.embedding_model
+    || THREAD_EMBEDDING_MODEL_PRESETS[0].id;
+  const generatedOperation =
+    summary?.metadata?.ui_hints?.operation
+    || summary?.metadata?.generation?.operation
+    || summary?.metadata?.operation
+    || null;
   const mergedLabelCount = Number(summary?.metadata?.ui_hints?.merged_label_count || 0);
   const generatedAtRaw =
     summary?.metadata?.generated_at_utc
@@ -1183,9 +1436,31 @@ const ThreadsTab = () => {
         : generatedScopeMode;
   const propertiesSummary = [
     `scope ${generatedScopeLabel}`,
+    generatedTopicPass === "seeded" ? "seeded tags" : "main-topic pass",
     `infer ${generatedInferTopics === false ? "off" : "on"}`,
     `merge ${generatedCoalesce === false ? "off" : "on"}`,
     mergedLabelCount > 0 ? `merged labels:${mergedLabelCount}` : "",
+  ]
+    .filter(Boolean)
+    .join(" | ");
+  const privacySummary = [
+    generatedSensitiveMode ? "respect sensitive:on" : "respect sensitive:off",
+    generatedSensitiveConversationCount > 0
+      ? `sensitive chats:${generatedSensitiveConversationCount}`
+      : "",
+    generatedExternalLabeling ? "external labels:on" : "external labels:off",
+    generatedApiLabelingBlocked
+      ? `api blocked:${generatedApiLabelingBlockedReason || "yes"}`
+      : "",
+  ]
+    .filter(Boolean)
+    .join(" | ");
+  const labelerSummary = [
+    `requested:${generatedTopicProviderRequested}`,
+    generatedTopicProvider !== generatedTopicProviderRequested
+      ? `used:${generatedTopicProvider}`
+      : "",
+    generatedTopicModel ? `model:${generatedTopicModel}` : "",
   ]
     .filter(Boolean)
     .join(" | ");
@@ -1254,7 +1529,25 @@ const ThreadsTab = () => {
     ],
     [conversations, selectedK, threadCards.length],
   );
+  const setManualTopicList = useCallback((topics) => {
+    setManualThreads(mergeTopicLists([], topics).join(", "));
+  }, []);
   const suggestedManualTopics = useMemo(() => {
+    const generatedSuggestions =
+      summary?.metadata?.generation?.suggested_topics
+      || summary?.metadata?.ui_hints?.suggested_topics
+      || [];
+    const generatedTopicLabels = Array.isArray(generatedSuggestions)
+      ? generatedSuggestions
+        .map((entry) => (
+          typeof entry === "string" ? entry : entry?.topic || entry?.label
+        ))
+        .map((label) => String(label || "").trim())
+        .filter(Boolean)
+      : [];
+    if (generatedTopicLabels.length) {
+      return mergeTopicLists([], generatedTopicLabels).slice(0, 10);
+    }
     const topicCounts = new Map();
     Object.values(conversations || {}).forEach((info) => {
       const topics =
@@ -1283,11 +1576,11 @@ const ThreadsTab = () => {
       .map((thread) => String(thread?.label || "").trim())
       .filter(Boolean)
       .slice(0, 10);
-  }, [conversations, threadCards]);
+  }, [conversations, summary, threadCards]);
   const suggestManualTopics = useCallback(() => {
     if (!suggestedManualTopics.length) return;
-    setManualThreads(suggestedManualTopics.join(", "));
-  }, [suggestedManualTopics]);
+    setManualTopicList(suggestedManualTopics);
+  }, [setManualTopicList, suggestedManualTopics]);
   const handleSubthreadSearchChange = useCallback((depth, value) => {
     setSubthreadSearchByDepth((prev) => ({
       ...prev,
@@ -1309,6 +1602,11 @@ const ThreadsTab = () => {
       .slice(0, 16);
     return [
       {
+        id: "auto:seeded",
+        name: "Recommended: seeded topics",
+        topics: RECOMMENDED_SEEDED_TOPIC_TAGS,
+      },
+      {
         id: "auto:suggested",
         name: "Auto: suggested topics",
         topics: suggestedManualTopics,
@@ -1328,6 +1626,69 @@ const ThreadsTab = () => {
     () => availableTopicBundles.find((bundle) => bundle.id === selectedBundleId) || null,
     [availableTopicBundles, selectedBundleId],
   );
+  const activeManualTopicTags = parseCommaSeparatedTopics(manualThreads);
+  const topicPlanTags = activeManualTopicTags.length
+    ? activeManualTopicTags
+    : RECOMMENDED_SEEDED_TOPIC_TAGS;
+  const topicPlanTagSource = activeManualTopicTags.length ? "selected" : "recommended";
+  const topicPlanEmbeddingModel = embeddingModel || generatedEmbeddingModel;
+  const topicPlanEmbeddingLabel = compactEmbeddingModelLabel(topicPlanEmbeddingModel);
+  const scopeTagTarget =
+    scopeMode === "thread" && scopeThreadInput.trim()
+      ? `thread group "${scopeThreadInput.trim()}"`
+      : scopeMode === "folder" && scopeFolder.trim()
+        ? `folder "${scopeFolder.trim()}"`
+        : "selected scope";
+  const addTopicDraft = useCallback(() => {
+    const topics = parseCommaSeparatedTopics(topicDraft);
+    if (!topics.length) return;
+    setManualThreads((prev) => (
+      mergeTopicLists(parseCommaSeparatedTopics(prev), topics).join(", ")
+    ));
+    setTopicDraft("");
+  }, [topicDraft]);
+  const removeManualTopic = useCallback((topicToRemove) => {
+    const target = String(topicToRemove || "").trim().toLowerCase();
+    if (!target) return;
+    setManualThreads((prev) => (
+      parseCommaSeparatedTopics(prev)
+        .filter((topic) => topic.toLowerCase() !== target)
+        .join(", ")
+    ));
+  }, []);
+  const clearManualTopics = useCallback(() => {
+    setManualThreads("");
+    setTopicDraft("");
+  }, []);
+  const topicPlanInspectorRows = useMemo(() => [
+    { label: "Owner", value: generatedOperation?.owner || "threads UI" },
+    { label: "Operation", value: generatedOperation?.id || "not running" },
+    { label: "Source", value: generatedOperation?.source || "current form state" },
+    { label: "Scope", value: scopeTagTarget },
+    {
+      label: "Topic labeler",
+      value: topicSuggestionProvider === "api"
+        ? `api:${apiTopicSuggestionModel || "default"}`
+        : `local:${localTopicSuggestionModel || "heuristic"}`,
+    },
+    { label: "Embedding model", value: embeddingModel || generatedEmbeddingModel },
+    { label: "Seed tags", value: activeManualTopicTags.length ? activeManualTopicTags.join(", ") : "none selected" },
+    { label: "Privacy", value: sensitiveMode ? "respect sensitive conversations" : "external labeling allowed by form" },
+  ], [
+    activeManualTopicTags,
+    apiTopicSuggestionModel,
+    embeddingModel,
+    generatedEmbeddingModel,
+    generatedOperation,
+    localTopicSuggestionModel,
+    scopeTagTarget,
+    sensitiveMode,
+    topicSuggestionProvider,
+  ]);
+  const applyRecommendedTopicTags = useCallback(() => {
+    setSelectedBundleId("auto:seeded");
+    setManualTopicList(RECOMMENDED_SEEDED_TOPIC_TAGS);
+  }, [setManualTopicList]);
 
   useEffect(() => {
     if (scopeMode !== "thread") return;
@@ -1365,8 +1726,8 @@ const ThreadsTab = () => {
       setManualThreads((prev) => mergeTopicLists(parseCommaSeparatedTopics(prev), bundleTopics).join(", "));
       return;
     }
-    setManualThreads(bundleTopics.join(", "));
-  }, [selectedTopicBundle]);
+    setManualTopicList(bundleTopics);
+  }, [selectedTopicBundle, setManualTopicList]);
 
   const saveManualTopicsAsBundle = useCallback(() => {
     const topics = parseCommaSeparatedTopics(manualThreads);
@@ -1942,6 +2303,15 @@ const ThreadsTab = () => {
                 <span className="threads-hero-chip" title="Planned signal path metadata for embeddings/SAE retrieval strategy">
                   Signal path: {signalSummary}
                 </span>
+                <span className="threads-hero-chip" title="Embedding model used for chunk vectors and seeded tag matching">
+                  Model: {generatedEmbeddingModel}
+                </span>
+                <span className="threads-hero-chip" title="Topic labeler requested and used for the last high-level pass">
+                  Topic labeler: {labelerSummary}
+                </span>
+                <span className="threads-hero-chip" title="When enabled, protected/secret conversations stay out of external LLM topic labeling.">
+                  Privacy: {privacySummary}
+                </span>
                 <span
                   className="threads-hero-chip"
                   title={
@@ -1955,12 +2325,23 @@ const ThreadsTab = () => {
                 <span className="threads-hero-chip" title="Experimental sparse autoencoder options from the last run">
                   SAE (experimental): {saeSummary}
                 </span>
+                {generatedManualThreads.length ? (
+                  <span className="threads-hero-chip" title="Topic tags used by the seeded pass">
+                    Tags: {generatedManualThreads.length}
+                  </span>
+                ) : null}
               </div>
             ) : null}
           </div>
           <div className="threads-hero-actions">
-            <button type="button" className="threads-btn-primary" onClick={generate} disabled={loading}>
-              {loading ? "Generating..." : "Generate threads"}
+            <button
+              type="button"
+              className="threads-btn-primary"
+              onClick={inferMainTopics}
+              disabled={loading}
+              title="Run the high-level main-topic pass for the selected scope."
+            >
+              {loading ? "Generating..." : "Infer main topics"}
             </button>
             <button type="button" className="threads-options-btn" onClick={() => setOptionsOpen(true)}>
               Generate options
@@ -2004,6 +2385,77 @@ const ThreadsTab = () => {
                 ))}
               </div>
             ) : null}
+          </div>
+        ) : null}
+        {!topBarCollapsed ? (
+          <div className="threads-topic-plan" aria-label="Topic generation plan">
+            <div className="threads-topic-plan-head">
+              <div>
+                <p className="threads-section-label">Topic plan</p>
+                <h3>{activeManualTopicTags.length ? "Seeded assignment ready" : "Main-topic pass first"}</h3>
+              </div>
+              <StateInspector
+                title="Why this topic plan is shown"
+                summary="Threads generation has three separable decisions: topic labels, editable seed tags, then embedding-based chunk assignment."
+                rows={topicPlanInspectorRows}
+                ariaLabel="Explain topic generation plan"
+                label="i"
+              />
+            </div>
+            <div className="threads-topic-plan-grid">
+              <div className="threads-topic-plan-step">
+                <span className="threads-step-index">1</span>
+                <div>
+                  <strong>Labels</strong>
+                  <span>{topicSuggestionProvider === "api" ? "API labeler" : "local labeler"} / {inferTopics ? "infer on" : "infer off"}</span>
+                </div>
+              </div>
+              <div className="threads-topic-plan-step is-topic-heavy">
+                <span className="threads-step-index">2</span>
+                <div>
+                  <strong>Seeds</strong>
+                  <span>{topicPlanTagSource} set, {topicPlanTags.length} topics</span>
+                  <div className="threads-topic-plan-tags" aria-label={`${topicPlanTagSource} topic tags`}>
+                    {topicPlanTags.slice(0, 6).map((topic) => (
+                      <span key={`plan-${topic.toLowerCase()}`} className="threads-topic-tag">
+                        {topic}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <div className="threads-topic-plan-step">
+                <span className="threads-step-index">3</span>
+                <div>
+                  <strong>Assign</strong>
+                  <span title={topicPlanEmbeddingModel}>
+                    {scopeMode} scope / {topicPlanEmbeddingLabel}
+                  </span>
+                </div>
+              </div>
+            </div>
+            <div className="threads-topic-plan-actions">
+              <button type="button" className="threads-subtle-btn" onClick={() => setOptionsOpen(true)}>
+                Edit topics
+              </button>
+              <button
+                type="button"
+                className="threads-subtle-btn"
+                onClick={applyRecommendedTopicTags}
+                title="Load the stable seed set: food, philosophy, tool use, creative projects, miscellaneous."
+              >
+                Use recommended seeds
+              </button>
+              <button
+                type="button"
+                className="threads-subtle-btn"
+                onClick={generateWithTopicTags}
+                disabled={loading}
+                title="Assign chunks to the selected seed tags. If no tags are selected, the recommended set is used."
+              >
+                Assign to seeds
+              </button>
+            </div>
           </div>
         ) : null}
       </section>
@@ -2701,6 +3153,180 @@ const ThreadsTab = () => {
               </button>
             </div>
 
+            <div className="threads-modal-topic-priority">
+              <section className="threads-topic-step" aria-labelledby="threads-topic-labeler-title">
+                <div className="threads-topic-step-head">
+                  <span className="threads-step-index">1</span>
+                  <div>
+                    <p className="threads-section-label">Topic labels</p>
+                    <h4 id="threads-topic-labeler-title">
+                      {topicSuggestionProvider === "api" ? "API topic pass" : "Local topic pass"}
+                    </h4>
+                  </div>
+                </div>
+                <div className="threads-segmented-control" role="group" aria-label="Topic labeler">
+                  {THREAD_TOPIC_SUGGESTION_PROVIDER_OPTIONS.map((option) => (
+                    <button
+                      key={option.id}
+                      type="button"
+                      className={topicSuggestionProvider === option.id ? "is-selected" : ""}
+                      onClick={() => setTopicSuggestionProvider(option.id)}
+                      aria-pressed={topicSuggestionProvider === option.id}
+                      title={option.id === "api" ? "Use the API labeler when the selected scope is allowed to leave this device." : "Keep topic labeling local."}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+                <label className="threads-modal-field threads-compact-field">
+                  model
+                  <input
+                    type="text"
+                    list={
+                      topicSuggestionProvider === "api"
+                        ? "threads-api-topic-model-presets"
+                        : "threads-local-topic-model-presets"
+                    }
+                    value={
+                      topicSuggestionProvider === "api"
+                        ? apiTopicSuggestionModel
+                        : localTopicSuggestionModel
+                    }
+                    onChange={(event) => {
+                      if (topicSuggestionProvider === "api") {
+                        setApiTopicSuggestionModel(event.target.value);
+                      } else {
+                        setLocalTopicSuggestionModel(event.target.value);
+                      }
+                    }}
+                    aria-label={
+                      topicSuggestionProvider === "api"
+                        ? "Primary API topic model"
+                        : "Primary local topic model"
+                    }
+                    title="Model or local strategy used only for the high-level topic-label pass."
+                  />
+                </label>
+              </section>
+
+              <section className="threads-topic-step threads-topic-step-wide" aria-labelledby="threads-topic-seeds-title">
+                <div className="threads-topic-step-head">
+                  <span className="threads-step-index">2</span>
+                  <div>
+                    <p className="threads-section-label">Review seeds</p>
+                    <h4 id="threads-topic-seeds-title">Editable target topics</h4>
+                  </div>
+                  <StateInspector
+                    title="Topic seed editor"
+                    summary="Seed topics are fixed labels for chunk assignment. Leave them empty to run free topic inference first."
+                    rows={[
+                      { label: "Recommended", value: RECOMMENDED_SEEDED_TOPIC_TAGS.join(", ") },
+                      { label: "Selected", value: activeManualTopicTags.length ? activeManualTopicTags.join(", ") : "none" },
+                      { label: "Saved bundles", value: String(topicBundles.length) },
+                    ]}
+                    ariaLabel="Explain topic seed editor"
+                    label="i"
+                  />
+                </div>
+                <div className="threads-topic-editor" aria-label="Editable topic seeds">
+                  <div className="threads-topic-editor-tags">
+                    {activeManualTopicTags.length ? (
+                      activeManualTopicTags.map((topic) => (
+                        <button
+                          key={`topic-edit-${topic.toLowerCase()}`}
+                          type="button"
+                          className="threads-topic-tag threads-topic-tag-editable"
+                          onClick={() => removeManualTopic(topic)}
+                          aria-label={`Remove topic ${topic}`}
+                          title={`Remove ${topic}`}
+                        >
+                          <span>{topic}</span>
+                          <span aria-hidden="true">x</span>
+                        </button>
+                      ))
+                    ) : (
+                      <span className="threads-topic-tag is-empty">No fixed seed topics selected</span>
+                    )}
+                  </div>
+                  <div className="threads-topic-add-row">
+                    <input
+                      type="text"
+                      value={topicDraft}
+                      onChange={(event) => setTopicDraft(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          addTopicDraft();
+                        }
+                      }}
+                      placeholder="add topic, or paste comma-separated topics"
+                      aria-label="Add topic seed"
+                      title="Press Enter to add one or more comma-separated seed topics."
+                    />
+                    <button
+                      type="button"
+                      className="threads-subtle-btn"
+                      onClick={addTopicDraft}
+                      disabled={!topicDraft.trim()}
+                      aria-label="Add typed topic seed"
+                      title="Add the typed topic seed"
+                    >
+                      Add
+                    </button>
+                  </div>
+                  <div className="threads-topic-editor-actions">
+                    <button type="button" className="threads-subtle-btn" onClick={applyRecommendedTopicTags}>
+                      Recommended
+                    </button>
+                    <button
+                      type="button"
+                      className="threads-subtle-btn"
+                      onClick={suggestManualTopics}
+                      disabled={!suggestedManualTopics.length}
+                      title="Fill from the last high-level topic scan."
+                    >
+                      From scan
+                    </button>
+                    <button type="button" className="threads-subtle-btn" onClick={clearManualTopics} disabled={!activeManualTopicTags.length && !topicDraft.trim()}>
+                      Clear
+                    </button>
+                  </div>
+                </div>
+              </section>
+
+              <section className="threads-topic-step" aria-labelledby="threads-topic-assign-title">
+                <div className="threads-topic-step-head">
+                  <span className="threads-step-index">3</span>
+                  <div>
+                    <p className="threads-section-label">Assign chunks</p>
+                    <h4 id="threads-topic-assign-title">{scopeTagTarget}</h4>
+                  </div>
+                </div>
+                <label className="threads-modal-field threads-compact-field">
+                  scope
+                  <select
+                    value={scopeMode}
+                    onChange={(event) => setScopeMode(event.target.value)}
+                    title="Choose all conversations, a folder path, or one existing thread group."
+                  >
+                    <option value="all">all conversations</option>
+                    <option value="folder">folder</option>
+                    <option value="thread">thread group</option>
+                  </select>
+                </label>
+                <div className="threads-topic-run-buttons">
+                  <button type="button" onClick={inferMainTopics} disabled={loading}>
+                    Infer labels
+                  </button>
+                  <button type="button" className="threads-btn-primary" onClick={generateWithTopicTags} disabled={loading}>
+                    Assign to seeds
+                  </button>
+                </div>
+              </section>
+            </div>
+
+            <details className="threads-modal-section">
+              <summary>Run mechanics and advanced controls</summary>
             <div className="threads-modal-grid">
               <label className="threads-modal-field inline-label">
                 <input
@@ -2708,24 +3334,98 @@ const ThreadsTab = () => {
                   checked={inferTopics}
                   onChange={(event) => setInferTopics(event.target.checked)}
                 />
-                <span title="When enabled, topics are inferred automatically instead of only using your manual labels.">
-                  infer topics automatically
+                <span title="High-level pass: k-means groups chunks, then labels the main topics for this scope.">
+                  infer main topics
                 </span>
+              </label>
+
+              <label
+                className="threads-modal-field"
+                title="Choose whether high-level topic labels are generated locally or by an API model."
+              >
+                topic labeler
+                <small className="threads-field-help">
+                  Local stays private. API can use a lightweight mini model when the selected scope is not marked sensitive.
+                </small>
+                <select
+                  value={topicSuggestionProvider}
+                  onChange={(event) => setTopicSuggestionProvider(event.target.value)}
+                >
+                  {THREAD_TOPIC_SUGGESTION_PROVIDER_OPTIONS.map((option) => (
+                    <option key={option.id} value={option.id}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label
+                className="threads-modal-field field-wide"
+                title={
+                  topicSuggestionProvider === "api"
+                    ? "API model used for the high-level topic scoring prompt."
+                    : "Local topic-label strategy. Current stable path is heuristic labeling with optional local topic-model fallback."
+                }
+              >
+                {topicSuggestionProvider === "api" ? "API topic model" : "local topic model"}
+                <small className="threads-field-help">
+                  Last local/API choices are remembered separately on this device.
+                </small>
+                <input
+                  type="text"
+                  list={
+                    topicSuggestionProvider === "api"
+                      ? "threads-api-topic-model-presets"
+                      : "threads-local-topic-model-presets"
+                  }
+                  value={
+                    topicSuggestionProvider === "api"
+                      ? apiTopicSuggestionModel
+                      : localTopicSuggestionModel
+                  }
+                  onChange={(event) => {
+                    if (topicSuggestionProvider === "api") {
+                      setApiTopicSuggestionModel(event.target.value);
+                    } else {
+                      setLocalTopicSuggestionModel(event.target.value);
+                    }
+                  }}
+                  placeholder={
+                    topicSuggestionProvider === "api"
+                      ? "gpt-4o-mini"
+                      : "local:heuristic"
+                  }
+                />
+                <datalist id="threads-api-topic-model-presets">
+                  {THREAD_API_TOPIC_MODEL_PRESETS.map((preset) => (
+                    <option key={preset.id} value={preset.id}>
+                      {preset.label}
+                    </option>
+                  ))}
+                </datalist>
+                <datalist id="threads-local-topic-model-presets">
+                  {THREAD_LOCAL_TOPIC_MODEL_PRESETS.map((preset) => (
+                    <option key={preset.id} value={preset.id}>
+                      {preset.label}
+                    </option>
+                  ))}
+                </datalist>
               </label>
 
               <label className="threads-modal-field">
                 top-K strategy
                 <small className="threads-field-help">
-                  K is the cluster count. Auto estimates it; fixed K forces an exact thread count.
+                  Auto estimates a compact main-topic count. Defaults bias toward 4-16.
                 </small>
                 <select
                   value={kOption}
                   onChange={(event) => setKOption(event.target.value)}
-                  title="Auto calculates cluster count from your data. Fixed K enforces a set number of threads."
+                  title="Auto uses k-means selection. Fixed K is available for controlled reruns."
                 >
                   <option value="auto">auto</option>
                   <option value="4">4</option>
                   <option value="8">8</option>
+                  <option value="12">12</option>
                   <option value="16">16</option>
                   <option value="32">32</option>
                 </select>
@@ -2736,27 +3436,29 @@ const ThreadsTab = () => {
                   <label className="threads-modal-field">
                     target k
                     <small className="threads-field-help">
-                      Preferred cluster target for auto mode.
+                      Preferred center for auto mode.
                     </small>
                     <input
                       type="number"
                       min={2}
-                      max={60}
+                      max={32}
                       value={preferredK}
                       onChange={(event) => setPreferredK(event.target.value)}
+                      title="Recommended range is 4-16; use higher only for dense scopes."
                     />
                   </label>
                   <label className="threads-modal-field">
                     max k
                     <small className="threads-field-help">
-                      Upper bound auto mode will not exceed.
+                      Soft upper bound for auto mode.
                     </small>
                     <input
                       type="number"
                       min={2}
-                      max={80}
+                      max={32}
                       value={maxK}
                       onChange={(event) => setMaxK(event.target.value)}
+                      title="32 is allowed, but smaller caps keep subthread fanout manageable."
                     />
                   </label>
                 </>
@@ -2776,15 +3478,15 @@ const ThreadsTab = () => {
               <label className="threads-modal-field threads-modal-field-half">
                 top threads to keep
                 <small className="threads-field-help">
-                  Keep only the strongest N discovered threads in the final gallery.
+                  Caps the gallery after the high-level pass.
                 </small>
                 <input
                   type="number"
                   min={1}
-                  max={30}
+                  max={32}
                   value={topN}
                   onChange={(event) => setTopN(event.target.value)}
-                  title="Number of strongest discovered threads kept in the final output."
+                  title="Use 16 for a compact pass; 32 is the practical ceiling for broad exploration."
                 />
               </label>
 
@@ -2802,6 +3504,41 @@ const ThreadsTab = () => {
                   <option value="folder">folder</option>
                   <option value="thread">thread group</option>
                 </select>
+              </label>
+
+              <label
+                className="threads-modal-field field-wide"
+                title="SentenceTransformer model id or local path used for chunk embeddings and topic-tag matching."
+              >
+                embedding model
+                <small className="threads-field-help">
+                  MiniLM is the fast default. MPNet and EmbeddingGemma are stronger candidates when available.
+                </small>
+                <input
+                  type="text"
+                  list="threads-embedding-model-presets"
+                  value={embeddingModel}
+                  onChange={(event) => setEmbeddingModel(event.target.value)}
+                  placeholder="sentence-transformers/all-MiniLM-L6-v2"
+                />
+                <datalist id="threads-embedding-model-presets">
+                  {THREAD_EMBEDDING_MODEL_PRESETS.map((preset) => (
+                    <option key={preset.id} value={preset.id}>
+                      {preset.label}
+                    </option>
+                  ))}
+                </datalist>
+              </label>
+
+              <label className="threads-modal-field inline-label field-wide">
+                <input
+                  type="checkbox"
+                  checked={sensitiveMode}
+                  onChange={(event) => setSensitiveMode(event.target.checked)}
+                />
+                <span title="When on, protected/secret conversations in the selected scope block external LLM topic labeling.">
+                  respect sensitive conversations
+                </span>
               </label>
 
               {scopeMode === "folder" ? (
@@ -2850,7 +3587,7 @@ const ThreadsTab = () => {
               ) : null}
 
               <label className="threads-modal-field field-wide">
-                seed tags (comma separated)
+                discovery hints (comma separated)
                 <small className="threads-field-help">
                   Optional bias terms for automatic discovery. Threads can still be inferred beyond these.
                 </small>
@@ -2864,18 +3601,27 @@ const ThreadsTab = () => {
               </label>
 
               <label className="threads-modal-field field-wide">
-                manual thread labels (comma separated)
+                topic tags for selected scope
                 <small className="threads-field-help">
-                  Pre-coded topic buckets. If set, mentions map directly to these labels.
+                  Seed topics for the {scopeTagTarget}. Chunks map directly to these tags.
                 </small>
                 <div className="threads-manual-topics-row">
                   <input
                     type="text"
                     value={manualThreads}
                     onChange={(event) => setManualThreads(event.target.value)}
-                    placeholder="Action items, recipe ideas"
-                    title="Manual labels become fixed target topics for assignment."
+                    placeholder="food, philosophy, tool use"
+                    aria-label="topic tags for selected scope"
+                    title="Topic tags become fixed target topics for assignment."
                   />
+                  <button
+                    type="button"
+                    className="threads-subtle-btn"
+                    onClick={applyRecommendedTopicTags}
+                    title="Use the recommended seeded topic set."
+                  >
+                    Seeded set
+                  </button>
                   <button
                     type="button"
                     className="threads-subtle-btn"
@@ -2885,6 +3631,17 @@ const ThreadsTab = () => {
                   >
                     Suggest topics
                   </button>
+                </div>
+                <div className="threads-topic-tag-strip" aria-label="Selected scope tags">
+                  {activeManualTopicTags.length ? (
+                    activeManualTopicTags.map((topic) => (
+                      <span key={topic.toLowerCase()} className="threads-topic-tag">
+                        {topic}
+                      </span>
+                    ))
+                  ) : (
+                    <span className="threads-topic-tag is-empty">No topic tags selected</span>
+                  )}
                 </div>
                 <div className="threads-bundle-row">
                   <select
@@ -2932,14 +3689,14 @@ const ThreadsTab = () => {
                     type="button"
                     className="threads-subtle-btn"
                     onClick={saveManualTopicsAsBundle}
-                    disabled={!parseCommaSeparatedTopics(manualThreads).length}
-                    title="Save current manual labels as a reusable bundle"
+                    disabled={!activeManualTopicTags.length}
+                    title="Save current topic tags as a reusable bundle"
                   >
                     Save bundle
                   </button>
                 </div>
                 <small className="threads-field-help">
-                  Auto bundles are derived from current data. Saved bundles persist on this device.
+                  Recommended tags are a stable seed. Auto bundles come from current data; saved bundles persist on this device.
                 </small>
               </label>
 
@@ -3190,10 +3947,27 @@ const ThreadsTab = () => {
                 )}
               </section>
             </div>
+            </details>
 
             <div className="threads-modal-actions">
               <button type="button" onClick={() => setOptionsOpen(false)}>
                 Close
+              </button>
+              <button
+                type="button"
+                onClick={inferMainTopics}
+                disabled={loading}
+                title="Run only the high-level main-topic pass for this scope."
+              >
+                Infer main topics
+              </button>
+              <button
+                type="button"
+                onClick={generateWithTopicTags}
+                disabled={loading}
+                title="Assign chunks to the topic tags above; fills the seeded set if the field is empty."
+              >
+                Use topic tags
               </button>
               <button type="button" className="threads-btn-primary" onClick={generateFromModal} disabled={loading}>
                 {loading ? "Generating..." : "Run generation"}

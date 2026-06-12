@@ -116,6 +116,13 @@ class CaptureService:
         content_type = (
             str(payload.get("content_type") or "image/png").strip() or "image/png"
         )
+        target = self._resolve_path(payload)
+        relative_path = ""
+        if target is not None:
+            try:
+                relative_path = target.relative_to(self.files_root).as_posix()
+            except Exception:
+                relative_path = ""
         descriptor = {
             "capture_id": capture_id,
             "source": str(payload.get("source") or "").strip() or "capture",
@@ -143,14 +150,18 @@ class CaptureService:
             "attachment_ref": payload.get("attachment_ref"),
             "memory_refs": list(payload.get("memory_refs") or []),
             "url": f"/api/captures/{capture_id}/content",
+            "relative_path": relative_path,
         }
         descriptor["attachment"] = {
             "name": descriptor["filename"],
             "type": descriptor["content_type"],
             "url": descriptor["url"],
             "origin": "captured",
+            "content_hash": descriptor["content_hash"],
+            "relative_path": relative_path,
             "capture_id": capture_id,
             "capture_source": descriptor["capture_source"] or descriptor["source"],
+            "transient": descriptor["transient"],
         }
         return descriptor
 
@@ -355,6 +366,24 @@ class CaptureService:
         if target is None or not target.exists():
             return None
         return target
+
+    def capture_path_for_content_hash(self, content_hash: str) -> Optional[Path]:
+        normalized = str(content_hash or "").strip().lower()
+        if not normalized:
+            return None
+        for meta_path in sorted(self.metadata_root.glob("*.json"), reverse=True):
+            try:
+                payload = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if str(payload.get("content_hash") or "").strip().lower() != normalized:
+                continue
+            target = self._resolve_path(payload)
+            if target is not None and target.exists() and target.is_file():
+                return target
+        return None
 
     def delete_capture(self, capture_id: str) -> Dict[str, Any]:
         payload = self._read_meta(capture_id)

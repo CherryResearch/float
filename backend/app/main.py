@@ -32,6 +32,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from workers.background_autonomy_runner import background_autonomy_runner
 from workers.scheduled_tool_runner import scheduled_tool_runner
 from workers.task_evaluator import evaluate_pending_tasks
 
@@ -62,6 +63,7 @@ async def lifespan(app: FastAPI):
     worker = asyncio.create_task(evaluate_pending_tasks(app))
     jobmon = asyncio.create_task(monitor_model_jobs(app))
     scheduled_tools = asyncio.create_task(scheduled_tool_runner(app))
+    background_autonomy = asyncio.create_task(background_autonomy_runner(app))
     try:
         app.state.main_loop = asyncio.get_running_loop()
         action_history = getattr(app.state, "action_history_service", None)
@@ -101,7 +103,14 @@ async def lifespan(app: FastAPI):
         worker.cancel()
         jobmon.cancel()
         scheduled_tools.cancel()
-        await asyncio.gather(worker, jobmon, scheduled_tools, return_exceptions=True)
+        background_autonomy.cancel()
+        await asyncio.gather(
+            worker,
+            jobmon,
+            scheduled_tools,
+            background_autonomy,
+            return_exceptions=True,
+        )
         shutdown_summary = shutdown_server_resources(
             app,
             provider_manager=getattr(routes_module, "provider_manager", None),
@@ -121,7 +130,7 @@ app = FastAPI(lifespan=lifespan)
 
 
 _DEVICE_ACCESS_PREFIXES = ("/devices", "/pairing", "/sync", "/gateway", "/stream")
-_DEVICE_ACCESS_EXEMPT_PATHS = {"/sync/overview"}
+_DEVICE_ACCESS_EXEMPT_PATHS = {"/sync/overview", "/sync/mobile-serve/status"}
 
 
 def _normalized_device_access_path(path: str) -> str:
@@ -244,6 +253,12 @@ try:
     reflection_service = services.ReflectionService(config)
     logger.info("ReflectionService initialized.")
 
+    background_autonomy_service = services.BackgroundAutonomyService(
+        config,
+        reflection_service=reflection_service,
+    )
+    logger.info("BackgroundAutonomyService initialized.")
+
     computer_service = services.ComputerService(config)
     services.set_computer_service(computer_service)
     logger.info("ComputerService initialized.")
@@ -253,6 +268,7 @@ try:
     app.state.livekit_service = livekit_service
     app.state.action_history_service = action_history_service
     app.state.reflection_service = reflection_service
+    app.state.background_autonomy_service = background_autonomy_service
     app.state.computer_service = computer_service
     # Broadcast stream so multiple consumers (main UI, dev panel, etc.) all see events.
     app.state.thought_broker = EventBroker(max_history=750, subscriber_queue_size=300)

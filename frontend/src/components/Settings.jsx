@@ -6,7 +6,7 @@ import React, {
   useRef,
   useCallback,
 } from "react";
-import { Link } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 
 import { Line, Rect } from "./Skeleton";
 
@@ -44,6 +44,7 @@ import {
   normalizeModelId,
   resolveLocalCatalogModelId,
   SUGGESTED_LOCAL_MODELS,
+  SUGGESTED_SERVER_MODELS,
   isGptOssModel,
 } from "../utils/modelUtils";
 import {
@@ -72,6 +73,8 @@ const FLOAT_SETTING_FIELDS = new Set([
   "stream_idle_timeout",
   "rag_chat_min_similarity",
   "sae_threads_signal_blend",
+  "background_autonomy_satisfied_threshold",
+  "background_autonomy_min_priority",
 ]);
 
 const INT_SETTING_FIELDS = new Set([
@@ -80,7 +83,31 @@ const INT_SETTING_FIELDS = new Set([
   "cpu_thread_count",
   "local_provider_port",
   "local_provider_default_context_length",
+  "background_autonomy_interval_seconds",
+  "background_autonomy_max_reflections_per_tick",
+  "background_autonomy_max_runtime_seconds",
+  "background_autonomy_basic_tick_count",
+  "background_autonomy_basic_tick_seconds",
 ]);
+
+const normalizeHarmonyFormatMode = (value, fallback = "auto") => {
+  const raw = String(value || "").trim().toLowerCase();
+  if (raw === "auto" || raw === "enabled" || raw === "disabled") return raw;
+  if (raw === "true" || raw === "1" || raw === "yes" || raw === "on") {
+    return "enabled";
+  }
+  if (raw === "false" || raw === "0" || raw === "no" || raw === "off") {
+    return "disabled";
+  }
+  return fallback === "enabled" || fallback === "disabled" ? fallback : "auto";
+};
+
+const resolveHarmonyFormat = (mode, prefersHarmony) => {
+  const normalized = normalizeHarmonyFormatMode(mode);
+  if (normalized === "disabled") return false;
+  if (normalized === "enabled") return true;
+  return !!prefersHarmony;
+};
 
 const MANAGED_LOCAL_PROVIDERS = new Set([
   "lmstudio",
@@ -128,6 +155,11 @@ const SETTINGS_SECTIONS = [
     description: "Mode, provider, device, and request behavior.",
     searchText: [
       "runtime",
+      "server",
+      "server url",
+      "server lan",
+      "server lan url",
+      "llm server",
       "mode",
       "provider",
       "local runtime",
@@ -229,6 +261,7 @@ const SETTINGS_SECTIONS = [
     searchText: [
       "workflow",
       "workflows",
+      "workflow editor",
       "default workflow",
       "workflow profile",
       "workflow module",
@@ -246,6 +279,25 @@ const SETTINGS_SECTIONS = [
       "camera capture",
       "computer use",
       "host shell",
+    ].join(" "),
+  },
+  {
+    id: "background",
+    label: "Background",
+    description: "Autonomy budgets, dry runs, and queued long-running checks.",
+    searchText: [
+      "background",
+      "autonomy",
+      "overnight",
+      "always on",
+      "extended",
+      "satisfied",
+      "runtime budget",
+      "max patience",
+      "container",
+      "orchestration",
+      "queued tests",
+      "reflection",
     ].join(" "),
   },
   {
@@ -318,6 +370,11 @@ const PRIVACY_FILTER_MODE_OPTIONS = [
   },
 ];
 
+const PRIVACY_FILTER_MODEL_PRESETS = [
+  { label: "openai/privacy-filter", value: "openai/privacy-filter" },
+  { label: "privacy-filter (download alias)", value: "privacy-filter" },
+];
+
 const PRIVACY_ROUTE_MODE_OPTIONS = [
   {
     value: "off",
@@ -368,6 +425,41 @@ const normalizeToolApproval = (value, fallback = "high") => {
     : fallback;
 };
 
+const BACKGROUND_AUTONOMY_MODE_OPTIONS = [
+  {
+    value: "manual",
+    label: "Manual",
+    description: "Only run dry-runs or explicit ticks.",
+  },
+  {
+    value: "basic",
+    label: "Basic test",
+    description: "Two short queued checks by default.",
+  },
+  {
+    value: "overnight",
+    label: "Overnight review",
+    description: "Use the runtime budget, 30 minutes by default.",
+  },
+  {
+    value: "extended",
+    label: "Extended",
+    description: "Stop when the satisfaction threshold is met.",
+  },
+  {
+    value: "always_on",
+    label: "Always on",
+    description: "Keep polling until manually disabled.",
+  },
+];
+
+const normalizeBackgroundAutonomyMode = (value) => {
+  const raw = String(value || "").trim().toLowerCase().replace(/-/g, "_");
+  return BACKGROUND_AUTONOMY_MODE_OPTIONS.some((option) => option.value === raw)
+    ? raw
+    : "overnight";
+};
+
 const normalizeToolPolicy = (policy) => ({
   workflow: normalizeToolWorkflow(policy?.workflow, "text"),
   approval: normalizeToolApproval(policy?.approval, "high"),
@@ -397,7 +489,7 @@ const DEFAULT_WORKFLOW_CATALOG = {
       thinking_default: "auto",
       preferred_continue: "mini_execution",
       allow_continue_to: ["default", "mini_execution"],
-      enabled_modules: ["computer_use", "camera_capture", "memory_promotion"],
+      enabled_modules: ["computer_use"],
     },
     {
       id: "architect_planner",
@@ -406,12 +498,7 @@ const DEFAULT_WORKFLOW_CATALOG = {
       thinking_default: "high",
       preferred_continue: "mini_execution",
       allow_continue_to: ["architect_planner", "default", "mini_execution"],
-      enabled_modules: [
-        "computer_use",
-        "camera_capture",
-        "memory_promotion",
-        "host_shell",
-      ],
+      enabled_modules: ["computer_use"],
     },
     {
       id: "mini_execution",
@@ -420,33 +507,37 @@ const DEFAULT_WORKFLOW_CATALOG = {
       thinking_default: "low",
       preferred_continue: "mini_execution",
       allow_continue_to: ["mini_execution"],
-      enabled_modules: ["computer_use", "camera_capture"],
+      enabled_modules: ["computer_use"],
     },
   ],
   modules: [
     {
       id: "computer_use",
       label: "Computer Use",
-      description: "Browser and desktop observation plus direct UI actions.",
+      description:
+        "Browser and desktop observation, camera capture, capture promotion, and approval-gated host actions.",
       status: "live",
-    },
-    {
-      id: "camera_capture",
-      label: "Camera Capture",
-      description: "Still-image capture from a connected camera via the client.",
-      status: "experimental",
-    },
-    {
-      id: "memory_promotion",
-      label: "Memory Promotion",
-      description: "Promote transient captures into durable attachments and later memory workflows.",
-      status: "live",
-    },
-    {
-      id: "host_shell",
-      label: "Host Shell",
-      description: "Approval-gated shell, patch, and host mutation tools.",
-      status: "live",
+      source: "base",
+      enabled: false,
+      skill_id: "computer_use",
+      doc_id: "skills:computer_use",
+      tool_names: [
+        "computer.session.start",
+        "computer.session.stop",
+        "computer.observe",
+        "computer.act",
+        "computer.navigate",
+        "computer.windows.list",
+        "computer.windows.focus",
+        "computer.app.launch",
+        "camera.capture",
+        "capture.list",
+        "capture.promote",
+        "capture.delete",
+        "shell.exec",
+        "patch.apply",
+        "mcp.call",
+      ],
     },
   ],
   addons: [],
@@ -478,8 +569,10 @@ const buildThemeDraftFromTheme = (themeSource, label = "Custom Theme") => {
 
 const Settings = () => {
 
+  const location = useLocation();
   const settingsContainerRef = useRef(null);
   const settingsToolbarRef = useRef(null);
+  const lastServerModelSyncRef = useRef(undefined);
 
   const [loading, setLoading] = useState(true);
 
@@ -506,6 +599,14 @@ const Settings = () => {
   const [svcCelery, setSvcCelery] = useState("loading");
 
   const [svcCeleryNote, setSvcCeleryNote] = useState("");
+
+  const [backgroundAutonomyStatus, setBackgroundAutonomyStatus] = useState(null);
+
+  const [backgroundAutonomyLoading, setBackgroundAutonomyLoading] = useState(false);
+
+  const [backgroundAutonomyMessage, setBackgroundAutonomyMessage] = useState("");
+
+  const [backgroundAutonomyTickBusy, setBackgroundAutonomyTickBusy] = useState(false);
 
   const [ragStatus, setRagStatus] = useState(null);
 
@@ -1114,6 +1215,22 @@ const Settings = () => {
 
     }
 
+    setBackgroundAutonomyLoading(true);
+    try {
+      const autonomyRes = await axios.get("/api/background/autonomy/status");
+      const autonomyData =
+        autonomyRes && typeof autonomyRes.data === "object"
+          ? autonomyRes.data.autonomy
+          : null;
+      setBackgroundAutonomyStatus(
+        autonomyData && typeof autonomyData === "object" ? autonomyData : null,
+      );
+    } catch {
+      setBackgroundAutonomyStatus({ error: "unreachable" });
+    } finally {
+      setBackgroundAutonomyLoading(false);
+    }
+
     setSvcWs(state.wsStatus || "offline");
 
   };
@@ -1195,6 +1312,7 @@ const Settings = () => {
   static_model: state.staticModel,
 
   harmony_format: state.harmonyFormat,
+  harmony_format_mode: normalizeHarmonyFormatMode(state.harmonyFormatMode),
 
   server_url: state.serverUrl,
 
@@ -1204,7 +1322,7 @@ const Settings = () => {
 
     voice_model: state.voiceModel,
     stream_backend: "api",
-    realtime_model: "gpt-realtime",
+    realtime_model: "gpt-realtime-2",
     realtime_voice: "alloy",
     live_agent_mode: "local",
     live_agent_model: "",
@@ -1251,6 +1369,16 @@ const Settings = () => {
     sae_steering_token_positions: "last",
     sae_steering_dry_run: true,
     sae_live_inspect_console: false,
+    background_autonomy_enabled: false,
+    background_autonomy_sandbox_processes: true,
+    background_autonomy_mode: "overnight",
+    background_autonomy_interval_seconds: 900,
+    background_autonomy_max_reflections_per_tick: 1,
+    background_autonomy_max_runtime_seconds: 1800,
+    background_autonomy_satisfied_threshold: 0.8,
+    background_autonomy_basic_tick_count: 2,
+    background_autonomy_basic_tick_seconds: 300,
+    background_autonomy_min_priority: 0.05,
     weaviate_url: "",
     weaviate_auto_start: false,
 
@@ -1303,6 +1431,7 @@ const Settings = () => {
     state.captureAllowSummaryFallback !== false,
   );
   const [privacyFilterMode, setPrivacyFilterMode] = useState("off");
+  const [privacyFilterModel, setPrivacyFilterModel] = useState("openai/privacy-filter");
   const [privacyRouteMode, setPrivacyRouteMode] = useState("off");
   const [defaultWorkflow, setDefaultWorkflow] = useState(state.workflowProfile || "default");
   const [enabledWorkflowModules, setEnabledWorkflowModules] = useState(
@@ -1311,6 +1440,13 @@ const Settings = () => {
   const [workflowCatalog, setWorkflowCatalog] = useState(DEFAULT_WORKFLOW_CATALOG);
   const [workflowCatalogLoading, setWorkflowCatalogLoading] = useState(false);
   const [workflowInspectorOpen, setWorkflowInspectorOpen] = useState(false);
+  const [moduleDetailsId, setModuleDetailsId] = useState("");
+  const [skillDocSelectedId, setSkillDocSelectedId] = useState("");
+  const [skillDoc, setSkillDoc] = useState(null);
+  const [skillDocDraft, setSkillDocDraft] = useState("");
+  const [skillDocLoading, setSkillDocLoading] = useState(false);
+  const [skillDocSaving, setSkillDocSaving] = useState(false);
+  const [skillDocMessage, setSkillDocMessage] = useState("");
   const [captureWorkflowSaving, setCaptureWorkflowSaving] = useState(false);
   const [captureWorkflowMessage, setCaptureWorkflowMessage] = useState("");
 
@@ -1364,6 +1500,7 @@ const Settings = () => {
   const [embeddingRuntimeMessage, setEmbeddingRuntimeMessage] = useState("");
   const [runtimeNow, setRuntimeNow] = useState(() => Date.now());
   const [includeCacheUnfiltered, setIncludeCacheUnfiltered] = useState(false);
+  const [showDownloadedOnly, setShowDownloadedOnly] = useState(false);
   const [registeredLocalModels, setRegisteredLocalModels] = useState([]);
   const [registerModelAlias, setRegisterModelAlias] = useState("");
   const [registerModelPath, setRegisterModelPath] = useState("");
@@ -1581,6 +1718,24 @@ const Settings = () => {
     },
     [getSettingsToolbarOffset],
   );
+  const hashSettingsSection = useMemo(() => {
+    const rawHash = String(location.hash || "").replace(/^#/, "");
+    const sectionId = rawHash.startsWith("settings-")
+      ? rawHash.slice("settings-".length)
+      : rawHash;
+    if (!sectionId) return "";
+    return SETTINGS_SECTIONS.some((section) => section.id === sectionId)
+      ? sectionId
+      : "";
+  }, [location.hash]);
+
+  useEffect(() => {
+    if (!hashSettingsSection) return;
+    if (settingsSearchTerms.length > 0) {
+      setSettingsSearch("");
+    }
+    setPendingSettingsScroll(hashSettingsSection);
+  }, [hashSettingsSection, settingsSearchTerms.length]);
 
   useEffect(() => {
     const container = settingsContainerRef.current;
@@ -1619,6 +1774,115 @@ const Settings = () => {
       window.removeEventListener("resize", queueResolve);
     };
   }, [getSettingsToolbarOffset, loading, visibleSettingsSectionList]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+
+    const ignoredScrollTransferTarget = (target) =>
+      !target ||
+      target.closest(
+        ".sidebar, .history-sidebar, .agent-console, .topbar-appbar, [role='dialog'], .modal, .download-tray",
+      );
+
+    const transferWheelToSettings = (event) => {
+      const container = settingsContainerRef.current;
+      if (!container || event.defaultPrevented) return;
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target || container.contains(target)) return;
+      if (ignoredScrollTransferTarget(target)) {
+        return;
+      }
+      const maxScrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
+      if (maxScrollTop <= 0) return;
+      const nextScrollTop = Math.max(
+        0,
+        Math.min(maxScrollTop, container.scrollTop + event.deltaY),
+      );
+      if (nextScrollTop === container.scrollTop && !event.deltaX) return;
+      event.preventDefault();
+      container.scrollTop = nextScrollTop;
+      if (event.deltaX) {
+        container.scrollLeft += event.deltaX;
+      }
+    };
+
+    window.addEventListener("wheel", transferWheelToSettings, { passive: false });
+    return () => {
+      window.removeEventListener("wheel", transferWheelToSettings);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+
+    let dragState = null;
+    const ignoredDragTransferTarget = (target) =>
+      !target ||
+      target.closest(
+        ".sidebar, .history-sidebar, .agent-console, .topbar-appbar, [role='dialog'], .modal, .download-tray",
+      ) ||
+      target.closest(
+        "a, button, input, select, textarea, summary, label, [role='button'], [role='tab'], [contenteditable='true']",
+      );
+
+    const endDragScroll = () => {
+      dragState = null;
+      document.body.classList.remove("settings-drag-scroll-active");
+    };
+
+    const handlePointerMove = (event) => {
+      if (!dragState) return;
+      const container = settingsContainerRef.current;
+      if (!container) {
+        endDragScroll();
+        return;
+      }
+      const dx = event.clientX - dragState.lastX;
+      const dy = event.clientY - dragState.lastY;
+      if (dx || dy) {
+        container.scrollLeft -= dx;
+        container.scrollTop -= dy;
+        dragState.lastX = event.clientX;
+        dragState.lastY = event.clientY;
+        event.preventDefault();
+      }
+    };
+
+    const handlePointerUp = () => {
+      endDragScroll();
+    };
+
+    const handlePointerDown = (event) => {
+      if (event.button !== 0 || event.defaultPrevented) return;
+      const container = settingsContainerRef.current;
+      if (!container) return;
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target || container.contains(target) || ignoredDragTransferTarget(target)) {
+        return;
+      }
+      const maxScrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
+      const maxScrollLeft = Math.max(0, container.scrollWidth - container.clientWidth);
+      if (maxScrollTop <= 0 && maxScrollLeft <= 0) return;
+      dragState = {
+        lastX: event.clientX,
+        lastY: event.clientY,
+      };
+      document.body.classList.add("settings-drag-scroll-active");
+      event.preventDefault();
+    };
+
+    window.addEventListener("pointerdown", handlePointerDown, { passive: false });
+    window.addEventListener("pointermove", handlePointerMove, { passive: false });
+    window.addEventListener("pointerup", handlePointerUp);
+    window.addEventListener("pointercancel", handlePointerUp);
+    return () => {
+      window.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", handlePointerUp);
+      endDragScroll();
+    };
+  }, []);
 
   useEffect(() => {
     if (!pendingSettingsScroll || loading || typeof window === "undefined") {
@@ -1687,11 +1951,32 @@ const Settings = () => {
       ...(Array.isArray(LOCAL_RUNTIME_ENTRIES) ? LOCAL_RUNTIME_ENTRIES : []),
     ]),
   );
+  const serverRuntimeModelOptions = Array.from(
+    new Set([
+      ...(Array.isArray(providerModelOptions) ? providerModelOptions : []),
+      ...(Array.isArray(SUGGESTED_SERVER_MODELS) ? SUGGESTED_SERVER_MODELS : []),
+      settings.transformer_model,
+    ].filter((model) => typeof model === "string" && model.trim())),
+  );
   const suggestedApiLangModels = apiModelGroups.all;
 
-  const suggestedSttModels = ["whisper-1", "whisper-large-v3-turbo", "whisper-small"];
+  const suggestedSttModels = [
+    "gpt-realtime-whisper",
+    "whisper-1",
+    "gpt-4o-mini-transcribe",
+    "gpt-4o-transcribe",
+    "whisper-large-v3-turbo",
+    "whisper-small",
+  ];
 
-  const suggestedTtsModels = ["tts-1", "tts-1-hd", "kokoro", "kitten"];
+  const suggestedTtsModels = [
+    "tts-1",
+    "tts-1-hd",
+    "gpt-4o-mini-tts",
+    "gpt-4o-mini-tts-2025-12-15",
+    "kokoro",
+    "kitten",
+  ];
 
   const languageToolingFamilies = new Set([
     "gpt-oss",
@@ -1753,6 +2038,7 @@ const Settings = () => {
     if (normalizedField === "stt_model") {
       if (
         normalizedValue === "whisper-1" ||
+        normalizedValue === "gpt-realtime-whisper" ||
         normalizedValue.startsWith("gpt-4o") ||
         normalizedValue.includes("transcribe")
       ) {
@@ -1761,7 +2047,10 @@ const Settings = () => {
       return { key: "local", label: "Local" };
     }
     if (normalizedField === "tts_model") {
-      if (normalizedValue.startsWith("tts-")) {
+      if (
+        normalizedValue.startsWith("tts-") ||
+        (normalizedValue.startsWith("gpt-4o") && normalizedValue.includes("tts"))
+      ) {
         return { key: "api", label: "API" };
       }
       return { key: "local", label: "Local" };
@@ -1818,7 +2107,12 @@ const Settings = () => {
       return "provider/server lane";
     }
     if (normalizedField === "tts_model") {
-      if (normalizedValue.startsWith("tts-")) return "OpenAI API";
+      if (
+        normalizedValue.startsWith("tts-") ||
+        (normalizedValue.startsWith("gpt-4o") && normalizedValue.includes("tts"))
+      ) {
+        return "OpenAI API";
+      }
       if (normalizedValue.includes("kitten") || normalizedValue.includes("kokoro")) {
         return "local engine";
       }
@@ -2011,8 +2305,38 @@ const Settings = () => {
     );
   };
 
-  const openAiVoiceOptions = ["alloy", "nova", "shimmer", "echo", "fable", "onyx"];
-  const realtimeModelOptions = ["gpt-realtime"];
+  const openAiVoiceOptions = [
+    "alloy",
+    "ash",
+    "ballad",
+    "coral",
+    "echo",
+    "fable",
+    "marin",
+    "nova",
+    "onyx",
+    "sage",
+    "shimmer",
+    "verse",
+    "cedar",
+  ];
+  const openAiLegacyTtsVoiceOptions = [
+    "alloy",
+    "ash",
+    "coral",
+    "echo",
+    "fable",
+    "nova",
+    "onyx",
+    "sage",
+    "shimmer",
+  ];
+  const realtimeModelOptions = [
+    "gpt-realtime-2",
+    "gpt-realtime-mini",
+    "gpt-realtime-1.5",
+    "gpt-realtime",
+  ];
   const realtimeVoiceOptions = [
     "alloy",
     "ash",
@@ -2029,6 +2353,8 @@ const Settings = () => {
     "gpt-oss-20b",
     "gemma-4-E2B-it",
     "gemma-4-E4B-it",
+    "gemma-4-12B-it-qat-q4_0-gguf",
+    "gemma-4-12B-it",
     "gemma-4-26B-A4B-it",
     "gemma-4-31B-it",
     "pixtral-12b-2409",
@@ -2113,9 +2439,10 @@ const Settings = () => {
   const ragEmbeddingPresets = [
     { label: "Hash fallback (local)", value: "simple" },
     { label: "Sentence Transformers · all-MiniLM-L6-v2", value: "local:all-MiniLM-L6-v2" },
+    { label: "Sentence Transformers - all-mpnet-base-v2", value: "local:all-mpnet-base-v2" },
     { label: "EmbeddingGemma 300M (local review)", value: "local:google/embeddinggemma-300M" },
-    { label: "OpenAI text-embedding-3-small (API stub)", value: "api:text-embedding-3-small" },
-    { label: "OpenAI text-embedding-3-large (API stub)", value: "api:text-embedding-3-large" },
+    { label: "OpenAI text-embedding-3-small (API)", value: "api:text-embedding-3-small" },
+    { label: "OpenAI text-embedding-3-large (API)", value: "api:text-embedding-3-large" },
   ];
   const embeddingLaneKey =
     getModelLaneMeta("rag_embedding_model", settings.rag_embedding_model)?.key || "local";
@@ -2142,9 +2469,6 @@ const Settings = () => {
   ];
 
   const suggestedVisionModels = [
-
-    "clip-vit-base-patch32",
-
     "paligemma2-3b-pt-224",
 
     "paligemma2-28b-pt-896",
@@ -2567,6 +2891,14 @@ const Settings = () => {
           static_model: data.static_model || "gpt-5.4-mini",
 
           harmony_format: data.harmony_format ?? false,
+          harmony_format_mode: normalizeHarmonyFormatMode(
+            data.harmony_format_mode ??
+              (typeof data.harmony_format === "boolean"
+                ? data.harmony_format
+                  ? "enabled"
+                  : "disabled"
+                : state.harmonyFormatMode),
+          ),
 
           server_url: data.server_url || "",
 
@@ -2578,7 +2910,7 @@ const Settings = () => {
 
           voice_model: data.voice_model || "alloy",
           stream_backend: data.stream_backend || "api",
-          realtime_model: data.realtime_model || "gpt-realtime",
+          realtime_model: data.realtime_model || "gpt-realtime-2",
           realtime_voice: data.realtime_voice || "alloy",
           live_agent_mode: data.live_agent_mode || "local",
           live_agent_model: data.live_agent_model || "",
@@ -2694,6 +3026,45 @@ const Settings = () => {
             typeof data.sae_live_inspect_console === "boolean"
               ? data.sae_live_inspect_console
               : false,
+          background_autonomy_enabled:
+            typeof data.background_autonomy_enabled === "boolean"
+              ? data.background_autonomy_enabled
+              : false,
+          background_autonomy_sandbox_processes:
+            typeof data.background_autonomy_sandbox_processes === "boolean"
+              ? data.background_autonomy_sandbox_processes
+              : true,
+          background_autonomy_mode: normalizeBackgroundAutonomyMode(
+            data.background_autonomy_mode,
+          ),
+          background_autonomy_interval_seconds:
+            typeof data.background_autonomy_interval_seconds === "number"
+              ? data.background_autonomy_interval_seconds
+              : 900,
+          background_autonomy_max_reflections_per_tick:
+            typeof data.background_autonomy_max_reflections_per_tick === "number"
+              ? data.background_autonomy_max_reflections_per_tick
+              : 1,
+          background_autonomy_max_runtime_seconds:
+            typeof data.background_autonomy_max_runtime_seconds === "number"
+              ? data.background_autonomy_max_runtime_seconds
+              : 1800,
+          background_autonomy_satisfied_threshold:
+            typeof data.background_autonomy_satisfied_threshold === "number"
+              ? Math.min(1, Math.max(0, data.background_autonomy_satisfied_threshold))
+              : 0.8,
+          background_autonomy_basic_tick_count:
+            typeof data.background_autonomy_basic_tick_count === "number"
+              ? data.background_autonomy_basic_tick_count
+              : 2,
+          background_autonomy_basic_tick_seconds:
+            typeof data.background_autonomy_basic_tick_seconds === "number"
+              ? data.background_autonomy_basic_tick_seconds
+              : 300,
+          background_autonomy_min_priority:
+            typeof data.background_autonomy_min_priority === "number"
+              ? Math.min(1, Math.max(0, data.background_autonomy_min_priority))
+              : 0.05,
 
         };
 
@@ -2746,6 +3117,8 @@ const Settings = () => {
         }));
 
         setSettings(newSettings);
+        setInitialComparable(buildComparable(newSettings, false, false));
+        setInitialized(true);
 
         setState((prev) => {
           const next = {
@@ -2765,6 +3138,12 @@ const Settings = () => {
           }
           if (typeof newSettings.stream_idle_timeout === "number") {
             next.streamIdleTimeoutSec = newSettings.stream_idle_timeout;
+          }
+          if (typeof newSettings.rag_embedding_model === "string") {
+            next.ragEmbeddingModel = newSettings.rag_embedding_model;
+          }
+          if (typeof newSettings.rag_clip_model === "string") {
+            next.ragClipModel = newSettings.rag_clip_model;
           }
           return next;
         });
@@ -3278,12 +3657,23 @@ const Settings = () => {
       wsErrorMessage && wsErrorMessage.length > 200
         ? `${wsErrorMessage.slice(0, 197)}...`
         : wsErrorMessage;
-    const normalizedWsStatus = normalizeStatus(svcWs);
+    const rawWsStatus = normalizeStatus(svcWs);
+    const wsLastActivityAt = Math.max(
+      Number(state.wsLastEventAt || 0),
+      Number(state.wsLastErrorAt || 0),
+    );
+    const wsRecentlyActive =
+      rawWsStatus === "offline" &&
+      wsLastActivityAt > 0 &&
+      runtimeNow - wsLastActivityAt < 30000;
+    const normalizedWsStatus = wsRecentlyActive ? "loading" : rawWsStatus;
     const wsStatusSummary =
       normalizedWsStatus === "online"
         ? "Live thought stream connected."
         : normalizedWsStatus === "loading"
-          ? "Connecting to live thought stream."
+          ? wsRecentlyActive
+            ? "Reconnecting to live thought stream."
+            : "Connecting to live thought stream."
           : "Live thought stream not connected.";
     const celeryStatusNormalized = normalizeStatus(svcCelery);
     const celeryNoticeTitle =
@@ -3308,6 +3698,47 @@ const Settings = () => {
         : celeryLoading
           ? "Loading tasks"
           : "No tasks in this view";
+    const celeryHasTasks = celeryTasks.length > 0;
+    const showCeleryOperations =
+      celeryStatusNormalized !== "offline" ||
+      celeryHasTasks ||
+      Boolean(celeryError) ||
+      showFailures;
+    const autonomy = backgroundAutonomyStatus || {};
+    const autonomySession =
+      autonomy && typeof autonomy.session === "object" ? autonomy.session : {};
+    const autonomyMode = normalizeBackgroundAutonomyMode(
+      autonomy.configured_mode || autonomy.mode || settings.background_autonomy_mode,
+    );
+    const autonomyRuntimeMinutes = Math.max(
+      1,
+      Math.round(
+        Number(
+          autonomy.max_runtime_seconds ||
+            settings.background_autonomy_max_runtime_seconds ||
+            1800,
+        ) / 60,
+      ),
+    );
+    const autonomyState = backgroundAutonomyLoading
+      ? "loading"
+      : autonomy.error
+        ? "offline"
+        : autonomy.routine_enabled
+          ? "online"
+          : autonomy.enabled
+            ? "degraded"
+            : "offline";
+    const autonomySummary = autonomy.error
+      ? "Autonomy status unavailable."
+      : autonomy.routine_enabled
+        ? `${autonomyMode.replace("_", " ")} mode, ${autonomyRuntimeMinutes} minute budget.`
+        : autonomy.enabled
+          ? "Configured but not running in routine mode."
+          : "Manual until enabled.";
+    const autonomyStopReason = autonomySession.stop_reason
+      ? String(autonomySession.stop_reason).replace(/_/g, " ")
+      : "";
     return (
 
       <div className="settings-section">
@@ -3398,7 +3829,7 @@ const Settings = () => {
 
               <div className="status-sub status-sub--stacked">
 
-                {renderStatusBadge(svcWs)}
+                {renderStatusBadge(normalizedWsStatus)}
 
                 <span
                   className={`status-note status-note--primary ${
@@ -3508,6 +3939,36 @@ const Settings = () => {
 
           </div>
 
+          <div className="status-item" title="Background autonomy supervisor">
+
+            {renderStatusDot(autonomyState)}
+
+            <div>
+
+              <div className="status-label">Autonomy</div>
+
+              <div className="status-sub status-sub--stacked">
+
+                {renderStatusBadge(autonomyState)}
+
+                <span className={`status-note ${autonomyState === "offline" ? "warn" : ""}`}>
+
+                  {autonomySummary}
+
+                </span>
+
+                {autonomyStopReason && (
+
+                  <span className="status-note">stopped: {autonomyStopReason}</span>
+
+                )}
+
+              </div>
+
+            </div>
+
+          </div>
+
         </div>
 
         <div className="celery-panel">
@@ -3520,7 +3981,6 @@ const Settings = () => {
             <div
               className="inline-flex"
               style={{ alignItems: 'center', gap: 8 }}
-              title="Celery coordinates background jobs so multiple agents can run in parallel."
             >
 
               {renderStatusDot(svcCelery)}
@@ -3528,6 +3988,13 @@ const Settings = () => {
               <h3 style={{ margin: 0 }}>Celery tasks</h3>
 
               {renderStatusBadge(svcCelery)}
+
+              <span
+                className="hint-badge"
+                title="Celery runs optional background workers, scheduled tasks, and multi-step queues. It can stay offline during normal chat."
+              >
+                ?
+              </span>
 
               {svcCeleryNote && (
 
@@ -3611,6 +4078,14 @@ const Settings = () => {
               </div>
             )}
 
+            {!showCeleryOperations && (
+              <div className="celery-empty-state" role="status">
+                Worker controls appear when the queue is reachable or tasks exist.
+              </div>
+            )}
+
+            {showCeleryOperations && (
+              <>
             <div className="celery-action-row">
 
               <div className="celery-action-group">
@@ -4067,6 +4542,9 @@ const Settings = () => {
 
             )}
 
+              </>
+            )}
+
             <ModelJobsPanel />
 
           </div>
@@ -4329,6 +4807,98 @@ const Settings = () => {
     refreshWorkflowCatalog();
   }, []);
 
+  useEffect(() => {
+    if (!workflowModules.length) {
+      return;
+    }
+    const moduleIds = workflowModules
+      .map((module) => String(module.id || "").trim())
+      .filter(Boolean);
+    if (moduleIds.length && (!moduleDetailsId || !moduleIds.includes(moduleDetailsId))) {
+      setModuleDetailsId(moduleIds[0]);
+    }
+    const knownSkillIds = workflowModules
+      .map((module) => String(module.skill_id || module.id || "").trim())
+      .filter(Boolean);
+    if (!knownSkillIds.length) {
+      return;
+    }
+    if (!skillDocSelectedId || !knownSkillIds.includes(skillDocSelectedId)) {
+      setSkillDocSelectedId(knownSkillIds[0]);
+    }
+  }, [moduleDetailsId, skillDocSelectedId, workflowModules]);
+
+  const fetchSkillDoc = async (skillId) => {
+    const normalized = String(skillId || "").trim();
+    if (!normalized) {
+      setSkillDoc(null);
+      setSkillDocDraft("");
+      return;
+    }
+    setSkillDocLoading(true);
+    setSkillDocMessage("");
+    try {
+      const res = await axios.get(`/api/workflows/skills/${encodeURIComponent(normalized)}`);
+      const payload = res?.data || null;
+      setSkillDoc(payload);
+      setSkillDocDraft(String(payload?.active?.body || ""));
+    } catch {
+      setSkillDoc(null);
+      setSkillDocDraft("");
+      setSkillDocMessage("Could not load that skill doc.");
+    } finally {
+      setSkillDocLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchSkillDoc(skillDocSelectedId);
+  }, [skillDocSelectedId]);
+
+  const handleSkillDocSave = async () => {
+    const normalized = String(skillDocSelectedId || "").trim();
+    if (!normalized) {
+      return;
+    }
+    setSkillDocSaving(true);
+    setSkillDocMessage("");
+    try {
+      const res = await axios.put(`/api/workflows/skills/${encodeURIComponent(normalized)}`, {
+        body: skillDocDraft,
+      });
+      const payload = res?.data || null;
+      setSkillDoc(payload);
+      setSkillDocDraft(String(payload?.active?.body || ""));
+      setSkillDocMessage("Local skill override saved.");
+      refreshWorkflowCatalog();
+    } catch {
+      setSkillDocMessage("Failed to save local skill override.");
+    } finally {
+      setSkillDocSaving(false);
+    }
+  };
+
+  const handleSkillDocDelete = async () => {
+    const normalized = String(skillDocSelectedId || "").trim();
+    if (!normalized) {
+      return;
+    }
+    setSkillDocSaving(true);
+    setSkillDocMessage("");
+    try {
+      const res = await axios.delete(`/api/workflows/skills/${encodeURIComponent(normalized)}`);
+      const payload = res?.data || null;
+      setSkillDoc(payload);
+      setSkillDocDraft(String(payload?.active?.body || ""));
+      setSkillDocMessage("Local skill override removed; base doc is active again.");
+      refreshWorkflowCatalog();
+    } catch {
+      setSkillDocMessage("Failed to remove local skill override.");
+    } finally {
+      setSkillDocSaving(false);
+    }
+  };
+
 
 
   useEffect(() => {
@@ -4377,6 +4947,9 @@ const Settings = () => {
         }
         if (typeof s.privacy_filter_mode === "string") {
           setPrivacyFilterMode(normalizePrivacyFilterMode(s.privacy_filter_mode));
+        }
+        if (typeof s.privacy_filter_model === "string" && s.privacy_filter_model.trim()) {
+          setPrivacyFilterModel(s.privacy_filter_model.trim());
         }
         if (typeof s.privacy_filter_route_private_mode === "string") {
           setPrivacyRouteMode(
@@ -4463,6 +5036,28 @@ const Settings = () => {
       if (name === "transformer_model" && isLocalRuntimeEntry(nextValue)) {
         next.local_provider = normalizeModelId(nextValue);
       }
+      if (name === "harmony_format") {
+        next.harmony_format_mode = nextValue ? "enabled" : "disabled";
+      }
+      if (name === "tts_model") {
+        const normalizedTts = String(nextValue || "").trim().toLowerCase();
+        let compatibleVoices = voicePresetOptions;
+        if (normalizedTts === "tts-1" || normalizedTts === "tts-1-hd") {
+          compatibleVoices = openAiLegacyTtsVoiceOptions;
+        } else if (normalizedTts.startsWith("gpt-4o") && normalizedTts.includes("tts")) {
+          compatibleVoices = openAiVoiceOptions;
+        } else if (normalizedTts.includes("kitten")) {
+          compatibleVoices = kittenVoiceOptions;
+        } else if (normalizedTts.includes("kokoro")) {
+          compatibleVoices = kokoroVoiceOptions;
+        }
+        if (
+          compatibleVoices.length > 0 &&
+          !compatibleVoices.includes(String(prev.voice_model || "").trim())
+        ) {
+          next.voice_model = compatibleVoices[0];
+        }
+      }
       if (name === "local_provider") {
         const normalized = normalizeModelId(nextValue);
         if (isLocalRuntimeEntry(prev.transformer_model)) {
@@ -4483,14 +5078,13 @@ const Settings = () => {
       return next;
     });
 
-    if (name === "harmony_format") {
-
-      // Mark as user-overridden so auto-defaulting stops
-
-      setState((prev) => ({ ...prev, harmonyTouched: true }));
-
-    }
-  }, [setState]);
+  }, [
+    kittenVoiceOptions,
+    kokoroVoiceOptions,
+    openAiLegacyTtsVoiceOptions,
+    openAiVoiceOptions,
+    voicePresetOptions,
+  ]);
 
   const handleChange = (e) => {
 
@@ -4619,13 +5213,6 @@ const Settings = () => {
       ) {
         patch.transformerModel = selectedLanguageModel;
       }
-    } else if (
-      nextSettings.mode === "server" &&
-      selectedLanguageModel &&
-      !isLocalRuntimeEntry(selectedLanguageModel) &&
-      selectedLanguageModel !== prevState.transformerModel
-    ) {
-      patch.transformerModel = selectedLanguageModel;
     }
     return patch;
   };
@@ -4666,6 +5253,31 @@ const Settings = () => {
       return next;
     });
   }, [settings.mode, settings.transformer_model, state.localModel]);
+
+  useEffect(() => {
+    if (settings.mode !== "server") {
+      lastServerModelSyncRef.current = undefined;
+      return;
+    }
+    const selectedServerModel =
+      typeof state.transformerModel === "string" ? state.transformerModel.trim() : "";
+    if (lastServerModelSyncRef.current === selectedServerModel) {
+      return;
+    }
+    lastServerModelSyncRef.current = selectedServerModel;
+    if (selectedServerModel === settings.transformer_model) {
+      return;
+    }
+    setSettings((prev) => {
+      if (prev.mode !== "server" || prev.transformer_model === selectedServerModel) {
+        return prev;
+      }
+      return {
+        ...prev,
+        transformer_model: selectedServerModel,
+      };
+    });
+  }, [settings.mode, settings.transformer_model, state.transformerModel]);
 
   const openDownloadsTray = () => {
     try {
@@ -5084,7 +5696,12 @@ const Settings = () => {
   const voiceOptionsForTts = useMemo(() => {
     const tts = String(settings.tts_model || "").toLowerCase();
     if (!tts) return voicePresetOptions;
-    if (tts.includes("tts-1")) return openAiVoiceOptions;
+    if (tts === "tts-1" || tts === "tts-1-hd") {
+      return openAiLegacyTtsVoiceOptions;
+    }
+    if (tts.startsWith("gpt-4o") && tts.includes("tts")) {
+      return openAiVoiceOptions;
+    }
     if (tts.includes("kokoro")) return kokoroVoiceOptions;
     if (tts.includes("kitten")) return kittenVoiceOptions;
     return voicePresetOptions;
@@ -5125,9 +5742,10 @@ const Settings = () => {
       )}
       <div className="status-note form-note">
         <em>
-          OpenAI API voices use `tts-1` or `tts-1-hd`. `kitten` and `kokoro`
-          use local voice presets. Live streaming voice stays in the section
-          below.
+          OpenAI API voices are model-specific: `tts-1` and `tts-1-hd` use the
+          legacy preset set, while `gpt-4o-mini-tts` can use the expanded OpenAI
+          voice list. `kitten` and `kokoro` use local voice presets. Live
+          streaming voice stays in the section below.
         </em>
       </div>
     </div>
@@ -5141,15 +5759,13 @@ const Settings = () => {
 
     try {
 
-      const generic = ["gpt-4o", "gpt-4.1", "gpt-5-mini", "gpt-5", "gpt-5.1", "gpt-5.2", "gpt-5.4"];
-
       return models
 
         .filter(Boolean)
 
         .map((model) => String(model).toLowerCase())
 
-        .some((m) => isGptOssModel(m) || generic.some((g) => m.startsWith(g)));
+        .some((m) => isGptOssModel(m));
 
     } catch {
 
@@ -5161,40 +5777,6 @@ const Settings = () => {
 
 
 
-  useEffect(() => {
-
-    // Auto-toggle harmony_format in the form when model changes, unless user overrode
-
-    if (!state.harmonyTouched) {
-
-      const preferred = isHarmonyPreferred(
-
-        settings.transformer_model,
-
-        settings.model,
-
-      );
-
-      if (preferred !== settings.harmony_format) {
-
-        setSettings((prev) => ({ ...prev, harmony_format: preferred }));
-
-      }
-
-    }
-
-  }, [
-
-    settings.transformer_model,
-
-    settings.model,
-
-    settings.harmony_format,
-
-    state.harmonyTouched,
-
-  ]);
-
   const preferHarmony = isHarmonyPreferred(
 
     settings.transformer_model,
@@ -5203,7 +5785,9 @@ const Settings = () => {
 
   );
 
-  const harmonyWarning = preferHarmony && !settings.harmony_format;
+  const harmonyMode = normalizeHarmonyFormatMode(settings.harmony_format_mode);
+  const harmonyFormatEnabled = resolveHarmonyFormat(harmonyMode, preferHarmony);
+  const harmonyWarning = preferHarmony && harmonyMode === "disabled";
 
   const harmonyAttentionModels = [settings.model, settings.transformer_model]
 
@@ -5239,16 +5823,13 @@ const Settings = () => {
 
     : "";
 
-  const harmonyAutoEnabled = state.harmonyTouched !== true;
-
-  const handleHarmonyAutoToggle = (event) => {
-    const checked = !!event.target.checked;
-    if (checked) {
-      setState((prev) => ({ ...prev, harmonyTouched: false }));
-      setSettings((prev) => ({ ...prev, harmony_format: preferHarmony }));
-      return;
-    }
-    setState((prev) => ({ ...prev, harmonyTouched: true }));
+  const handleHarmonyModeChange = (event) => {
+    const mode = normalizeHarmonyFormatMode(event.target.value);
+    setSettings((prev) => ({
+      ...prev,
+      harmony_format_mode: mode,
+      harmony_format: resolveHarmonyFormat(mode, preferHarmony),
+    }));
   };
 
 
@@ -5569,7 +6150,11 @@ const Settings = () => {
 
       static_model: s.static_model,
 
-      harmony_format: s.harmony_format,
+      harmony_format: resolveHarmonyFormat(
+        normalizeHarmonyFormatMode(s.harmony_format_mode),
+        isHarmonyPreferred(s.transformer_model, s.model),
+      ),
+      harmony_format_mode: normalizeHarmonyFormatMode(s.harmony_format_mode),
 
       server_url: s.server_url,
 
@@ -5651,6 +6236,40 @@ const Settings = () => {
           ? s.sae_steering_dry_run
           : true,
       sae_live_inspect_console: !!s.sae_live_inspect_console,
+      background_autonomy_enabled: !!s.background_autonomy_enabled,
+      background_autonomy_sandbox_processes:
+        s.background_autonomy_sandbox_processes !== false,
+      background_autonomy_mode: normalizeBackgroundAutonomyMode(
+        s.background_autonomy_mode,
+      ),
+      background_autonomy_interval_seconds:
+        typeof s.background_autonomy_interval_seconds === "number"
+          ? s.background_autonomy_interval_seconds
+          : 900,
+      background_autonomy_max_reflections_per_tick:
+        typeof s.background_autonomy_max_reflections_per_tick === "number"
+          ? s.background_autonomy_max_reflections_per_tick
+          : 1,
+      background_autonomy_max_runtime_seconds:
+        typeof s.background_autonomy_max_runtime_seconds === "number"
+          ? s.background_autonomy_max_runtime_seconds
+          : 1800,
+      background_autonomy_satisfied_threshold:
+        typeof s.background_autonomy_satisfied_threshold === "number"
+          ? Math.min(1, Math.max(0, s.background_autonomy_satisfied_threshold))
+          : 0.8,
+      background_autonomy_basic_tick_count:
+        typeof s.background_autonomy_basic_tick_count === "number"
+          ? s.background_autonomy_basic_tick_count
+          : 2,
+      background_autonomy_basic_tick_seconds:
+        typeof s.background_autonomy_basic_tick_seconds === "number"
+          ? s.background_autonomy_basic_tick_seconds
+          : 300,
+      background_autonomy_min_priority:
+        typeof s.background_autonomy_min_priority === "number"
+          ? Math.min(1, Math.max(0, s.background_autonomy_min_priority))
+          : 0.05,
       weaviate_url: s.weaviate_url,
 
       weaviate_auto_start: !!s.weaviate_auto_start,
@@ -5847,6 +6466,11 @@ const Settings = () => {
         value,
         className,
         laneKey: optionLaneKey,
+        isApiOnly,
+        isAvailable,
+        isProviderInventory,
+        isRegistered,
+        isSuggested,
         labelText: [
           isRegistered ? `${labelText} (local)` : labelText,
           providerLabel ? `\u00b7 ${providerLabel}` : "",
@@ -5884,10 +6508,24 @@ const Settings = () => {
     const activeLaneKey = isLanguageField
       ? languageLaneKey
       : laneMeta?.key || laneOptions[0] || null;
-    const visibleOptionEntries =
+    const laneVisibleOptionEntries =
       laneOptions.length > 1
         ? optionEntries.filter((entry) => entry.laneKey === activeLaneKey)
         : optionEntries;
+    const downloadedOnlyActive =
+      showDownloadedOnly && !(isLanguageField && activeLaneKey === "api");
+    const installedOnlyEntries = downloadedOnlyActive
+      ? laneVisibleOptionEntries.filter(
+          (entry) =>
+            entry.isAvailable || entry.isProviderInventory || entry.isRegistered,
+        )
+      : laneVisibleOptionEntries;
+    const visibleOptionEntries = installedOnlyEntries;
+    const currentSelectionVisible =
+      !model || visibleOptionEntries.some((entry) => entry.value === model);
+    const currentSelectionFilteredOut =
+      downloadedOnlyActive && !!model && !currentSelectionVisible;
+    const selectValue = currentSelectionVisible ? model : "";
 
     return (
 
@@ -5922,7 +6560,14 @@ const Settings = () => {
                 }));
                 return;
               }
-              const nextEntry = optionEntries.find((entry) => entry.laneKey === nextLaneKey);
+              const nextEntry =
+                optionEntries.find(
+                  (entry) =>
+                    entry.laneKey === nextLaneKey &&
+                    (entry.isAvailable ||
+                      entry.isProviderInventory ||
+                      entry.isRegistered),
+                ) || optionEntries.find((entry) => entry.laneKey === nextLaneKey);
               if (nextEntry) {
                 commitSettingValue(field, nextEntry.value);
               }
@@ -5944,19 +6589,33 @@ const Settings = () => {
             <select
               id={`settings-model-${field}`}
               name={isLanguageField && activeLaneKey === "api" ? "model" : field}
-              value={model}
+              value={selectValue}
               onChange={
                 isLanguageField
                   ? (event) => {
+                      if (!event.target.value) return;
                       commitSettingValue(
                         activeLaneKey === "api" ? "model" : field,
                         event.target.value,
                       );
                     }
-                  : handleChange
+                  : (event) => {
+                      if (!event.target.value) return;
+                      handleChange(event);
+                    }
               }
               title={fieldTooltips[field] || `Select ${label}`}
             >
+              {visibleOptionEntries.length === 0 && (
+                <option value="" disabled>
+                  No downloaded models in this lane
+                </option>
+              )}
+              {currentSelectionFilteredOut && (
+                <option value="" disabled>
+                  Choose a downloaded model
+                </option>
+              )}
               {visibleOptionEntries.map((meta) => {
                 return (
                   <option key={meta.value} value={meta.value} className={meta.className}>
@@ -5971,7 +6630,9 @@ const Settings = () => {
                 type="button"
                 className="icon-btn"
                 title={
-                  downloadBlocked
+                  currentSelectionFilteredOut
+                    ? "Choose a downloaded model before using model actions"
+                    : downloadBlocked
                     ? "Not downloadable (external/API-only)"
                     : requiresAuth
                       ? "Requires Hugging Face auth"
@@ -5984,6 +6645,7 @@ const Settings = () => {
                 onClick={() => handleModelDownload(field)}
                 disabled={
                   !!downloadingModel[field] ||
+                  currentSelectionFilteredOut ||
                   downloadBlocked ||
                   !downloadable ||
                   (available && verified)
@@ -5992,7 +6654,7 @@ const Settings = () => {
                 ⬇️
               </button>
 
-              {repoId && !String(repoId).startsWith("TODO") && (
+              {repoId && !String(repoId).startsWith("TODO") && !currentSelectionFilteredOut && (
                 <button
                   type="button"
                   className="icon-btn"
@@ -6006,7 +6668,13 @@ const Settings = () => {
               <button
                 type="button"
                 className="icon-btn"
-                title={available ? "Open containing folder" : "Model not present"}
+                title={
+                  currentSelectionFilteredOut
+                    ? "Choose a downloaded model before opening its folder"
+                    : available
+                      ? "Open containing folder"
+                      : "Model not present"
+                }
                 onClick={async () => {
                   try {
                     await axios.get(
@@ -6019,7 +6687,7 @@ const Settings = () => {
                     alert("Unable to open folder on host.");
                   }
                 }}
-                disabled={!available}
+                disabled={!available || currentSelectionFilteredOut}
               >
                 📂
               </button>
@@ -6027,9 +6695,18 @@ const Settings = () => {
               <button
                 type="button"
                 className="icon-btn"
-                title="Delete model"
+                title={
+                  currentSelectionFilteredOut
+                    ? "Choose a downloaded model before deleting"
+                    : "Delete model"
+                }
                 onClick={() => handleModelDelete(field)}
-                disabled={!!downloadingModel[field] || !available || downloadBlocked}
+                disabled={
+                  !!downloadingModel[field] ||
+                  currentSelectionFilteredOut ||
+                  !available ||
+                  downloadBlocked
+                }
               >
                 🗑️
               </button>
@@ -6050,6 +6727,12 @@ const Settings = () => {
               </span>
             </div>
           </div>
+
+          {currentSelectionFilteredOut && (
+            <div className="status-note warn form-note">
+              Saved selection <code>{model}</code> is not downloaded or registered in this lane.
+            </div>
+          )}
 
           {extra && <div className="model-inline-panel">{extra}</div>}
         </div>
@@ -6130,7 +6813,8 @@ const Settings = () => {
 
       static_model: settings.static_model,
 
-      harmony_format: settings.harmony_format,
+      harmony_format: harmonyFormatEnabled,
+      harmony_format_mode: normalizeHarmonyFormatMode(settings.harmony_format_mode),
 
       server_url: settings.server_url,
 
@@ -6187,6 +6871,25 @@ const Settings = () => {
       sae_steering_token_positions: settings.sae_steering_token_positions,
       sae_steering_dry_run: !!settings.sae_steering_dry_run,
       sae_live_inspect_console: !!settings.sae_live_inspect_console,
+      background_autonomy_enabled: !!settings.background_autonomy_enabled,
+      background_autonomy_sandbox_processes:
+        settings.background_autonomy_sandbox_processes !== false,
+      background_autonomy_mode: normalizeBackgroundAutonomyMode(
+        settings.background_autonomy_mode,
+      ),
+      background_autonomy_interval_seconds:
+        settings.background_autonomy_interval_seconds,
+      background_autonomy_max_reflections_per_tick:
+        settings.background_autonomy_max_reflections_per_tick,
+      background_autonomy_max_runtime_seconds:
+        settings.background_autonomy_max_runtime_seconds,
+      background_autonomy_satisfied_threshold:
+        settings.background_autonomy_satisfied_threshold,
+      background_autonomy_basic_tick_count:
+        settings.background_autonomy_basic_tick_count,
+      background_autonomy_basic_tick_seconds:
+        settings.background_autonomy_basic_tick_seconds,
+      background_autonomy_min_priority: settings.background_autonomy_min_priority,
       weaviate_url: settings.weaviate_url,
 
       weaviate_auto_start: !!settings.weaviate_auto_start,
@@ -6208,7 +6911,14 @@ const Settings = () => {
         const storedProviderToken =
           settings.local_provider_api_token &&
           settings.local_provider_api_token.trim();
-        let nextSettings = settings;
+        const savedHarmonyMode = normalizeHarmonyFormatMode(
+          settings.harmony_format_mode,
+        );
+        let nextSettings = {
+          ...settings,
+          harmony_format_mode: savedHarmonyMode,
+          harmony_format: resolveHarmonyFormat(savedHarmonyMode, preferHarmony),
+        };
         if (storedKey) {
           nextSettings = {
             ...nextSettings,
@@ -6250,7 +6960,7 @@ const Settings = () => {
           nextSettings = {
             ...nextSettings,
             stream_backend: nextSettings.stream_backend || "api",
-            realtime_model: nextSettings.realtime_model || "gpt-realtime",
+            realtime_model: nextSettings.realtime_model || "gpt-realtime-2",
             realtime_voice: nextSettings.realtime_voice || "alloy",
             live_agent_mode: nextSettings.live_agent_mode || "local",
             live_agent_model: nextSettings.live_agent_model || "",
@@ -6277,6 +6987,8 @@ const Settings = () => {
 
         setInitialized(true);
 
+        refreshStatus();
+
       })
 
       .catch(() => {
@@ -6294,6 +7006,7 @@ const Settings = () => {
           ...prev,
  
           backendMode: settings.mode,
+          runtimeSelectionTouchedAt: Date.now(),
 
           devices: settings.devices,
 
@@ -6311,12 +7024,19 @@ const Settings = () => {
 
           apiModel: settings.model,
           ...buildGlobalSelectionPatch(prev, settings),
+          ...(settings.mode === "server"
+            ? { transformerModel: settings.transformer_model || "" }
+            : {}),
  
           staticModel: settings.static_model,
 
           approvalLevel: settings.approvalLevel,
 
-          harmonyFormat: settings.harmony_format,
+          harmonyFormatMode: normalizeHarmonyFormatMode(settings.harmony_format_mode),
+          harmonyFormat: resolveHarmonyFormat(
+            normalizeHarmonyFormatMode(settings.harmony_format_mode),
+            preferHarmony,
+          ),
 
           serverUrl: settings.server_url,
 
@@ -6327,6 +7047,8 @@ const Settings = () => {
           voiceModel: settings.voice_model,
 
           visionModel: settings.vision_model,
+          ragEmbeddingModel: settings.rag_embedding_model,
+          ragClipModel: settings.rag_clip_model,
 
           maxContextLength: settings.context_length,
 
@@ -6338,6 +7060,39 @@ const Settings = () => {
 
       });
 
+  };
+
+  const handleBackgroundAutonomyDryRun = async () => {
+    setBackgroundAutonomyTickBusy(true);
+    setBackgroundAutonomyMessage("");
+    try {
+      const mode = normalizeBackgroundAutonomyMode(settings.background_autonomy_mode);
+      const response = await axios.post("/api/background/autonomy/tick", {
+        mode,
+        dry_run: true,
+        max_reflections:
+          mode === "basic"
+            ? settings.background_autonomy_basic_tick_count
+            : settings.background_autonomy_max_reflections_per_tick,
+        max_runtime_seconds: settings.background_autonomy_max_runtime_seconds,
+        satisfied_threshold: settings.background_autonomy_satisfied_threshold,
+      });
+      const tick = response?.data?.tick || {};
+      const autonomy = response?.data?.autonomy || null;
+      if (autonomy && typeof autonomy === "object") {
+        setBackgroundAutonomyStatus(autonomy);
+      }
+      const candidates = Number(tick.candidate_count || 0);
+      setBackgroundAutonomyMessage(
+        `Dry run ${tick.status || "planned"}: ${candidates} candidate${
+          candidates === 1 ? "" : "s"
+        } visible.`,
+      );
+    } catch {
+      setBackgroundAutonomyMessage("Dry run failed.");
+    } finally {
+      setBackgroundAutonomyTickBusy(false);
+    }
   };
 
   const fetchRegisteredLocalModels = () => {
@@ -6445,6 +7200,8 @@ const Settings = () => {
     const nextWorkflow = String(defaultWorkflow || "default").trim() || "default";
     const nextRetentionDays = Math.max(1, Number(captureRetentionDays) || 7);
     const nextPrivacyFilterMode = normalizePrivacyFilterMode(privacyFilterMode);
+    const nextPrivacyFilterModel =
+      String(privacyFilterModel || "").trim() || "openai/privacy-filter";
     const nextPrivacyRouteMode = normalizePrivacyRouteMode(privacyRouteMode);
     setCaptureWorkflowSaving(true);
     setCaptureWorkflowMessage("");
@@ -6455,11 +7212,13 @@ const Settings = () => {
         capture_allow_model_raw_image_access: captureAllowModelRawImageAccess !== false,
         capture_allow_summary_fallback: captureAllowSummaryFallback !== false,
         privacy_filter_mode: nextPrivacyFilterMode,
+        privacy_filter_model: nextPrivacyFilterModel,
         privacy_filter_route_private_mode: nextPrivacyRouteMode,
         default_workflow: nextWorkflow,
         enabled_workflow_modules: nextModules,
       });
       setPrivacyFilterMode(nextPrivacyFilterMode);
+      setPrivacyFilterModel(nextPrivacyFilterModel);
       setPrivacyRouteMode(nextPrivacyRouteMode);
       setState((prev) => ({
         ...prev,
@@ -7039,24 +7798,6 @@ const Settings = () => {
 
           />
 
-          <label title="URL for an OpenAI-compatible LLM server (e.g., LM Studio)">LLM Server URL</label>
-
-          <input
-
-            name="server_url"
-
-            type="text"
-
-            value={settings.server_url}
-
-            onChange={handleChange}
-
-            placeholder="http://localhost:11434"
-
-            title="URL for an OpenAI-compatible LLM server (e.g., LM Studio)"
-
-          />
-
             </section>
           )}
 
@@ -7089,7 +7830,46 @@ const Settings = () => {
           <option value="server">Server/LAN</option>
 
         </select>
-          <div className="status-note form-note">Offline = Local (on-device).</div>
+          <div className="status-note form-note">
+            Local means direct Transformers or a configured provider bridge.
+          </div>
+
+        <label title="URL for an OpenAI-compatible LLM server, such as LM Studio or Ollama. Used when Mode is Server/LAN.">
+          Server/LAN URL
+        </label>
+        <input
+          name="server_url"
+          type="text"
+          value={settings.server_url}
+          onChange={handleChange}
+          placeholder="http://127.0.0.1:1234/v1"
+          title="URL for an OpenAI-compatible LLM server, such as LM Studio or Ollama. Used when Mode is Server/LAN."
+        />
+        <div className="status-note form-note">
+          Used by Server/LAN mode. Local provider bridges keep their own base URL below.
+        </div>
+
+        {settings.mode === "server" && (
+          <>
+            <label title="Model id sent to the Server/LAN endpoint. Leave blank only when the server should choose its loaded model.">
+              Server model
+            </label>
+            <input
+              name="transformer_model"
+              type="text"
+              value={settings.transformer_model || ""}
+              onChange={handleChange}
+              placeholder={providerModelOptions[0] || "gemma-4-12B-it-qat-q4_0-gguf"}
+              list="server-runtime-model-options"
+              title="Model id sent to the Server/LAN endpoint."
+            />
+            <datalist id="server-runtime-model-options">
+              {serverRuntimeModelOptions.map((model) => (
+                <option key={model} value={model} />
+              ))}
+            </datalist>
+          </>
+        )}
 
         {directLocalRuntimeSelected && availableDevices.length > 0 && (
           <>
@@ -7640,23 +8420,45 @@ const Settings = () => {
                 </div>
               </div>
 
-          <h3 className="settings-subsection-title">Model library</h3>
-          <div className="inline-flex" style={{ justifyContent: "flex-end", marginTop: -6 }}>
+          <div className="model-library-header">
+            <div>
+              <h3 className="settings-subsection-title">Model library</h3>
+              <p className="status-note form-note">
+                Downloads land in the configured models folder, normally <code>data/models</code>.
+                Direct Transformers expects Hugging Face checkpoint folders; GGUF models run through LM Studio or Ollama.
+              </p>
+            </div>
             <button type="button" className="icon-btn" onClick={openDownloadsTray}>
               Downloads
             </button>
           </div>
-          <label className="field-label" title="Include every Hugging Face cache entry, even tiny utility models.">
-            <input
-              type="checkbox"
-              checked={includeCacheUnfiltered}
-              onChange={(e) => {
-                const next = e.target.checked;
-                setIncludeCacheUnfiltered(next);
-              }}
-            />
-            <span style={{ marginLeft: 6 }}>Show all HF cache models (may include utility/noisy entries)</span>
-          </label>
+          <div className="model-library-controls">
+            <label
+              className="field-label model-library-toggle"
+              title="Only show installed, provider-discovered, or registered models in dropdowns. The currently selected model remains visible."
+            >
+              <input
+                type="checkbox"
+                checked={showDownloadedOnly}
+                onChange={(e) => setShowDownloadedOnly(!!e.target.checked)}
+              />
+              <span>Downloaded only</span>
+            </label>
+            <label
+              className="field-label model-library-toggle"
+              title="Include every Hugging Face cache entry, even tiny utility models that are usually hidden from chat selectors."
+            >
+              <input
+                type="checkbox"
+                checked={includeCacheUnfiltered}
+                onChange={(e) => {
+                  const next = e.target.checked;
+                  setIncludeCacheUnfiltered(next);
+                }}
+              />
+              <span>Include noisy HF cache entries</span>
+            </label>
+          </div>
           {useCustomModelsFolder ? (
             <>
               <label title="Register a local model file/folder by alias so it appears in model pickers.">
@@ -7998,7 +8800,7 @@ const Settings = () => {
                     )}
                   </div>
                   <p className="status-note form-note">
-                    Keeps tool metadata intact for GPT-OSS and similar tool-aware chat models.
+                    Keeps GPT-OSS tool metadata intact. Auto follows the selected language model.
                   </p>
                   {harmonyWarning && harmonyWarningMessage && (
                     <div className="status-note warn form-note" role="note">
@@ -8007,27 +8809,22 @@ const Settings = () => {
                   )}
                 </div>
                 <div className="settings-toggle-controls">
-                  <label className="settings-switch-row" htmlFor="harmony-auto-toggle">
-                    <span>Enable automatically</span>
-                    <input
-                      id="harmony-auto-toggle"
-                      type="checkbox"
-                      checked={harmonyAutoEnabled}
-                      onChange={handleHarmonyAutoToggle}
-                      title="Automatically enable Harmony Formatting when the selected model prefers it."
-                    />
+                  <label className="settings-switch-row" htmlFor="harmony-mode-select">
+                    <span>Mode</span>
+                    <select
+                      id="harmony-mode-select"
+                      value={harmonyMode}
+                      onChange={handleHarmonyModeChange}
+                      title="Auto enables Harmony only when the selected language model is GPT-OSS."
+                    >
+                      <option value="auto">Auto</option>
+                      <option value="enabled">Enabled</option>
+                      <option value="disabled">Disabled</option>
+                    </select>
                   </label>
-                  <label className="settings-switch-row" htmlFor="harmony-enable-toggle">
-                    <span>Enabled</span>
-                    <input
-                      id="harmony-enable-toggle"
-                      name="harmony_format"
-                      type="checkbox"
-                      checked={settings.harmony_format}
-                      onChange={handleChange}
-                      title="Format responses using Harmony metadata when supported"
-                    />
-                  </label>
+                  <div className="status-note form-note">
+                    Backend routing only applies Harmony to GPT-OSS, even when enabled.
+                  </div>
                 </div>
               </div>
             </div>
@@ -8037,7 +8834,7 @@ const Settings = () => {
                 <div>
                   <h3>Speech</h3>
                   <p className="settings-subcard-copy">
-                    Transcription, synthesis, and TTS voice presets. Gemma 4 is not part of the speech stack in this pass.
+                    Chat mic transcription, synthesis, and TTS voice presets. API STT can use the selected OpenAI transcription model; local STT waits for a finished recording.
                   </p>
                 </div>
               </div>
@@ -8092,7 +8889,7 @@ const Settings = () => {
                     value={settings.realtime_model || ""}
                     onChange={handleChange}
                     list="realtime-model-options"
-                    placeholder="gpt-realtime"
+                    placeholder="gpt-realtime-2"
                     title={fieldTooltips.realtime_model}
                   />
                   <datalist id="realtime-model-options">
@@ -8155,9 +8952,10 @@ const Settings = () => {
 
                   <p className="status-note form-note">
                     OpenAI Realtime uses a short-lived client secret from the
-                    backend and connects from the browser over WebRTC. The TTS
-                    voice field above is separate and only affects speech
-                    synthesis, not live streaming mode.
+                    backend and connects from the browser over WebRTC. Realtime
+                    STT inherits the compatible API STT model when one is selected;
+                    the normal chat mic still uses the STT model after recording
+                    stops.
                   </p>
                   <p className="status-note form-note">
                     Keep the local lane configured as well if you want a
@@ -8385,9 +9183,8 @@ const Settings = () => {
 
               <p className="status-note">
                 Values starting with <code>local:</code> attempt to use on-device
-                embeddings. <code>api:</code> entries are optional cloud paths and
-                currently fall back to the hash-based encoder until remote
-                providers are wired up.
+                embeddings. <code>api:</code> entries use the configured API
+                embedding provider and should be reserved for non-sensitive scopes.
               </p>
               {String(settings.rag_embedding_model || "").includes("embeddinggemma") && (
                 <p className="status-note form-note">
@@ -8961,9 +9758,18 @@ const Settings = () => {
             </div>
           </details>
 
-          <label title="Use an explicit models directory instead of default (Default: ./models)">
+          <label
+            className="field-label"
+            title="Add a custom models directory to the search path. Default storage is data/models; repo-root models is treated as a legacy search location."
+          >
 
             Use Custom Models Folder
+            <span
+              className="hint-badge"
+              title="When enabled, Float scans this folder and shows the local-path registration tool in Model library."
+            >
+              ?
+            </span>
 
           </label>
 
@@ -8977,9 +9783,12 @@ const Settings = () => {
 
             onChange={(e) => setUseCustomModelsFolder(!!e.target.checked)}
 
-            title="Use an explicit models directory instead of default (Default: ./models)"
+            title="Add a custom models directory to the search path. Default storage is data/models; repo-root models is treated as a legacy search location."
 
           />
+          <div className="status-note form-note">
+            Default model downloads use <code>data/models</code>. The repo-root <code>models</code> folder is scanned as a legacy/bundled location, not the primary download target.
+          </div>
 
           {useCustomModelsFolder && (
 
@@ -9874,8 +10683,35 @@ const Settings = () => {
                       (option) => option.value === normalizePrivacyFilterMode(privacyFilterMode),
                     )?.description
                   }{" "}
-                  Uses openai/privacy-filter for text only. Image access remains controlled by
-                  the raw-image and summary-fallback settings above.
+                  Uses a local text classifier. Image access remains controlled by the
+                  raw-image and summary-fallback settings above.
+                </p>
+                <label
+                  className="field-label"
+                  htmlFor="privacy-filter-model"
+                  title="Text classifier used by the privacy filter. The download manager lists privacy-filter as the local download alias."
+                >
+                  Privacy filter model
+                </label>
+                <input
+                  id="privacy-filter-model"
+                  value={privacyFilterModel}
+                  onChange={(event) => setPrivacyFilterModel(event.target.value)}
+                  list="privacy-filter-model-presets"
+                  placeholder="openai/privacy-filter"
+                  title="Hugging Face model id or local alias for the text privacy classifier."
+                />
+                <datalist id="privacy-filter-model-presets">
+                  {PRIVACY_FILTER_MODEL_PRESETS.map((preset) => (
+                    <option key={preset.value} value={preset.value}>
+                      {preset.label}
+                    </option>
+                  ))}
+                </datalist>
+                <p className="status-note" style={{ marginTop: 6 }}>
+                  This is not a RAG embedding model. Use Downloads in Models to fetch
+                  {" "}
+                  <code>privacy-filter</code> locally before enabling always-on checks.
                 </p>
                 <label
                   className="field-label"
@@ -10036,26 +10872,80 @@ const Settings = () => {
                   routing, prompt layers, and permission gates themselves is still the next
                   workflow pass.
                 </p>
-                <div style={{ marginTop: 12 }}>
-                  <div className="field-label" style={{ marginBottom: 8 }}>
-                    Enabled modules
-                  </div>
-                  <div style={{ display: "grid", gap: 8 }}>
-                    {workflowModules.map((module) => (
-                      <label
-                        key={module.id}
-                        className="checkbox-row"
-                        style={{
-                          display: "grid",
-                          gap: 4,
-                          padding: "10px 12px",
-                          border: "1px solid var(--glass-border)",
-                          borderRadius: 12,
-                        }}
+                <div className="workflow-modules-card">
+                  <div className="workflow-modules-heading">
+                    <div>
+                      <div className="field-label">
+                        Modules{" "}
+                        <span
+                          className="settings-help-dot"
+                          title="Disabled modules stay visible as capability docs, but their tools are not listed as callable."
+                        >
+                          ?
+                        </span>
+                      </div>
+                      <p className="status-note workflow-module-location">
+                        Custom add-ons live in{" "}
+                        <code>
+                          {workflowCatalog.addons_root || DEFAULT_WORKFLOW_CATALOG.addons_root}
+                        </code>.
+                      </p>
+                    </div>
+                    <div className="workflow-module-heading-actions">
+                      <select
+                        aria-label="Module details"
+                        value={moduleDetailsId}
+                        onChange={(event) => setModuleDetailsId(event.target.value)}
                       >
-                        <span style={{ display: "inline-flex", gap: 8, alignItems: "center" }}>
+                        {workflowModules.map((module) => (
+                          <option key={module.id} value={module.id}>
+                            {module.label || module.id}
+                          </option>
+                        ))}
+                      </select>
+                      <span className="workflow-module-count">
+                        {enabledWorkflowModules.length}/{workflowModules.length} enabled
+                      </span>
+                    </div>
+                  </div>
+                  <div className="workflow-module-list">
+                    {workflowModules.map((module) => {
+                      const source = String(module.source || "base").toLowerCase();
+                      const sourceLabel =
+                        source === "custom" || source === "local"
+                          ? "custom"
+                          : source === "base"
+                            ? "base"
+                            : source;
+                      const toolCount = Array.isArray(module.tool_names)
+                        ? module.tool_names.length
+                        : 0;
+                      return (
+                        <label key={module.id} className="workflow-module-row">
+                          <span className="workflow-module-main">
+                            <span className="workflow-module-title">
+                              <strong>{module.label || module.id}</strong>
+                              <span
+                                className={`workflow-module-source workflow-module-source--${sourceLabel}`}
+                              >
+                                {sourceLabel}
+                              </span>
+                              <span className="workflow-module-status">
+                                {module.status || "live"}
+                              </span>
+                              {toolCount > 0 && (
+                                <span className="workflow-module-tools">
+                                  {toolCount} tool{toolCount === 1 ? "" : "s"}
+                                </span>
+                              )}
+                            </span>
+                            <span className="status-note workflow-module-description">
+                              {module.description || "No module description supplied."}
+                            </span>
+                          </span>
                           <input
                             type="checkbox"
+                            aria-label={`${module.label || module.id} enabled`}
                             checked={enabledWorkflowModules.includes(module.id)}
                             onChange={(event) => {
                               setEnabledWorkflowModules((prev) => {
@@ -10067,24 +10957,186 @@ const Settings = () => {
                               });
                             }}
                           />
-                          <strong>{module.label}</strong>
-                          <span className="status-note">({module.status || "live"})</span>
-                        </span>
-                        <span className="status-note" style={{ margin: 0 }}>
-                          {module.description}
-                        </span>
-                      </label>
-                    ))}
+                        </label>
+                      );
+                    })}
                   </div>
+                  {(() => {
+                    const selectedModule =
+                      workflowModuleMap.get(moduleDetailsId) || workflowModules[0] || {};
+                    const selectedTools = Array.isArray(selectedModule.tool_names)
+                      ? selectedModule.tool_names
+                      : [];
+                    const selectedAssets = Array.isArray(selectedModule.assets)
+                      ? selectedModule.assets
+                      : [];
+                    const selectedConfig =
+                      selectedModule.config && typeof selectedModule.config === "object"
+                        ? selectedModule.config
+                        : {};
+                    const configKeys = Object.keys(selectedConfig);
+                    return (
+                      <div className="workflow-module-details">
+                        <div>
+                          <strong>{selectedModule.label || selectedModule.id || "Module"}</strong>
+                          <span className="status-note">
+                            {" "}
+                            {selectedModule.doc_id || "No skill doc linked"}
+                          </span>
+                        </div>
+                        <div className="workflow-module-detail-grid">
+                          <div>
+                            <span className="workflow-detail-label">skills</span>
+                            <p>{selectedModule.skill_id || "No skill listed"}</p>
+                          </div>
+                          <div>
+                            <span className="workflow-detail-label">tools</span>
+                            <p>
+                              {selectedTools.length
+                                ? selectedTools.join(", ")
+                                : "No tools listed"}
+                            </p>
+                          </div>
+                          <div>
+                            <span className="workflow-detail-label">assets</span>
+                            <p>
+                              {selectedAssets.length
+                                ? selectedAssets
+                                    .map((asset) =>
+                                      typeof asset === "string"
+                                        ? asset
+                                        : asset?.label || asset?.path || "asset",
+                                    )
+                                    .join(", ")
+                                : "No assets listed"}
+                            </p>
+                          </div>
+                          <div>
+                            <span className="workflow-detail-label">config</span>
+                            {configKeys.length ? (
+                              <textarea
+                                className="workflow-config-editor"
+                                aria-label={`${selectedModule.label || selectedModule.id} config`}
+                                value={JSON.stringify(selectedConfig, null, 2)}
+                                readOnly
+                              />
+                            ) : (
+                              <p>No editable config for this module.</p>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })()}
+                <div className="workflow-skill-manager workflow-skill-manager--subcard" aria-label="Module skill docs">
+                  <div className="workflow-modules-heading">
+                    <div>
+                      <div className="field-label">Module skill docs</div>
+                      <p className="status-note">
+                        Edit local markdown overrides in <code>data/modules/skills/</code>. Base
+                        docs stay read-only and can be restored by deleting the local override.
+                      </p>
+                    </div>
+                    {skillDoc?.active?.source && (
+                      <span className="workflow-module-count">
+                        active: {skillDoc.active.source}
+                      </span>
+                    )}
+                  </div>
+                  <label className="field-label" htmlFor="workflow-skill-doc-select">
+                    Skill doc
+                  </label>
+                  <select
+                    id="workflow-skill-doc-select"
+                    value={skillDocSelectedId}
+                    onChange={(event) => setSkillDocSelectedId(event.target.value)}
+                    disabled={skillDocLoading || skillDocSaving}
+                  >
+                    {Array.from(
+                      new Map(
+                        workflowModules
+                          .map((module) => {
+                            const skillId = String(module.skill_id || module.id || "").trim();
+                            if (!skillId) {
+                              return null;
+                            }
+                            return [
+                              skillId,
+                              `${module.label || module.id || skillId} (${skillId})`,
+                            ];
+                          })
+                          .filter(Boolean),
+                      ).entries(),
+                    ).map(([skillId, label]) => (
+                      <option key={skillId} value={skillId}>
+                        {label}
+                      </option>
+                    ))}
+                  </select>
+                  <div className="workflow-skill-meta">
+                    <span>
+                      Local override: <strong>{skillDoc?.local_exists ? "yes" : "no"}</strong>
+                    </span>
+                    <span>
+                      Base doc: <strong>{skillDoc?.repo_exists ? "available" : "missing"}</strong>
+                    </span>
+                    {skillDoc?.local_path && (
+                      <span title={skillDoc.local_path}>
+                        Save path: <code>{skillDoc.local_path}</code>
+                      </span>
+                    )}
+                  </div>
+                  <textarea
+                    className="workflow-skill-editor"
+                    aria-label="Skill markdown editor"
+                    value={skillDocDraft}
+                    onChange={(event) => setSkillDocDraft(event.target.value)}
+                    disabled={skillDocLoading || skillDocSaving || !skillDocSelectedId}
+                    spellCheck={false}
+                  />
+                  <div className="inline-flex" style={{ gap: 10, marginTop: 10, flexWrap: "wrap" }}>
+                    <button
+                      type="button"
+                      className="icon-btn"
+                      onClick={handleSkillDocSave}
+                      disabled={skillDocLoading || skillDocSaving || !skillDocSelectedId}
+                      style={{ marginTop: 0 }}
+                    >
+                      {skillDocSaving ? "Saving..." : "Save local override"}
+                    </button>
+                    <button
+                      type="button"
+                      className="icon-btn"
+                      onClick={handleSkillDocDelete}
+                      disabled={
+                        skillDocLoading ||
+                        skillDocSaving ||
+                        !skillDocSelectedId ||
+                        !skillDoc?.local_exists
+                      }
+                      style={{ marginTop: 0 }}
+                    >
+                      Delete local override
+                    </button>
+                    <button
+                      type="button"
+                      className="icon-btn"
+                      onClick={() => fetchSkillDoc(skillDocSelectedId)}
+                      disabled={skillDocLoading || skillDocSaving || !skillDocSelectedId}
+                      style={{ marginTop: 0 }}
+                    >
+                      Reload doc
+                    </button>
+                  </div>
+                  {skillDocMessage && <p className="status-note">{skillDocMessage}</p>}
+                </div>
                 </div>
                 <p className="status-note" style={{ marginTop: 10 }}>
-                  Custom add-ons live in{" "}
-                  <code>{workflowCatalog.addons_root || DEFAULT_WORKFLOW_CATALOG.addons_root}</code>.
                   {Array.isArray(workflowCatalog.addons) && workflowCatalog.addons.length > 0
                     ? ` ${workflowCatalog.addons.length} add-on${
                         workflowCatalog.addons.length === 1 ? "" : "s"
                       } currently registered.`
-                    : " Drop sanctioned workflow/module packs there to surface them here later."}
+                    : "Drop sanctioned workflow/module packs there to surface them here later."}
                 </p>
                 <div className="inline-flex" style={{ gap: 10, marginTop: 10, flexWrap: "wrap" }}>
                   <button
@@ -10094,12 +11146,342 @@ const Settings = () => {
                     disabled={captureWorkflowSaving}
                     style={{ marginTop: 0 }}
                   >
-                    {captureWorkflowSaving ? "Saving..." : "Save capture defaults"}
+                    {captureWorkflowSaving ? "Saving..." : "Save capture & workflow settings"}
                   </button>
                 </div>
                 {captureWorkflowMessage && (
                   <p className="status-note">{captureWorkflowMessage}</p>
                 )}
+              </div>
+            </section>
+          )}
+
+          {showSettingsSection("background") && (
+            <section
+              id="settings-background"
+              className="settings-card settings-section"
+              aria-label="Background autonomy"
+            >
+              <div className="settings-card-header">
+                <div>
+                  <h2>Background Processing</h2>
+                  <p className="settings-card-copy">
+                    Bounded autonomy settings for reflection review, overnight runs,
+                    and separate long-running container checks.
+                  </p>
+                </div>
+              </div>
+
+              <div className="settings-section">
+                <label
+                  className="checkbox-row"
+                  style={{ display: "inline-flex", gap: 8, alignItems: "center" }}
+                >
+                  <input
+                    type="checkbox"
+                    name="background_autonomy_enabled"
+                    checked={!!settings.background_autonomy_enabled}
+                    onChange={handleChange}
+                  />
+                  <span>Enable background autonomy</span>
+                </label>
+
+                <label
+                  className="checkbox-row"
+                  style={{ display: "inline-flex", gap: 8, alignItems: "center" }}
+                  title="Prefer container or execution-session isolation for background and subagent work when a sandbox backend is available."
+                >
+                  <input
+                    type="checkbox"
+                    name="background_autonomy_sandbox_processes"
+                    checked={settings.background_autonomy_sandbox_processes !== false}
+                    onChange={handleChange}
+                  />
+                  <span>Sandbox background processes</span>
+                </label>
+
+                <label
+                  className="field-label"
+                  htmlFor="background-autonomy-mode"
+                  title="Controls how the background autonomy runner decides when to stop."
+                >
+                  Background autonomy mode
+                </label>
+                <select
+                  id="background-autonomy-mode"
+                  name="background_autonomy_mode"
+                  value={normalizeBackgroundAutonomyMode(settings.background_autonomy_mode)}
+                  onChange={handleChange}
+                >
+                  {BACKGROUND_AUTONOMY_MODE_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                <p className="status-note" style={{ marginTop: 6 }}>
+                  {
+                    BACKGROUND_AUTONOMY_MODE_OPTIONS.find(
+                      (option) =>
+                        option.value ===
+                        normalizeBackgroundAutonomyMode(settings.background_autonomy_mode),
+                    )?.description
+                  }
+                </p>
+
+                <div className="advanced-grid" style={{ marginTop: 12 }}>
+                  <label
+                    htmlFor="background-runtime-minutes"
+                    title="Default overnight review budget. Extended mode stops by threshold instead."
+                  >
+                    Runtime budget (minutes)
+                  </label>
+                  <input
+                    id="background-runtime-minutes"
+                    type="number"
+                    min="1"
+                    max="1440"
+                    step="1"
+                    value={Math.max(
+                      1,
+                      Math.round(
+                        Number(settings.background_autonomy_max_runtime_seconds || 1800) /
+                          60,
+                      ),
+                    )}
+                    onChange={(event) => {
+                      const parsed = parseInt(event.target.value, 10);
+                      commitSettingValue(
+                        "background_autonomy_max_runtime_seconds",
+                        (Number.isFinite(parsed) ? Math.max(1, parsed) : 30) * 60,
+                      );
+                    }}
+                  />
+
+                  <label
+                    htmlFor="background-routine-interval"
+                    title="How often the routine runner wakes up outside basic-test mode."
+                  >
+                    Routine poll interval (minutes)
+                  </label>
+                  <input
+                    id="background-routine-interval"
+                    type="number"
+                    min="1"
+                    max="1440"
+                    step="1"
+                    value={Math.max(
+                      1,
+                      Math.round(
+                        Number(settings.background_autonomy_interval_seconds || 900) /
+                          60,
+                      ),
+                    )}
+                    onChange={(event) => {
+                      const parsed = parseInt(event.target.value, 10);
+                      commitSettingValue(
+                        "background_autonomy_interval_seconds",
+                        (Number.isFinite(parsed) ? Math.max(1, parsed) : 15) * 60,
+                      );
+                    }}
+                  />
+
+                  <label
+                    htmlFor="background-basic-tick-count"
+                    title="Basic mode tick budget. Default is two checks."
+                  >
+                    Basic test ticks
+                  </label>
+                  <input
+                    id="background-basic-tick-count"
+                    name="background_autonomy_basic_tick_count"
+                    type="number"
+                    min="1"
+                    max="20"
+                    step="1"
+                    value={settings.background_autonomy_basic_tick_count ?? 2}
+                    onChange={handleChange}
+                  />
+
+                  <label
+                    htmlFor="background-basic-tick-minutes"
+                    title="Basic mode interval. Default is five minutes."
+                  >
+                    Basic tick interval (minutes)
+                  </label>
+                  <input
+                    id="background-basic-tick-minutes"
+                    type="number"
+                    min="1"
+                    max="1440"
+                    step="1"
+                    value={Math.max(
+                      1,
+                      Math.round(
+                        Number(settings.background_autonomy_basic_tick_seconds || 300) /
+                          60,
+                      ),
+                    )}
+                    onChange={(event) => {
+                      const parsed = parseInt(event.target.value, 10);
+                      commitSettingValue(
+                        "background_autonomy_basic_tick_seconds",
+                        (Number.isFinite(parsed) ? Math.max(1, parsed) : 5) * 60,
+                      );
+                    }}
+                  />
+
+                  <label
+                    htmlFor="background-satisfied-threshold"
+                    title="Extended mode stops after a run reaches this usefulness/novelty score."
+                  >
+                    Satisfied threshold
+                  </label>
+                  <input
+                    id="background-satisfied-threshold"
+                    name="background_autonomy_satisfied_threshold"
+                    type="number"
+                    min="0"
+                    max="1"
+                    step="0.05"
+                    value={settings.background_autonomy_satisfied_threshold ?? 0.8}
+                    onChange={handleChange}
+                  />
+
+                  <label
+                    htmlFor="background-reflection-cap"
+                    title="Safety cap for reflection scheduler runs inside one autonomy tick."
+                  >
+                    Reflection cap per tick
+                  </label>
+                  <input
+                    id="background-reflection-cap"
+                    name="background_autonomy_max_reflections_per_tick"
+                    type="number"
+                    min="0"
+                    max="5"
+                    step="1"
+                    value={settings.background_autonomy_max_reflections_per_tick ?? 1}
+                    onChange={handleChange}
+                  />
+
+                  <label
+                    htmlFor="background-min-priority"
+                    title="Lowest reflection priority eligible for background review."
+                  >
+                    Minimum priority
+                  </label>
+                  <input
+                    id="background-min-priority"
+                    name="background_autonomy_min_priority"
+                    type="number"
+                    min="0"
+                    max="1"
+                    step="0.05"
+                    value={settings.background_autonomy_min_priority ?? 0.05}
+                    onChange={handleChange}
+                  />
+                </div>
+
+                <div
+                  className="inline-flex"
+                  style={{ gap: 10, marginTop: 12, flexWrap: "wrap" }}
+                >
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    onClick={handleSave}
+                    disabled={saving || !isDirty}
+                    style={{ marginTop: 0 }}
+                  >
+                    {saving ? "Saving..." : "Save background settings"}
+                  </button>
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    onClick={handleBackgroundAutonomyDryRun}
+                    disabled={backgroundAutonomyTickBusy}
+                    style={{ marginTop: 0 }}
+                  >
+                    {backgroundAutonomyTickBusy ? "Planning..." : "Dry run tick"}
+                  </button>
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    onClick={() => refreshStatus()}
+                    disabled={backgroundAutonomyLoading}
+                    style={{ marginTop: 0 }}
+                  >
+                    {backgroundAutonomyLoading ? "Refreshing..." : "Refresh status"}
+                  </button>
+                </div>
+
+                {backgroundAutonomyMessage && (
+                  <p className="status-note">{backgroundAutonomyMessage}</p>
+                )}
+
+                <div className="settings-subcard" style={{ marginTop: 12 }}>
+                  <div className="settings-subcard-header">
+                    <div>
+                      <h3>Autonomy status</h3>
+                      <p className="settings-subcard-copy">
+                        {backgroundAutonomyStatus?.error
+                          ? "Status endpoint is not reachable."
+                          : backgroundAutonomyStatus
+                            ? `${
+                                backgroundAutonomyStatus.routine_enabled
+                                  ? "Routine enabled"
+                                  : "Manual or disabled"
+                              }; ${
+                                backgroundAutonomyStatus.reflection?.candidate_count ?? 0
+                              } reflection candidate(s).`
+                            : "Status has not loaded yet."}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="workflow-profile-meta">
+                    <span>
+                      Mode:{" "}
+                      <strong>
+                        {normalizeBackgroundAutonomyMode(
+                          backgroundAutonomyStatus?.configured_mode ||
+                            settings.background_autonomy_mode,
+                        ).replace("_", " ")}
+                      </strong>
+                    </span>
+                    <span>
+                      Budget:{" "}
+                      <strong>
+                        {Math.max(
+                          1,
+                          Math.round(
+                            Number(
+                              backgroundAutonomyStatus?.max_runtime_seconds ||
+                                settings.background_autonomy_max_runtime_seconds ||
+                                1800,
+                            ) / 60,
+                          ),
+                        )}{" "}
+                        min
+                      </strong>
+                    </span>
+                    <span>
+                      Threshold:{" "}
+                      <strong>
+                        {Number(
+                          backgroundAutonomyStatus?.satisfied_threshold ??
+                            settings.background_autonomy_satisfied_threshold ??
+                            0.8,
+                        ).toFixed(2)}
+                      </strong>
+                    </span>
+                  </div>
+                </div>
+
+                <p className="status-note" style={{ marginTop: 10 }}>
+                  Container orchestration and API background-response checks are kept in
+                  a separate opt-in test suite so normal Poetry runs do not stall.
+                </p>
               </div>
             </section>
           )}

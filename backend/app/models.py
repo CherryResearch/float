@@ -101,6 +101,8 @@ class ChatRequest(BaseModel):
     attachments: List[Attachment] = Field(default_factory=list)
     vision_workflow: Optional[str] = "auto"
     use_rag: Optional[bool] = True
+    use_text_rag: Optional[bool] = True
+    use_vision_rag: Optional[bool] = True
     patience: Optional[int] = 1
     thinking: Optional[Union[bool, str]] = None
     workflow: Optional[str] = None

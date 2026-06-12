@@ -63,6 +63,13 @@ def test_tool_catalog_endpoint_returns_builtin_metadata(tmp_path, monkeypatch):
     assert any(
         "workspace" in str(item).lower() for item in list_dir.get("can_access", [])
     )
+    capability_docs = next(
+        (tool for tool in tools if tool.get("id") == "read_capability_docs"), None
+    )
+    assert capability_docs is not None
+    assert capability_docs["category"] == "docs"
+    assert "modules/skills/" in capability_docs["sandbox"]["read_roots"]
+    assert capability_docs["policy"]["approval"] == "low"
     read_file = next((tool for tool in tools if tool.get("id") == "read_file"), None)
     assert read_file is not None
     assert read_file["limits"]["default_start_line"] == 1
@@ -70,6 +77,17 @@ def test_tool_catalog_endpoint_returns_builtin_metadata(tmp_path, monkeypatch):
     assert read_file["limits"]["max_line_count"] == 1000
     assert read_file["limits"]["default_max_chars"] == 12000
     assert read_file["limits"]["max_chars"] == 20000
+    route_to_local = next(
+        (tool for tool in tools if tool.get("id") == "route_to_local_model"),
+        None,
+    )
+    assert route_to_local is not None
+    assert route_to_local["category"] == "routing"
+    assert route_to_local["runtime"]["executor"] == "client_resolution"
+    assert route_to_local["policy"]["live_auto"] is False
+    assert route_to_local["policy"]["live_unavailable_reason"] == (
+        "client_resolution_required"
+    )
     list_actions = next(
         (tool for tool in tools if tool.get("id") == "list_actions"), None
     )

@@ -254,9 +254,9 @@ class LMStudioAdapter(LocalProviderAdapter):
                     break
 
         inventory_result = (
-            self._inventory_snapshot(cfg, timeout=0.35 if quick else 2.5)
-            if (not quick or loaded_model is None or context_length is None)
-            else {"ok": False, "models": [], "items": []}
+            {"ok": False, "models": [], "items": []}
+            if quick
+            else self._inventory_snapshot(cfg, timeout=2.5)
         )
         models = (
             inventory_result.get("models") if isinstance(inventory_result, dict) else []

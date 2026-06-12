@@ -374,6 +374,78 @@
   margin-top: 0;
 }
 
+.knowledge-sync-card--sync-inbox {
+  gap: 10px;
+}
+
+.knowledge-sync-suggestion-list {
+  display: grid;
+  gap: 8px;
+}
+
+.knowledge-sync-suggestion {
+  border: 1px solid color-mix(in oklab, var(--glass-border) 74%, transparent);
+  border-left: 3px solid color-mix(in oklab, var(--color-pear) 58%, var(--glass-border) 42%);
+  border-radius: 8px;
+  background: color-mix(in oklab, var(--glass-tint) 82%, transparent);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.knowledge-sync-suggestion.is-pending {
+  border-left-color: color-mix(in oklab, #f2c36d 74%, var(--glass-border) 26%);
+}
+
+.knowledge-sync-suggestion.is-legacy {
+  border-left-color: color-mix(in oklab, #f28482 70%, var(--glass-border) 30%);
+}
+
+.knowledge-sync-suggestion.is-paired {
+  border-left-color: color-mix(in oklab, #76d39e 70%, var(--glass-border) 30%);
+}
+
+.knowledge-sync-suggestion-requirements {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 6px;
+}
+
+.knowledge-sync-requirement {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding: 6px 8px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 76%, transparent);
+  background: color-mix(in oklab, var(--glass-tint) 88%, transparent);
+  font-size: 0.78rem;
+  line-height: 1.25;
+}
+
+.knowledge-sync-requirement span {
+  color: var(--color-text-muted);
+}
+
+.knowledge-sync-requirement.is-ready {
+  border-color: color-mix(in oklab, #76d39e 45%, var(--glass-border) 55%);
+}
+
+.knowledge-sync-requirement.is-missing,
+.knowledge-sync-requirement.is-needs_check {
+  border-color: color-mix(in oklab, #f2c36d 44%, var(--glass-border) 56%);
+}
+
+.knowledge-sync-requirement.is-off {
+  border-color: color-mix(in oklab, var(--glass-border) 86%, transparent);
+}
+
+.knowledge-sync-suggestion-footer {
+  align-items: center;
+}
+
 .knowledge-sync-card input[type="text"] {
   width: 100%;
 }

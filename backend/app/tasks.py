@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
-import requests
 from app import config as app_config
 from app.services.rag_provider import ingest_calendar_event, try_ingest_text
+from app.services.stt_service import STTService
 from app.services.tts_service import TTSService
 from app.utils import calendar_store, memory_store, user_settings
 from app.utils.metrics import celery_task_duration_seconds, celery_task_executions_total
@@ -458,28 +458,22 @@ def rehydrate_memories(limit: Optional[int] = None) -> Dict[str, Any]:
 
 @celery_app.task
 def process_livekit_audio(data: bytes) -> Dict:
-    """Transcribe and synthesize audio using external APIs."""
+    """Transcribe and synthesize audio using the configured STT/TTS lanes."""
     cfg = app_config.load_config()
-    api_key = cfg.get("api_key")
-    if not api_key:
-        return {"text": "", "audio": ""}
-
-    headers = {"Authorization": f"Bearer {api_key}"}
-    files = {"file": ("audio.wav", data, "audio/wav")}
     stt_model = cfg.get("stt_model", "whisper-1")
     tts_model = cfg.get("tts_model", "tts-1")
-    voice_model = cfg.get("voice_model", "nova")
+    voice_model = cfg.get("voice_model", "alloy")
     try:
-        resp = requests.post(
-            "https://api.openai.com/v1/audio/transcriptions",
-            headers=headers,
-            files=files,
-            data={"model": stt_model},
-            timeout=30,
+        stt_result = STTService().transcribe(
+            data,
+            cfg,
+            model=stt_model,
+            filename="audio.wav",
+            content_type="audio/wav",
         )
-        resp.raise_for_status()
-        text = resp.json().get("text", "")
-    except Exception:
+        text = stt_result.text
+    except Exception as exc:
+        logging.warning("process_livekit_audio: STT failed: %s", exc)
         text = ""
 
     audio_b64 = ""

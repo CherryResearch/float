@@ -421,7 +421,7 @@ class LocalProviderManager:
         adapter = self._adapter(provider_key)
         runtime = None
         cached_models = None if force else self._cached_models(provider_key)
-        should_refresh_models = refresh_models or cached_models is None
+        should_refresh_models = refresh_models or (cached_models is None and not quick)
 
         current = adapter.poll_status(cfg, quick=quick)
         runtime = self._merge_cached_runtime(provider_key, current)
@@ -756,7 +756,11 @@ class LocalProviderManager:
     def _status(
         self, provider: Optional[str], *, quick: bool = False
     ) -> Dict[str, Any]:
-        snapshot = self.provider_snapshot(provider, quick=quick, refresh_models=True)
+        snapshot = self.provider_snapshot(
+            provider,
+            quick=quick,
+            refresh_models=not quick,
+        )
         runtime = snapshot.get("runtime")
         return dict(runtime) if isinstance(runtime, dict) else {}
 

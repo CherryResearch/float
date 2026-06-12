@@ -56,7 +56,12 @@ export const normalizeRagMatches = (rawMatches) => {
     .filter(Boolean);
 };
 
-const RagContextPanel = ({ matches, defaultOpen = false, onToggle = null }) => {
+const RagContextPanel = ({
+  matches,
+  defaultOpen = false,
+  onToggle = null,
+  className = "",
+}) => {
   const normalized = useMemo(
     () => normalizeRagMatches(matches),
     [matches],
@@ -78,7 +83,11 @@ const RagContextPanel = ({ matches, defaultOpen = false, onToggle = null }) => {
     });
 
   return (
-    <div className={`rag-context ${expanded ? "open" : ""}`}>
+    <div
+      className={`rag-context${expanded ? " open" : ""}${
+        className ? ` ${className}` : ""
+      }`}
+    >
       <button
         type="button"
         className="rag-toggle"

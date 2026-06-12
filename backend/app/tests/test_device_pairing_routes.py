@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -122,12 +123,142 @@ def test_sync_overview_reports_visibility_and_urls(client):
     assert payload["egress_summary"]["inbound_visibility"]["lan_enabled"] is True
     assert payload["egress_summary"]["outbound_target"]["mode"] == "none"
     assert payload["egress_summary"]["push_review_mode"] == "review_required"
+    assert payload["egress_summary"]["auto_sync"]["enabled"] is False
+    assert payload["egress_summary"]["auto_sync"]["available"] is False
+    assert payload["egress_summary"]["background_owner"]["mode"] == "idle"
     assert (
         "automatic stop-kill safeguards"
         in payload["egress_summary"]["unfinished_notice"].lower()
     )
     assert payload["sync_operations"]["active_operation"] is None
     assert payload["sync_operations"]["last_attempt"] is None
+    assert payload["sync_suggestions"][0]["id"] == "pair-a-device"
+    assert payload["sync_suggestions"][0]["auto_sync_enabled"] is False
+
+
+def test_mobile_float_serve_start_uses_current_frontend_port(
+    client, tmp_path, monkeypatch
+):
+    from app import routes
+
+    state_path = tmp_path / ".dev_state.json"
+    state_path.write_text(
+        json.dumps({"frontend_port": 5173, "backend_port": 8000}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FLOAT_DEV_STATE_PATH", str(state_path))
+    monkeypatch.setattr(routes.shutil, "which", lambda name: "tailscale")
+    calls = []
+    started = {"value": False}
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        args = cmd[1:]
+        if args == ["status", "--self", "--json"]:
+            return routes.subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=json.dumps(
+                    {
+                        "Self": {
+                            "DNSName": "studio.tail.ts.net.",
+                            "HostName": "studio",
+                            "TailscaleIPs": ["100.100.100.10"],
+                        }
+                    }
+                ),
+                stderr="",
+            )
+        if args == ["serve", "status"]:
+            stdout = (
+                "http://studio.tail.ts.net:64345 -> http://127.0.0.1:5173"
+                if started["value"]
+                else "No serve config"
+            )
+            return routes.subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        if args == [
+            "serve",
+            "--http=64345",
+            "--bg",
+            "--yes",
+            "localhost:5173",
+        ]:
+            started["value"] = True
+            return routes.subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        raise AssertionError(f"Unexpected tailscale command: {args}")
+
+    monkeypatch.setattr(routes.subprocess, "run", fake_run)
+
+    res = client.post("/sync/mobile-serve/start", json={"serve_port": 64345})
+
+    assert res.status_code == 200
+    payload = res.json()
+    assert payload["running"] is True
+    assert payload["serve_port"] == 64345
+    assert payload["frontend_port"] == 5173
+    assert payload["url"] == "http://studio.tail.ts.net:64345/"
+    assert payload["target"] == "localhost:5173"
+    assert [
+        "tailscale",
+        "serve",
+        "--http=64345",
+        "--bg",
+        "--yes",
+        "localhost:5173",
+    ] in calls
+
+
+def test_mobile_float_serve_status_reports_missing_tailscale(client, monkeypatch):
+    from app import routes
+
+    monkeypatch.setattr(routes.shutil, "which", lambda name: None)
+
+    res = client.get("/sync/mobile-serve/status")
+
+    assert res.status_code == 200
+    payload = res.json()
+    assert payload["installed"] is False
+    assert payload["running"] is False
+    assert "Tailscale" in payload["warning"]
+
+
+def test_sync_overview_suggests_reviewed_sync_without_auto_sync(client):
+    paired = {
+        "id": "peer-pear",
+        "label": "Pear",
+        "remote_url": "http://pear.float:5000",
+        "scopes": ["sync"],
+        "remote_device_id": "remote-device-1",
+        "remote_public_key": "pk-pear",
+        "local_workspace_ids": ["root"],
+        "remote_workspace_ids": ["root"],
+        "workspace_mode": "merge",
+    }
+    client.post(
+        "/user-settings",
+        json={
+            "sync_visible_on_lan": True,
+            "sync_remote_url": paired["remote_url"],
+            "sync_saved_peers": [paired],
+        },
+    )
+
+    payload = client.get("/sync/overview").json()
+
+    assert payload["egress_summary"]["outbound_target"]["mode"] == "saved_peer"
+    assert payload["egress_summary"]["auto_sync"]["enabled"] is False
+    assert payload["egress_summary"]["auto_sync"]["mode"] == "manual_review_only"
+    suggestions = payload["sync_suggestions"]
+    ready = next(
+        item for item in suggestions if item["id"] == "ready-reviewed-sync-peer-pear"
+    )
+    assert ready["action"] == "check_then_preview"
+    assert ready["manual_review_required"] is True
+    assert ready["auto_sync_enabled"] is False
+    assert ready["auto_sync_available"] is False
+    rows = {row["label"]: row["value"] for row in ready["state_explanation"]["rows"]}
+    assert rows["Automatic sync"] == "Off"
+    assert rows["Review"] == "Manual approval required"
 
 
 def test_sync_peer_status_records_operation_lifecycle(client, monkeypatch):
@@ -1318,6 +1449,135 @@ def test_sync_apply_pull_refreshes_search_mirrors(client, monkeypatch):
         "Attachment search mirrors refreshed for 1 synced image attachments (1 scanned).",
         "Calendar retrieval refreshed for 1 synced events (1 scanned).",
     ]
+
+
+def test_sync_apply_pull_supersedes_prior_pending_review_push(client, monkeypatch):
+    from app import routes
+    from app.utils import sync_store
+
+    sync_store.start_operation(
+        kind="push",
+        operation_id="push-old",
+        remote_url="http://example.test:5000",
+        remote_label="Pear",
+        sections=["conversations"],
+        workspace_mode="merge",
+    )
+    sync_store.finish_operation(
+        "push-old",
+        status="completed",
+        result={
+            "direction": "push",
+            "remote": "http://example.test:5000",
+            "workspace_mode": "merge",
+            "remote_status": "pending_review",
+        },
+    )
+
+    class FakeSyncService:
+        def normalize_sections(self, sections):
+            return list(sections or [])
+
+        def normalize_item_selections(self, sections, selections):
+            return selections or {}
+
+        def current_instance_identity(self, source_namespace=None):
+            return {
+                "display_name": "Local",
+                "hostname": "local-host",
+                "source_namespace": source_namespace or "",
+            }
+
+        def build_snapshot(self, sections, workspace_ids=None):
+            return {"sections": {section: [] for section in sections or []}}
+
+        def filter_snapshot_by_item_selections(self, snapshot, item_selections=None):
+            return snapshot
+
+        def merge_snapshot(self, snapshot, **_kwargs):
+            return {
+                "applied_at": "2026-03-25T00:00:00+00:00",
+                "effective_namespace": None,
+                "sections": {"conversations": {"applied": 0, "skipped": 0}},
+                "notes": [],
+            }
+
+    monkeypatch.setattr(routes, "_sync_service", lambda: FakeSyncService())
+    monkeypatch.setattr(
+        routes.RemoteFloatClient,
+        "get_sync_overview",
+        lambda self: {
+            "workspaces": {
+                "active_workspace_id": "root",
+                "selected_workspace_ids": ["root"],
+                "profiles": [
+                    {
+                        "id": "root",
+                        "name": "Main workspace",
+                        "slug": "main",
+                        "namespace": "",
+                        "root_path": "data/files/workspace",
+                        "kind": "root",
+                        "is_root": True,
+                    }
+                ],
+            }
+        },
+    )
+    monkeypatch.setattr(
+        routes.RemoteFloatClient,
+        "export_snapshot",
+        lambda self, sections, workspace_ids=None: {
+            "instance": {
+                "display_name": "Pear",
+                "hostname": "pear-host",
+                "source_namespace": "",
+            },
+            "sections": {section: [] for section in sections or []},
+        },
+    )
+    monkeypatch.setattr(
+        routes.RemoteFloatClient,
+        "get_pairing_state",
+        lambda self: {"id": "peer-1", "remote_url": "http://example.test:5000"},
+    )
+
+    async def fake_refresh(_result):
+        return {}
+
+    monkeypatch.setattr(routes, "_refresh_sync_result_indexes", fake_refresh)
+    monkeypatch.setattr(
+        routes,
+        "_persist_saved_peer_state",
+        lambda pair_state, remote_label=None: pair_state,
+    )
+    monkeypatch.setattr(routes, "sync_record_changes", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(routes, "_record_sync_action", lambda *_args, **_kwargs: None)
+
+    res = client.post(
+        "/sync/apply",
+        json={
+            "remote_url": "http://example.test:5000",
+            "direction": "pull",
+            "sections": ["conversations"],
+            "operation_id": "pull-new",
+        },
+    )
+
+    assert res.status_code == 200
+    payload = res.json()
+    assert payload["superseded_pending_pushes"] == {
+        "count": 1,
+        "operation_ids": ["push-old"],
+    }
+    overview = client.get("/sync/overview").json()["sync_operations"]
+    assert overview["last_attempt"]["id"] == "pull-new"
+    recent_by_id = {item["id"]: item for item in overview["recent"]}
+    assert recent_by_id["push-old"]["status"] == "cancelled"
+    assert recent_by_id["push-old"]["result"]["remote_status"] == "superseded_by_pull"
+    assert (
+        recent_by_id["push-old"]["result"]["superseded_by_operation_id"] == "pull-new"
+    )
 
 
 def test_sync_plan_rejects_recursive_workspace_selection(client):

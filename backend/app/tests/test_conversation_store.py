@@ -109,6 +109,19 @@ def test_list_conversations_skips_object_artifacts(monkeypatch, tmp_path):
     assert names == ["demo/sess-1"]
 
 
+def test_list_conversations_skips_context_snapshot_tree(monkeypatch, tmp_path):
+    store = setup_store(tmp_path, monkeypatch)
+    store.save_conversation("demo/sess-1", [{"role": "user", "content": "x"}])
+    snapshot_dir = tmp_path / ".context_snapshots" / "demo" / "sess-1"
+    snapshot_dir.mkdir(parents=True)
+    (snapshot_dir / "snap-1.json").write_text(
+        '[{"role":"user","content":"snapshot copy"}]',
+        encoding="utf-8",
+    )
+    names = store.list_conversations()
+    assert names == ["demo/sess-1"]
+
+
 def test_load_conversation_returns_empty_for_object_payload(monkeypatch, tmp_path):
     store = setup_store(tmp_path, monkeypatch)
     (tmp_path / "demo_manifest.json").write_text(

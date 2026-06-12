@@ -24,6 +24,9 @@ data/
     downloaded/                # assets fetched by approved tools
     workspace/                 # root workspace plus named workspace roots / nested sync copies
   models/                      # default download/cache target for local models
+  modules/
+    addons/{addon}/config.json # local add-on manifest/config overrides
+    skills/{skill_id}.md       # local skill markdown overrides
   themes/                      # user-created visual themes saved from Settings
   workspace/                   # tool-writable scratch space for general workflows
 ```
@@ -36,7 +39,7 @@ Conversation history lives under `data/conversations/` (legacy `conversations/` 
 - Use project-relative paths (`Path(__file__).resolve().parents[2] / "data" / ...`) so the same layout works on Windows and Linux.
 - Documents/knowledge folder-ingest defaults to `data/files/workspace` so UI workflows stay inside the managed sandbox.
 - Named workspace profiles typically live under `data/files/workspace/<slug>/` unless the user points them somewhere else.
-- `data/modules/` is optional. When used, it acts as the local untracked override area for add-on manifests and related module assets, while repo-shipped content lives under the tracked root `modules/` tree.
+- `data/modules/` is optional. When used, it acts as the local untracked override area for add-on package config, local skill markdown, and related module assets, while repo-shipped content lives under the tracked root `modules/` tree.
 - `data/themes/` is the local storage area for user-created or edited visual themes saved from Settings.
 - Imported nested sync copies can create deeper workspace roots beneath an existing workspace, and synced attachments may also keep custody paths like `workspace/sync/<source>/...` so source ownership stays visible after sync.
 - Tools should request:
@@ -51,9 +54,11 @@ Conversation history lives under `data/conversations/` (legacy `conversations/` 
 
 - `modules/` at the repo root is the tracked home for shipped module assets.
 - `modules/skills/` holds the base skills Float ships with.
-- `modules/addons/` is for repo-shipped workflow add-on manifests that should be discoverable in git.
-- `data/modules/addons/` is optional and is for local or user-installed add-on manifests when a machine wants untracked overrides.
+- `modules/addons/{addon}/config.json` is for repo-shipped workflow add-on manifests/config that should be discoverable in git.
+- `data/modules/addons/{addon}/config.json` is optional and is for local or user-installed add-on manifests/config when a machine wants untracked overrides.
+- `data/modules/skills/` is optional and is for local or user-written skill markdown that should override or extend the repo-shipped `modules/skills/` guidance.
 - If an add-on id exists in both places, the local `data/` copy should override the tracked repo copy.
+- If a skill markdown id exists in both places, the local `data/` copy should override the tracked repo copy.
 - Legacy `models/` at the repo root is documentation-only. Keep placeholder README files there, but store actual checkpoints in `data/models/`.
 
 ## Recent Migrations

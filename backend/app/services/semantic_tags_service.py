@@ -8,6 +8,7 @@ text chunking, embedding, clustering and tagging utilities are available
 without requiring the external dependency.
 """
 
+import json
 from dataclasses import dataclass
 from math import fsum
 from pathlib import Path
@@ -18,6 +19,12 @@ from collections import Counter, defaultdict
 
 from app.services.text_chunks import chunk_text as shared_chunk_text
 from app.services.text_chunks import split_into_nuggets as shared_split_into_nuggets
+
+
+PROMPTS_DIR = Path(__file__).resolve().parents[1] / "prompts"
+THREAD_TOPIC_SUGGESTION_PROMPT = PROMPTS_DIR / "threads_topic_suggestions.txt"
+DEFAULT_TOPIC_SUGGESTION_MODEL = "gpt-4o-mini"
+TOOLISH_ROLES = {"tool", "function", "system", "developer"}
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +324,9 @@ def _torch_cluster_embeddings(
 
     backend_state = resolve_cluster_backend("torch", cluster_device)
     if backend_state.get("backend") != "torch":
-        raise RuntimeError(str(backend_state.get("reason") or "torch backend unavailable"))
+        raise RuntimeError(
+            str(backend_state.get("reason") or "torch backend unavailable")
+        )
 
     arr = embeddings if preprocessed else _as_clustering_array(embeddings)
     data = torch.as_tensor(
@@ -345,7 +354,9 @@ def _torch_cluster_embeddings(
             else:
                 farthest_idx = int(torch.argmax(min_distances).item())
                 new_centroids[cluster_id] = data[farthest_idx]
-        delta = float(torch.max(torch.linalg.norm(new_centroids - centroids, dim=1)).item())
+        delta = float(
+            torch.max(torch.linalg.norm(new_centroids - centroids, dim=1)).item()
+        )
         centroids = new_centroids
         if delta <= float(tol):
             break
@@ -363,7 +374,7 @@ def choose_k(
     embeddings,
     k_min: int = 2,
     k_max: int | None = None,
-    preferred_k: int | None = 16,
+    preferred_k: int | None = 8,
     preference_weight: float = 0.08,
     silhouette_sample_size: int | None = DEFAULT_SILHOUETTE_SAMPLE_SIZE,
     preprocessed: bool = False,
@@ -632,11 +643,143 @@ def _normalize_topic_label(value: str) -> str:
     return text
 
 
+def _normalize_topic_suggestion_model(value: str | None) -> str:
+    model = str(value or "").strip()
+    return model or DEFAULT_TOPIC_SUGGESTION_MODEL
+
+
+def _topic_prompt_template() -> str:
+    fallback = (
+        "Score candidate topics from the supplied conversation excerpts. "
+        "Ignore tool/system artifacts, weight user messages highest, and return "
+        "compact JSON with label, score, suggested_topics, and conversations."
+    )
+    try:
+        text = THREAD_TOPIC_SUGGESTION_PROMPT.read_text(encoding="utf-8").strip()
+    except Exception:
+        return fallback
+    return text or fallback
+
+
+def _strip_tool_text(text: str) -> str:
+    candidate = str(text or "")
+    if not candidate:
+        return ""
+    candidate = re.sub(r"\[\[tool_call:[^\]]+\]\]", " ", candidate, flags=re.I)
+    candidate = re.sub(
+        r"<\s*(tool_call|tool_result|function_call)[^>]*>.*?</\s*\1\s*>",
+        " ",
+        candidate,
+        flags=re.I | re.S,
+    )
+    kept_lines: list[str] = []
+    for line in candidate.splitlines():
+        if re.match(
+            r"^\s*(tool|tool_call|tool_result|function_call|observation)\b",
+            line,
+            flags=re.I,
+        ):
+            continue
+        kept_lines.append(line)
+    candidate = "\n".join(kept_lines)
+    candidate = re.sub(r"\s{2,}", " ", candidate).strip()
+    return candidate
+
+
+def _topic_role_weight(role: str | None) -> float:
+    normalized = str(role or "").strip().lower()
+    if normalized in TOOLISH_ROLES:
+        return 0.0
+    if normalized == "user":
+        return 1.0
+    if normalized == "assistant":
+        return 0.45
+    return 0.65
+
+
+def _topic_prompt_records(
+    cluster_indices: list[int],
+    nuggets: list[str],
+    *,
+    speakers: list[str | None] | None = None,
+    conversations: list[str] | None = None,
+    limit: int = 18,
+) -> list[dict[str, Any]]:
+    aliases: dict[str, str] = {}
+    records: list[dict[str, Any]] = []
+    for index in cluster_indices:
+        role = speakers[index] if speakers and index < len(speakers) else None
+        weight = _topic_role_weight(role)
+        if weight <= 0:
+            continue
+        text = _strip_tool_text(nuggets[index] if index < len(nuggets) else "")
+        if not text:
+            continue
+        conversation = (
+            conversations[index] if conversations and index < len(conversations) else ""
+        )
+        conversation_key = str(conversation or "conversation").strip()
+        if conversation_key not in aliases:
+            aliases[conversation_key] = f"c{len(aliases) + 1:03d}"
+        records.append(
+            {
+                "conversation_ref": aliases[conversation_key],
+                "role": str(role or "message").strip().lower() or "message",
+                "weight": weight,
+                "text": text[:700],
+            }
+        )
+        if len(records) >= limit:
+            break
+    return records
+
+
+def _extract_json_object(text: str) -> dict[str, Any]:
+    raw = str(text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I)
+        raw = re.sub(r"\s*```$", "", raw)
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        raw = raw[start : end + 1]
+    parsed = json.loads(raw)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _label_from_topic_response(text: str) -> str:
+    try:
+        payload = _extract_json_object(text)
+    except Exception:
+        return _normalize_topic_label(text)
+
+    candidates: list[Any] = [
+        payload.get("label"),
+        payload.get("topic"),
+        payload.get("name"),
+    ]
+    topics = payload.get("topics") or payload.get("suggested_topics")
+    if isinstance(topics, list) and topics:
+        first = topics[0]
+        if isinstance(first, dict):
+            candidates.extend([first.get("topic"), first.get("label")])
+        else:
+            candidates.append(first)
+    for candidate in candidates:
+        label = _normalize_topic_label(str(candidate or ""))
+        if label:
+            return label
+    return ""
+
+
 def infer_cluster_tags(
     nuggets: List[str],
     labels: List[int],
     top_n: int = 2,
     api_key: str | None = None,
+    topic_model: str | None = None,
+    nug_speakers: Optional[List[Optional[str]]] = None,
+    nug_conversations: Optional[List[str]] = None,
 ) -> Dict[int, str]:
     """Return a short label for each cluster.
 
@@ -646,8 +789,10 @@ def infer_cluster_tags(
     """
     n_clusters = max(labels) + 1 if labels else 0
     result: Dict[int, str] = {}
+    normalized_topic_model = _normalize_topic_suggestion_model(topic_model)
     for cid in range(n_clusters):
-        texts = [t for t, l in zip(nuggets, labels) if l == cid]
+        cluster_indices = [i for i, label in enumerate(labels) if int(label) == cid]
+        texts = [nuggets[i] for i in cluster_indices if i < len(nuggets)]
         if not texts:
             continue
         if api_key:
@@ -655,22 +800,43 @@ def infer_cluster_tags(
                 from openai import OpenAI
 
                 client = OpenAI(api_key=api_key)
+                records = _topic_prompt_records(
+                    cluster_indices,
+                    nuggets,
+                    speakers=nug_speakers,
+                    conversations=nug_conversations,
+                )
+                prompt_payload = {
+                    "cluster_id": cid,
+                    "records": records
+                    or [
+                        {
+                            "conversation_ref": "c001",
+                            "role": "message",
+                            "weight": 0.65,
+                            "text": _strip_tool_text(" ".join(texts))[:1600],
+                        }
+                    ],
+                }
                 prompt = (
-                    "Provide a 1-2 word topic label for the following text:\n"
-                    + " ".join(texts)
+                    _topic_prompt_template()
+                    + "\n\nConversation excerpts JSON:\n"
+                    + json.dumps(prompt_payload, ensure_ascii=False)
                 )
                 resp = client.responses.create(
-                    model="gpt-4o-mini",
+                    model=normalized_topic_model,
                     input=[
                         {
                             "role": "system",
-                            "content": "Return only a concise 1-2 word topic label.",
+                            "content": (
+                                "Return compact JSON only. Do not quote private text."
+                            ),
                         },
                         {"role": "user", "content": prompt},
                     ],
-                    max_output_tokens=16,
+                    max_output_tokens=220,
                 )
-                label = _normalize_topic_label(
+                label = _label_from_topic_response(
                     str(getattr(resp, "output_text", "") or "")
                 )
                 if label:
@@ -682,14 +848,32 @@ def infer_cluster_tags(
 
                     openai.api_key = api_key
                     prompt = (
-                        "Provide a 1-2 word topic label for the following text:\n"
-                        + " ".join(texts)
+                        _topic_prompt_template()
+                        + "\n\nConversation excerpts JSON:\n"
+                        + json.dumps(
+                            {
+                                "cluster_id": cid,
+                                "records": _topic_prompt_records(
+                                    cluster_indices,
+                                    nuggets,
+                                    speakers=nug_speakers,
+                                    conversations=nug_conversations,
+                                ),
+                            },
+                            ensure_ascii=False,
+                        )
                     )
                     resp = openai.ChatCompletion.create(
-                        model="gpt-3.5-turbo",
-                        messages=[{"role": "user", "content": prompt}],
+                        model=normalized_topic_model,
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": "Return compact JSON only.",
+                            },
+                            {"role": "user", "content": prompt},
+                        ],
                     )
-                    label = _normalize_topic_label(
+                    label = _label_from_topic_response(
                         str(resp["choices"][0]["message"]["content"] or "")
                     )
                     if label:
@@ -863,7 +1047,11 @@ def chunk_text(text: str) -> List[str]:
     return shared_chunk_text(text)
 
 
-def embed_texts(texts: List[str]) -> Tuple[List[List[float]], Any]:
+def embed_texts(
+    texts: List[str],
+    model_name: Optional[str] = None,
+    device: Optional[str] = None,
+) -> Tuple[List[List[float]], Any]:
     """Embed ``texts`` and return both embeddings and the embedder.
 
     Parameters
@@ -877,7 +1065,10 @@ def embed_texts(texts: List[str]) -> Tuple[List[List[float]], Any]:
         A tuple of embeddings and the embedder instance.
     """
 
-    embedder = Embedder()
+    embedder = Embedder(
+        model_name=model_name or "sentence-transformers/all-MiniLM-L6-v2",
+        device=device,
+    )
     embeddings = embedder.embed(texts).tolist()
     return embeddings, embedder
 
@@ -885,8 +1076,8 @@ def embed_texts(texts: List[str]) -> Tuple[List[List[float]], Any]:
 def cluster_texts(
     embeddings: List[List[float]],
     *,
-    preferred_k: int | None = 16,
-    max_k: int | None = None,
+    preferred_k: int | None = 8,
+    max_k: int | None = 16,
     cluster_backend: str | None = None,
     cluster_device: str | None = None,
 ) -> Tuple[List[int], int]:
@@ -945,6 +1136,7 @@ def summarize_clusters(
     nug_conversations: Optional[List[str]] = None,
     nug_msg_indices: Optional[List[int]] = None,
     nug_datestamps: Optional[List[str]] = None,
+    topic_model: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, List[float]]]:
     """Build a summary graph and threads mapping.
 
@@ -997,6 +1189,9 @@ def summarize_clusters(
             nuggets_text,
             labels,
             api_key=openai_key,
+            topic_model=topic_model,
+            nug_speakers=nug_speakers,
+            nug_conversations=nug_conversations,
         )
         tag_lists = [
             ts + [cluster_tags.get(int(lbl), f"cluster_{lbl}")]

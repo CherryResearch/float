@@ -76,6 +76,22 @@ def _coerce_bool(value: Any) -> Optional[bool]:
     return None
 
 
+def _value_matches_json_type(value: Any, expected: str) -> bool:
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "array":
+        return isinstance(value, list)
+    if expected == "object":
+        return isinstance(value, dict) and not isinstance(value, list)
+    return False
+
+
 def _schema_for_tool(tool_name: str) -> Optional[dict]:
     try:
         from app.tool_specs import BUILTIN_TOOL_SPECS
@@ -139,6 +155,14 @@ def _apply_aliases(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
                     args["value"] = args.get(alias)
                     break
         for alias in ("content", "text", "note", "body"):
+            args.pop(alias, None)
+    elif tool_name == "recall":
+        if "key" not in args or not str(args.get("key") or "").strip():
+            for alias in ("query", "search", "text", "content"):
+                if alias in args and str(args.get(alias) or "").strip():
+                    args["key"] = args.get(alias)
+                    break
+        for alias in ("query", "search", "text", "content"):
             args.pop(alias, None)
     elif tool_name == "write_file":
         if "content" not in args:
@@ -246,7 +270,13 @@ def normalize_tool_args(tool_name: str, raw_args: Any) -> Dict[str, Any]:
             continue
         expected = prop_schema.get("type")
         if isinstance(expected, list):
-            expected = expected[0] if expected else None
+            expected_types = [str(item) for item in expected if item]
+            if any(
+                _value_matches_json_type(value, expected_type)
+                for expected_type in expected_types
+            ):
+                continue
+            expected = expected_types[0] if expected_types else None
         if not expected:
             continue
         value = base.get(key)

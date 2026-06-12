@@ -95,6 +95,26 @@ def test_lmstudio_poll_status_reads_loaded_model_from_inventory(monkeypatch):
     assert status["context_length"] == 10379
 
 
+def test_lmstudio_quick_poll_status_does_not_probe_model_inventory(monkeypatch):
+    adapter = LMStudioAdapter()
+    called_urls = []
+
+    def fake_get(url, timeout, headers=None):
+        called_urls.append(url)
+        if url.endswith("/api/v1/status"):
+            return _FakeResponse({"status": "ok"})
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr("app.local_providers.lmstudio.requests.get", fake_get)
+
+    status = adapter.poll_status(_base_cfg(), quick=True)
+
+    assert status["server_running"] is True
+    assert status["status_reachable"] is True
+    assert status["inventory_reachable"] is False
+    assert all("/models" not in url for url in called_urls)
+
+
 def test_lmstudio_remote_unmanaged_load_uses_http(monkeypatch):
     adapter = LMStudioAdapter()
 

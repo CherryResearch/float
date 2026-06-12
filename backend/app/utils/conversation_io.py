@@ -468,6 +468,9 @@ def list_openai_conversation_json_candidates_from_object(
             continue
         key = _openai_conversation_selector(conversation, index, used=used)
         used.add(key)
+        messages = import_openai_conversation_json(conversation)
+        if not messages:
+            continue
         candidates.append(
             {
                 "path": key,
@@ -475,11 +478,39 @@ def list_openai_conversation_json_candidates_from_object(
                 or conversation.get("name")
                 or conversation.get("id")
                 or key,
-                "message_count": _openai_conversation_message_count(conversation),
+                "message_count": len(messages),
             }
         )
     candidates.sort(key=lambda item: item["message_count"], reverse=True)
     return candidates
+
+
+def summarize_openai_conversation_json_candidates(
+    data: bytes, *, filename: Optional[str] = None
+) -> Dict[str, Any]:
+    del filename
+    try:
+        text = data.decode("utf-8", errors="ignore")
+    except Exception:
+        return {
+            "detected_files": [],
+            "importable_conversation_count": 0,
+            "ignored_json_entry_count": 0,
+        }
+    parsed = _safe_json_loads(text)
+    candidates = list_openai_conversation_json_candidates_from_object(parsed)
+    ignored_count = 0
+    total_count = 0
+    if isinstance(parsed, dict) and isinstance(parsed.get("conversations"), list):
+        conversations = parsed.get("conversations") or []
+        total_count = sum(1 for item in conversations if isinstance(item, dict))
+        ignored_count = max(0, total_count - len(candidates))
+    return {
+        "detected_files": candidates,
+        "importable_conversation_count": len(candidates),
+        "ignored_json_entry_count": ignored_count,
+        "json_entry_count": total_count,
+    }
 
 
 def extract_openai_json_conversations(
@@ -593,7 +624,7 @@ def _extract_openai_zip_messages(parsed: Any) -> List[Dict[str, Any]]:
 
 
 def _collect_openai_zip_message_map(
-    data: bytes
+    data: bytes,
 ) -> tuple[Dict[str, Any], Dict[str, List[Dict[str, Any]]]]:
     parsed_payloads: Dict[str, Any] = {}
     parsed_messages: Dict[str, List[Dict[str, Any]]] = {}
@@ -651,6 +682,31 @@ def list_openai_conversation_zip_candidates(
     ]
     candidates.sort(key=lambda item: item["message_count"], reverse=True)
     return candidates
+
+
+def summarize_openai_conversation_zip_candidates(
+    data: bytes, *, filename: Optional[str] = None
+) -> Dict[str, Any]:
+    del filename
+    parsed_payloads, parsed_messages = _collect_openai_zip_message_map(data)
+    candidates = [
+        {
+            "path": path,
+            "message_count": len(messages),
+        }
+        for path, messages in parsed_messages.items()
+    ]
+    candidates.sort(key=lambda item: item["message_count"], reverse=True)
+    ignored_files = sorted(
+        path for path in parsed_payloads.keys() if path not in parsed_messages
+    )
+    return {
+        "detected_files": candidates,
+        "importable_conversation_count": len(candidates),
+        "ignored_json_file_count": len(ignored_files),
+        "ignored_json_files": ignored_files[:20],
+        "json_file_count": len(parsed_payloads),
+    }
 
 
 def import_openai_conversation_zip(

@@ -28,7 +28,7 @@ def test_openai_realtime_connect_uses_client_secret_flow(monkeypatch):
                 "expires_at": 1_234_567_890,
                 "session": {
                     "id": "sess_123",
-                    "model": "gpt-realtime",
+                    "model": "gpt-realtime-2",
                 },
             }
 
@@ -45,7 +45,7 @@ def test_openai_realtime_connect_uses_client_secret_flow(monkeypatch):
         {
             "stream_backend": "api",
             "api_key": "test-key",
-            "realtime_model": "gpt-realtime",
+            "realtime_model": "gpt-realtime-2",
             "voice_model": "kitten",
             "realtime_voice": "marin",
             "realtime_base_url": "https://api.openai.com/v1/realtime/client_secrets",
@@ -57,7 +57,7 @@ def test_openai_realtime_connect_uses_client_secret_flow(monkeypatch):
     assert captured["url"] == "https://api.openai.com/v1/realtime/client_secrets"
     assert captured["headers"]["Authorization"] == "Bearer test-key"
     assert captured["json"]["session"]["type"] == "realtime"
-    assert captured["json"]["session"]["model"] == "gpt-realtime"
+    assert captured["json"]["session"]["model"] == "gpt-realtime-2"
     assert captured["json"]["session"]["audio"]["output"]["voice"] == "marin"
     assert (
         captured["json"]["session"]["audio"]["input"]["turn_detection"]["type"]
@@ -70,7 +70,7 @@ def test_openai_realtime_connect_uses_client_secret_flow(monkeypatch):
         is False
     )
     assert captured["json"]["session"]["audio"]["input"]["transcription"] == {
-        "model": "gpt-4o-mini-transcribe"
+        "model": "gpt-realtime-whisper"
     }
     assert captured["json"]["expires_after"] == {
         "anchor": "created_at",
@@ -82,13 +82,13 @@ def test_openai_realtime_connect_uses_client_secret_flow(monkeypatch):
         "url": "https://api.openai.com/v1/realtime/calls",
         "client_secret": "ephemeral-secret",
         "expires_at": 1_234_567_890,
-        "model": "gpt-realtime",
-        "response_model": "gpt-realtime",
+        "model": "gpt-realtime-2",
+        "response_model": "gpt-realtime-2",
         "multimodal_model": "",
         "caption_model": "",
         "session": {
             "id": "sess_123",
-            "model": "gpt-realtime",
+            "model": "gpt-realtime-2",
         },
         "session_id": "sess_123",
         "source": "live",
@@ -99,16 +99,144 @@ def test_openai_realtime_connect_uses_client_secret_flow(monkeypatch):
             "transport_backend": "api",
             "provider": "openai-realtime",
             "mode": "api",
-            "response_model": "gpt-realtime",
+            "response_model": "gpt-realtime-2",
             "multimodal_model": "",
             "caption_model": "",
             "stt_model": "",
+            "realtime_transcription_model": "gpt-realtime-whisper",
             "tts_model": "",
             "voice_model": "marin",
             "supports_visual_input": False,
         },
         "voice": "marin",
     }
+
+
+def test_openai_realtime_connect_accepts_nested_client_secret(monkeypatch):
+    from app.services import livekit_service
+    from app.services.livekit_service import LiveKitService
+
+    class DummyResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "session": {
+                    "id": "sess_nested",
+                    "model": "gpt-realtime-2",
+                    "client_secret": {
+                        "value": "nested-ephemeral-secret",
+                        "expires_at": 1_234_567_999,
+                    },
+                },
+            }
+
+    monkeypatch.setattr(
+        livekit_service.requests,
+        "post",
+        lambda *args, **kwargs: DummyResponse(),
+    )
+
+    result = LiveKitService(
+        {
+            "stream_backend": "api",
+            "api_key": "test-key",
+            "realtime_model": "gpt-realtime-2",
+        }
+    ).connect("user-1", "float")
+
+    assert result["client_secret"] == "nested-ephemeral-secret"
+    assert result["expires_at"] == 1_234_567_999
+    assert result["response_model"] == "gpt-realtime-2"
+
+
+def test_openai_realtime_inherits_stt_and_reasoning_controls(monkeypatch):
+    from app.services import livekit_service
+    from app.services.livekit_service import LiveKitService
+
+    captured = {}
+
+    class DummyResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "value": "ephemeral-secret",
+                "session": {
+                    "id": "sess_reasoning",
+                    "model": "gpt-realtime-2",
+                },
+            }
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured["json"] = json
+        return DummyResponse()
+
+    monkeypatch.setattr(livekit_service.requests, "post", fake_post)
+
+    result = LiveKitService(
+        {
+            "stream_backend": "api",
+            "api_key": "test-key",
+            "realtime_model": "gpt-realtime-2",
+            "stt_model": "gpt-realtime-whisper",
+            "realtime_tracing": "auto",
+            "realtime_transcription_logprobs": True,
+        }
+    ).connect("user-1", "float", reasoning_effort="high")
+
+    session = captured["json"]["session"]
+    assert session["audio"]["input"]["transcription"] == {
+        "model": "gpt-realtime-whisper"
+    }
+    assert session["reasoning"] == {"effort": "high"}
+    assert session["tracing"] == "auto"
+    assert session["include"] == ["item.input_audio_transcription.logprobs"]
+    assert result["runtime"]["stt_model"] == "gpt-realtime-whisper"
+    assert result["runtime"]["realtime_transcription_model"] == "gpt-realtime-whisper"
+    assert result["runtime"]["realtime_reasoning_effort"] == "high"
+
+
+def test_openai_realtime_legacy_model_omits_reasoning_controls(monkeypatch):
+    from app.services import livekit_service
+    from app.services.livekit_service import LiveKitService
+
+    captured = {}
+
+    class DummyResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "value": "ephemeral-secret",
+                "session": {
+                    "id": "sess_legacy",
+                    "model": "gpt-realtime-1.5",
+                },
+            }
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured["json"] = json
+        return DummyResponse()
+
+    monkeypatch.setattr(livekit_service.requests, "post", fake_post)
+
+    result = LiveKitService(
+        {
+            "stream_backend": "api",
+            "api_key": "test-key",
+            "realtime_model": "gpt-realtime-1.5",
+        }
+    ).connect("user-1", "float", reasoning_effort="high")
+
+    session = captured["json"]["session"]
+    assert session["model"] == "gpt-realtime-1.5"
+    assert "reasoning" not in session
+    assert result["response_model"] == "gpt-realtime-1.5"
+    assert "realtime_reasoning_effort" not in result["runtime"]
 
 
 def test_livekit_connect_returns_room_token():
@@ -172,6 +300,7 @@ def test_local_bridge_connect_returns_runtime_metadata():
         "multimodal_model": "gemma-4-E4B-it",
         "caption_model": "google/paligemma2-3b-pt-224",
         "stt_model": "",
+        "realtime_transcription_model": "gpt-realtime-whisper",
         "tts_model": "",
         "voice_model": "",
         "supports_visual_input": True,
@@ -211,6 +340,7 @@ def test_livekit_connect_reports_live_runtime_models():
         "multimodal_model": "gemma-4-26B-A4B-it",
         "caption_model": "google/paligemma2-3b-pt-224",
         "stt_model": "",
+        "realtime_transcription_model": "gpt-realtime-whisper",
         "tts_model": "",
         "voice_model": "",
         "supports_visual_input": True,

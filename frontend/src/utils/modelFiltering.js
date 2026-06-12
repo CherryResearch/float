@@ -46,13 +46,20 @@ const isLikelyVisionModelName = (name) => {
   return includesAny(value, ["clip", "pixtral", "paligemma", "llava", "siglip", "blip"]);
 };
 
+const isLikelyImageCaptionModelName = (name) => {
+  const value = normalizeModelName(name).toLowerCase();
+  if (!value) return false;
+  if (includesAny(value, ["clip", "siglip"])) return false;
+  return includesAny(value, ["pixtral", "paligemma", "llava", "blip"]);
+};
+
 const isLikelyTtsModelName = (name) => {
   const value = normalizeModelName(name).toLowerCase();
   if (!value) return false;
   return includesAny(value, ["tts", "kokoro", "kitten", "bark"]);
 };
 
-const isLikelyVoiceModelName = (name) => {
+const isLikelyLiveVoiceModelName = (name) => {
   const value = normalizeModelName(name).toLowerCase();
   if (!value) return false;
   return includesAny(value, ["voxtral"]);
@@ -69,15 +76,15 @@ export const isModelRelevantForField = (field, modelName) => {
   const isSpeech = isLikelySpeechModelName(name);
   const isVision = isLikelyVisionModelName(name);
   const isTts = isLikelyTtsModelName(name);
-  const isVoice = isLikelyVoiceModelName(name);
+  const isLiveVoice = isLikelyLiveVoiceModelName(name);
 
   if (field === "transformer_model") {
-    return !(isSpeech || isVision || isTts || isVoice);
+    return !(isSpeech || isVision || isTts || isLiveVoice);
   }
   if (field === "stt_model") return isSpeech;
-  if (field === "vision_model") return isVision;
+  if (field === "vision_model") return isLikelyImageCaptionModelName(name);
   if (field === "tts_model") return isTts;
-  if (field === "voice_model") return isVoice;
+  if (field === "voice_model") return false;
   return true;
 };
 

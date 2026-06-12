@@ -16,10 +16,11 @@ transformers/PIL/torch stack is detected and the model can be loaded.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
 import io
 import logging
 import os
+import re
+from dataclasses import dataclass, field
 from typing import Any, Dict, Set
 
 # simple in-memory caches standing in for Redis/S3 backends
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 ASR_CACHE: Dict[str, Any] = {}
 
 PLACEHOLDER_PREFIX = "[placeholder]"
+DEFAULT_VISION_CAPTION_MODEL = "google/paligemma2-3b-pt-224"
 
 
 def placeholder_caption(ref: str) -> str:
@@ -44,6 +46,67 @@ def is_placeholder_caption(text: str) -> bool:
     """Check whether `text` is one of our placeholder captions."""
 
     return isinstance(text, str) and text.startswith(PLACEHOLDER_PREFIX)
+
+
+def is_embedding_only_vision_model(model: str | None) -> bool:
+    """Return true for vision embedding checkpoints that cannot caption images."""
+
+    value = str(model or "").strip().lower()
+    if not value:
+        return False
+    caption_capable_markers = ("paligemma", "llava", "blip", "pixtral", "qwen-vl")
+    if any(marker in value for marker in caption_capable_markers):
+        return False
+    return "clip" in value or "siglip" in value
+
+
+def resolve_vision_caption_model(*candidates: str | None) -> str:
+    """Pick the first caption-capable model, falling back to PaliGemma."""
+
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if value and not is_embedding_only_vision_model(value):
+            return value
+    return DEFAULT_VISION_CAPTION_MODEL
+
+
+def normalize_generated_caption(text: str) -> str:
+    """Clean known model prompt echoes without changing user-authored captions."""
+
+    value = re.sub(r"\s+", " ", str(text or "").strip())
+    value = re.sub(r"(?i)^caption\s*[:\-]?\s*", "", value).strip()
+    return value
+
+
+def is_low_quality_generated_caption(text: str) -> bool:
+    """Detect generated captions that should be retried instead of preserved."""
+
+    value = normalize_generated_caption(text)
+    if not value or is_placeholder_caption(value):
+        return True
+    lowered = value.lower()
+    if any(
+        marker in lowered
+        for marker in (
+            "unable to generate caption",
+            "vision model offline",
+            "model offline",
+            "missing model",
+        )
+    ):
+        return True
+    compact = re.sub(r"\s+", "", value)
+    if compact and not re.search(r"[A-Za-z0-9]", compact):
+        return True
+    alnum_count = sum(1 for ch in compact if ch.isalnum())
+    if len(compact) >= 12 and alnum_count / max(len(compact), 1) < 0.35:
+        return True
+    tokens = re.findall(r"[A-Za-z0-9#]+", lowered)
+    if len(tokens) >= 8 and len(set(tokens)) <= 2:
+        return True
+    if len(value) < 4:
+        return True
+    return False
 
 
 @dataclass
@@ -84,8 +147,12 @@ class LLM(Worker):
 class VisionCaptioner(Worker):
     def __init__(self, model: str | None = None) -> None:
         # Accept either raw image bytes ("image") or a keyframe reference ("keyframe")
-        default = os.getenv("VISION_CAPTION_MODEL", "google/paligemma2-3b-pt-224")
-        super().__init__(model or default, {"image_caption"}, {"image", "keyframe"})
+        default = resolve_vision_caption_model(os.getenv("VISION_CAPTION_MODEL"))
+        super().__init__(
+            resolve_vision_caption_model(model, default),
+            {"image_caption"},
+            {"image", "keyframe"},
+        )
         # Lazy-loaded inference stack
         self._loaded = False
         self._proc = None
@@ -100,6 +167,7 @@ class VisionCaptioner(Worker):
         self._loaded = True  # ensure we only try once
         try:
             import importlib
+
             from transformers import AutoProcessor
 
             # Prefer the specific PaliGemma class if available; otherwise abort
@@ -108,7 +176,9 @@ class VisionCaptioner(Worker):
                     "transformers.models.paligemma2.modeling_paligemma2"
                 ).PaliGemmaForConditionalGeneration
             except Exception:
-                from transformers import PaliGemmaForConditionalGeneration as PaligemmaCls  # type: ignore
+                from transformers import (
+                    PaliGemmaForConditionalGeneration as PaligemmaCls,  # type: ignore
+                )
 
             # Try local-only load first to avoid accidental network calls
             local_only = True
@@ -131,14 +201,24 @@ class VisionCaptioner(Worker):
             # Resolve optional auth token
             token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
 
-            # Lazy import torch and PIL only when available
+            # Lazy import torch only when available
             import torch  # type: ignore
-            from PIL import Image  # type: ignore
 
             dtype = torch.bfloat16 if hasattr(torch, "bfloat16") else torch.float16
-            device = "cuda" if torch.cuda.is_available() else ("mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu")
+            device = (
+                "cuda"
+                if torch.cuda.is_available()
+                else (
+                    "mps"
+                    if getattr(torch.backends, "mps", None)
+                    and torch.backends.mps.is_available()
+                    else "cpu"
+                )
+            )
 
-            proc = AutoProcessor.from_pretrained(model_id, local_files_only=local_only, token=token)
+            proc = AutoProcessor.from_pretrained(
+                model_id, local_files_only=local_only, token=token
+            )
             net = PaligemmaCls.from_pretrained(
                 model_id,
                 local_files_only=local_only,
@@ -159,8 +239,8 @@ class VisionCaptioner(Worker):
         if not self._net or not self._proc:
             return None
         try:
-            from PIL import Image  # type: ignore
             import torch  # type: ignore
+            from PIL import Image  # type: ignore
 
             img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
             # PaliGemma expects an explicit image token prefix in text prompts.
@@ -170,7 +250,10 @@ class VisionCaptioner(Worker):
                 return_tensors="pt",
             )
             if self._device and self._device != "cpu":
-                inputs = {k: v.to(self._device) if hasattr(v, "to") else v for k, v in inputs.items()}
+                inputs = {
+                    k: v.to(self._device) if hasattr(v, "to") else v
+                    for k, v in inputs.items()
+                }
             with torch.no_grad():
                 out = self._net.generate(**inputs, max_new_tokens=48)
             text = self._proc.decode(out[0], skip_special_tokens=True)
@@ -191,8 +274,10 @@ class VisionCaptioner(Worker):
             self._load_if_possible()
             best = self._caption_with_model(bytes(data))
             if best:
-                VISION_CACHE[key] = best
-                return best
+                best = normalize_generated_caption(best)
+                if not is_low_quality_generated_caption(best):
+                    VISION_CACHE[key] = best
+                    return best
             # Placeholder fallback
             caption = placeholder_caption(key[:8])
             VISION_CACHE[key] = caption
@@ -207,7 +292,9 @@ class VisionCaptioner(Worker):
             self._load_if_possible()
             best = self._caption_with_model(raw)
             if best:
-                return {"image_caption": best, "placeholder": False}
+                best = normalize_generated_caption(best)
+                if not is_low_quality_generated_caption(best):
+                    return {"image_caption": best, "placeholder": False}
         else:
             # Fall back to a keyframe identifier/path string
             keyframe_ref = str(data.get("keyframe", ""))
@@ -216,7 +303,10 @@ class VisionCaptioner(Worker):
         caption = VISION_CACHE.get(key)
         if caption is None:
             caption = placeholder_caption(key[:8])
-        return {"image_caption": caption, "placeholder": is_placeholder_caption(caption)}
+        return {
+            "image_caption": caption,
+            "placeholder": is_placeholder_caption(caption),
+        }
 
 
 class ImageEmbedder(Worker):

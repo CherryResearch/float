@@ -60,6 +60,80 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    parsed = _safe_int(value, default)
+    return max(minimum, min(maximum, parsed))
+
+
+def normalize_reflection_patience_budget(value: Any, legacy: Any = None) -> JsonDict:
+    """Normalize reflection patience into explicit budgets.
+
+    The legacy integer maps to reasoning passes only. Tool continuations are not
+    counted as reasoning turns; they should be budgeted by their own tool/runtime
+    limits.
+    """
+
+    legacy_patience = max(0, min(3, _safe_int(legacy, 1)))
+    defaults: JsonDict = {
+        "profile": {0: "low", 1: "medium", 2: "high", 3: "max"}.get(
+            legacy_patience, "medium"
+        ),
+        "max_reasoning_turns": {0: 1, 1: 2, 2: 3, 3: 4}.get(legacy_patience, 2),
+        "max_runtime_seconds": 0,
+        "max_context_tokens": 0,
+        "max_output_tokens": 0,
+        "reserve_output_tokens": 0,
+    }
+    if isinstance(value, dict):
+        source = value
+    else:
+        source = {}
+        if value not in (None, ""):
+            legacy_patience = max(0, min(3, _safe_int(value, legacy_patience)))
+            defaults["profile"] = {0: "low", 1: "medium", 2: "high", 3: "max"}.get(
+                legacy_patience, "medium"
+            )
+            defaults["max_reasoning_turns"] = {0: 1, 1: 2, 2: 3, 3: 4}.get(
+                legacy_patience, 2
+            )
+    profile = str(source.get("profile") or defaults["profile"]).strip().lower()
+    if profile not in {"low", "medium", "high", "max", "custom"}:
+        profile = "custom"
+    return {
+        "profile": profile,
+        "max_reasoning_turns": _bounded_int(
+            source.get("max_reasoning_turns", defaults["max_reasoning_turns"]),
+            default=int(defaults["max_reasoning_turns"]),
+            minimum=1,
+            maximum=20,
+        ),
+        "max_runtime_seconds": _bounded_int(
+            source.get("max_runtime_seconds", defaults["max_runtime_seconds"]),
+            default=int(defaults["max_runtime_seconds"]),
+            minimum=0,
+            maximum=24 * 60 * 60,
+        ),
+        "max_context_tokens": _bounded_int(
+            source.get("max_context_tokens", defaults["max_context_tokens"]),
+            default=int(defaults["max_context_tokens"]),
+            minimum=0,
+            maximum=2_000_000,
+        ),
+        "max_output_tokens": _bounded_int(
+            source.get("max_output_tokens", defaults["max_output_tokens"]),
+            default=int(defaults["max_output_tokens"]),
+            minimum=0,
+            maximum=128_000,
+        ),
+        "reserve_output_tokens": _bounded_int(
+            source.get("reserve_output_tokens", defaults["reserve_output_tokens"]),
+            default=int(defaults["reserve_output_tokens"]),
+            minimum=0,
+            maximum=128_000,
+        ),
+    }
+
+
 def _safe_timestamp(value: Any) -> float:
     if value is None or value == "":
         return 0.0
@@ -230,7 +304,8 @@ class ReflectionService:
         source_thread_id: str = "",
         cluster_id: str = "",
         source: str = "user",
-        patience: int = 1,
+        patience: Any = 1,
+        patience_budget: Optional[JsonDict] = None,
         memory_keys: Optional[Sequence[str]] = None,
         event_id: str = "",
         metadata: Optional[JsonDict] = None,
@@ -243,6 +318,10 @@ class ReflectionService:
         now = self.now()
         task_id = f"thought-{int(now * 1000)}-{uuid4().hex[:8]}"
         normalized_patience = max(0, min(3, _safe_int(patience, 1)))
+        normalized_budget = normalize_reflection_patience_budget(
+            patience_budget if patience_budget is not None else patience,
+            legacy=normalized_patience,
+        )
         judgment: JsonDict = {}
         if utility is None or uncertainty is None:
             judgment = self._initial_task_judgment(
@@ -272,6 +351,7 @@ class ReflectionService:
             "staleness": 0.0,
             "priority": 0.0,
             "patience": normalized_patience,
+            "patience_budget": normalized_budget,
             "created_at": now,
             "updated_at": now,
             "last_run_at": None,
@@ -617,6 +697,14 @@ class ReflectionService:
         return "unknown"
 
     def _depth_budget(self, task: JsonDict) -> int:
+        budget = task.get("patience_budget")
+        if isinstance(budget, dict):
+            return _bounded_int(
+                budget.get("max_reasoning_turns"),
+                default=2,
+                minimum=1,
+                maximum=20,
+            )
         patience = max(0, min(3, _safe_int(task.get("patience"), 1)))
         return {0: 1, 1: 2, 2: 3, 3: 4}.get(patience, 2)
 

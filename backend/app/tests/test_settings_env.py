@@ -125,6 +125,31 @@ def test_mode_setting_persists_to_env_and_settings(client, tmp_path):
     assert resp2.json()["mode"] == "local"
 
 
+def test_harmony_format_mode_persists_as_tristate(client, tmp_path):
+    env_path = tmp_path / ".env"
+    resp = client.post("/settings", json={"harmony_format_mode": "auto"})
+    assert resp.status_code == 200
+    settings = resp.json().get("settings") or {}
+    assert settings.get("harmony_format_mode") == "auto"
+    assert settings.get("harmony_format") is True
+    content = env_path.read_text()
+    assert "HARMONY_FORMAT_MODE" in content and "auto" in content
+    assert "HARMONY_FORMAT" in content and "true" in content
+
+    resp2 = client.post("/settings", json={"harmony_format_mode": "disabled"})
+    assert resp2.status_code == 200
+    settings2 = resp2.json().get("settings") or {}
+    assert settings2.get("harmony_format_mode") == "disabled"
+    assert settings2.get("harmony_format") is False
+
+    resp3 = client.get("/settings")
+    assert resp3.status_code == 200
+    assert resp3.json()["harmony_format_mode"] == "disabled"
+
+    invalid = client.post("/settings", json={"harmony_format_mode": "sometimes"})
+    assert invalid.status_code == 400
+
+
 def test_rag_similarity_setting_allows_zero(client, tmp_path):
     env_path = tmp_path / ".env"
     resp = client.post("/settings", json={"rag_chat_min_similarity": 0})
@@ -145,7 +170,8 @@ def test_realtime_voice_settings_refresh_service(client, tmp_path):
         "/settings",
         json={
             "stream_backend": "api",
-            "realtime_model": "gpt-realtime",
+            "stt_model": "gpt-realtime-whisper",
+            "realtime_model": "gpt-realtime-2",
             "realtime_voice": "marin",
             "live_agent_mode": "server",
             "live_agent_model": "gemma-4-E4B-it",
@@ -157,7 +183,8 @@ def test_realtime_voice_settings_refresh_service(client, tmp_path):
     assert resp.status_code == 200
     settings = resp.json().get("settings") or {}
     assert settings.get("stream_backend") == "api"
-    assert settings.get("realtime_model") == "gpt-realtime"
+    assert settings.get("stt_model") == "gpt-realtime-whisper"
+    assert settings.get("realtime_model") == "gpt-realtime-2"
     assert settings.get("realtime_voice") == "marin"
     assert settings.get("live_agent_mode") == "server"
     assert settings.get("live_agent_model") == "gemma-4-E4B-it"
@@ -172,15 +199,18 @@ def test_realtime_voice_settings_refresh_service(client, tmp_path):
     )
     content = env_path.read_text()
     assert "FLOAT_STREAM_BACKEND" in content and "api" in content
-    assert "OPENAI_REALTIME_MODEL" in content and "gpt-realtime" in content
+    assert "STT_MODEL" in content and "gpt-realtime-whisper" in content
+    assert "OPENAI_REALTIME_MODEL" in content and "gpt-realtime-2" in content
     assert "OPENAI_REALTIME_VOICE" in content and "marin" in content
+    assert "OPENAI_REALTIME_TRANSCRIPTION_MODEL" not in content
     assert "FLOAT_LIVE_AGENT_MODE" in content and "server" in content
     assert "FLOAT_LIVE_AGENT_MODEL" in content and "gemma-4-E4B-it" in content
     assert "FLOAT_LIVE_MULTIMODAL_MODEL" in content and "gemma-4-26B-A4B-it" in content
     livekit_service = client.app.state.livekit_service
     assert livekit_service.mode == "api"
-    assert livekit_service.realtime_model == "gpt-realtime"
+    assert livekit_service.realtime_model == "gpt-realtime-2"
     assert livekit_service.realtime_voice == "marin"
+    assert livekit_service.realtime_transcription_model == "gpt-realtime-whisper"
     assert livekit_service.live_agent_mode == "server"
     assert livekit_service.live_agent_model == "gemma-4-E4B-it"
     assert livekit_service.live_multimodal_model == "gemma-4-26B-A4B-it"
@@ -213,6 +243,96 @@ def test_local_live_settings_refresh_service(client, tmp_path):
     assert livekit_service.live_agent_mode == "local"
     assert livekit_service.live_agent_model == "gemma-4-E2B-it"
     assert livekit_service.live_multimodal_model == "gemma-4-E4B-it"
+
+
+def test_voice_connect_forwards_chat_thinking_to_realtime_reasoning(client):
+    captured = {}
+
+    class DummyLiveKitService:
+        mode = "api"
+        realtime_model = "gpt-realtime-2"
+
+        def connect(self, identity, room, *, reasoning_effort=None):
+            captured["identity"] = identity
+            captured["room"] = room
+            captured["reasoning_effort"] = reasoning_effort
+            return {"provider": "openai-realtime", "client_secret": "test-secret"}
+
+    client.app.state.livekit_service = DummyLiveKitService()
+
+    resp = client.post(
+        "/voice/connect",
+        json={"identity": "user-1", "room": "float", "thinking": "high"},
+    )
+
+    assert resp.status_code == 200
+    assert captured == {
+        "identity": "user-1",
+        "room": "float",
+        "reasoning_effort": "high",
+    }
+
+
+def test_voice_connect_uses_workflow_reasoning_when_thinking_is_auto(client):
+    captured = {}
+
+    class DummyLiveKitService:
+        mode = "api"
+        realtime_model = "gpt-realtime-2"
+
+        def connect(self, identity, room, *, reasoning_effort=None):
+            captured["reasoning_effort"] = reasoning_effort
+            return {"provider": "openai-realtime", "client_secret": "test-secret"}
+
+    client.app.state.livekit_service = DummyLiveKitService()
+
+    resp = client.post(
+        "/voice/connect",
+        json={
+            "identity": "user-1",
+            "workflow": "architect_planner",
+            "thinking": "auto",
+        },
+    )
+
+    assert resp.status_code == 200
+    assert captured["reasoning_effort"] == "high"
+
+
+def test_voice_transcribe_uses_requested_stt_model(client, monkeypatch):
+    from app import routes
+    from app.services.stt_service import SttResult
+
+    captured = {}
+
+    class DummySTTService:
+        def transcribe(
+            self,
+            audio,
+            cfg,
+            *,
+            model=None,
+            filename="recording.webm",
+            content_type="audio/webm",
+        ):
+            captured["audio"] = audio
+            captured["model"] = model
+            captured["filename"] = filename
+            captured["content_type"] = content_type
+            return SttResult(text="hello", provider="openai", model="whisper-1")
+
+    monkeypatch.setattr(routes, "stt_service", DummySTTService())
+
+    resp = client.post(
+        "/voice/transcribe",
+        files={"file": ("recording.webm", b"audio-bytes", "audio/webm")},
+        data={"model": "whisper-1"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"text": "hello", "model": "whisper-1", "provider": "openai"}
+    assert captured["audio"] == b"audio-bytes"
+    assert captured["model"] == "whisper-1"
 
 
 def test_model_search_dirs_includes_custom(tmp_path, monkeypatch):
@@ -276,9 +396,12 @@ def test_default_system_prompt_is_loaded_from_plaintext_asset():
     assert prompt_path.exists()
 
     raw_prompt = prompt_path.read_text(encoding="utf-8")
-    normalized_prompt = " ".join(
-        line.strip() for line in raw_prompt.splitlines() if line.strip()
-    )
+    lines = [line.rstrip() for line in raw_prompt.splitlines()]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    normalized_prompt = "\n".join(lines)
 
     cfg = app_config.load_config()
     assert cfg["system_prompt"] == normalized_prompt

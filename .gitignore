@@ -47,6 +47,8 @@ devices.json
 blobs/
 
 # Local test/tool temp artifacts
+.tmp/
+.codex-remote-attachments/
 .precommit-cache/
 .pytest_tmp/
 .tmp_pytest/

@@ -153,6 +153,22 @@ export const buildSyncOwnershipInspectorRows = ({
     .map((row) => `${row.label}: ${row.value}`)
     .join(" | ");
   const nextFromOperation = operationRows.find((row) => row.label === "Next")?.value;
+  const backgroundOwner =
+    summary.background_owner && typeof summary.background_owner === "object"
+      ? summary.background_owner
+      : {};
+  const autoSync =
+    summary.auto_sync && typeof summary.auto_sync === "object" ? summary.auto_sync : {};
+  const backgroundLabel =
+    cleanExplanationText(backgroundOwner.mode) === "active"
+      ? [
+          cleanExplanationText(backgroundOwner.active_owner) || "this device",
+          cleanExplanationText(backgroundOwner.active_kind),
+          cleanExplanationText(backgroundOwner.active_status),
+        ]
+          .filter(Boolean)
+          .join(" / ")
+      : "Idle";
   return normalizeStateExplanationRows([
     { label: "Source", value: "/api/sync/overview" },
     {
@@ -162,6 +178,13 @@ export const buildSyncOwnershipInspectorRows = ({
     {
       label: "Outbound",
       value: cleanExplanationText(summary.default_target_label || summary.default_target_url),
+    },
+    { label: "Background owner", value: backgroundLabel },
+    {
+      label: "Auto sync",
+      value: autoSync.enabled
+        ? "Enabled"
+        : cleanExplanationText(autoSync.reason) || "Off; suggestions only",
     },
     { label: "Active", value: activeDescription },
     { label: "Last", value: lastDescription },

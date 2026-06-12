@@ -173,6 +173,63 @@ def _upload_via_capture(
     }
 
 
+def _upload_via_transient_capture(
+    session: requests.Session,
+    base_url: str,
+    image_path: Path,
+    *,
+    timeout: float,
+) -> Dict[str, Any]:
+    content_type = mimetypes.guess_type(image_path.name)[0] or "image/png"
+    with image_path.open("rb") as handle:
+        uploaded = _request_json(
+            session,
+            "POST",
+            f"{base_url}/captures/upload",
+            timeout=timeout,
+            files={"file": (image_path.name, handle, content_type)},
+            data={"source": "camera"},
+        )
+    capture_id = str(uploaded.get("capture_id") or "").strip()
+    if not capture_id:
+        raise RuntimeError(
+            f"Transient capture upload returned no capture_id: {uploaded}"
+        )
+    attachment = uploaded.get("attachment")
+    if not isinstance(attachment, dict):
+        attachment = {}
+    return {
+        "attachment": {
+            "name": attachment.get("name")
+            or uploaded.get("filename")
+            or image_path.name,
+            "type": (
+                attachment.get("type") or uploaded.get("content_type") or content_type
+            ),
+            "url": attachment.get("url") or uploaded.get("url"),
+            "size": attachment.get("size") or uploaded.get("size"),
+            "content_hash": (
+                attachment.get("content_hash") or uploaded.get("content_hash")
+            ),
+            "origin": attachment.get("origin") or "captured",
+            "relative_path": (
+                attachment.get("relative_path") or uploaded.get("relative_path")
+            ),
+            "capture_source": (
+                attachment.get("capture_source")
+                or uploaded.get("capture_source")
+                or uploaded.get("source")
+                or "camera"
+            ),
+            "capture_id": capture_id,
+            "transient": True,
+            "expires_at": uploaded.get("expires_at_iso") or uploaded.get("expires_at"),
+        },
+        "capture_id": capture_id,
+        "content_hash": uploaded.get("content_hash"),
+    }
+
+
 def _upload_via_attachment(
     session: requests.Session,
     base_url: str,
@@ -445,7 +502,14 @@ def run(args: argparse.Namespace) -> int:
     _print_step(image_step)
 
     upload_start = time.time()
-    if args.upload_mode == "capture":
+    if args.upload_mode == "transient-capture":
+        upload_result = _upload_via_transient_capture(
+            session,
+            base_url,
+            image_path,
+            timeout=args.timeout,
+        )
+    elif args.upload_mode == "capture":
         upload_result = _upload_via_capture(
             session,
             base_url,
@@ -611,9 +675,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--upload-mode",
-        default="capture",
-        choices=["capture", "attachment"],
-        help="Whether to exercise /captures/upload + promote or direct /attachments/upload.",
+        default="transient-capture",
+        choices=["transient-capture", "capture", "attachment"],
+        help=(
+            "Upload path to exercise. transient-capture matches the Chrome/Windows "
+            "camera composer flow; capture promotes before chat; attachment uses direct upload."
+        ),
     )
     parser.add_argument(
         "--timeout",

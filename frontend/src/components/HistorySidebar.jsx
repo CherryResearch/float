@@ -316,6 +316,7 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
     detectedFiles: [],
     selectedFiles: {},
     destinationFolder: "",
+    summary: null,
   });
   const [exportOptions, setExportOptions] = React.useState({
     format: "md",
@@ -389,10 +390,11 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
   }, []);
 
   const applySidebarWidth = React.useCallback(
-    (width) => {
+    (width, { persist = true } = {}) => {
       const root = typeof document !== "undefined" ? document.documentElement : null;
       if (!root) return;
       root.style.setProperty("--sidebar-width-left", `${width}px`);
+      if (!persist) return;
       try {
         localStorage.setItem("sidebarWidthLeft", String(width));
       } catch {}
@@ -450,19 +452,40 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
       root.style.setProperty("cursor", "col-resize");
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
+      document.body.classList.add("is-layout-resizing");
       setIsResizing(true);
+      let lastWidth = startWidth;
+      let frameId = null;
+
+      const flushWidth = (persist = false) => {
+        if (frameId !== null && typeof cancelAnimationFrame === "function") {
+          cancelAnimationFrame(frameId);
+          frameId = null;
+        }
+        applySidebarWidth(lastWidth, { persist });
+      };
 
       const onMove = (moveEvent) => {
         const delta = moveEvent.clientX - startX;
-        const next = clampSidebarWidth(startWidth + delta, minWidth, maxWidth);
-        applySidebarWidth(next);
+        lastWidth = clampSidebarWidth(startWidth + delta, minWidth, maxWidth);
+        if (typeof requestAnimationFrame !== "function") {
+          applySidebarWidth(lastWidth, { persist: false });
+          return;
+        }
+        if (frameId !== null) return;
+        frameId = requestAnimationFrame(() => {
+          frameId = null;
+          applySidebarWidth(lastWidth, { persist: false });
+        });
       };
       const onUp = () => {
         window.removeEventListener("pointermove", onMove);
         window.removeEventListener("pointerup", onUp);
         window.removeEventListener("pointercancel", onUp);
+        flushWidth(true);
         document.body.style.cursor = "";
         document.body.style.userSelect = "";
+        document.body.classList.remove("is-layout-resizing");
         root.style.removeProperty("cursor");
         setIsResizing(false);
       };
@@ -2081,14 +2104,14 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
   const triggerImportPicker = () => {
     if (apiUnavailable) return;
     setImportStatus("");
-    setImportReview((prev) => ({ ...prev, open: false }));
+    setImportReview((prev) => ({ ...prev, open: false, summary: null }));
     if (importFileInputRef.current) {
       importFileInputRef.current.value = "";
       importFileInputRef.current.click();
     }
   };
 
-  const openImportReview = (file, detectedFiles) => {
+  const openImportReview = (file, detectedFiles, summary = null) => {
     const normalized = Array.isArray(detectedFiles) ? detectedFiles : [];
     const selectedFiles = {};
     normalized.forEach((item) => {
@@ -2106,6 +2129,7 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
       detectedFiles: normalized,
       selectedFiles,
       destinationFolder: "",
+      summary,
     });
   };
 
@@ -2122,7 +2146,7 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
       );
       const detectedFiles = response.data?.detected_files || [];
       if (Array.isArray(detectedFiles) && detectedFiles.length > 0) {
-        openImportReview(file, detectedFiles);
+        openImportReview(file, detectedFiles, response.data || null);
       } else {
         await uploadConversationImport({ file });
       }
@@ -2256,6 +2280,13 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
   const importReviewAllSelected =
     importReviewTotalCount > 0 &&
     importReviewSelectedCount === importReviewTotalCount;
+  const importReviewIgnoredJsonCount = Number(
+    importReview.summary?.ignored_json_file_count ??
+      importReview.summary?.ignored_json_entry_count ??
+      0,
+  );
+  const importReviewIgnoredJsonLabel =
+    importReview.summary?.ignored_json_entry_count != null ? "entries" : "files";
 
   const handleDelete = async (conv) => {
     if (!conv) return;
@@ -3016,6 +3047,15 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
                     {importReviewAllSelected ? "Deselect all" : "Select all"}
                   </button>
                 </div>
+                {importReviewIgnoredJsonCount > 0 ? (
+                  <div className="history-empty" style={{ paddingTop: "2px" }}>
+                    Ignored {importReviewIgnoredJsonCount} metadata-only JSON
+                    {importReviewIgnoredJsonCount === 1
+                      ? ` ${importReviewIgnoredJsonLabel.slice(0, -1)}`
+                      : ` ${importReviewIgnoredJsonLabel}`}
+                    .
+                  </div>
+                ) : null}
                 <div className="history-import-list">
                   {importReview.detectedFiles.length === 0 ? (
                     <div className="history-empty">No files detected.</div>

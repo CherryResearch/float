@@ -10,7 +10,7 @@ This document outlines the steps to set up the development environment for the F
 - **Poetry** for Python package management.
 - **Node.js 16+** with npm for frontend development.
 - **Docker** (Optional, for containerized deployment).
-- **Redis** (Optional, for Celery/background workers).
+- **Redis server** (Required for Celery/background workers; optional for backend/frontend-only local runs).
 
 ---
 
@@ -31,7 +31,8 @@ The project pins `huggingface-hub` with `hf-xet` and `hf-transfer` extras, so
 no additional system dependencies (like git‑lfs) are required for model
 downloads.
 
-To install optional dependencies for Celery workers, you can run:
+`poetry install` includes the Python Redis client used by Celery broker paths.
+To install the optional Flower dashboard for worker monitoring, run:
 ```bash
 poetry install --extras "workers"
 ```
