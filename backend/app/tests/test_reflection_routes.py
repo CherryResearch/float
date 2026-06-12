@@ -58,7 +58,12 @@ def test_reflection_routes_create_run_and_emit_console(tmp_path, monkeypatch):
         "/api/reflections/tasks",
         json={
             "question": "What is the most useful next reflection?",
-            "patience": 1,
+            "patience_budget": {
+                "profile": "custom",
+                "max_reasoning_turns": 3,
+                "max_runtime_seconds": 600,
+                "max_context_tokens": 24000,
+            },
             "run_now": True,
             "metadata": {"source_mode": "manual"},
         },
@@ -71,6 +76,15 @@ def test_reflection_routes_create_run_and_emit_console(tmp_path, monkeypatch):
     task_id = payload["task"]["id"]
     assert service.get_task(task_id)["status"] == "resolved"
     assert f"reflection:{task_id}" in app.state.agent_console_state["agents"]
+    console_record = app.state.agent_console_state["agents"][f"reflection:{task_id}"]
+    assert "Current best synthesis" in console_record["summary"]
+    latest_event = console_record["events"][-1]
+    assert latest_event["type"] == "thought"
+    assert "Current best synthesis" in latest_event["content"]
+    assert latest_event["metadata"]["depth_budget"] == 3
+    assert latest_event["metadata"]["run_count"] == 1
+    assert latest_event["metadata"]["input_context_count"] >= 0
+    assert latest_event["metadata"]["should_surface_to_user"] is True
 
     listed = client.get("/api/reflections/tasks", params={"include_runs": "true"})
     assert listed.status_code == 200

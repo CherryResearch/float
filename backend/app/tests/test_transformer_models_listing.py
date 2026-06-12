@@ -24,6 +24,15 @@ def _make_dummy_model(dir_path: Path, name: str):
     return target
 
 
+def _make_dummy_onnx_model(dir_path: Path, name: str):
+    target = dir_path / name
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "config.json").write_text("{}")
+    (target / "model.onnx").write_text("stub")
+    (target / "voices.npz").write_text("stub")
+    return target
+
+
 def _make_app(monkeypatch, search_dirs):
     from app import config as app_config
     from app import routes
@@ -81,3 +90,15 @@ def test_transformer_models_can_include_cache_noise_when_requested(
     assert resp.status_code == 200
     models = resp.json().get("models", [])
     assert "all-MiniLM-L6-v2" in models
+
+
+def test_transformer_models_lists_local_tts_payloads(tmp_path: Path, monkeypatch):
+    repo_dir = tmp_path / "models_repo"
+    repo_dir.mkdir()
+    _make_dummy_onnx_model(repo_dir, "kitten")
+
+    client = _make_app(monkeypatch, [repo_dir])
+
+    resp = client.get("/api/transformers/models")
+    assert resp.status_code == 200
+    assert "kitten" in resp.json().get("models", [])

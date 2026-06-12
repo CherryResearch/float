@@ -32,6 +32,8 @@ const REMOTE_URL_HELP =
   "Use the other Float instance's reachable URL. The host or port can change; Float treats the saved device fingerprint as identity and the URL as a reachability hint.";
 const LAN_VISIBILITY_HELP =
   "Allow private-network devices to pair, request sync tokens, and pull or push data from this Float instance. Public internet sync is not supported yet.";
+const MOBILE_FLOAT_HELP =
+  "Expose the current Float dev server over Tailscale Serve for tailnet devices.";
 const ONLINE_VISIBILITY_HELP =
   "Reserved for a future gateway path. Public internet sync is not supported yet. If you need https://, the remote or tunnel must already terminate TLS.";
 const PAIRING_CODE_HELP =
@@ -294,6 +296,7 @@ const syncOperationKindLabel = (kind) => {
 const syncOperationStatusLabel = (status) => {
   const key = String(status || "").trim().toLowerCase();
   if (key === "cancel_requested") return "Cancel requested";
+  if (key === "cancelled") return "Cancelled";
   if (key === "completed") return "Completed";
   if (key === "failed") return "Failed";
   if (key === "running") return "Running";
@@ -317,6 +320,22 @@ const describeSyncOperation = (operation) => {
   return parts.filter(Boolean).join(" - ");
 };
 
+const syncSuggestionTone = (severity) => {
+  const key = String(severity || "").trim().toLowerCase();
+  if (["warning", "pending", "needs_check"].includes(key)) return "pending";
+  if (["blocked", "error", "danger"].includes(key)) return "legacy";
+  if (["success", "ready"].includes(key)) return "paired";
+  return "default";
+};
+
+const syncSuggestionSeverityLabel = (severity) => {
+  const key = String(severity || "").trim().toLowerCase();
+  if (key === "warning") return "needs review";
+  if (key === "blocked" || key === "error" || key === "danger") return "blocked";
+  if (key === "success" || key === "ready") return "ready";
+  return "suggestion";
+};
+
 const formatDateTime = (value) => {
   if (!value) return "never";
   const numeric = Number(value);
@@ -335,8 +354,8 @@ const syncPreviewStatusLabel = (status) => {
 };
 
 const SYNC_ACTIONABLE_STATUSES = {
-  pull: new Set(["only_remote", "remote_newer"]),
-  push: new Set(["only_local", "local_newer"]),
+  pull: new Set(["only_remote", "remote_newer", "only_local"]),
+  push: new Set(["only_local", "local_newer", "only_remote"]),
 };
 
 const normalizeSyncSelectionIds = (value) => {
@@ -368,21 +387,23 @@ const describeSyncDirectionSummary = (section, direction, remoteLabel) => {
   if (direction === "pull") {
     const onlyRemote = Number(section?.only_remote || 0);
     const remoteNewer = Number(section?.remote_newer || 0);
-    if (!onlyRemote && !remoteNewer) {
+    const onlyLocal = Number(section?.only_local || 0);
+    if (!onlyRemote && !remoteNewer && !onlyLocal) {
       return identical
         ? `${identical} already match here. Nothing new to pull from ${label}.`
         : `Nothing to pull from ${label}.`;
     }
-    return `${onlyRemote} new on ${label}, ${remoteNewer} newer on ${label}, ${identical} already match here.`;
+    return `${onlyRemote} new on ${label}, ${remoteNewer} newer on ${label}, ${onlyLocal} deleted on ${label}, ${identical} already match here.`;
   }
   const onlyLocal = Number(section?.only_local || 0);
   const localNewer = Number(section?.local_newer || 0);
-  if (!onlyLocal && !localNewer) {
+  const onlyRemote = Number(section?.only_remote || 0);
+  if (!onlyLocal && !localNewer && !onlyRemote) {
     return identical
       ? `${identical} already match there. Nothing to push from this device.`
       : "Nothing to push from this device.";
   }
-  return `${onlyLocal} only on this device, ${localNewer} newer here, ${identical} already match there.`;
+  return `${onlyLocal} only on this device, ${localNewer} newer here, ${onlyRemote} deleted here, ${identical} already match there.`;
 };
 
 const describeSyncItemTiming = (item) => {
@@ -400,7 +421,13 @@ const summarizeSyncSections = (sectionMap) =>
     .map(([, section]) => {
       const applied = Number(section?.applied || 0);
       const skipped = Number(section?.skipped || 0);
-      return `${section?.label || "section"}: ${applied} applied, ${skipped} skipped`;
+      const deleted = Number(section?.deleted || 0);
+      const deleteSkipped = Number(section?.delete_skipped || 0);
+      const deletePart =
+        deleted || deleteSkipped
+          ? `, ${deleted} deleted, ${deleteSkipped} delete skipped`
+          : "";
+      return `${section?.label || "section"}: ${applied} applied, ${skipped} skipped${deletePart}`;
     })
     .join(" | ") || "No changes were applied.";
 
@@ -570,6 +597,8 @@ const KnowledgeSyncTab = () => {
   const [pairBusy, setPairBusy] = useState(false);
   const [pairSyncBusy, setPairSyncBusy] = useState(false);
   const [visibilityBusy, setVisibilityBusy] = useState("");
+  const [mobileServeStatus, setMobileServeStatus] = useState(null);
+  const [mobileServeBusy, setMobileServeBusy] = useState("");
   const [reviewBusyId, setReviewBusyId] = useState("");
   const [pruneLegacyBusy, setPruneLegacyBusy] = useState(false);
   const [peerStatusBusy, setPeerStatusBusy] = useState(false);
@@ -584,6 +613,7 @@ const KnowledgeSyncTab = () => {
     detectedFiles: [],
     selectedFiles: {},
     destinationFolder: "",
+    summary: null,
   });
 
   const selectedPeer = useMemo(
@@ -707,12 +737,13 @@ const KnowledgeSyncTab = () => {
     const load = async () => {
       setLoading(true);
       try {
-        const [overviewRes, settingsRes, actionsRes] = await Promise.all([
+        const [overviewRes, settingsRes, actionsRes, mobileServeRes] = await Promise.all([
           axios.get("/api/sync/overview"),
           axios.get("/api/user-settings"),
           axios
             .get("/api/actions", { params: { limit: 30, include_reverted: true } })
             .catch(() => ({ data: { actions: [] } })),
+          axios.get("/api/sync/mobile-serve/status").catch(() => ({ data: null })),
         ]);
         if (cancelled) return;
         const nextOverview = overviewRes?.data || {};
@@ -752,6 +783,7 @@ const KnowledgeSyncTab = () => {
         setSyncLinkToSourceDevice(!!nextOverview?.sync_defaults?.link_to_source);
         setSyncSourceNamespace(String(nextOverview?.sync_defaults?.source_namespace || "").trim());
         setSyncHistory(coerceSyncActions(actionsRes?.data?.actions));
+        setMobileServeStatus(mobileServeRes?.data || null);
         setExportDefaults({
           format: normalizeExportFormat(settings?.export_default_format),
           includeChat:
@@ -1036,6 +1068,25 @@ const KnowledgeSyncTab = () => {
     setMessage("");
   };
 
+  const selectSavedPeer = (peer, nextMessage = "") => {
+    if (!peer) return;
+    setSelectedPeerId(peer.id);
+    setTargetLabel(peer.label);
+    setTargetScopes(normalizePeerScopes(peer.scopes));
+    setSyncRemoteUrl(peer.remote_url);
+    setSelectedWorkspaceIds(
+      normalizeWorkspaceIdList(peer.local_workspace_ids).length
+        ? normalizeWorkspaceIdList(peer.local_workspace_ids)
+        : [activeWorkspaceId || "root"],
+    );
+    setRemoteWorkspaceIds(normalizeWorkspaceIdList(peer.remote_workspace_ids));
+    setWorkspaceMode(peer.workspace_mode || "merge");
+    setLocalTargetWorkspaceId(peer.local_target_workspace_id || activeWorkspaceId || "root");
+    setRemoteTargetWorkspaceId(peer.remote_target_workspace_id || "root");
+    setSyncPreview(null);
+    setMessage(nextMessage);
+  };
+
   const saveDeviceSettings = async () => {
     setSavingPrefs(true);
     setMessage("");
@@ -1105,6 +1156,57 @@ const KnowledgeSyncTab = () => {
       setMessage(extractSyncError(error, "Failed to update push review mode."));
     } finally {
       setVisibilityBusy("");
+    }
+  };
+
+  const refreshMobileServeStatus = async () => {
+    setMobileServeBusy("refresh");
+    setMessage("");
+    try {
+      const res = await axios.get("/api/sync/mobile-serve/status");
+      setMobileServeStatus(res?.data || null);
+      return res?.data || null;
+    } catch (error) {
+      setMessage(extractSyncError(error, "Failed to read Mobile Float status."));
+      return null;
+    } finally {
+      setMobileServeBusy("");
+    }
+  };
+
+  const startMobileServe = async () => {
+    const servePort = mobileServeStatus?.serve_port || 64345;
+    setMobileServeBusy("start");
+    setMessage("");
+    try {
+      const res = await axios.post("/api/sync/mobile-serve/start", {
+        serve_port: servePort,
+      });
+      const nextStatus = res?.data || null;
+      setMobileServeStatus(nextStatus);
+      setMessage(nextStatus?.message || `Mobile Float Serve started on port ${servePort}.`);
+    } catch (error) {
+      setMessage(extractSyncError(error, "Failed to start Mobile Float Serve."));
+    } finally {
+      setMobileServeBusy("");
+    }
+  };
+
+  const stopMobileServe = async () => {
+    const servePort = mobileServeStatus?.serve_port || 64345;
+    setMobileServeBusy("stop");
+    setMessage("");
+    try {
+      const res = await axios.post("/api/sync/mobile-serve/stop", {
+        serve_port: servePort,
+      });
+      const nextStatus = res?.data || null;
+      setMobileServeStatus(nextStatus);
+      setMessage(nextStatus?.message || "Mobile Float Serve stopped.");
+    } catch (error) {
+      setMessage(extractSyncError(error, "Failed to stop Mobile Float Serve."));
+    } finally {
+      setMobileServeBusy("");
     }
   };
 
@@ -1678,6 +1780,7 @@ const KnowledgeSyncTab = () => {
       detectedFiles: [],
       selectedFiles: {},
       destinationFolder: "",
+      summary: null,
     });
 
   const triggerImportPicker = () => {
@@ -1709,7 +1812,13 @@ const KnowledgeSyncTab = () => {
         const path = String(item?.path || item?.name || "").trim();
         if (path) selectedFiles[path] = true;
       });
-      setImportReview({ file, detectedFiles, selectedFiles, destinationFolder: "" });
+      setImportReview({
+        file,
+        detectedFiles,
+        selectedFiles,
+        destinationFolder: "",
+        summary: response?.data || null,
+      });
       setImportStatus("");
     } catch (error) {
       setImportStatus(extractSyncError(error, "Import preview failed."));
@@ -1763,6 +1872,13 @@ const KnowledgeSyncTab = () => {
   const importReviewAllSelected =
     importReview.detectedFiles.length > 0 &&
     importReviewSelectedCount === importReview.detectedFiles.length;
+  const importReviewIgnoredJsonCount = Number(
+    importReview.summary?.ignored_json_file_count ??
+      importReview.summary?.ignored_json_entry_count ??
+      0,
+  );
+  const importReviewIgnoredJsonLabel =
+    importReview.summary?.ignored_json_entry_count != null ? "entries" : "files";
   const deviceAccess = overview?.device_access || {};
   const advertisedUrls = deviceAccess?.advertised_urls || {};
   const lanUrl = String(advertisedUrls?.lan || "").trim();
@@ -1799,6 +1915,15 @@ const KnowledgeSyncTab = () => {
     overview?.sync_operations && typeof overview.sync_operations === "object"
       ? overview.sync_operations
       : {};
+  const syncSuggestions = Array.isArray(overview?.sync_suggestions)
+    ? [...overview.sync_suggestions]
+        .filter((entry) => entry && typeof entry === "object")
+        .sort(
+          (left, right) =>
+            Number(left.priority || 100) - Number(right.priority || 100)
+            || String(left.id || "").localeCompare(String(right.id || "")),
+        )
+    : [];
   const activeSyncOperation =
     syncOperations.active_operation && typeof syncOperations.active_operation === "object"
       ? syncOperations.active_operation
@@ -1815,6 +1940,15 @@ const KnowledgeSyncTab = () => {
     String(syncOwnershipSummary?.push_review_mode || "").trim().toLowerCase() === "auto_accept"
       ? "Auto-accept"
       : "Review required";
+  const syncOwnershipAutoSync =
+    syncOwnershipSummary?.auto_sync && typeof syncOwnershipSummary.auto_sync === "object"
+      ? syncOwnershipSummary.auto_sync
+      : {};
+  const syncOwnershipAutoSyncLabel = syncOwnershipAutoSync.enabled ? "Enabled" : "Off";
+  const syncOwnershipBackgroundOwner =
+    syncOwnershipSummary?.background_owner && typeof syncOwnershipSummary.background_owner === "object"
+      ? syncOwnershipSummary.background_owner
+      : {};
   const syncOwnershipSavedPeerCount =
     Number.isFinite(syncOwnershipSummary?.saved_peer_count)
       ? Number(syncOwnershipSummary.saved_peer_count)
@@ -1878,6 +2012,26 @@ const KnowledgeSyncTab = () => {
     workspaceMode === "import" &&
     (normalizeWorkspaceIdList(selectedWorkspaceIds).length !== 1
       || normalizeWorkspaceIdList(remoteWorkspaceIds).length !== 1);
+  const mobileServeTone = mobileServeBusy
+    ? "pending"
+    : mobileServeStatus?.running
+      ? "paired"
+      : mobileServeStatus?.ok
+        ? "saved"
+        : mobileServeStatus
+          ? "legacy"
+          : "saved";
+  const mobileServeLabel = mobileServeBusy
+    ? mobileServeBusy === "refresh"
+      ? "checking"
+      : "working"
+    : mobileServeStatus?.running
+      ? "running"
+      : mobileServeStatus?.ok
+        ? "ready"
+        : "not ready";
+  const mobileServePort = mobileServeStatus?.serve_port || 64345;
+  const mobileServeUrl = String(mobileServeStatus?.url || "").trim();
 
   if (loading) return <div className="knowledge-sync-tab">Loading sync overview...</div>;
 
@@ -1939,8 +2093,20 @@ const KnowledgeSyncTab = () => {
             <dd>{syncOwnershipPushMode}</dd>
           </div>
           <div>
+            <dt>Auto sync</dt>
+            <dd>{syncOwnershipAutoSyncLabel}</dd>
+          </div>
+          <div>
             <dt>Saved peers</dt>
             <dd>{syncOwnershipSavedPeerCount}</dd>
+          </div>
+          <div>
+            <dt>Background owner</dt>
+            <dd>
+              {syncOwnershipBackgroundOwner.mode === "active"
+                ? syncOwnershipBackgroundOwner.active_owner || "This device"
+                : "Idle"}
+            </dd>
           </div>
           <div>
             <dt>Active request</dt>
@@ -1963,6 +2129,10 @@ const KnowledgeSyncTab = () => {
           <span className="knowledge-sync-preview-chip">
             <strong>push</strong>
             <span>{syncOwnershipPushMode}</span>
+          </span>
+          <span className="knowledge-sync-preview-chip">
+            <strong>auto sync</strong>
+            <span>{syncOwnershipAutoSyncLabel}</span>
           </span>
           <span className="knowledge-sync-preview-chip">
             <strong>operation</strong>
@@ -2018,6 +2188,124 @@ const KnowledgeSyncTab = () => {
               {syncProgress.phaseCount || 1}
             </span>
             {syncProgress.note ? <span>{syncProgress.note}</span> : null}
+          </div>
+        </section>
+      ) : null}
+
+      {syncSuggestions.length ? (
+        <section className="knowledge-sync-card knowledge-sync-card--sync-inbox">
+          <div className="knowledge-sync-section-head">
+            <h4>
+              <SyncLabelText
+                text="Sync inbox"
+                tooltip="Local suggestions for safe manual sync setup. Auto-sync stays off in this pass."
+              />
+            </h4>
+            <span className="knowledge-sync-target-status is-pending">
+              {syncSuggestions.length} suggestion{syncSuggestions.length === 1 ? "" : "s"}
+            </span>
+          </div>
+          <p className="status-note">
+            Suggestions only. Nothing checks, pulls, pushes, or applies until you start that action.
+          </p>
+          <div className="knowledge-sync-suggestion-list">
+            {syncSuggestions.map((suggestion) => {
+              const explanation =
+                suggestion?.state_explanation && typeof suggestion.state_explanation === "object"
+                  ? suggestion.state_explanation
+                  : null;
+              const requirements = Array.isArray(suggestion?.requirements)
+                ? suggestion.requirements.filter((entry) => entry && typeof entry === "object")
+                : [];
+              const suggestedPeer = savedPeers.find((peer) => peer.id === suggestion.peer_id);
+              return (
+                <article
+                  key={suggestion.id || suggestion.title}
+                  className={`knowledge-sync-suggestion is-${syncSuggestionTone(suggestion.severity)}`}
+                >
+                  <div className="knowledge-sync-section-head">
+                    <div className="knowledge-sync-section-stack">
+                      <strong>{suggestion.title || "Sync suggestion"}</strong>
+                      {suggestion.summary ? (
+                        <span className="status-note">{suggestion.summary}</span>
+                      ) : null}
+                    </div>
+                    <div className="knowledge-sync-head-actions">
+                      {explanation ? (
+                        <StateInspector
+                          title={explanation.title || "Why this sync suggestion is shown"}
+                          summary={explanation.summary || ""}
+                          rows={explanation.rows || []}
+                          ariaLabel={`Explain sync suggestion ${suggestion.title || ""}`.trim()}
+                        />
+                      ) : null}
+                      <span
+                        className={`knowledge-sync-target-status is-${syncSuggestionTone(
+                          suggestion.severity,
+                        )}`}
+                      >
+                        {syncSuggestionSeverityLabel(suggestion.severity)}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="knowledge-sync-preview-chip-row">
+                    <span className="knowledge-sync-preview-chip">
+                      <strong>next</strong>
+                      <span>{suggestion.action_label || "Review"}</span>
+                    </span>
+                    <span className="knowledge-sync-preview-chip">
+                      <strong>auto sync</strong>
+                      <span>{suggestion.auto_sync_enabled ? "On" : "Off"}</span>
+                    </span>
+                    <span className="knowledge-sync-preview-chip">
+                      <strong>review</strong>
+                      <span>{suggestion.manual_review_required === false ? "Optional" : "Required"}</span>
+                    </span>
+                    {suggestion.peer_label || suggestion.remote_url ? (
+                      <span className="knowledge-sync-preview-chip">
+                        <strong>peer</strong>
+                        <span>{suggestion.peer_label || suggestion.remote_url}</span>
+                      </span>
+                    ) : null}
+                  </div>
+                  {requirements.length ? (
+                    <div className="knowledge-sync-suggestion-requirements">
+                      {requirements.map((requirement) => (
+                        <span
+                          key={`${suggestion.id}-${requirement.label}`}
+                          className={`knowledge-sync-requirement is-${String(
+                            requirement.status || "",
+                          )
+                            .trim()
+                            .toLowerCase()}`}
+                          title={requirement.detail || requirement.label}
+                        >
+                          <strong>{requirement.label}</strong>
+                          <span>{requirement.detail || requirement.status}</span>
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
+                  <div className="knowledge-sync-section-head knowledge-sync-suggestion-footer">
+                    <span className="status-note">{suggestion.next_step || suggestion.summary}</span>
+                    {suggestedPeer ? (
+                      <button
+                        type="button"
+                        className="icon-btn"
+                        onClick={() =>
+                          selectSavedPeer(
+                            suggestedPeer,
+                            `Selected ${suggestedPeer.label}. Run Check remote when you are ready.`,
+                          )
+                        }
+                      >
+                        Select pair
+                      </button>
+                    ) : null}
+                  </div>
+                </article>
+              );
+            })}
           </div>
         </section>
       ) : null}
@@ -2321,6 +2609,57 @@ const KnowledgeSyncTab = () => {
                   : "Turn this on before another device connects."}
               </span>
             </label>
+            <div className="knowledge-sync-visibility-card" title={MOBILE_FLOAT_HELP}>
+              <div className="knowledge-sync-visibility-header">
+                <div className="knowledge-sync-section-stack">
+                  <strong>Mobile Float</strong>
+                  <span className={`knowledge-sync-visibility-badge is-${mobileServeStatus?.running ? "on" : mobileServeStatus?.ok ? "off" : "disabled"}`}>
+                    {mobileServeLabel}
+                  </span>
+                </div>
+                <span className={`knowledge-sync-target-status is-${mobileServeTone}`}>
+                  :{mobileServePort}
+                </span>
+              </div>
+              <div className="knowledge-sync-url-stack">
+                <span className="knowledge-sync-url-label">Tailscale URL</span>
+                <code>{mobileServeUrl || "Not served yet."}</code>
+              </div>
+              <div className="knowledge-sync-target-meta">
+                <span>{mobileServeStatus?.target || "local frontend unknown"}</span>
+                {mobileServeStatus?.tailnet_host ? <span>{mobileServeStatus.tailnet_host}</span> : null}
+              </div>
+              <span className="status-note">
+                {mobileServeStatus?.warning || (mobileServeStatus?.running ? "Tailnet devices can open this URL." : "Ready to serve over Tailscale.")}
+              </span>
+              <div className="knowledge-sync-head-actions">
+                <button
+                  type="button"
+                  className="icon-btn"
+                  onClick={startMobileServe}
+                  disabled={mobileServeBusy === "start" || !mobileServeStatus?.ok}
+                  title={MOBILE_FLOAT_HELP}
+                >
+                  {mobileServeBusy === "start" ? "Starting..." : "Start serve"}
+                </button>
+                <button
+                  type="button"
+                  className="icon-btn"
+                  onClick={stopMobileServe}
+                  disabled={mobileServeBusy === "stop" || !mobileServeStatus?.installed}
+                >
+                  {mobileServeBusy === "stop" ? "Stopping..." : "Stop"}
+                </button>
+                <button
+                  type="button"
+                  className="icon-btn"
+                  onClick={refreshMobileServeStatus}
+                  disabled={mobileServeBusy === "refresh"}
+                >
+                  {mobileServeBusy === "refresh" ? "Checking..." : "Status"}
+                </button>
+              </div>
+            </div>
             <label
               className="knowledge-sync-visibility-card"
               title="Choose whether paired devices can push changes straight into this Float instance or whether they must wait for approval first."
@@ -2724,25 +3063,7 @@ const KnowledgeSyncTab = () => {
                   <button
                     type="button"
                     className="knowledge-sync-target-main"
-                    onClick={() => {
-                      setSelectedPeerId(peer.id);
-                      setTargetLabel(peer.label);
-                      setTargetScopes(normalizePeerScopes(peer.scopes));
-                      setSyncRemoteUrl(peer.remote_url);
-                      setSelectedWorkspaceIds(
-                        normalizeWorkspaceIdList(peer.local_workspace_ids).length
-                          ? normalizeWorkspaceIdList(peer.local_workspace_ids)
-                          : [activeWorkspaceId || "root"],
-                      );
-                      setRemoteWorkspaceIds(normalizeWorkspaceIdList(peer.remote_workspace_ids));
-                      setWorkspaceMode(peer.workspace_mode || "merge");
-                      setLocalTargetWorkspaceId(
-                        peer.local_target_workspace_id || activeWorkspaceId || "root",
-                      );
-                      setRemoteTargetWorkspaceId(peer.remote_target_workspace_id || "root");
-                      setSyncPreview(null);
-                      setMessage("");
-                    }}
+                    onClick={() => selectSavedPeer(peer)}
                   >
                     <div className="knowledge-sync-target-title-row">
                       <strong>{peer.label}</strong>
@@ -3001,8 +3322,8 @@ const KnowledgeSyncTab = () => {
                 </strong>
                 <span className="status-note">
                   {syncItemReviewDirection === "push"
-                    ? `Choose which ${syncItemReviewSection.label.toLowerCase()} to send from this device.`
-                    : `Choose which ${syncItemReviewSection.label.toLowerCase()} to pull from ${remotePreviewLabel}.`}
+                    ? `Choose which ${syncItemReviewSection.label.toLowerCase()} to send or delete on ${remotePreviewLabel}.`
+                    : `Choose which ${syncItemReviewSection.label.toLowerCase()} to pull or delete here from ${remotePreviewLabel}.`}
                 </span>
               </div>
               <button type="button" className="icon-btn" onClick={() => setSyncItemReview(null)}>
@@ -3419,6 +3740,15 @@ const KnowledgeSyncTab = () => {
                 {importReviewAllSelected ? "Deselect all" : "Select all"}
               </button>
             </div>
+            {importReviewIgnoredJsonCount > 0 ? (
+              <span className="status-note">
+                Ignored {importReviewIgnoredJsonCount} metadata-only JSON
+                {importReviewIgnoredJsonCount === 1
+                  ? ` ${importReviewIgnoredJsonLabel.slice(0, -1)}`
+                  : ` ${importReviewIgnoredJsonLabel}`}
+                .
+              </span>
+            ) : null}
             <div className="knowledge-sync-import-list">
               {importReview.detectedFiles.map((item) => {
                 const path = String(item?.path || item?.name || "").trim();

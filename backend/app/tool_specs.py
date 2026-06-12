@@ -198,6 +198,89 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
             }
         },
     ),
+    "read_capability_docs": _spec(
+        "read_capability_docs",
+        "List, search, or read curated Float capability docs from packaged skills and function-description roots.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "title": "Action",
+                    "enum": ["list", "search", "read"],
+                    "default": "list",
+                },
+                "scope": {
+                    "type": "string",
+                    "title": "Doc scope",
+                    "enum": [
+                        "all",
+                        "skills",
+                        "function_descriptions",
+                        "feature_overviews",
+                    ],
+                    "default": "all",
+                },
+                "doc_id": {
+                    "type": "string",
+                    "title": "Doc id",
+                    "default": "",
+                },
+                "path": {
+                    "type": "string",
+                    "title": "Doc path or stem",
+                    "default": "",
+                },
+                "query": {
+                    "type": "string",
+                    "title": "Search query",
+                    "default": "",
+                },
+                "start_line": {
+                    "type": "integer",
+                    "title": "Start line",
+                    "default": 1,
+                    "minimum": 1,
+                    "maximum": 1000000,
+                },
+                "line_count": {
+                    "type": "integer",
+                    "title": "Line count",
+                    "default": 200,
+                    "minimum": 1,
+                    "maximum": 1000,
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "title": "Maximum chars",
+                    "default": 12000,
+                    "minimum": 200,
+                    "maximum": 20000,
+                },
+                "limit": {
+                    "type": "integer",
+                    "title": "List/search limit",
+                    "default": 20,
+                    "minimum": 1,
+                    "maximum": 100,
+                },
+            },
+        },
+        metadata={
+            "ui": {
+                "action": {"placeholder": "list"},
+                "scope": {"placeholder": "all"},
+                "doc_id": {"placeholder": "skills:computer_use"},
+                "path": {"placeholder": "memory.md or computer_use"},
+                "query": {"placeholder": "memory UX or agent console"},
+                "start_line": {"advanced": True},
+                "line_count": {"advanced": True},
+                "max_chars": {"advanced": True},
+                "limit": {"advanced": True},
+            }
+        },
+    ),
     "subchat": _spec(
         "subchat",
         "Control a child subchat: return to the parent chat or request more time.",
@@ -270,11 +353,87 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                     "default": "user",
                 },
                 "patience": {
-                    "type": "integer",
+                    "oneOf": [
+                        {"type": "integer"},
+                        {
+                            "type": "object",
+                            "properties": {
+                                "profile": {
+                                    "type": "string",
+                                    "enum": ["low", "medium", "high", "max", "custom"],
+                                },
+                                "max_reasoning_turns": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "maximum": 20,
+                                },
+                                "max_runtime_seconds": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 86400,
+                                },
+                                "max_context_tokens": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 2000000,
+                                },
+                                "max_output_tokens": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 128000,
+                                },
+                                "reserve_output_tokens": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 128000,
+                                },
+                            },
+                            "additionalProperties": False,
+                        },
+                    ],
                     "title": "Patience",
                     "default": 1,
-                    "minimum": 0,
-                    "maximum": 3,
+                    "description": (
+                        "Legacy integer or explicit budget. max_reasoning_turns "
+                        "counts assistant reflection passes only; tool continues "
+                        "are budgeted separately."
+                    ),
+                },
+                "patience_budget": {
+                    "type": "object",
+                    "title": "Patience budget",
+                    "properties": {
+                        "profile": {
+                            "type": "string",
+                            "enum": ["low", "medium", "high", "max", "custom"],
+                        },
+                        "max_reasoning_turns": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 20,
+                        },
+                        "max_runtime_seconds": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 86400,
+                        },
+                        "max_context_tokens": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 2000000,
+                        },
+                        "max_output_tokens": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 128000,
+                        },
+                        "reserve_output_tokens": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 128000,
+                        },
+                    },
+                    "additionalProperties": False,
                 },
                 "memory_keys": {
                     "type": "array",
@@ -1206,6 +1365,10 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                     "type": ["number", "string", "object"],
                     "title": "Start alias",
                 },
+                "start_at": {
+                    "type": ["number", "string", "object"],
+                    "title": "Start alias",
+                },
                 "when": {
                     "type": ["number", "string", "object"],
                     "title": "Start alias",
@@ -1219,6 +1382,10 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                     "title": "End alias",
                 },
                 "ends_at": {
+                    "type": ["number", "string", "object"],
+                    "title": "End alias",
+                },
+                "end_at": {
                     "type": ["number", "string", "object"],
                     "title": "End alias",
                 },
@@ -1239,6 +1406,14 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                     "title": "Time zone",
                     "default": "UTC",
                 },
+                "tz": {
+                    "type": "string",
+                    "title": "Time zone alias",
+                },
+                "time_zone": {
+                    "type": "string",
+                    "title": "Time zone alias",
+                },
                 "status": {
                     "type": "string",
                     "title": "Status",
@@ -1258,10 +1433,16 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
             "anyOf": [
                 {"required": ["title", "start_time"]},
                 {"required": ["title", "start"]},
+                {"required": ["title", "starts_at"]},
+                {"required": ["title", "start_at"]},
                 {"required": ["summary", "start_time"]},
                 {"required": ["summary", "start"]},
+                {"required": ["summary", "starts_at"]},
+                {"required": ["summary", "start_at"]},
                 {"required": ["name", "start_time"]},
                 {"required": ["name", "start"]},
+                {"required": ["name", "starts_at"]},
+                {"required": ["name", "start_at"]},
                 {"required": ["title", "when"]},
                 {"required": ["summary", "when"]},
                 {"required": ["name", "when"]},
@@ -1271,11 +1452,15 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
             "ui": {
                 "description": {"multiline": True, "rows": 4},
                 "location": {"advanced": True},
+                "start_at": {"advanced": True},
                 "end_time": {"advanced": True},
                 "end": {"advanced": True},
+                "end_at": {"advanced": True},
                 "grounded_at": {"advanced": True},
                 "duration_min": {"advanced": True},
                 "duration": {"advanced": True},
+                "tz": {"advanced": True},
+                "time_zone": {"advanced": True},
                 "rrule": {"advanced": True},
                 "actions": {"advanced": True},
             }
@@ -1358,6 +1543,10 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                     "type": ["number", "string", "object"],
                     "title": "Start alias",
                 },
+                "start_at": {
+                    "type": ["number", "string", "object"],
+                    "title": "Start alias",
+                },
                 "when": {
                     "type": ["number", "string", "object"],
                     "title": "Start alias",
@@ -1371,6 +1560,10 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                     "title": "End alias",
                 },
                 "ends_at": {
+                    "type": ["number", "string", "object"],
+                    "title": "End alias",
+                },
+                "end_at": {
                     "type": ["number", "string", "object"],
                     "title": "End alias",
                 },
@@ -1391,6 +1584,14 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                     "title": "Time zone",
                     "default": "UTC",
                 },
+                "tz": {
+                    "type": "string",
+                    "title": "Time zone alias",
+                },
+                "time_zone": {
+                    "type": "string",
+                    "title": "Time zone alias",
+                },
                 "status": {
                     "type": "string",
                     "title": "Status",
@@ -1410,10 +1611,16 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
             "anyOf": [
                 {"required": ["title", "start_time"]},
                 {"required": ["title", "start"]},
+                {"required": ["title", "starts_at"]},
+                {"required": ["title", "start_at"]},
                 {"required": ["summary", "start_time"]},
                 {"required": ["summary", "start"]},
+                {"required": ["summary", "starts_at"]},
+                {"required": ["summary", "start_at"]},
                 {"required": ["name", "start_time"]},
                 {"required": ["name", "start"]},
+                {"required": ["name", "starts_at"]},
+                {"required": ["name", "start_at"]},
                 {"required": ["title", "when"]},
                 {"required": ["summary", "when"]},
                 {"required": ["name", "when"]},
@@ -1423,11 +1630,15 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
             "ui": {
                 "description": {"multiline": True, "rows": 4},
                 "location": {"advanced": True},
+                "start_at": {"advanced": True},
                 "end_time": {"advanced": True},
                 "end": {"advanced": True},
+                "end_at": {"advanced": True},
                 "grounded_at": {"advanced": True},
                 "duration_min": {"advanced": True},
                 "duration": {"advanced": True},
+                "tz": {"advanced": True},
+                "time_zone": {"advanced": True},
                 "rrule": {"advanced": True},
                 "actions": {"advanced": True},
             }

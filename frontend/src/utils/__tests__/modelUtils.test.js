@@ -26,6 +26,9 @@ describe("modelUtils", () => {
   it("normalizes repo-style ids for local catalog routes", () => {
     expect(resolveLocalCatalogModelId("google/gemma-3-270m")).toBe("gemma-3-270m");
     expect(resolveLocalCatalogModelId("openai/gpt-oss-20b")).toBe("gpt-oss-20b");
+    expect(resolveLocalCatalogModelId("local:google/embeddinggemma-300M")).toBe(
+      "embeddinggemma-300M",
+    );
   });
 
   it("does not fall back to api or local models for server mode", () => {
@@ -43,18 +46,40 @@ describe("modelUtils", () => {
   it("keeps provider-first Gemma 4 variants in server suggestions only", () => {
     expect(SUGGESTED_SERVER_MODELS).toEqual(
       expect.arrayContaining([
+        "gemma-4-12B-it",
+        "gemma-4-12B-it-qat-q4_0-gguf",
         "gemma-4-E4B-it",
         "gemma-4-26B-A4B-it",
         "gemma-4-31B-it",
       ]),
     );
+    expect(SUGGESTED_LOCAL_MODELS).toEqual(
+      expect.arrayContaining(["gemma-4-12B-it-qat-q4_0", "gemma-4-E2B-it"]),
+    );
     expect(SUGGESTED_LOCAL_MODELS).not.toEqual(
-      expect.arrayContaining(["gemma-4-26B-A4B-it", "gemma-4-31B-it"]),
+      expect.arrayContaining([
+        "gemma-3-270m",
+        "gemma-3-12b-it",
+        "gemma-3-27b-it",
+        "gemma-4-12B-it-qat-q4_0-gguf",
+        "gemma-4-26B-A4B-it",
+        "gemma-4-31B-it",
+      ]),
     );
   });
 
-  it("treats provider-first e4b as downloadable", () => {
+  it("treats provider-first Gemma 4 suggestions as downloadable", () => {
+    expect(isKnownDownloadableModel("gemma-4-12B-it-qat-q4_0")).toBe(true);
+    expect(isKnownDownloadableModel("gemma-4-12B-it-qat-q4_0-gguf")).toBe(true);
+    expect(isKnownDownloadableModel("gemma-4-12B-it")).toBe(true);
     expect(isKnownDownloadableModel("gemma-4-E4B-it")).toBe(true);
+  });
+
+  it("treats utility embedding and privacy models as downloadable", () => {
+    expect(isKnownDownloadableModel("all-MiniLM-L6-v2")).toBe(true);
+    expect(isKnownDownloadableModel("all-mpnet-base-v2")).toBe(true);
+    expect(isKnownDownloadableModel("embeddinggemma-300m")).toBe(true);
+    expect(isKnownDownloadableModel("privacy-filter")).toBe(true);
   });
 
   it("sorts GPT API models newest to oldest", () => {

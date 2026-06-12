@@ -70,6 +70,37 @@ export const buildToolContinuationSignature = (tools, options = {}) => {
   }
 };
 
+const activeToolContinuationLocks = new Set();
+
+export const buildToolContinuationLockKey = ({
+  sessionId,
+  messageId,
+  tools,
+} = {}) => {
+  const sessionPart = String(sessionId || "").trim() || "default";
+  const messagePart = String(messageId || "").trim();
+  const semanticSignature = buildToolContinuationSignature(tools, {
+    includeIds: false,
+  });
+  const exactSignature = semanticSignature || buildToolContinuationSignature(tools);
+  if (!messagePart || !exactSignature) return "";
+  return `${sessionPart}:${messagePart}:${exactSignature}`;
+};
+
+export const acquireToolContinuationLock = (key) => {
+  const normalized = String(key || "").trim();
+  if (!normalized) return false;
+  if (activeToolContinuationLocks.has(normalized)) return false;
+  activeToolContinuationLocks.add(normalized);
+  return true;
+};
+
+export const releaseToolContinuationLock = (key) => {
+  const normalized = String(key || "").trim();
+  if (!normalized) return;
+  activeToolContinuationLocks.delete(normalized);
+};
+
 export const hasMatchingToolContinuationSignature = (
   metadata,
   tools,

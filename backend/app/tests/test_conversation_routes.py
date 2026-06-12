@@ -56,6 +56,23 @@ def test_nested_conversation_name_roundtrip_and_rename(client):
     assert "projects/archive/alpha" not in listed.json()["conversations"]
 
 
+def test_conversations_listing_counts_real_json_not_sidecars(client):
+    payload = {
+        "name": "Counted",
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+    assert client.post("/conversations/counted", json=payload).status_code == 200
+
+    listed = client.get("/conversations", params={"detailed": True})
+
+    assert listed.status_code == 200
+    body = listed.json()
+    assert body["count"] == 1
+    assert body["counts"]["real_conversation_json"] == 1
+    assert body["counts"]["metadata_sidecars_excluded"] is True
+    assert [entry["name"] for entry in body["conversations"]] == ["counted"]
+
+
 def test_conversation_rename_route_updates_privacy_metadata(client):
     nested_name = "projects/privacy-note"
     encoded = quote(nested_name, safe="")

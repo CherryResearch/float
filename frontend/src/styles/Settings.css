@@ -20,6 +20,11 @@
   -webkit-overflow-scrolling: touch;
 }
 
+body.settings-drag-scroll-active {
+  cursor: grabbing;
+  user-select: none;
+}
+
 body.dark-mode .settings-container {
   background: color-mix(in oklab, var(--color-background-secondary) 58%, var(--glass-tint) 42%);
 }
@@ -314,6 +319,225 @@ body.dark-mode .settings-container {
   opacity: 0.72;
 }
 
+.workflow-modules-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.workflow-modules-heading .status-note {
+  margin: 4px 0 0;
+}
+
+.workflow-module-count,
+.workflow-module-status,
+.workflow-module-tools,
+.workflow-module-source {
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  line-height: 1;
+}
+
+.workflow-module-count {
+  padding: 5px 9px;
+  border: 1px solid var(--glass-border);
+  color: var(--color-text-muted);
+}
+
+.workflow-modules-card {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.workflow-module-heading-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.workflow-module-heading-actions select {
+  width: auto;
+  min-width: 180px;
+  margin: 0;
+}
+
+.workflow-module-location code {
+  font-size: 0.82rem;
+}
+
+.settings-help-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: 1px solid var(--glass-border);
+  border-radius: 999px;
+  color: var(--color-text-muted);
+  font-size: 0.76rem;
+  font-weight: 700;
+  cursor: help;
+}
+
+.workflow-module-list {
+  display: grid;
+  gap: 6px;
+}
+
+.workflow-module-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: start;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 74%, transparent);
+  border-radius: 10px;
+  background: color-mix(in oklab, var(--glass-panel-bg) 58%, transparent);
+}
+
+.settings-container label.workflow-module-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  margin-top: 0;
+  font-weight: inherit;
+}
+
+.settings-container label.workflow-module-row input[type="checkbox"] {
+  width: auto;
+  margin-top: 3px;
+  justify-self: end;
+}
+
+.workflow-module-main {
+  min-width: 0;
+}
+
+.workflow-module-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.workflow-module-source {
+  padding: 3px 7px;
+  border: 1px solid color-mix(in oklab, var(--color-text-muted) 28%, transparent);
+  color: var(--color-text-muted);
+}
+
+.workflow-module-source--base {
+  border-color: color-mix(in oklab, var(--color-accent) 34%, transparent);
+  color: var(--color-accent);
+}
+
+.workflow-module-source--custom,
+.workflow-module-source--local {
+  border-color: color-mix(in oklab, var(--color-success, #4f9f68) 42%, transparent);
+  color: var(--color-success, #4f9f68);
+}
+
+.workflow-module-status,
+.workflow-module-tools {
+  color: var(--color-text-muted);
+}
+
+.workflow-module-description {
+  display: block;
+  margin: 3px 0 0;
+}
+
+.workflow-module-details {
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+  border: 1px dashed color-mix(in oklab, var(--glass-border) 82%, transparent);
+  border-radius: 12px;
+  background: color-mix(in oklab, var(--glass-panel-bg) 42%, transparent);
+}
+
+.workflow-module-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+}
+
+.workflow-module-detail-grid p {
+  margin: 4px 0 0;
+  color: var(--color-text-muted);
+  font-size: 0.86rem;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.workflow-detail-label {
+  color: var(--color-text);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.workflow-config-editor {
+  width: 100%;
+  min-height: 120px;
+  padding: 8px 10px;
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  background: color-mix(in oklab, var(--glass-panel-bg) 72%, transparent);
+  color: var(--color-text);
+  font-family: "Cascadia Code", "Fira Code", Consolas, monospace;
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+
+.workflow-skill-manager {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 10px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 72%, transparent);
+  border-radius: 12px;
+  background: color-mix(in oklab, var(--glass-panel-bg) 50%, transparent);
+}
+
+.workflow-skill-manager--subcard {
+  margin-top: 0;
+}
+
+.workflow-skill-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  color: var(--color-text-muted);
+  font-size: 0.86rem;
+}
+
+.workflow-skill-meta code {
+  font-size: 0.78rem;
+}
+
+.workflow-skill-editor {
+  width: 100%;
+  min-height: 180px;
+  resize: vertical;
+  padding: 10px 12px;
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  background: color-mix(in oklab, var(--glass-panel-bg) 78%, transparent);
+  color: var(--color-text);
+  font-family: "Cascadia Code", "Fira Code", Consolas, monospace;
+  font-size: 0.88rem;
+  line-height: 1.45;
+}
+
 .settings-container label {
   display: block;
   margin-top: 10px;
@@ -494,6 +718,42 @@ body.dark-mode .settings-toolbar-card {
 .settings-subsection-title {
   margin: 0 0 10px;
   font-size: 0.96rem;
+}
+
+.model-library-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 4px;
+}
+
+.model-library-header .settings-subsection-title {
+  margin-bottom: 4px;
+}
+
+.model-library-header .icon-btn {
+  margin-top: 0;
+  flex: 0 0 auto;
+}
+
+.model-library-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  margin: 10px 0 12px;
+}
+
+.settings-container label.model-library-toggle {
+  width: auto;
+  margin-top: 0;
+  font-weight: 650;
+}
+
+.settings-container label.model-library-toggle input {
+  width: auto;
+  margin-top: 0;
 }
 
 .settings-search-row {
@@ -869,6 +1129,14 @@ body.dark-mode .settings-toolbar-card {
 .celery-notice--offline {
   border-color: color-mix(in oklab, var(--color-error) 52%, var(--glass-border));
 }
+.celery-empty-state {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border: 1px dashed var(--glass-border);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-muted);
+  font-size: 0.84rem;
+}
 .celery-action-row {
   display: flex;
   align-items: center;
@@ -1110,13 +1378,13 @@ body.dark-mode .model-lane-switch {
 }
 
 .settings-toggle-card {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 18px;
+  display: grid;
+  grid-template-columns: 1fr;
+  align-items: start;
+  gap: 12px;
   padding: 12px 14px;
   border: 1px solid var(--glass-border);
-  border-radius: 16px;
+  border-radius: var(--radius-sm);
   background: color-mix(in oklab, var(--glass-tint) 82%, transparent);
 }
 
@@ -1138,21 +1406,29 @@ body.dark-mode .model-lane-switch {
 
 .settings-toggle-controls {
   display: grid;
-  gap: 8px;
-  min-width: min(240px, 100%);
+  gap: 6px;
+  min-width: 0;
+  width: 100%;
 }
 
 .settings-switch-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(56px, max-content) minmax(0, 1fr);
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: 8px;
   font-size: 0.8rem;
 }
 
-.settings-switch-row input {
+.settings-switch-row input,
+.settings-switch-row select {
   width: auto;
   margin: 0;
+}
+
+.settings-switch-row select {
+  min-width: 0;
+  width: 100%;
 }
 
 .model-select-stack {
@@ -1258,7 +1534,7 @@ body.dark-mode .model-lane-switch {
 .model-inline-panel {
   padding: 10px 12px;
   border: 1px solid var(--glass-border);
-  border-radius: 16px;
+  border-radius: var(--radius-sm);
   background: color-mix(in oklab, var(--glass-tint) 84%, transparent);
 }
 
@@ -1266,7 +1542,7 @@ body.dark-mode .model-lane-switch {
   display: grid;
   gap: 10px;
   padding: 12px 14px;
-  border-radius: 18px;
+  border-radius: var(--radius-sm);
   background: color-mix(in oklab, var(--glass-tint) 82%, transparent);
 }
 
@@ -1544,7 +1820,7 @@ body.dark-mode .model-lane-switch {
   }
 
   .settings-toggle-card {
-    flex-direction: column;
+    grid-template-columns: 1fr;
   }
 
   .model-row-trailing {

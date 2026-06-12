@@ -303,8 +303,8 @@ def main():
         if args.with_worker or args.with_redis:
             print(
                 "[WARN] Python package 'redis' is not installed in this environment. "
-                "Run 'poetry install --extras workers' before using --with-worker, "
-                "--with-redis, or --agents."
+                "Run 'poetry install' to repair the base environment before using "
+                "--with-worker, --with-redis, or --agents."
             )
         args.with_worker = False
         args.with_redis = False

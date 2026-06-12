@@ -276,7 +276,7 @@ def test_chat_includes_rag_context(monkeypatch, client):
         "/chat",
         json={
             "message": "What is the capital of France?",
-            "session_id": "sess",
+            "session_id": "sess-rag-context",
             "use_rag": True,
         },
     )
@@ -365,6 +365,91 @@ def test_chat_rag_filters_excluded_and_sensitive(monkeypatch, client):
     assert "ok" in sources
     assert "excluded" not in sources
     assert "secret" not in sources
+
+
+def test_chat_rag_respects_text_and_vision_request_toggles(monkeypatch, client):
+    calls = {"text": 0, "clip": 0}
+
+    class DummyTextRAG:
+        embedding_model = "local:test"
+
+        def query(self, text, top_k=3):
+            calls["text"] += 1
+            return [
+                {
+                    "id": "text-doc",
+                    "text": "text memory",
+                    "metadata": {"source": "text-source"},
+                    "score": 0.99,
+                }
+            ]
+
+        def trace(self, doc_id):
+            return None
+
+    class DummyClipRAG:
+        embedding_model = "clip:ViT-B-32"
+        _embedding_encoder = object()
+
+        def query(self, text, top_k=3):
+            calls["clip"] += 1
+            return [
+                {
+                    "id": "clip-doc",
+                    "text": "image memory",
+                    "metadata": {"source": "image-source"},
+                    "score": 0.98,
+                }
+            ]
+
+    monkeypatch.setattr(routes, "_get_rag_service", lambda: DummyTextRAG())
+    monkeypatch.setattr(
+        routes, "_get_clip_rag_service", lambda *, raise_http=False: DummyClipRAG()
+    )
+    monkeypatch.setattr(routes.llm_service, "mode", "api", raising=False)
+    monkeypatch.setitem(client.app.state.config, "rag_chat_clip_top_k", 1)
+
+    def fake_generate(
+        prompt,
+        session_id="default",
+        model=None,
+        attachments=None,
+        context=None,
+        **kwargs,
+    ):
+        return {
+            "text": "ok",
+            "thought": "",
+            "tools_used": [],
+            "metadata": {},
+        }
+
+    monkeypatch.setattr(routes.llm_service, "generate", fake_generate)
+
+    response = client.post(
+        "/chat",
+        json={
+            "message": "What is in this image?",
+            "session_id": "sess-rag-toggles",
+            "use_rag": True,
+            "use_text_rag": False,
+            "use_vision_rag": True,
+            "attachments": [
+                {
+                    "url": "/api/attachments/test/sample.png",
+                    "content_type": "image/png",
+                    "name": "sample.png",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert calls == {"text": 0, "clip": 1}
+    rag_section = response.json()["metadata"].get("rag") or {}
+    assert rag_section["text_enabled"] is False
+    assert rag_section["vision_enabled"] is True
+    assert [m["source"] for m in rag_section["matches"]] == ["image-source"]
 
 
 def test_chat_rag_truncates_metadata_text(monkeypatch, client):

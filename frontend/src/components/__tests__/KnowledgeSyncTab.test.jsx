@@ -46,6 +46,16 @@ const buildOverview = () => ({
     },
     push_review_mode: "review_required",
     saved_peer_count: 0,
+    background_owner: {
+      mode: "idle",
+    },
+    auto_sync: {
+      enabled: false,
+      available: false,
+      mode: "manual_review_only",
+      reason:
+        "Automatic sync is not enabled. This device can suggest manual Check remote and Preview sync steps, but it will not schedule or apply sync automatically.",
+    },
     unfinished_notice:
       "Automatic stop-kill safeguards are future work. Stop records cancel intent and aborts the current local request where possible, but it does not kill remote work that another device already accepted.",
   },
@@ -54,6 +64,7 @@ const buildOverview = () => ({
     last_attempt: null,
     recent: [],
   },
+  sync_suggestions: [],
   workspaces: {
     profiles: [
       {
@@ -81,6 +92,21 @@ const buildOverview = () => ({
     legacy: 0,
     pending_push_reviews: 0,
   },
+});
+
+const buildMobileServeStatus = (overrides = {}) => ({
+  ok: true,
+  installed: true,
+  running: false,
+  serve_port: 64345,
+  frontend_port: 50802,
+  backend_port: 50801,
+  tailnet_host: "studio.tail.ts.net",
+  url: "http://studio.tail.ts.net:64345/",
+  target: "localhost:50802",
+  status_text: "ready",
+  warning: "Tailscale Serve is not currently pointing at this Float frontend.",
+  ...overrides,
 });
 
 const buildPlanResponse = () => ({
@@ -280,6 +306,9 @@ describe("KnowledgeSyncTab", () => {
       if (url === "/api/sync/overview") {
         return Promise.resolve({ data: buildOverview() });
       }
+      if (url === "/api/sync/mobile-serve/status") {
+        return Promise.resolve({ data: buildMobileServeStatus() });
+      }
       if (url === "/api/user-settings") {
         return Promise.resolve({ data: { device_display_name: "Studio" } });
       }
@@ -289,6 +318,40 @@ describe("KnowledgeSyncTab", () => {
       return Promise.reject(new Error(`Unexpected GET ${url}`));
     });
     vi.spyOn(axios, "post").mockResolvedValue({ data: {} });
+  });
+
+  it("starts Mobile Float Tailscale Serve from the sync panel", async () => {
+    axios.post.mockImplementation((url, payload) => {
+      if (url === "/api/sync/mobile-serve/start") {
+        expect(payload).toEqual({ serve_port: 64345 });
+        return Promise.resolve({
+          data: buildMobileServeStatus({
+            running: true,
+            status_text: "running",
+            warning: "",
+            message: "Mobile Float available at http://studio.tail.ts.net:64345/",
+          }),
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    render(<KnowledgeSyncTab />);
+
+    expect(await screen.findByText("Mobile Float")).toBeInTheDocument();
+    const startButton = screen.getByRole("button", { name: /Start serve/i });
+    await waitFor(() => expect(startButton).not.toBeDisabled());
+    fireEvent.click(startButton);
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith("/api/sync/mobile-serve/start", {
+        serve_port: 64345,
+      });
+    });
+    expect(
+      await screen.findByText("Mobile Float available at http://studio.tail.ts.net:64345/"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("running")).toBeInTheDocument();
   });
 
   it("lets you review and uncheck individual sync items before pulling", async () => {
@@ -305,7 +368,7 @@ describe("KnowledgeSyncTab", () => {
           direction: "pull",
           sections: ["conversations", "settings"],
           item_selections: {
-            conversations: ["conv-a"],
+            conversations: ["conv-a", "conv-c"],
             settings: ["settings"],
           },
         });
@@ -314,7 +377,7 @@ describe("KnowledgeSyncTab", () => {
             effective_namespace: "Pear",
             result: {
               sections: {
-                conversations: { applied: 1, skipped: 0 },
+                conversations: { applied: 1, skipped: 0, deleted: 1, delete_skipped: 0 },
                 settings: { applied: 1, skipped: 0 },
               },
             },
@@ -331,11 +394,11 @@ describe("KnowledgeSyncTab", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: /preview sync/i }));
 
-    expect(await screen.findByText(/1 new on Pear, 1 newer on Pear, 4 already match here\./i)).toBeInTheDocument();
-    expect(screen.getByText(/1 only on this device, 2 newer here, 4 already match there\./i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /review pull items \(2\/2\)/i })).toBeInTheDocument();
+    expect(await screen.findByText(/1 new on Pear, 1 newer on Pear, 1 deleted on Pear, 4 already match here\./i)).toBeInTheDocument();
+    expect(screen.getByText(/1 only on this device, 2 newer here, 0 deleted here, 4 already match there\./i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /review pull items \(3\/3\)/i })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /review pull items \(2\/2\)/i }));
+    fireEvent.click(screen.getByRole("button", { name: /review pull items \(3\/3\)/i }));
 
     const dialog = await screen.findByRole("dialog", {
       name: /review pull items for conversations/i,
@@ -347,7 +410,7 @@ describe("KnowledgeSyncTab", () => {
     fireEvent.click(within(dialog).getByRole("checkbox", { name: /Beta/i }));
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /review pull items \(1\/2\)/i })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /review pull items \(2\/3\)/i })).toBeInTheDocument();
     });
 
     fireEvent.click(screen.getByRole("button", { name: /pull here/i }));
@@ -360,7 +423,7 @@ describe("KnowledgeSyncTab", () => {
           direction: "pull",
           sections: ["conversations", "settings"],
           item_selections: {
-            conversations: ["conv-a"],
+            conversations: ["conv-a", "conv-c"],
             settings: ["settings"],
           },
         }),
@@ -415,6 +478,9 @@ describe("KnowledgeSyncTab", () => {
     axios.get.mockImplementation((url) => {
       if (url === "/api/sync/overview") {
         return Promise.resolve({ data: buildOverview() });
+      }
+      if (url === "/api/sync/mobile-serve/status") {
+        return Promise.resolve({ data: buildMobileServeStatus() });
       }
       if (url === "/api/user-settings") {
         return Promise.resolve({ data: { device_display_name: "Studio" } });
@@ -536,6 +602,110 @@ describe("KnowledgeSyncTab", () => {
     expect(inspector).toBeInTheDocument();
     expect(screen.getByText("/api/sync/overview")).toBeInTheDocument();
     expect(within(inspector).getByText(/Stop records cancel intent/i)).toBeInTheDocument();
+  });
+
+  it("shows sync inbox suggestions without starting auto sync", async () => {
+    const overview = buildOverview();
+    overview.sync_defaults.remote_url = "http://pear.float:5000";
+    overview.sync_defaults.saved_peers = [
+      {
+        id: "peer-pear",
+        label: "Pear",
+        remote_url: "http://pear.float:5000",
+        scopes: ["sync"],
+        remote_device_id: "remote-device-1",
+        remote_public_key: "pk-pear",
+        local_workspace_ids: ["root"],
+        remote_workspace_ids: ["root"],
+        workspace_mode: "merge",
+      },
+    ];
+    overview.egress_summary.saved_peer_count = 1;
+    overview.egress_summary.outbound_target = {
+      mode: "saved_peer",
+      remote_url: "http://pear.float:5000",
+      peer_id: "peer-pear",
+      peer_label: "Pear",
+    };
+    overview.sync_suggestions = [
+      {
+        id: "ready-reviewed-sync-peer-pear",
+        title: "Pear is ready for reviewed sync",
+        summary:
+          "Auto-sync is still off. This pair has sync scope, a saved fingerprint, and workspace mapping.",
+        severity: "info",
+        priority: 30,
+        action: "check_then_preview",
+        action_label: "Check remote, then preview",
+        next_step:
+          "Check remote to confirm reachability, then Preview sync before pulling or pushing selected sections.",
+        peer_id: "peer-pear",
+        peer_label: "Pear",
+        remote_url: "http://pear.float:5000",
+        manual_review_required: true,
+        auto_sync_enabled: false,
+        auto_sync_available: false,
+        requirements: [
+          {
+            label: "Stable identity",
+            status: "ready",
+            detail: "Remote fingerprint saved",
+          },
+          {
+            label: "Automatic sync",
+            status: "off",
+            detail: "Only suggestions are shown; nothing runs automatically",
+          },
+        ],
+        state_explanation: {
+          title: "Why Pear is ready for reviewed sync is suggested",
+          summary:
+            "Auto-sync is still off. This pair has sync scope, a saved fingerprint, and workspace mapping.",
+          rows: [
+            { label: "Source", value: "/api/sync/overview.sync_suggestions" },
+            { label: "Automatic sync", value: "Off" },
+            { label: "Review", value: "Manual approval required" },
+            {
+              label: "Next",
+              value:
+                "Check remote to confirm reachability, then Preview sync before pulling or pushing selected sections.",
+            },
+          ],
+        },
+      },
+    ];
+    axios.get.mockImplementation((url) => {
+      if (url === "/api/sync/overview") {
+        return Promise.resolve({ data: overview });
+      }
+      if (url === "/api/user-settings") {
+        return Promise.resolve({ data: { device_display_name: "Studio" } });
+      }
+      if (url === "/api/actions") {
+        return Promise.resolve({ data: { actions: [] } });
+      }
+      return Promise.reject(new Error(`Unexpected GET ${url}`));
+    });
+
+    render(<KnowledgeSyncTab />);
+
+    expect(await screen.findByText("Sync inbox")).toBeInTheDocument();
+    expect(screen.getByText("Pear is ready for reviewed sync")).toBeInTheDocument();
+    expect(screen.getByText("Check remote, then preview")).toBeInTheDocument();
+    expect(screen.getByText("Remote fingerprint saved")).toBeInTheDocument();
+    expect(screen.getByText("Only suggestions are shown; nothing runs automatically")).toBeInTheDocument();
+    expect(axios.post).not.toHaveBeenCalled();
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: /explain sync suggestion pear is ready for reviewed sync/i,
+      }),
+    );
+    const inspector = screen.getByRole("dialog", {
+      name: /why pear is ready for reviewed sync is suggested/i,
+    });
+    expect(within(inspector).getByText("/api/sync/overview.sync_suggestions")).toBeInTheDocument();
+    expect(within(inspector).getByText("Manual approval required")).toBeInTheDocument();
   });
 
   it("moves browser-shaped trusted-device records into the legacy cleanup bucket", async () => {

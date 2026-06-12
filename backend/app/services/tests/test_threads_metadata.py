@@ -4,8 +4,29 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[4]
 THREADS_SERVICE_PATH = REPO_ROOT / "backend" / "app" / "services" / "threads_service.py"
+STUBBED_MODULES = [
+    "app",
+    "app.services",
+    "app.services.semantic_tags_service",
+    "app.services.threads_service",
+    "app.utils",
+    "app.utils.conversation_store",
+]
+
+
+@pytest.fixture(autouse=True)
+def restore_stubbed_modules():
+    saved = {name: sys.modules.get(name) for name in STUBBED_MODULES}
+    yield
+    for name in STUBBED_MODULES:
+        if saved[name] is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = saved[name]
 
 
 def _load_threads_service():

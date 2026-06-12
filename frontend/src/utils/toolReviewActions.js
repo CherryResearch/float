@@ -59,7 +59,21 @@ export const normalizeToolReviewTarget = (value = {}) => {
 };
 
 export const toolReviewItems = (target) => {
+  const source =
+    target && typeof target === "object" && target.data && typeof target.data === "object"
+      ? target.data
+      : target || {};
   const normalized = normalizeToolReviewTarget(target);
+  const toolArgs = Array.isArray(source.toolArgs)
+    ? source.toolArgs
+    : Array.isArray(source.tool_args)
+      ? source.tool_args
+      : [];
+  const toolStatuses = Array.isArray(source.toolStatuses)
+    ? source.toolStatuses
+    : Array.isArray(source.tool_statuses)
+      ? source.tool_statuses
+      : [];
   const maxLength = Math.max(normalized.toolIds.length, normalized.toolNames.length, 1);
   const items = [];
   for (let index = 0; index < maxLength; index += 1) {
@@ -70,6 +84,8 @@ export const toolReviewItems = (target) => {
       id: toolId || `${normalized.batchId || normalized.notificationId || "tool"}:${index}`,
       toolId,
       toolName,
+      args: toolArgs[index],
+      status: String(toolStatuses[index] || "").trim().toLowerCase(),
       index,
       label: toolName || (toolId ? `tool ${toolId.slice(0, 8)}` : `tool ${index + 1}`),
     });

@@ -113,7 +113,46 @@ const normalizeBackendMode = (value) => {
   return "api";
 };
 
+const RUNTIME_SELECTION_PROTECTION_MS = 6000;
+
+const normalizeHarmonyFormatMode = (value, fallback = "auto") => {
+  const raw = String(value || "").trim().toLowerCase();
+  if (raw === "auto" || raw === "enabled" || raw === "disabled") return raw;
+  if (raw === "true" || raw === "1" || raw === "yes" || raw === "on") {
+    return "enabled";
+  }
+  if (raw === "false" || raw === "0" || raw === "no" || raw === "off") {
+    return "disabled";
+  }
+  return fallback === "enabled" || fallback === "disabled" ? fallback : "auto";
+};
+
+const isHarmonyPreferred = (...models) => {
+  try {
+    return models
+      .filter(Boolean)
+      .map((model) => String(model).toLowerCase())
+      .some((m) => isGptOssModel(m));
+  } catch {
+    return false;
+  }
+};
+
+const resolveHarmonyFormat = (mode, ...models) => {
+  const normalized = normalizeHarmonyFormatMode(mode);
+  if (normalized === "disabled") return false;
+  if (normalized === "enabled") return true;
+  return isHarmonyPreferred(...models);
+};
+
 const applyBackendRuntimeSelection = (prev, data = {}) => {
+  const runtimeTouchedAt = Number(prev.runtimeSelectionTouchedAt || 0);
+  if (
+    runtimeTouchedAt > 0 &&
+    Date.now() - runtimeTouchedAt < RUNTIME_SELECTION_PROTECTION_MS
+  ) {
+    return prev;
+  }
   const next = { ...prev };
   let changed = false;
   const nextBackendMode = normalizeBackendMode(data.mode || prev.backendMode);
@@ -190,8 +229,16 @@ const GlobalProvider = ({ children }) => {
     const storedStaticModel =
       localStorage.getItem("staticModel") || "gpt-5.4-mini";
     const storedHarmonyFormatRaw = localStorage.getItem("harmonyFormat");
-    const storedHarmonyFormat = storedHarmonyFormatRaw === "true";
-    const storedHarmonyTouched = localStorage.getItem("harmonyTouched") === "true";
+    const storedHarmonyModeRaw = localStorage.getItem("harmonyFormatMode");
+    const legacyHarmonyTouched = localStorage.getItem("harmonyTouched") === "true";
+    const storedHarmonyFormatMode = normalizeHarmonyFormatMode(
+      storedHarmonyModeRaw ||
+        (legacyHarmonyTouched
+          ? storedHarmonyFormatRaw === "false"
+            ? "disabled"
+            : "enabled"
+          : "auto"),
+    );
     const storedServerUrl = localStorage.getItem("serverUrl") || "";
     const storedSttModel = localStorage.getItem("sttModel") || "whisper-1";
     const storedTtsModel = localStorage.getItem("ttsModel") || "tts-1";
@@ -267,34 +314,19 @@ const GlobalProvider = ({ children }) => {
       if (raw === "false") return "low";
       return "auto";
     })();
+    const storedTextRagEnabled = localStorage.getItem("textRagEnabled") !== "false";
+    const storedVisionRagEnabled = localStorage.getItem("visionRagEnabled") !== "false";
+    const storedRagEmbeddingModel =
+      localStorage.getItem("ragEmbeddingModel") || "local:all-MiniLM-L6-v2";
+    const storedRagClipModel = localStorage.getItem("ragClipModel") || "ViT-B-32";
     const initialSessionId = storedSessionId || `sess-${Date.now()}`;
     const storedSessionName = localStorage.getItem("sessionName");
 
-    // Determine Harmony default when not explicitly set
-    const isHarmonyPreferred = (...models) => {
-      try {
-        const generic = [
-          "gpt-4o",
-          "gpt-4.1",
-          "gpt-5-mini",
-          "gpt-5",
-          "gpt-5.1",
-          "gpt-5.2",
-          "gpt-5.4",
-        ];
-        return models
-          .filter(Boolean)
-          .map((model) => String(model).toLowerCase())
-          .some((m) => isGptOssModel(m) || generic.some((g) => m.startsWith(g)));
-      } catch {
-        return false;
-      }
-    };
-
-    const initialHarmonyFormat =
-      storedHarmonyFormatRaw == null
-        ? isHarmonyPreferred(storedTransformerModel, storedApiModel)
-        : storedHarmonyFormat;
+    const initialHarmonyFormat = resolveHarmonyFormat(
+      storedHarmonyFormatMode,
+      storedTransformerModel,
+      storedApiModel,
+    );
 
     const initialHistory = buildHistoryFromConversation(
       storedConversationSnapshot.messages,
@@ -319,7 +351,7 @@ const GlobalProvider = ({ children }) => {
       transformerModel: storedTransformerModel,
       staticModel: storedStaticModel,
       harmonyFormat: initialHarmonyFormat,
-      harmonyTouched: storedHarmonyTouched,
+      harmonyFormatMode: storedHarmonyFormatMode,
       serverUrl: storedServerUrl,
       sttModel: storedSttModel,
       ttsModel: storedTtsModel,
@@ -357,9 +389,14 @@ const GlobalProvider = ({ children }) => {
       requestTimeoutSec: storedRequestTimeoutSec ?? 30,
       streamIdleTimeoutSec: storedStreamIdleTimeoutSec ?? 120,
       thinkingMode: storedThinkingMode,
+      textRagEnabled: storedTextRagEnabled,
+      visionRagEnabled: storedVisionRagEnabled,
+      ragEmbeddingModel: storedRagEmbeddingModel,
+      ragClipModel: storedRagClipModel,
       toolDisplayMode: storedToolDisplayMode,
       toolLinkBehavior: storedToolLinkBehavior,
       customThemes: storedCustomThemes,
+      runtimeSelectionTouchedAt: null,
     };
   });
   const [userSettingsLoaded, setUserSettingsLoaded] = useState(false);
@@ -549,6 +586,14 @@ const GlobalProvider = ({ children }) => {
           )
             ? data.local_model_registrations
             : prev.registeredLocalModels;
+          const nextRagEmbeddingModel =
+            typeof data.rag_embedding_model === "string" && data.rag_embedding_model.trim()
+              ? data.rag_embedding_model.trim()
+              : prev.ragEmbeddingModel;
+          const nextRagClipModel =
+            typeof data.rag_clip_model === "string" && data.rag_clip_model.trim()
+              ? data.rag_clip_model.trim()
+              : prev.ragClipModel;
           lastUserSettingsRef.current = {
             approvalLevel: nextApproval,
             theme: nextTheme,
@@ -564,6 +609,8 @@ const GlobalProvider = ({ children }) => {
             captureAllowSummaryFallback: nextCaptureAllowSummaryFallback,
             enabledWorkflowModules: nextEnabledWorkflowModules,
             userTimezone: nextUserTimezone,
+            ragEmbeddingModel: nextRagEmbeddingModel,
+            ragClipModel: nextRagClipModel,
           };
           return {
             ...prev,
@@ -585,6 +632,8 @@ const GlobalProvider = ({ children }) => {
             enabledWorkflowModules: nextEnabledWorkflowModules,
             userTimezone: nextUserTimezone,
             registeredLocalModels: nextRegisteredLocalModels,
+            ragEmbeddingModel: nextRagEmbeddingModel,
+            ragClipModel: nextRagClipModel,
           };
         });
         setUserSettingsLoaded(true);
@@ -726,41 +775,21 @@ const GlobalProvider = ({ children }) => {
     localStorage.setItem("transformerModel", state.transformerModel);
   }, [state.transformerModel]);
 
-  // Auto-default Harmony when model changes, unless user explicitly toggled
+  // Derive the compatibility boolean from the backend tri-state mode.
   useEffect(() => {
-    const isHarmonyPreferred = (...models) => {
-      try {
-        const generic = [
-          "gpt-4o",
-          "gpt-4.1",
-          "gpt-5-mini",
-          "gpt-5",
-          "gpt-5.1",
-          "gpt-5.2",
-          "gpt-5.4",
-        ];
-        return models
-          .filter(Boolean)
-          .map((model) => String(model).toLowerCase())
-          .some((m) => isGptOssModel(m) || generic.some((g) => m.startsWith(g)));
-      } catch {
-        return false;
-      }
-    };
-    if (!state.harmonyTouched) {
-      const preferred = isHarmonyPreferred(
-        state.transformerModel,
-        state.apiModel,
-      );
-      if (preferred !== state.harmonyFormat) {
-        setState((prev) => ({ ...prev, harmonyFormat: preferred }));
-      }
+    const nextHarmonyFormat = resolveHarmonyFormat(
+      state.harmonyFormatMode,
+      state.transformerModel,
+      state.apiModel,
+    );
+    if (nextHarmonyFormat !== state.harmonyFormat) {
+      setState((prev) => ({ ...prev, harmonyFormat: nextHarmonyFormat }));
     }
   }, [
+    state.harmonyFormatMode,
     state.transformerModel,
     state.apiModel,
     state.harmonyFormat,
-    state.harmonyTouched,
   ]);
 
   useEffect(() => {
@@ -772,8 +801,12 @@ const GlobalProvider = ({ children }) => {
   }, [state.harmonyFormat]);
 
   useEffect(() => {
-    localStorage.setItem("harmonyTouched", String(state.harmonyTouched));
-  }, [state.harmonyTouched]);
+    localStorage.setItem(
+      "harmonyFormatMode",
+      normalizeHarmonyFormatMode(state.harmonyFormatMode),
+    );
+    localStorage.removeItem("harmonyTouched");
+  }, [state.harmonyFormatMode]);
 
   useEffect(() => {
     localStorage.setItem("serverUrl", state.serverUrl);
@@ -903,6 +936,25 @@ const GlobalProvider = ({ children }) => {
   useEffect(() => {
     localStorage.setItem("thinkingMode", String(state.thinkingMode || "auto"));
   }, [state.thinkingMode]);
+
+  useEffect(() => {
+    localStorage.setItem("textRagEnabled", String(state.textRagEnabled !== false));
+  }, [state.textRagEnabled]);
+
+  useEffect(() => {
+    localStorage.setItem("visionRagEnabled", String(state.visionRagEnabled !== false));
+  }, [state.visionRagEnabled]);
+
+  useEffect(() => {
+    localStorage.setItem(
+      "ragEmbeddingModel",
+      String(state.ragEmbeddingModel || "local:all-MiniLM-L6-v2"),
+    );
+  }, [state.ragEmbeddingModel]);
+
+  useEffect(() => {
+    localStorage.setItem("ragClipModel", String(state.ragClipModel || "ViT-B-32"));
+  }, [state.ragClipModel]);
 
   useEffect(() => {
     if (state.wsLastEventAt != null) {
@@ -1066,6 +1118,24 @@ const GlobalProvider = ({ children }) => {
           const runtimeSelection = applyBackendRuntimeSelection(prev, data);
           if (runtimeSelection !== prev) {
             Object.assign(next, runtimeSelection);
+            changed = true;
+          }
+          const incomingHarmonyMode = normalizeHarmonyFormatMode(
+            data.harmony_format_mode ??
+              (typeof data.harmony_format === "boolean"
+                ? data.harmony_format
+                  ? "enabled"
+                  : "disabled"
+                : prev.harmonyFormatMode),
+            prev.harmonyFormatMode,
+          );
+          if (incomingHarmonyMode !== prev.harmonyFormatMode) {
+            next.harmonyFormatMode = incomingHarmonyMode;
+            next.harmonyFormat = resolveHarmonyFormat(
+              incomingHarmonyMode,
+              next.transformerModel,
+              next.apiModel,
+            );
             changed = true;
           }
           if (typeof data.dev_mode !== "undefined" && Boolean(data.dev_mode) !== prev.devMode) {

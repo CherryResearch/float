@@ -25,6 +25,8 @@ const syncMocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../../utils/proxy", () => ({
+  debugLog: vi.fn(),
+  getConversationMessageLimit: vi.fn(() => 400),
   memoryStore: {},
   apiWrapper: {
     chat: proxyMocks.chat,
@@ -98,6 +100,7 @@ const renderChat = (stateOverrides = {}) => {
 describe("Chat vision integration", () => {
   afterEach(() => {
     cleanup();
+    sessionStorage.clear();
     if (originalXMLHttpRequest) {
       globalThis.XMLHttpRequest = originalXMLHttpRequest;
       originalXMLHttpRequest = undefined;
@@ -151,6 +154,7 @@ describe("Chat vision integration", () => {
     });
 
     xhrRequests.length = 0;
+    sessionStorage.clear();
     proxyMocks.chat.mockReset();
     syncMocks.ensureDeviceAndToken.mockReset();
 
@@ -306,7 +310,7 @@ describe("Chat vision integration", () => {
       proxyMocks.chat.mock.calls[0]?.[0] ||
       (typeof chatRequest?.body === "string" ? JSON.parse(chatRequest.body) : chatRequest?.body);
     expect(payload.vision_workflow).toBe("caption");
-    expect(payload.message).toBe("Describe the attached image.");
+    expect(payload.message).toBe("");
     expect(payload.attachments).toHaveLength(1);
     expect(payload.attachments[0].origin).toBe("upload");
     expect(payload.attachments[0].relative_path).toBe(
@@ -317,6 +321,48 @@ describe("Chat vision integration", () => {
     );
     expect(screen.queryByText("sample.png")).not.toBeInTheDocument();
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:preview");
+  });
+
+  it("restores an uploaded attachment draft after the chat view unmounts", async () => {
+    const view = renderChat();
+    const fileInput = document.body.querySelector('input[type="file"]');
+
+    fireEvent.change(fileInput, {
+      target: {
+        files: [new File(["upload-bytes"], "sample.png", { type: "image/png" })],
+      },
+    });
+
+    await waitFor(() =>
+      expect(
+        xhrRequests.some((request) => request.url === "/api/attachments/upload"),
+      ).toBe(true),
+    );
+    view.unmount();
+
+    await waitFor(() => {
+      const stored = Array.from({ length: sessionStorage.length }, (_, index) =>
+        sessionStorage.getItem(sessionStorage.key(index)),
+      ).join("\n");
+      expect(stored).toContain("sample.png");
+      expect(stored).toContain("/api/attachments/upload-hash/sample.png");
+    });
+
+    renderChat();
+    expect(await screen.findByText("sample.png")).toBeInTheDocument();
+    expect(screen.getByLabelText("Vision mode")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /send message/i }));
+
+    await waitFor(() => expect(proxyMocks.chat).toHaveBeenCalled());
+    const payload = proxyMocks.chat.mock.calls[0][0];
+    expect(payload.attachments).toHaveLength(1);
+    expect(payload.attachments[0].url).toContain(
+      "/api/attachments/upload-hash/sample.png",
+    );
+    expect(payload.attachments[0].relative_path).toBe(
+      "uploads/upload-hash/sample.png",
+    );
   });
 
   it("captures a camera frame and uploads it as a captured attachment", async () => {

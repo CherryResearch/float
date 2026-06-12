@@ -104,6 +104,8 @@ Important caption rule from the 2026-04-12 sync consolidation: imported/manual i
 - Tool schemas come from `backend/app/tool_specs.py`.
 - Capability metadata comes from `backend/app/tool_catalog.py`.
 - The Agent Console hydrates from `/api/agents/console` and streams live state from `/api/stream/thoughts`.
+- The bounded autonomy supervisor wraps reflection scheduler ticks with a durable heartbeat, dry-run planning, attention-ranked candidates, and an opt-in loop controlled by `FLOAT_BACKGROUND_AUTONOMY_ENABLED` plus Settings background controls. Modes are `manual`, `basic`, `overnight`, `extended`, and `always_on`; overnight defaults to a 30 minute runtime budget, basic defaults to two five-minute checks, and extended mode can stop when the satisfaction threshold is met. `FLOAT_BACKGROUND_AUTONOMY_SANDBOX_PROCESSES` records whether background/subagent work should prefer container or execution-session isolation when a sandbox backend is available.
+- Live container orchestration/API background-response checks live in `backend/app/tests/integration/test_autonomy_container_orchestration.py` and are skipped unless `FLOAT_RUN_AUTONOMY_INTEGRATION_TESTS=1` is set. Use `scripts/run_autonomy_integration_tests.ps1` to run that suite separately from normal Poetry test passes.
 - Browser-first computer-use sessions and guarded Windows desktop sessions are exposed through the shared tool/API surface and keep screenshots/captures in managed storage.
 
 ## Sync And Workspace Flow

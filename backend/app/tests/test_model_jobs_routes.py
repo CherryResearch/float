@@ -133,6 +133,30 @@ def test_model_info_reports_gemma4_metadata(tmp_path, monkeypatch):
     assert payload["supports_images"] is True
 
 
+def test_model_info_reports_gemma4_qat_metadata(tmp_path, monkeypatch):
+    backend_dir = Path(__file__).resolve().parents[2]
+    if str(backend_dir) not in sys.path:
+        sys.path.insert(0, str(backend_dir))
+
+    from app import routes
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda token=None: _DummyInfoApi())
+
+    app = FastAPI()
+    app.include_router(routes.router, prefix="/api")
+    app.state.config = {"models_folder": str(tmp_path / "models")}
+    client = TestClient(app)
+
+    resp = client.get("/api/models/info/gemma-4-12B-it-qat-q4_0")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["repo_id"] == "google/gemma-4-12B-it-qat-q4_0-unquantized"
+    assert payload["downloadable"] is True
+    assert payload["lane"] == "local"
+    assert payload["local_loader"] == "image_text_to_text"
+    assert payload["supports_images"] is True
+
+
 def test_downloadable_models_include_provider_first_gemma4(tmp_path):
     backend_dir = Path(__file__).resolve().parents[2]
     if str(backend_dir) not in sys.path:
@@ -148,6 +172,8 @@ def test_downloadable_models_include_provider_first_gemma4(tmp_path):
     resp = client.get("/api/models/downloadable")
     assert resp.status_code == 200
     assert "gemma-4-E4B-it" in resp.json()["models"]
+    assert "gemma-4-12B-it-qat-q4_0" in resp.json()["models"]
+    assert "gemma-4-12B-it-qat-q4_0-gguf" in resp.json()["models"]
 
 
 def test_create_model_job_accepts_downloadable_provider_first_gemma4(
@@ -172,3 +198,35 @@ def test_create_model_job_accepts_downloadable_provider_first_gemma4(
     payload = resp.json()["job"]
     assert payload["model"] == "gemma-4-E4B-it"
     assert payload["repo_id"] == "google/gemma-4-E4B-it"
+
+
+def test_create_model_job_accepts_gemma4_qat_gguf(tmp_path, monkeypatch):
+    backend_dir = Path(__file__).resolve().parents[2]
+    if str(backend_dir) not in sys.path:
+        sys.path.insert(0, str(backend_dir))
+
+    from app import routes
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda token=None: _DummyInfoApi())
+    monkeypatch.setattr(routes, "_start_download_process", lambda *args: _DummyProc())
+
+    app = FastAPI()
+    app.include_router(routes.router, prefix="/api")
+    app.state.config = {"models_folder": str(tmp_path / "models")}
+    client = TestClient(app)
+
+    resp = client.post(
+        "/api/models/jobs",
+        json={"model": "gemma-4-12B-it-qat-q4_0-gguf"},
+    )
+    assert resp.status_code == 200
+    payload = resp.json()["job"]
+    assert payload["model"] == "gemma-4-12B-it-qat-q4_0-gguf"
+    assert payload["repo_id"] == "google/gemma-4-12B-it-qat-q4_0-gguf"
+    assert payload["allow_patterns"] == [
+        ".gitattributes",
+        "LICENSE",
+        "README.md",
+        "gemma-4-12b-it-qat-q4_0.gguf",
+        "mmproj-gemma-4-12b-it-qat-q4_0.gguf",
+    ]

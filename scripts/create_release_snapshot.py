@@ -33,12 +33,13 @@ INCLUDE_PATHS = [
     "docs/environment setup.md",
     "docs/feature_overviews",
     "docs/open_source_licenses.md",
-    "docs/resources/floatlogo.png",
+    "docs/resources",
     "docs/ui-snapshot-2026-04-12.png",
     "frontend",
     "jwt.py",
     "main.py",
     "makefile",
+    "modules",
     "package-lock.json",
     "package.json",
     "poetry.lock",
@@ -93,9 +94,7 @@ EXCLUDED_PREFIXES = (
     "user_settings.json",
 )
 
-EXCLUDED_GLOBS = (
-    "scripts/*_eval.py",
-)
+EXCLUDED_GLOBS = ("scripts/*_eval.py",)
 
 TEXT_SUFFIXES = {
     ".css",

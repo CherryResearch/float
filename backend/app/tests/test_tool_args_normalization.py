@@ -106,7 +106,12 @@ def test_tool_help_full_detail_alias_is_canonicalized():
 
     args = normalize_tool_args(
         "tool_help",
-        {"tool_name": "write_file", "detail": "full", "include_schema": "true", "max_tools": "1"},
+        {
+            "tool_name": "write_file",
+            "detail": "full",
+            "include_schema": "true",
+            "max_tools": "1",
+        },
     )
     assert args["tool_name"] == "write_file"
     assert args["detail"] == "rich"
@@ -165,6 +170,16 @@ def test_remember_and_write_file_accept_common_text_aliases():
     assert write_args["path"] == "notes/food.txt"
     assert write_args["content"] == "Food diary entry"
     assert "text" not in write_args
+
+
+def test_recall_accepts_search_query_alias():
+    from app.utils.tool_args import normalize_tool_args
+
+    args = normalize_tool_args("recall", {"query": "temporary eval marker"})
+
+    assert args["key"] == "temporary eval marker"
+    assert args["mode"] == "hybrid"
+    assert "query" not in args
 
 
 def test_list_dir_defaults_are_applied():
@@ -232,6 +247,22 @@ def test_tool_info_accepts_single_tools_alias():
     assert args["include_schema"] is True
 
 
+def test_create_task_accepts_natural_language_when_union_type():
+    from app.utils.tool_args import normalize_tool_args
+
+    args = normalize_tool_args(
+        "create_task",
+        {
+            "title": "Check the build",
+            "when": "tomorrow at 9",
+            "timezone": "America/Vancouver",
+        },
+    )
+
+    assert args["when"] == "tomorrow at 9"
+    assert args["timezone"] == "America/Vancouver"
+
+
 def test_routes_normalize_camera_alias():
     from app.routes import _normalize_tool_name
 
@@ -239,8 +270,39 @@ def test_routes_normalize_camera_alias():
     assert _normalize_tool_name(" camera.capture ") == "camera.capture"
 
 
+def test_routes_normalize_common_tool_name_aliases():
+    from app.routes import _normalize_tool_name
+
+    assert _normalize_tool_name("memory.search") == "recall"
+    assert _normalize_tool_name("memory.store") == "remember"
+    assert _normalize_tool_name("browser.open") == "computer.navigate"
+    assert _normalize_tool_name("patch") == "patch.apply"
+    assert _normalize_tool_name("writefile") == "write_file"
+
+
 def test_routes_suggest_memory_read_compatibility_names():
     from app.routes import _suggest_tool_names
 
     suggestions = _suggest_tool_names("memory.read")
     assert suggestions[:3] == ["recall", "remember", "memory.save"]
+
+
+def test_chat_context_schema_converts_to_service_context():
+    from app.models import Message, ModelContext
+    from app.routes import _context_schema_to_service_context
+
+    context = ModelContext(
+        system_prompt="eval prompt",
+        messages=[Message(role="user", content="hello", metadata={"source": "test"})],
+        metadata={"eval": True},
+    )
+
+    service_context = _context_schema_to_service_context(context)
+
+    assert service_context.system_prompt == "eval prompt"
+    assert service_context.messages == [
+        {"role": "user", "content": "hello", "metadata": {"source": "test"}}
+    ]
+    assert service_context.metadata == {"eval": True}
+    service_context.add_message("assistant", "ok")
+    assert service_context.messages[-1]["content"] == "ok"

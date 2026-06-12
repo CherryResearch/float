@@ -10,7 +10,12 @@ import BrowserSessionDialog from "./BrowserSessionDialog";
 import RagContextPanel, { normalizeRagMatches } from "./RagContextPanel";
 import axios from "axios";
 import { Room, RoomEvent } from "livekit-client";
-import { debugLog, memoryStore, apiWrapper } from "../utils/proxy";
+import {
+  debugLog,
+  getConversationMessageLimit,
+  memoryStore,
+  apiWrapper,
+} from "../utils/proxy";
 import { ensureDeviceAndToken } from "../utils/sync";
 import { GlobalContext } from "../main";
 import DOMPurify from "dompurify";
@@ -42,8 +47,11 @@ import TuneIcon from "@mui/icons-material/Tune";
 import KeyboardArrowRightIcon from "@mui/icons-material/KeyboardArrowRight";
 import { normalizeToolDisplayMode } from "../utils/toolDisplayModes";
 import {
+  acquireToolContinuationLock,
+  buildToolContinuationLockKey,
   buildToolContinuationSignature,
   hasMatchingToolContinuationSignature,
+  releaseToolContinuationLock,
   stableValue,
 } from "../utils/toolContinuations";
 import {
@@ -53,8 +61,10 @@ import {
   toolReviewScopeSelectors,
 } from "../utils/toolReviewActions";
 import {
+  appendToolContinuationPhase,
   isContinuationPlaceholderText,
   mergeContinuationText,
+  normalizeToolContinuationPhases,
   stripInlineToolPlaceholders,
 } from "../utils/continuationText";
 import {
@@ -79,6 +89,7 @@ const EMPTY_GLOBAL_STATE = Object.freeze({
   conversation: [],
   history: [],
 });
+const EMPTY_CONVERSATION = Object.freeze([]);
 const NOOP_SET_STATE = () => {};
 const TOOL_PLACEHOLDER_RE = /\[\[tool_call:(\d+)\]\]/g;
 const VISION_WORKFLOW_OPTIONS = [
@@ -117,10 +128,82 @@ const TOOL_DIRECTIVE_TOKEN_RE = /(^|[\s\n])%([a-z0-9._-]+)(?=$|[\s\n.,;:!?])/gi;
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 const LIVE_TOOL_PANEL_OFFSETS = {
   camera: 0,
-  mic: 44,
+  microphone: 44,
   volume: 88,
   thinking: 132,
+  workflow: 176,
 };
+const RAG_TOOLTIP_TEXT =
+  "Memory: automatic Retrieval Augmented Generation to find similar memories.";
+const RAG_TEXT_MODEL_OPTIONS = [
+  { value: "simple", label: "Hash fallback", lane: "local" },
+  { value: "local:all-MiniLM-L6-v2", label: "all-MiniLM-L6-v2", lane: "local" },
+  {
+    value: "local:google/embeddinggemma-300M",
+    label: "EmbeddingGemma 300M",
+    lane: "local",
+  },
+  { value: "api:text-embedding-3-small", label: "text-embedding-3-small", lane: "api" },
+  { value: "api:text-embedding-3-large", label: "text-embedding-3-large", lane: "api" },
+];
+const RAG_VISION_MODEL_OPTIONS = [
+  { value: "ViT-B-32", label: "OpenCLIP ViT-B-32", lane: "local" },
+  { value: "ViT-B-16", label: "OpenCLIP ViT-B-16", lane: "local" },
+  { value: "ViT-L-14", label: "OpenCLIP ViT-L-14", lane: "local" },
+];
+const AUDIO_STT_MODEL_OPTIONS = [
+  { value: "gpt-realtime-whisper", label: "gpt-realtime-whisper", lane: "api" },
+  { value: "whisper-1", label: "whisper-1", lane: "api" },
+  { value: "gpt-4o-mini-transcribe", label: "gpt-4o-mini-transcribe", lane: "api" },
+  { value: "gpt-4o-transcribe", label: "gpt-4o-transcribe", lane: "api" },
+  { value: "whisper-large-v3-turbo", label: "whisper-large-v3-turbo", lane: "local" },
+  { value: "whisper-small", label: "whisper-small", lane: "local" },
+];
+const AUDIO_TTS_MODEL_OPTIONS = [
+  { value: "tts-1", label: "tts-1", lane: "api" },
+  { value: "tts-1-hd", label: "tts-1-hd", lane: "api" },
+  { value: "gpt-4o-mini-tts", label: "gpt-4o-mini-tts", lane: "api" },
+  {
+    value: "gpt-4o-mini-tts-2025-12-15",
+    label: "gpt-4o-mini-tts-2025-12-15",
+    lane: "api",
+  },
+  { value: "kokoro", label: "kokoro", lane: "local" },
+  { value: "kitten", label: "kitten", lane: "local" },
+];
+const OPENAI_TTS_VOICE_OPTIONS = [
+  "alloy",
+  "ash",
+  "ballad",
+  "coral",
+  "echo",
+  "fable",
+  "nova",
+  "onyx",
+  "sage",
+  "shimmer",
+  "verse",
+];
+const OPENAI_LEGACY_TTS_VOICE_OPTIONS = [
+  "alloy",
+  "echo",
+  "fable",
+  "onyx",
+  "nova",
+  "shimmer",
+];
+const KITTEN_TTS_VOICE_OPTIONS = [
+  "expr-voice-2-f",
+  "expr-voice-3-f",
+  "expr-voice-4-f",
+  "expr-voice-5-f",
+  "expr-voice-2-m",
+  "expr-voice-3-m",
+  "expr-voice-4-m",
+  "expr-voice-5-m",
+];
+const KOKORO_TTS_VOICE_OPTIONS = ["af_heart", "af_bella", "af_nova", "bf_emma"];
+const REALTIME_TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
 const LIVE_SESSION_CANCELLED_CODE = "LIVE_SESSION_CANCELLED";
 const RESPONSE_FAILURE_METADATA_KEYS = [
   "error",
@@ -149,6 +232,63 @@ const isLiveSessionCancelledError = (error) =>
   error &&
   (error.code === LIVE_SESSION_CANCELLED_CODE ||
     error.message === "Live streaming start was cancelled.");
+
+const inferAudioModelLane = (model, fallback = "local") => {
+  const normalized = String(model || "").trim().toLowerCase();
+  if (!normalized) return fallback;
+  if (
+    normalized.startsWith("api:") ||
+    normalized === "whisper-1" ||
+    normalized === "gpt-realtime-whisper" ||
+    normalized.startsWith("tts-") ||
+    normalized.startsWith("gpt-4o") ||
+    normalized.includes("transcribe")
+  ) {
+    return "api";
+  }
+  return "local";
+};
+
+const optionLabelWithLane = (option) =>
+  `${option.label || option.value} (${option.lane === "api" ? "API" : "Local"})`;
+
+const voiceOptionsForTtsModel = (modelValue) => {
+  const normalized = String(modelValue || "").trim().toLowerCase();
+  if (normalized === "tts-1" || normalized === "tts-1-hd") {
+    return OPENAI_LEGACY_TTS_VOICE_OPTIONS;
+  }
+  if (normalized.startsWith("gpt-4o") && normalized.includes("tts")) {
+    return OPENAI_TTS_VOICE_OPTIONS;
+  }
+  if (normalized.includes("kitten")) return KITTEN_TTS_VOICE_OPTIONS;
+  if (normalized.includes("kokoro")) return KOKORO_TTS_VOICE_OPTIONS;
+  return [
+    ...OPENAI_TTS_VOICE_OPTIONS,
+    ...KITTEN_TTS_VOICE_OPTIONS,
+    ...KOKORO_TTS_VOICE_OPTIONS,
+  ];
+};
+
+const defaultVoiceForTtsModel = (modelValue, currentVoice = "") => {
+  const options = voiceOptionsForTtsModel(modelValue);
+  const selected = String(currentVoice || "").trim();
+  return selected && options.includes(selected) ? selected : options[0] || selected;
+};
+
+const realtimeToolApiName = (name, usedNames = new Set()) => {
+  const raw = String(name || "").trim();
+  let base = raw.replace(/[^a-zA-Z0-9_-]+/g, "_").replace(/_+/g, "_");
+  base = base.replace(/^_+|_+$/g, "");
+  if (!base) base = "tool";
+  let candidate = base;
+  let suffix = 2;
+  while (!REALTIME_TOOL_NAME_PATTERN.test(candidate) || usedNames.has(candidate)) {
+    candidate = `${base}_${suffix}`;
+    suffix += 1;
+  }
+  usedNames.add(candidate);
+  return candidate;
+};
 
 const normalizeRealtimeToolSchema = (schema) => {
   if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
@@ -222,6 +362,58 @@ const formatMessageTimestampTitle = (timestamp) => {
     ? date.toLocaleString([], { dateStyle: "medium", timeStyle: "short" })
     : "";
 };
+
+const MermaidBlock = React.memo(({ code }) => {
+  const containerRef = React.useRef(null);
+  const idRef = React.useRef(
+    `merm-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`,
+  );
+
+  React.useEffect(() => {
+    let cancelled = false;
+    const container = containerRef.current;
+    if (!container || !window.mermaid || typeof window.mermaid.render !== "function") {
+      if (container) container.textContent = code;
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    container.textContent = "";
+    try {
+      const result = window.mermaid.render(idRef.current, code, (svg) => {
+        if (!cancelled && containerRef.current) {
+          containerRef.current.innerHTML = svg;
+        }
+      });
+      if (result && typeof result.then === "function") {
+        result
+          .then((rendered) => {
+            if (!cancelled && containerRef.current) {
+              containerRef.current.innerHTML = rendered?.svg || "";
+            }
+          })
+          .catch((err) => {
+            console.error("Mermaid render error", err);
+            if (!cancelled && containerRef.current) {
+              containerRef.current.textContent = code;
+            }
+          });
+      }
+    } catch (err) {
+      console.error("Mermaid render error", err);
+      container.textContent = code;
+    }
+
+    return () => {
+      cancelled = true;
+    };
+  }, [code]);
+
+  return <div ref={containerRef} />;
+});
+
+MermaidBlock.displayName = "MermaidBlock";
 
 const getRequestErrorDetail = (error, fallback = "Request failed") => {
   const data = error?.response?.data;
@@ -594,12 +786,14 @@ const LIVE_STREAM_INPUT_TRANSCRIPT_DONE_TYPES = new Set([
 const LIVE_STREAM_ASSISTANT_TRANSCRIPT_DELTA_TYPES = new Set([
   "response.audio_transcript.delta",
   "response.output_audio_transcript.delta",
+  "response.output_text.delta",
   "response.text.delta",
 ]);
 
 const LIVE_STREAM_ASSISTANT_TRANSCRIPT_DONE_TYPES = new Set([
   "response.audio_transcript.done",
   "response.output_audio_transcript.done",
+  "response.output_text.done",
   "response.text.done",
 ]);
 
@@ -646,6 +840,180 @@ const createClientMessageId = (prefix = "msg") => {
     return `${prefix}-${crypto.randomUUID()}`;
   }
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+};
+
+const COMPOSER_DRAFT_STORAGE_PREFIX = "float:chat-composer-draft:v1:";
+const MAX_STORED_COMPOSER_ATTACHMENTS = 12;
+
+const getComposerDraftStorage = () => {
+  try {
+    if (typeof window === "undefined" || !window.sessionStorage) return null;
+    return window.sessionStorage;
+  } catch (_) {
+    return null;
+  }
+};
+
+const getComposerDraftStorageKey = (sessionId) =>
+  `${COMPOSER_DRAFT_STORAGE_PREFIX}${String(sessionId || "default")}`;
+
+const normalizeStoredString = (value) =>
+  typeof value === "string" ? value.trim() : "";
+
+const isPersistableAttachmentUrl = (value) => {
+  const url = normalizeStoredString(value);
+  return Boolean(url) && !/^blob:/i.test(url) && !/^data:/i.test(url);
+};
+
+const normalizeVisionWorkflow = (value) => {
+  const normalized = normalizeStoredString(value) || "auto";
+  return VISION_WORKFLOW_OPTIONS.some((option) => option.value === normalized)
+    ? normalized
+    : "auto";
+};
+
+const draftAttachmentId = (attachment, index) => {
+  const raw =
+    attachment?.id ||
+    attachment?.contentHash ||
+    attachment?.content_hash ||
+    attachment?.remoteUrl ||
+    attachment?.url ||
+    attachment?.name ||
+    index;
+  const safe = String(raw || index)
+    .replace(/[^a-z0-9_-]+/gi, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+  return `attachment-draft-${safe || index}`;
+};
+
+export const serializeComposerDraftAttachments = (attachments = []) => {
+  if (!Array.isArray(attachments)) return [];
+  return attachments
+    .map((attachment, index) => {
+      if (!attachment || typeof attachment !== "object") return null;
+      const remoteUrl = isPersistableAttachmentUrl(attachment.remoteUrl)
+        ? normalizeStoredString(attachment.remoteUrl)
+        : isPersistableAttachmentUrl(attachment.url)
+          ? normalizeStoredString(attachment.url)
+          : "";
+      if (!remoteUrl) return null;
+      const name =
+        normalizeStoredString(attachment.file?.name) ||
+        normalizeStoredString(attachment.name) ||
+        "attachment";
+      const type =
+        normalizeStoredString(attachment.file?.type) ||
+        normalizeStoredString(attachment.type);
+      const size =
+        typeof attachment.file?.size === "number"
+          ? attachment.file.size
+          : typeof attachment.size === "number"
+            ? attachment.size
+            : null;
+      const contentHash =
+        normalizeStoredString(attachment.contentHash) ||
+        normalizeStoredString(attachment.content_hash);
+      return {
+        id: draftAttachmentId(attachment, index),
+        name,
+        type,
+        size,
+        url: remoteUrl,
+        remoteUrl,
+        contentHash: contentHash || null,
+        content_hash: contentHash || null,
+        origin: normalizeStoredString(attachment.origin) || null,
+        relative_path:
+          normalizeStoredString(attachment.relative_path) ||
+          normalizeStoredString(attachment.relativePath) ||
+          null,
+        capture_source:
+          normalizeStoredString(attachment.capture_source) ||
+          normalizeStoredString(attachment.captureSource) ||
+          null,
+        capture_id:
+          normalizeStoredString(attachment.capture_id) ||
+          normalizeStoredString(attachment.captureId) ||
+          null,
+        transient: attachment.transient === true,
+        expires_at: normalizeStoredString(attachment.expires_at) || null,
+        caption_status: normalizeStoredString(attachment.caption_status) || null,
+        index_status: normalizeStoredString(attachment.index_status) || null,
+        placeholder_caption:
+          typeof attachment.placeholder_caption === "boolean"
+            ? attachment.placeholder_caption
+            : null,
+        uploading: false,
+      };
+    })
+    .filter(Boolean)
+    .slice(0, MAX_STORED_COMPOSER_ATTACHMENTS);
+};
+
+const readStoredComposerDraft = (sessionId) => {
+  const storage = getComposerDraftStorage();
+  if (!storage) return { message: "", attachments: [], visionWorkflow: "auto" };
+  try {
+    const raw = storage.getItem(getComposerDraftStorageKey(sessionId));
+    if (!raw) return { message: "", attachments: [], visionWorkflow: "auto" };
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") {
+      return { message: "", attachments: [], visionWorkflow: "auto" };
+    }
+    return {
+      message: typeof parsed.message === "string" ? parsed.message : "",
+      attachments: serializeComposerDraftAttachments(parsed.attachments),
+      visionWorkflow: normalizeVisionWorkflow(parsed.visionWorkflow),
+    };
+  } catch (_) {
+    return { message: "", attachments: [], visionWorkflow: "auto" };
+  }
+};
+
+const writeStoredComposerDraft = (sessionId, draft = {}) => {
+  const storage = getComposerDraftStorage();
+  if (!storage) return;
+  const message = typeof draft.message === "string" ? draft.message : "";
+  const attachments = serializeComposerDraftAttachments(draft.attachments);
+  const visionWorkflow = normalizeVisionWorkflow(draft.visionWorkflow);
+  const hasDraft = Boolean(message.trim()) || attachments.length > 0;
+  const key = getComposerDraftStorageKey(sessionId);
+  try {
+    if (!hasDraft) {
+      storage.removeItem(key);
+      return;
+    }
+    storage.setItem(
+      key,
+      JSON.stringify({
+        message,
+        attachments,
+        visionWorkflow,
+        updatedAt: new Date().toISOString(),
+      }),
+    );
+  } catch (_) {
+    // Storage quota/privacy failures should never block chat composition.
+  }
+};
+
+const mergeStoredComposerDraftAttachment = (sessionId, attachment) => {
+  const [serialized] = serializeComposerDraftAttachments([attachment]);
+  if (!serialized) return;
+  const draft = readStoredComposerDraft(sessionId);
+  const keyFor = (item) =>
+    item?.content_hash || item?.contentHash || item?.remoteUrl || item?.url || item?.name;
+  const nextKey = keyFor(serialized);
+  const attachments = (draft.attachments || []).filter(
+    (item) => keyFor(item) !== nextKey,
+  );
+  attachments.push(serialized);
+  writeStoredComposerDraft(sessionId, {
+    ...draft,
+    attachments,
+  });
 };
 
 const getLiveStreamingStatusLabel = (phase) => {
@@ -735,8 +1103,11 @@ const resolveTtsRoute = (modelValue, voiceValue, response = {}) => {
   const voice = String(response?.voice || voiceValue || DEFAULT_TTS_VOICE).trim();
   const provider = String(response?.provider || "").trim().toLowerCase();
   const modelLower = model.toLowerCase();
+  const isOpenAiTtsModel =
+    modelLower.startsWith("tts-") ||
+    (modelLower.startsWith("gpt-4o") && modelLower.includes("tts"));
   const route =
-    provider === "openai" || modelLower.startsWith("tts-")
+    provider === "openai" || isOpenAiTtsModel
       ? "API"
       : provider === "local" || model
         ? "Local"
@@ -1019,6 +1390,29 @@ const summarizeToolPayloadValue = (value, toolName) => {
     if (query) return `Search: "${query}"`;
   }
   if (normalized && typeof normalized === "object") {
+    if (normalized.error && Array.isArray(normalized.suggestions)) {
+      const suggestions = normalized.suggestions
+        .slice(0, 4)
+        .map((item) => String(item || "").trim())
+        .filter(Boolean)
+        .join(", ");
+      return suggestions
+        ? `${String(normalized.error).replace(/_/g, " ")}; suggestions: ${suggestions}`
+        : String(normalized.error).replace(/_/g, " ");
+    }
+    if (Array.isArray(normalized.suggestions) && normalized.suggestions.length) {
+      return `suggestions: ${normalized.suggestions
+        .slice(0, 4)
+        .map((item) => String(item || "").trim())
+        .filter(Boolean)
+        .join(", ")}`;
+    }
+    if (Array.isArray(normalized.matches)) {
+      const count = normalized.matches.length;
+      const first = normalized.matches.find((match) => match && typeof match === "object");
+      const snippet = first?.snippet || first?.source || first?.title || "";
+      return snippet ? `${count} match${count === 1 ? "" : "es"}: ${snippet}` : `${count} matches`;
+    }
     if (normalized.key) return `key: ${normalized.key}`;
     if (normalized.title) return `title: ${normalized.title}`;
     if (normalized.name) return String(normalized.name);
@@ -1520,6 +1914,60 @@ const getMessageRagMatches = (msg) => {
   return [];
 };
 
+const compactMetadataValue = (value, limit = 96) => {
+  if (value === null || typeof value === "undefined") return "";
+  let text = "";
+  if (typeof value === "string") {
+    text = value.trim();
+  } else if (typeof value === "number" || typeof value === "boolean") {
+    text = String(value);
+  } else if (Array.isArray(value)) {
+    text = value.map((item) => compactMetadataValue(item, 40)).filter(Boolean).join(", ");
+  } else if (typeof value === "object") {
+    try {
+      text = JSON.stringify(value);
+    } catch {
+      text = String(value);
+    }
+  }
+  if (!text) return "";
+  return text.length > limit ? `${text.slice(0, Math.max(0, limit - 3)).trim()}...` : text;
+};
+
+const buildMessageMetadataRows = (
+  msg,
+  { sourceLabel = "", toolCount = 0, ragCount = 0 } = {},
+) => {
+  if (!msg || typeof msg !== "object") return [];
+  const metadata = msg.metadata && typeof msg.metadata === "object" ? msg.metadata : {};
+  const workflow =
+    metadata.workflow && typeof metadata.workflow === "object"
+      ? metadata.workflow.name
+      : metadata.workflow;
+  const usage =
+    metadata.usage && typeof metadata.usage === "object"
+      ? [
+          metadata.usage.prompt_tokens ? `in ${metadata.usage.prompt_tokens}` : "",
+          metadata.usage.completion_tokens ? `out ${metadata.usage.completion_tokens}` : "",
+          metadata.usage.total_tokens ? `total ${metadata.usage.total_tokens}` : "",
+        ]
+          .filter(Boolean)
+          .join(" / ")
+      : "";
+  return [
+    { label: "Status", value: metadata.status },
+    { label: "Source", value: sourceLabel },
+    { label: "Mode", value: metadata.mode },
+    { label: "Model", value: metadata.model || metadata.model_received || metadata.model_requested },
+    { label: "Workflow", value: workflow },
+    { label: "Tools", value: toolCount ? `${toolCount}` : "" },
+    { label: "Context", value: ragCount ? `${ragCount}` : "" },
+    { label: "Response", value: compactMetadataValue(metadata.response_id, 42) },
+    { label: "Request", value: compactMetadataValue(metadata.request_id, 42) },
+    { label: "Usage", value: usage },
+  ].filter((row) => compactMetadataValue(row.value));
+};
+
 const Chat = ({
     thoughts = [],
     activeMessageId,
@@ -1537,19 +1985,33 @@ const Chat = ({
       ? globalContext.setState
       : NOOP_SET_STATE;
   const navigate = useNavigate();
-  const [message, setMessage] = useState("");
-  const [composerCursor, setComposerCursor] = useState(0);
+  const initialComposerDraftRef = useRef(undefined);
+  if (initialComposerDraftRef.current === undefined) {
+    initialComposerDraftRef.current = readStoredComposerDraft(state.sessionId);
+  }
+  const initialComposerDraft = initialComposerDraftRef.current || {};
+  const [message, setMessage] = useState(() => initialComposerDraft.message || "");
+  const [composerCursor, setComposerCursor] = useState(() =>
+    (initialComposerDraft.message || "").length,
+  );
   const [commandSuggestions, setCommandSuggestions] = useState([]);
   const [commandSuggestionsLoading, setCommandSuggestionsLoading] = useState(false);
   const [activeCommandSuggestionIndex, setActiveCommandSuggestionIndex] = useState(0);
   const [commandMenuStyle, setCommandMenuStyle] = useState(null);
   const [loading, setLoading] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [regeneratingMessageId, setRegeneratingMessageId] = useState(null);
   const [error, setError] = useState(null);
   const [banner, setBanner] = useState(null);
   // attachments: [{ id, file, url }]
-  const [attachments, setAttachments] = useState([]);
-  const [visionWorkflow, setVisionWorkflow] = useState("auto");
+  const [attachments, setAttachments] = useState(() =>
+    Array.isArray(initialComposerDraft.attachments)
+      ? initialComposerDraft.attachments
+      : [],
+  );
+  const [visionWorkflow, setVisionWorkflow] = useState(() =>
+    normalizeVisionWorkflow(initialComposerDraft.visionWorkflow),
+  );
   const [cameraOpen, setCameraOpen] = useState(false);
   const [cameraBusy, setCameraBusy] = useState(false);
   const [cameraError, setCameraError] = useState("");
@@ -1578,12 +2040,14 @@ const Chat = ({
   const voiceAudioContextRef = useRef(null);
   const voiceGainNodeRef = useRef(null);
   const realtimeToolStateRef = useRef({});
+  const realtimeToolNameMapRef = useRef({});
   const realtimePendingToolCallsRef = useRef(new Set());
   const realtimeConfiguredToolsRef = useRef(false);
   const chatSettingsMenuRef = useRef(null);
   const chatSettingsTriggerRef = useRef(null);
   const chatSettingsPopoverRef = useRef(null);
   const attachmentMenuRef = useRef(null);
+  const removedAttachmentIdsRef = useRef(new Set());
   const toolCatalogRef = useRef(null);
   const knowledgeDocsRef = useRef(null);
   const commandLookupRequestRef = useRef(0);
@@ -1595,6 +2059,7 @@ const Chat = ({
     type: "server_vad",
     interrupt_response: true,
   });
+  const realtimeTranscriptionModelRef = useRef("gpt-realtime-whisper");
   const micTestRef = useRef({
     rawStream: null,
     processedStream: null,
@@ -1653,21 +2118,38 @@ const Chat = ({
     route: null,
   });
   const ttsAudioRef = useRef(null);
+  const ttsRequestIdRef = useRef(0);
   const [collapsedTools, setCollapsedTools] = useState({});
   const [collapseAllTools, setCollapseAllTools] = useState(true);
   const thinkingMode = state.thinkingMode || "auto";
   const workflowProfile = state.workflowProfile || "default";
+  const textRagEnabled = state.textRagEnabled !== false;
+  const visionRagEnabled = state.visionRagEnabled !== false;
+  const ragEmbeddingModel = state.ragEmbeddingModel || "local:all-MiniLM-L6-v2";
+  const ragClipModel = state.ragClipModel || "ViT-B-32";
   const preferredMicDeviceId = String(state.preferredMicDeviceId || "");
   const preferredCameraDeviceId = String(state.preferredCameraDeviceId || "");
   const micInputGain = clamp(Number(state.micInputGain) || 1, 0.25, 2);
   const outputVolume = clamp(Number(state.outputVolume) || 1, 0, 1.5);
   const liveCameraDefaultEnabled = state.liveCameraDefaultEnabled === true;
+  const selectedSttModel = String(state.sttModel || "gpt-realtime-whisper").trim();
+  const selectedTtsModel = String(state.ttsModel || "tts-1").trim();
+  const selectedTtsVoice = String(state.voiceModel || "").trim();
+  const selectedTtsVoiceOptions = useMemo(
+    () => voiceOptionsForTtsModel(selectedTtsModel),
+    [selectedTtsModel],
+  );
   const configuredTtsRoute = useMemo(
     () => resolveTtsRoute(state.ttsModel, state.voiceModel),
     [state.ttsModel, state.voiceModel],
   );
   const thinkingPayload =
     thinkingMode === "auto" ? {} : { thinking: thinkingMode };
+  const ragPayload = {
+    use_rag: textRagEnabled || visionRagEnabled,
+    use_text_rag: textRagEnabled,
+    use_vision_rag: visionRagEnabled,
+  };
   const workflowPayload = {
     workflow: workflowProfile,
     modules: Array.isArray(state.enabledWorkflowModules)
@@ -1691,6 +2173,27 @@ const Chat = ({
       return { ...prev, thinkingMode: normalized };
     });
   }, [setState]);
+  const setRagEnabled = useCallback((field, enabled) => {
+    setState((prev) => {
+      const nextValue = Boolean(enabled);
+      if (prev[field] === nextValue) return prev;
+      return { ...prev, [field]: nextValue };
+    });
+  }, [setState]);
+  const setRagModel = useCallback((field, value) => {
+    const nextValue = String(value || "").trim();
+    const stateKey = field === "rag_clip_model" ? "ragClipModel" : "ragEmbeddingModel";
+    const fallback = field === "rag_clip_model" ? "ViT-B-32" : "local:all-MiniLM-L6-v2";
+    const normalizedValue = nextValue || fallback;
+    setState((prev) => {
+      if (prev[stateKey] === normalizedValue) return prev;
+      return { ...prev, [stateKey]: normalizedValue };
+    });
+    axios.post("/api/settings", { [field]: normalizedValue }).catch((err) => {
+      console.error("RAG model setting failed", err);
+      setError(getRequestErrorDetail(err, "RAG model setting failed."));
+    });
+  }, [setError, setState]);
   const setWorkflowProfile = useCallback((workflow) => {
     const normalized = ["default", "architect_planner", "mini_execution"].includes(
       workflow,
@@ -1702,6 +2205,10 @@ const Chat = ({
       return { ...prev, workflowProfile: normalized };
     });
   }, [setState]);
+  const openWorkflowSettings = useCallback(() => {
+    setChatSettingsOpen(false);
+    navigate("/settings#settings-workflows");
+  }, [navigate]);
   const placeComposerSelection = useCallback((nextText, nextCursor) => {
     const safeText = typeof nextText === "string" ? nextText : "";
     const safeCursor = clampCursor(nextCursor, safeText.length);
@@ -1967,6 +2474,7 @@ const Chat = ({
   const inputOffsetRef = useRef(null);
   const inputOffsetRafRef = useRef(null);
   const inputOffsetTimerRef = useRef(null);
+  const composerRailRafRef = useRef(null);
   const highlightChainId = hoverChainId || activeChainId;
   const toolDisplayMode = useMemo(
     () => normalizeToolDisplayMode(state.toolDisplayMode),
@@ -2004,6 +2512,19 @@ const Chat = ({
       if (!msg?.id) return false;
       if (activeMessageId && msg.id === activeMessageId) return true;
       if (highlightChainId && msg.id === highlightChainId) return true;
+      const metadata =
+        msg.metadata && typeof msg.metadata === "object" ? msg.metadata : {};
+      if (
+        toolDisplayMode === "auto" &&
+        msg.role === "ai" &&
+        Array.isArray(msg.tools) &&
+        msg.tools.length > 0 &&
+        (metadata.tool_continued ||
+          metadata.tool_response_pending ||
+          normalizeToolContinuationPhases(metadata).length > 0)
+      ) {
+        return true;
+      }
       return (
         toolDisplayMode === "auto" &&
         isStreaming &&
@@ -2930,18 +3451,37 @@ const Chat = ({
           params: { workflow: "live" },
         });
         const tools = Array.isArray(res?.data?.tools) ? res.data.tools : [];
+        const usedRealtimeToolNames = new Set();
+        const nextRealtimeToolNameMap = {};
         const liveTools = tools
           .filter((tool) => tool?.name && tool?.policy?.live_auto !== false)
-          .map((tool) => ({
-            type: "function",
-            name: tool.name,
-            description: tool.description,
-            parameters:
-              tool.parameters && typeof tool.parameters === "object"
-                ? normalizeRealtimeToolSchema(tool.parameters)
-                : { type: "object", properties: {} },
-          }));
+          .map((tool) => {
+            const canonicalName = String(tool.name || "").trim();
+            const apiName = realtimeToolApiName(canonicalName, usedRealtimeToolNames);
+            nextRealtimeToolNameMap[apiName] = canonicalName;
+            nextRealtimeToolNameMap[canonicalName] = canonicalName;
+            const descriptionParts = [];
+            if (tool.description) descriptionParts.push(String(tool.description));
+            if (apiName !== canonicalName) {
+              descriptionParts.push(`Float tool name: ${canonicalName}.`);
+            }
+            return {
+              type: "function",
+              name: apiName,
+              description: descriptionParts.join("\n"),
+              parameters:
+                tool.parameters && typeof tool.parameters === "object"
+                  ? normalizeRealtimeToolSchema(tool.parameters)
+                  : { type: "object", properties: {} },
+            };
+          });
+        realtimeToolNameMapRef.current = nextRealtimeToolNameMap;
         const turnDetection = realtimeTurnDetectionRef.current || {};
+        const transcriptionModel =
+          typeof realtimeTranscriptionModelRef.current === "string" &&
+          realtimeTranscriptionModelRef.current.trim()
+            ? realtimeTranscriptionModelRef.current.trim()
+            : "gpt-realtime-whisper";
         const sessionUpdate = {
           type: "realtime",
           audio: {
@@ -2950,6 +3490,9 @@ const Chat = ({
                 type: turnDetection.type || "server_vad",
                 create_response: false,
                 interrupt_response: turnDetection.interrupt_response !== false,
+              },
+              transcription: {
+                model: transcriptionModel,
               },
             },
           },
@@ -3100,6 +3643,8 @@ const Chat = ({
       const normalizedCallId = String(callId || "").trim();
       const normalizedName = String(name || "").trim();
       if (!normalizedCallId || !normalizedName) return;
+      const canonicalName =
+        realtimeToolNameMapRef.current[normalizedName] || normalizedName;
       const current = realtimeToolStateRef.current[normalizedCallId] || {};
       if (current.handled) return;
       let args = {};
@@ -3113,7 +3658,8 @@ const Chat = ({
       }
       realtimeToolStateRef.current[normalizedCallId] = {
         callId: normalizedCallId,
-        name: normalizedName,
+        name: canonicalName,
+        realtimeName: normalizedName,
         argumentsText: typeof argumentsText === "string" ? argumentsText : "",
         handled: true,
       };
@@ -3121,7 +3667,7 @@ const Chat = ({
       realtimeResponseLifecycleRef.current = createRealtimeResponseLifecycleState();
       await invokeRealtimeToolCall({
         callId: normalizedCallId,
-        name: normalizedName,
+        name: canonicalName,
         args,
       });
     },
@@ -3209,6 +3755,7 @@ const Chat = ({
   }, [toggleLiveScreenShare]);
 
   const stopTtsPlayback = useCallback(() => {
+    ttsRequestIdRef.current += 1;
     const audio = ttsAudioRef.current;
     if (audio) {
       try {
@@ -3266,6 +3813,7 @@ const Chat = ({
     }
     liveStreamStateRef.current = { sessionId: null, currentTurn: null, runtime: null };
     realtimeToolStateRef.current = {};
+    realtimeToolNameMapRef.current = {};
     realtimePendingToolCallsRef.current = new Set();
     realtimeToolSetupPromiseRef.current = null;
     realtimeConfiguredToolsRef.current = false;
@@ -3346,7 +3894,7 @@ const Chat = ({
       setLiveStreamingPhase("assistant-thinking");
       return;
     }
-    if (type === "conversation.item.created") {
+    if (type === "conversation.item.created" || type === "conversation.item.added") {
       const item = payload.item;
       if (item?.type === "message" && item.role === "user") {
         const itemId = String(item.id || payload.item_id || "").trim();
@@ -3426,7 +3974,7 @@ const Chat = ({
       }).catch(() => {});
       return;
     }
-    if (type === "response.output_item.done") {
+    if (type === "response.output_item.done" || type === "conversation.item.done") {
       const item = payload.item;
       if (item?.type === "function_call") {
         handleRealtimeFunctionCall({
@@ -3548,6 +4096,10 @@ const Chat = ({
       }
 
       const sessionTurnDetection = session?.session?.audio?.input?.turn_detection;
+      const sessionTranscriptionModel =
+        session?.session?.audio?.input?.transcription?.model ||
+        session?.runtime?.realtime_transcription_model ||
+        "gpt-realtime-whisper";
       realtimeTurnDetectionRef.current = {
         type:
           typeof sessionTurnDetection?.type === "string" &&
@@ -3556,6 +4108,10 @@ const Chat = ({
             : "server_vad",
         interrupt_response: sessionTurnDetection?.interrupt_response !== false,
       };
+      realtimeTranscriptionModelRef.current = String(
+        sessionTranscriptionModel || "gpt-realtime-whisper",
+      ).trim();
+      realtimeToolNameMapRef.current = {};
       realtimePendingToolCallsRef.current = new Set();
       realtimeResponseLifecycleRef.current = createRealtimeResponseLifecycleState();
 
@@ -3755,7 +4311,16 @@ const Chat = ({
         }
         return;
       }
+      if (
+        messageId &&
+        ttsActiveMessageId === messageId &&
+        ttsPlayback.status === "loading"
+      ) {
+        return;
+      }
       stopTtsPlayback();
+      const requestId = ttsRequestIdRef.current + 1;
+      ttsRequestIdRef.current = requestId;
       setTtsActiveMessageId(messageId);
       const requestedRoute = resolveTtsRoute(state.ttsModel, state.voiceModel);
       setTtsPlayback({
@@ -3777,6 +4342,9 @@ const Chat = ({
           payload.voice = state.voiceModel.trim();
         }
         const res = await axios.post("/api/voice/tts", payload);
+        if (ttsRequestIdRef.current !== requestId) {
+          return;
+        }
         const audioB64 = res?.data?.audio_b64;
         const contentType = res?.data?.content_type || "audio/wav";
         if (!audioB64) {
@@ -3836,12 +4404,25 @@ const Chat = ({
           stopTtsPlayback();
         };
         await audio.play();
+        if (ttsRequestIdRef.current !== requestId) {
+          try {
+            audio.pause();
+            audio.src = "";
+          } catch (_) {}
+          if (ttsAudioRef.current === audio) {
+            ttsAudioRef.current = null;
+          }
+          return;
+        }
         setTtsPlayback((prev) =>
           prev.messageId === messageId
             ? { ...prev, status: "playing", route: resolvedRoute }
             : prev,
         );
       } catch (err) {
+        if (ttsRequestIdRef.current !== requestId) {
+          return;
+        }
         console.error("TTS playback failed", err);
         setBanner({
           message: "TTS playback failed",
@@ -3854,7 +4435,14 @@ const Chat = ({
         stopTtsPlayback();
       }
     },
-    [outputVolume, state.ttsModel, state.voiceModel, stopTtsPlayback, ttsActiveMessageId],
+    [
+      outputVolume,
+      state.ttsModel,
+      state.voiceModel,
+      stopTtsPlayback,
+      ttsActiveMessageId,
+      ttsPlayback.status,
+    ],
   );
   const clearActiveRequest = useCallback(() => {
     if (activeRequestRef.current) {
@@ -3923,10 +4511,11 @@ const Chat = ({
     },
     [attachmentCount, baseTimeoutSec, historyLength, idleTimeoutSec, state.backendMode],
   );
-  const applyChatWindowWidth = useCallback((width) => {
+  const applyChatWindowWidth = useCallback((width, { persist = true } = {}) => {
     const root = typeof document !== "undefined" ? document.documentElement : null;
     if (!root) return;
     root.style.setProperty("--center-rail-width", `${width}px`);
+    if (!persist) return;
     try {
       localStorage.setItem(CHAT_WINDOW_STORAGE_KEY, String(width));
     } catch {}
@@ -3995,19 +4584,40 @@ const Chat = ({
       root.style.setProperty("cursor", "col-resize");
       document.body.style.cursor = "col-resize";
       document.body.style.userSelect = "none";
+      document.body.classList.add("is-layout-resizing");
       setIsChatWindowResizing(true);
+      let lastWidth = startWidth;
+      let frameId = null;
+
+      const flushWidth = (persist = false) => {
+        if (frameId !== null && typeof cancelAnimationFrame === "function") {
+          cancelAnimationFrame(frameId);
+          frameId = null;
+        }
+        applyChatWindowWidth(lastWidth, { persist });
+      };
 
       const onMove = (moveEvent) => {
         const delta = (moveEvent.clientX - startX) * 2;
-        const next = Math.min(maxWidth, Math.max(minWidth, Math.round(startWidth + delta)));
-        applyChatWindowWidth(next);
+        lastWidth = Math.min(maxWidth, Math.max(minWidth, Math.round(startWidth + delta)));
+        if (typeof requestAnimationFrame !== "function") {
+          applyChatWindowWidth(lastWidth, { persist: false });
+          return;
+        }
+        if (frameId !== null) return;
+        frameId = requestAnimationFrame(() => {
+          frameId = null;
+          applyChatWindowWidth(lastWidth, { persist: false });
+        });
       };
       const onUp = () => {
         window.removeEventListener("pointermove", onMove);
         window.removeEventListener("pointerup", onUp);
         window.removeEventListener("pointercancel", onUp);
+        flushWidth(true);
         document.body.style.cursor = "";
         document.body.style.userSelect = "";
+        document.body.classList.remove("is-layout-resizing");
         root.style.removeProperty("cursor");
         setIsChatWindowResizing(false);
       };
@@ -4470,8 +5080,56 @@ const Chat = ({
   }, [state.conversation, isAtBottom]);
 
   useEffect(() => {
+    if (typeof window === "undefined" || typeof document === "undefined") {
+      return undefined;
+    }
+    const root = document.documentElement;
+    const scheduleSync = () => {
+      if (composerRailRafRef.current !== null) return;
+      composerRailRafRef.current = window.requestAnimationFrame(() => {
+        composerRailRafRef.current = null;
+        const node = chatContainerRef.current;
+        if (!node || typeof node.getBoundingClientRect !== "function") {
+          root.style.removeProperty("--chat-composer-center");
+          root.style.removeProperty("--chat-composer-width");
+          return;
+        }
+        const rect = node.getBoundingClientRect();
+        if (!Number.isFinite(rect.width) || rect.width <= 0) return;
+        root.style.setProperty(
+          "--chat-composer-center",
+          `${Math.round(rect.left + rect.width / 2)}px`,
+        );
+        root.style.setProperty(
+          "--chat-composer-width",
+          `${Math.max(320, Math.round(rect.width - 24))}px`,
+        );
+      });
+    };
+
+    scheduleSync();
+    window.addEventListener("resize", scheduleSync);
+    let observer = null;
+    if (typeof ResizeObserver !== "undefined" && chatContainerRef.current) {
+      observer = new ResizeObserver(scheduleSync);
+      observer.observe(chatContainerRef.current);
+    }
+    return () => {
+      window.removeEventListener("resize", scheduleSync);
+      observer?.disconnect();
+      if (composerRailRafRef.current !== null) {
+        window.cancelAnimationFrame(composerRailRafRef.current);
+        composerRailRafRef.current = null;
+      }
+      root.style.removeProperty("--chat-composer-center");
+      root.style.removeProperty("--chat-composer-width");
+    };
+  }, []);
+
+  useEffect(() => {
     if (!state || !state.sessionId) return;
     initialScrollRef.current = false;
+    messageRefs.current = {};
   }, [state.sessionId]);
 
   useEffect(() => {
@@ -4619,6 +5277,7 @@ const Chat = ({
 
   const revokeAttachmentPreview = useCallback((attachment) => {
     if (!attachment?.url) return;
+    if (!/^blob:/i.test(String(attachment.url))) return;
     try {
       URL.revokeObjectURL(attachment.url);
     } catch (_) {}
@@ -4626,7 +5285,12 @@ const Chat = ({
 
   const clearComposerAttachments = useCallback(() => {
     setAttachments((prev) => {
-      prev.forEach((attachment) => revokeAttachmentPreview(attachment));
+      prev.forEach((attachment) => {
+        if (attachment?.id) {
+          removedAttachmentIdsRef.current.add(attachment.id);
+        }
+        revokeAttachmentPreview(attachment);
+      });
       return [];
     });
     if (fileInputRef.current) {
@@ -4634,6 +5298,14 @@ const Chat = ({
     }
     setVisionWorkflow("auto");
   }, [revokeAttachmentPreview]);
+
+  useEffect(() => {
+    writeStoredComposerDraft(state.sessionId, {
+      message,
+      attachments,
+      visionWorkflow,
+    });
+  }, [attachments, message, state.sessionId, visionWorkflow]);
 
   const stopCameraCapture = useCallback(() => {
     const stream = cameraStreamRef.current;
@@ -4953,7 +5625,7 @@ const Chat = ({
     setError(null);
     setLoading(true);
     setIsStreaming(true);
-    const msgId = crypto.randomUUID();
+    const msgId = createClientMessageId("msg");
     setActiveMessageId && setActiveMessageId(msgId);
     debugLog("Sending message:", displayMessage);
 
@@ -5038,6 +5710,7 @@ const Chat = ({
               attachments: apiAttachments,
               vision_workflow: effectiveVisionWorkflow,
               ...thinkingPayload,
+              ...ragPayload,
             },
             { signal: controller?.signal },
           );
@@ -5061,6 +5734,7 @@ const Chat = ({
                 vision_workflow: effectiveVisionWorkflow,
                 ...workflowPayload,
                 ...thinkingPayload,
+                ...ragPayload,
               },
               { signal: controller?.signal },
             );
@@ -5111,6 +5785,7 @@ const Chat = ({
           vision_workflow: effectiveVisionWorkflow,
           ...workflowPayload,
           ...thinkingPayload,
+          ...ragPayload,
         };
         const r = await requestModelCompletion(payload, effectiveMessage, {
           trackAbort: true,
@@ -5404,7 +6079,42 @@ const Chat = ({
     clearActiveRequest();
     setLoading(true);
     setIsStreaming(true);
+    setRegeneratingMessageId(msg.id);
     setActiveMessageId && setActiveMessageId(msg.id);
+    const regenerateStartedAt = new Date().toISOString();
+    setState((prev) => {
+      const updated = Array.isArray(prev.conversation) ? [...prev.conversation] : [];
+      if (overrideUserText != null) {
+        const userIdx = updated.findIndex((m) => m && m.id === `${msg.id}:user`);
+        if (userIdx !== -1) {
+          updated[userIdx] = {
+            ...updated[userIdx],
+            text: overrideUserText,
+            timestamp: regenerateStartedAt,
+          };
+        }
+      }
+      const mIdx = updated.findIndex((m) => m && m.id === msg.id);
+      if (mIdx === -1) return prev;
+      updated[mIdx] = {
+        ...updated[mIdx],
+        text: "",
+        content: "",
+        thoughts: [],
+        tools: [],
+        ragMatches: [],
+        timestamp: regenerateStartedAt,
+        metadata: mergeAssistantMessageMetadata(updated[mIdx]?.metadata, {
+          status: "regenerating",
+          tool_response_pending: false,
+          tool_continued: false,
+          tool_continuation_phases: [],
+          tool_continuation_text: "",
+          tool_prelude_text: "",
+        }),
+      };
+      return { ...prev, conversation: updated };
+    });
     const regenerateTarget = resolveRegenerateRequestTarget(state, msg);
     let responseMetadata = null;
     let ragMatchesFromResponse = [];
@@ -5430,6 +6140,7 @@ const Chat = ({
               vision_workflow: previousVisionWorkflow,
               ...workflowPayload,
               ...thinkingPayload,
+              ...ragPayload,
             },
             { signal: controller?.signal },
           );
@@ -5469,6 +6180,7 @@ const Chat = ({
           vision_workflow: previousVisionWorkflow,
           ...workflowPayload,
           ...thinkingPayload,
+          ...ragPayload,
         };
         const r = await requestModelCompletion(payload, userText, {
           trackAbort: true,
@@ -5518,6 +6230,7 @@ const Chat = ({
           const entry = {
             ...updated[mIdx],
             text: aiResponse,
+            content: aiResponse,
             timestamp: new Date().toISOString(),
           };
           if (responseMetadata && Object.keys(responseMetadata).length) {
@@ -5628,6 +6341,7 @@ const Chat = ({
     } finally {
       setLoading(false);
       setIsStreaming(false);
+      setRegeneratingMessageId(null);
       setActiveMessageId && setActiveMessageId(null);
       clearActiveRequest();
     }
@@ -5678,6 +6392,8 @@ const Chat = ({
   const continueGenerating = useCallback(
     async (msg, options = {}) => {
       if (!msg || !msg.id) return;
+      let continuationLockKey = "";
+      let continuationLockAcquired = false;
       abortActiveRequest();
       clearActiveRequest();
       setError(null);
@@ -5751,6 +6467,14 @@ const Chat = ({
           toolPayload,
           { includeIds: false },
         );
+        continuationLockKey = buildToolContinuationLockKey({
+          sessionId: state.sessionId,
+          messageId: msg.id,
+          tools: toolPayload,
+        });
+        continuationLockAcquired =
+          !continuationLockKey || acquireToolContinuationLock(continuationLockKey);
+        if (!continuationLockAcquired) return;
         const res = await axios.post("/api/chat/continue", {
           session_id: state.sessionId,
           message_id: msg.id,
@@ -5808,7 +6532,7 @@ const Chat = ({
                 mergedTools.push(tool);
               }
             });
-            const nextMetadata = {
+            const nextMetadataBase = {
               ...(updated[mIdx]?.metadata || {}),
               ...(md || {}),
               ...(Object.prototype.hasOwnProperty.call(
@@ -5829,6 +6553,12 @@ const Chat = ({
                   }
                 : {}),
             };
+            const nextMetadata = appendToolContinuationPhase(
+              nextMetadataBase,
+              existingText,
+              aiContinuation,
+            );
+            nextMetadata.inline_tool_continuation_pending = false;
             if (
               returnedTools.length === 0 &&
               !Object.prototype.hasOwnProperty.call(md || {}, "inline_tool_payload") &&
@@ -5889,11 +6619,14 @@ const Chat = ({
           "Continue failed";
         setError(detail);
       } finally {
-      setLoading(false);
-      setIsStreaming(false);
-      setActiveMessageId && setActiveMessageId(null);
-    }
-  },
+        if (continuationLockAcquired) {
+          releaseToolContinuationLock(continuationLockKey);
+        }
+        setLoading(false);
+        setIsStreaming(false);
+        setActiveMessageId && setActiveMessageId(null);
+      }
+    },
   [
     abortActiveRequest,
     applySubchatControlFromTools,
@@ -5940,6 +6673,23 @@ const Chat = ({
   );
 
   useEffect(() => {
+    if (loading || isStreaming) return;
+    const conversation = Array.isArray(state.conversation) ? state.conversation : [];
+    const candidate = conversation.find((entry) => {
+      if (!entry || entry.role !== "ai") return false;
+      const metadata =
+        entry.metadata && typeof entry.metadata === "object" ? entry.metadata : {};
+      return (
+        metadata.inline_tool_continuation_pending === true &&
+        metadata.tool_response_pending === true &&
+        Boolean(buildToolContinuationBatch(resolveMessageTools(entry)))
+      );
+    });
+    if (!candidate) return;
+    void maybeContinueAfterTools(candidate);
+  }, [loading, isStreaming, maybeContinueAfterTools, state.conversation]);
+
+  useEffect(() => {
     if (typeof window === "undefined") return undefined;
     const handleToolReviewContinue = (event) => {
       const detail = event?.detail || {};
@@ -5968,29 +6718,23 @@ const Chat = ({
       });
       if (!msg) return;
       const messageTools = resolveMessageTools(msg);
-      const scopedTools = targetIds.size
-        ? messageTools.filter((tool) => {
-            const rawId = tool?.id ?? tool?.request_id ?? null;
-            return rawId ? targetIds.has(String(rawId)) : false;
-          })
-        : messageTools;
-      const batch =
-        buildToolContinuationBatch(scopedTools) ||
-        (target.scope === "batch"
-          ? buildToolContinuationBatch(scopedTools.filter(isToolReadyForContinue))
-          : null);
+      const scopedTools =
+        target.scope !== "batch" && targetIds.size
+          ? messageTools.filter((tool) => {
+              const rawId = tool?.id ?? tool?.request_id ?? null;
+              return rawId ? targetIds.has(String(rawId)) : false;
+            })
+          : messageTools;
+      const batch = buildToolContinuationBatch(scopedTools);
       if (!batch) return;
       detail.handled = true;
-      void continueGenerating(
-        { ...msg, tools: batch },
-        { toolsOverride: batch },
-      );
+      void maybeContinueAfterTools(msg, batch);
     };
     window.addEventListener(TOOL_REVIEW_ACTION_EVENT, handleToolReviewContinue);
     return () => {
       window.removeEventListener(TOOL_REVIEW_ACTION_EVENT, handleToolReviewContinue);
     };
-  }, [continueGenerating, state.conversation]);
+  }, [maybeContinueAfterTools, state.conversation]);
 
   const openEditUserMessage = useCallback(
     (userMsg) => {
@@ -6342,15 +7086,7 @@ const Chat = ({
     };
     if (/```mermaid/.test(text)) {
       const code = text.replace(/```mermaid|```/g, "").trim();
-      const id = `merm-${idx}`;
-      setTimeout(() => {
-        if (window.mermaid) {
-          window.mermaid.render(id, code, (svg) => {
-            document.getElementById(id).innerHTML = svg;
-          });
-        }
-      }, 0);
-      return <div id={id} />;
+      return <MermaidBlock code={code} key={`mermaid-${msg?.id || idx}`} />;
     }
     if (/\.(png|jpg|jpeg|gif|svg|mp4|webm|mp3|wav)$/i.test(text)) {
       return <MediaViewer src={text} />;
@@ -6429,6 +7165,79 @@ const Chat = ({
       console.error("Markdown render error", err);
     }
     return text;
+  };
+
+  const splitFlattenedToolContinuationText = (value) => {
+    const text = typeof value === "string" ? value.replace(/\r\n/g, "\n").trim() : "";
+    if (!text) return null;
+    const parts = text
+      .split(
+        /\n{2,}(?=(?:Recalling worked|Recall worked|Saved\b|Done\b|I (?:found|checked|retrieved|got|saved|created|updated)\b|The (?:tool|search|result)\b|Here(?:'s| is)\b|Based on (?:the )?(?:tool|results)\b))/i,
+      )
+      .map((part) => part.trim())
+      .filter(Boolean);
+    if (parts.length < 2) return null;
+    return {
+      prelude: parts[0],
+      phases: parts.slice(1).map((part) => ({ text: part })),
+    };
+  };
+
+  const getToolContinuationRenderState = (msg) => {
+    if (!msg || (msg.role !== "ai" && msg.role !== "assistant")) return null;
+    const metadata =
+      msg.metadata && typeof msg.metadata === "object" ? msg.metadata : {};
+    let phases = normalizeToolContinuationPhases(metadata);
+    const rawPrelude =
+      typeof metadata.tool_prelude_text === "string"
+        ? metadata.tool_prelude_text.trim()
+        : "";
+    if (phases.length) {
+      return {
+        prelude: rawPrelude && !isContinuationPlaceholderText(rawPrelude) ? rawPrelude : "",
+        phases,
+      };
+    }
+    if (
+      metadata.tool_continued &&
+      Array.isArray(msg.tools) &&
+      msg.tools.length
+    ) {
+      const fallbackText =
+        typeof msg.text === "string"
+          ? msg.text.trim()
+          : typeof msg.content === "string"
+            ? msg.content.trim()
+            : "";
+      const split = splitFlattenedToolContinuationText(fallbackText);
+      if (split?.phases?.length) {
+        return split;
+      }
+    }
+    return null;
+  };
+
+  const renderToolContinuationPhases = (msg, idx, toolsForRender, phaseState) => {
+    if (!phaseState?.phases?.length) return null;
+    const stepOffset = phaseState.prelude ? 2 : 1;
+    return (
+      <div className="tool-continuation-phase-stack">
+        {phaseState.phases.map((phase, phaseIndex) => (
+          <React.Fragment key={`${msg?.id || idx}-tool-phase-${phaseIndex}`}>
+            <div className="tool-continuation-divider">
+              <span>{`step ${phaseIndex + stepOffset}`}</span>
+            </div>
+            <div className="tool-continuation-phase">
+              {renderContent(
+                { ...msg, text: phase.text },
+                `${idx}-tool-phase-${phaseIndex}`,
+                toolsForRender,
+              )}
+            </div>
+          </React.Fragment>
+        ))}
+      </div>
+    );
   };
 
   const acceptCommandSuggestion = useCallback(
@@ -6520,11 +7329,13 @@ const Chat = ({
       setError("Unsupported file type");
       return;
     }
-    const id = crypto.randomUUID();
+    const id = createClientMessageId("attachment");
     const url = URL.createObjectURL(file);
     const origin = options.origin || "upload";
     const captureSource = options.captureSource || null;
     const isTransientCapture = origin === "captured";
+    const uploadSessionId = state.sessionId;
+    removedAttachmentIdsRef.current.delete(id);
     setAttachments((prev) => [
       ...prev,
       {
@@ -6564,6 +7375,28 @@ const Chat = ({
       const remoteUrl = res.data?.url;
       const contentHash = res.data?.content_hash || null;
       const captureId = res.data?.capture_id || null;
+      if (!removedAttachmentIdsRef.current.has(id)) {
+        mergeStoredComposerDraftAttachment(uploadSessionId, {
+          id,
+          name: file.name,
+          type: file.type,
+          size: file.size,
+          url: remoteUrl,
+          remoteUrl,
+          contentHash,
+          origin: res.data?.origin || origin,
+          relative_path: res.data?.relative_path || "",
+          capture_source: captureSource,
+          capture_id: captureId,
+          transient:
+            typeof res.data?.transient === "boolean"
+              ? res.data.transient
+              : isTransientCapture,
+          expires_at: res.data?.expires_at_iso || res.data?.expires_at || null,
+          index_status: res.data?.index_status || null,
+          caption_status: res.data?.caption_status || null,
+        });
+      }
       setAttachments((prev) =>
         prev.map((a) =>
           a.id === id
@@ -6678,6 +7511,7 @@ const Chat = ({
   };
 
   const removeAttachment = (id) => {
+    removedAttachmentIdsRef.current.add(id);
     setAttachments((prev) => {
       const found = prev.find((a) => a.id === id);
       if (found) revokeAttachmentPreview(found);
@@ -6693,6 +7527,9 @@ const Chat = ({
     }
     const formData = new FormData();
     formData.append("file", blob, "recording.webm");
+    if (selectedSttModel) {
+      formData.append("model", selectedSttModel);
+    }
     setAudioTranscribing(true);
     try {
       const res = await axios.post("/api/voice/transcribe", formData, {
@@ -6703,6 +7540,7 @@ const Chat = ({
         setError("Speech-to-text returned no transcript.");
         return;
       }
+      setError(null);
       setMessage(text);
       await sendMessage(text);
     } catch (err) {
@@ -6713,21 +7551,47 @@ const Chat = ({
     }
   };
 
-  const toggleAudioRecording = async () => {
-    if (audioRecording) {
-      if (mediaRecorderRef.current) {
-        mediaRecorderRef.current.stop();
-        mediaRecorderRef.current.stream.getTracks().forEach((t) => t.stop());
-      }
+  const stopAudioRecorder = useCallback(({ process = true } = {}) => {
+    const recorder = mediaRecorderRef.current;
+    if (!process) {
+      audioChunksRef.current = [];
+    }
+    if (!recorder) {
       setAudioRecording(false);
       return;
     }
+    if (!process) {
+      recorder.onstop = null;
+    }
+    try {
+      if (recorder.state !== "inactive") {
+        recorder.stop();
+      }
+    } catch (_) {}
+    try {
+      recorder.stream?.getTracks?.().forEach((track) => track.stop());
+    } catch (_) {}
+    mediaRecorderRef.current = null;
+    setAudioRecording(false);
+  }, []);
+
+  const toggleAudioRecording = async () => {
+    if (audioRecording) {
+      stopAudioRecorder({ process: true });
+      return;
+    }
     if (audioTranscribing) return;
+    if (liveStreamingActive) {
+      setError("Stop live streaming mode before recording an audio message.");
+      return;
+    }
     if (state.backendMode === "api" && state.apiStatus !== "online") {
       setError("API not ready");
       return;
     }
     try {
+      setError(null);
+      stopMicTest();
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: buildAudioConstraints(),
       });
@@ -6751,21 +7615,24 @@ const Chat = ({
       stopLiveVoiceSession();
       return;
     }
+    if (audioRecording || mediaRecorderRef.current) {
+      stopAudioRecorder({ process: false });
+    }
     const attemptId = liveSessionAttemptRef.current + 1;
     liveSessionAttemptRef.current = attemptId;
     stopMicTest();
     setChatSettingsOpen(false);
     try {
       setError(null);
+      setBanner(null);
       setLiveSessionPending(true);
       setLiveStreamingPhase("connecting");
       setLiveStreamingTranscript({ user: "", assistant: "" });
       const res = await axios.post("/api/voice/connect", {
-        identity:
-          typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
-            ? crypto.randomUUID()
-            : `voice-${Date.now()}`,
+        identity: createClientMessageId("voice"),
         room: "float",
+        workflow: workflowProfile,
+        ...thinkingPayload,
       });
       ensureLiveSessionAttemptCurrent(attemptId);
       const session = res?.data || {};
@@ -6863,14 +7730,59 @@ const Chat = ({
       : hasDraftText
         ? "Send message"
         : "Type a message to send";
-  const renderedConversationMessages = Array.isArray(state.conversation)
-    ? state.conversation.length
-    : 0;
-  const rawConversationWindowMeta =
+  const conversationMessages = Array.isArray(state.conversation)
+    ? state.conversation
+    : EMPTY_CONVERSATION;
+  const stateConversationWindowMeta =
     state.conversationTrimMeta?.truncated ? state.conversationTrimMeta : null;
+  const renderConversationWindow = useMemo(() => {
+    if (!conversationMessages.length) {
+      return {
+        messages: conversationMessages,
+        startIndex: 0,
+        meta: stateConversationWindowMeta,
+      };
+    }
+    if (stateConversationWindowMeta) {
+      const startIndex = Number.isFinite(Number(stateConversationWindowMeta.start_index))
+        ? Number(stateConversationWindowMeta.start_index)
+        : 0;
+      return {
+        messages: conversationMessages,
+        startIndex,
+        meta: stateConversationWindowMeta,
+      };
+    }
+    const messageLimit = getConversationMessageLimit();
+    if (conversationMessages.length <= messageLimit) {
+      return {
+        messages: conversationMessages,
+        startIndex: 0,
+        meta: null,
+      };
+    }
+    const startIndex = Math.max(0, conversationMessages.length - messageLimit);
+    return {
+      messages: conversationMessages.slice(startIndex),
+      startIndex,
+      meta: {
+        truncated: true,
+        source: "render",
+        render_only: true,
+        total_messages: conversationMessages.length,
+        omitted_messages: startIndex,
+        start_index: startIndex,
+        message_limit: messageLimit,
+        omitted_tools: 0,
+      },
+    };
+  }, [conversationMessages, stateConversationWindowMeta]);
+  const visibleConversationMessages = renderConversationWindow.messages;
+  const renderedConversationMessages = visibleConversationMessages.length;
+  const rawConversationWindowMeta = renderConversationWindow.meta;
   const visibleWindowStart = Number.isFinite(Number(rawConversationWindowMeta?.start_index))
     ? Number(rawConversationWindowMeta.start_index)
-    : 0;
+    : renderConversationWindow.startIndex;
   const recordedConversationTotal = Number.isFinite(
     Number(rawConversationWindowMeta?.total_messages),
   )
@@ -7080,6 +7992,11 @@ const Chat = ({
   const inputAlerts = [error, cameraError, liveVisualError].filter(
     (value) => typeof value === "string" && value.trim(),
   );
+  const audioRecorderStatus = audioRecording
+    ? "Recording microphone input"
+    : audioTranscribing
+      ? "Transcribing microphone input"
+      : "";
   const liveStreamingActive =
     recording || liveSessionPending || liveStreamingPhase === "connecting";
   const liveTranscriptVisible =
@@ -7104,6 +8021,28 @@ const Chat = ({
           document.body,
         )
       : null;
+  const renderAudioModelSelect = (id, value, options, onChange, fallbackLane) => {
+    const selectedValue = String(value || "").trim();
+    const selectedOption = options.find((option) => option.value === selectedValue);
+    const lane = selectedOption?.lane || inferAudioModelLane(selectedValue, fallbackLane);
+    const allOptions = selectedOption
+      ? options
+      : selectedValue
+        ? [{ value: selectedValue, label: selectedValue, lane }, ...options]
+        : options;
+    return (
+      <div className={`chat-settings-model-select model-lane-${lane}`}>
+        <span className="model-lane-pip" aria-hidden="true" />
+        <select id={id} value={selectedValue} onChange={onChange}>
+          {allOptions.map((option) => (
+            <option key={option.value} value={option.value} data-lane={option.lane}>
+              {optionLabelWithLane(option)}
+            </option>
+          ))}
+        </select>
+      </div>
+    );
+  };
   const chatSettingsPopover =
     chatSettingsOpen && typeof document !== "undefined"
       ? createPortal(
@@ -7116,7 +8055,7 @@ const Chat = ({
             <div className="chat-settings-list">
               {[
                 ["camera", "camera"],
-                ["mic", "mic"],
+                ["microphone", "microphone"],
                 ["volume", "volume"],
                 ["thinking", "thinking"],
                 ["workflow", "workflow"],
@@ -7193,9 +8132,9 @@ const Chat = ({
                   </label>
                 </>
               )}
-              {chatSettingsSection === "mic" && (
+              {chatSettingsSection === "microphone" && (
                 <>
-                  <label htmlFor="chat-mic-input">mic input</label>
+                  <label htmlFor="chat-mic-input">microphone input</label>
                   <select
                     id="chat-mic-input"
                     value={preferredMicDeviceId}
@@ -7213,6 +8152,18 @@ const Chat = ({
                       </option>
                     ))}
                   </select>
+                  <label htmlFor="chat-stt-model">STT model</label>
+                  {renderAudioModelSelect(
+                    "chat-stt-model",
+                    selectedSttModel,
+                    AUDIO_STT_MODEL_OPTIONS,
+                    (event) =>
+                      setState((prev) => ({
+                        ...prev,
+                        sttModel: event.target.value,
+                      })),
+                    "api",
+                  )}
                   <div className="chat-settings-inline">
                     <button
                       type="button"
@@ -7232,11 +8183,7 @@ const Chat = ({
                       style={{ width: `${Math.round(micTestLevel * 100)}%` }}
                     />
                   </div>
-                </>
-              )}
-              {chatSettingsSection === "volume" && (
-                <>
-                  <label htmlFor="chat-mic-gain">mic level</label>
+                  <label htmlFor="chat-mic-gain">microphone level</label>
                   <input
                     id="chat-mic-gain"
                     type="range"
@@ -7254,6 +8201,54 @@ const Chat = ({
                   <span className="chat-settings-slider-value">
                     {Math.round(micInputGain * 100)}%
                   </span>
+                </>
+              )}
+              {chatSettingsSection === "volume" && (
+                <>
+                  <label htmlFor="chat-tts-model">TTS model</label>
+                  {renderAudioModelSelect(
+                    "chat-tts-model",
+                    selectedTtsModel,
+                    AUDIO_TTS_MODEL_OPTIONS,
+                    (event) =>
+                      setState((prev) => ({
+                        ...prev,
+                        ttsModel: event.target.value,
+                        voiceModel: defaultVoiceForTtsModel(
+                          event.target.value,
+                          prev.voiceModel,
+                        ),
+                      })),
+                    "api",
+                  )}
+                  <label htmlFor="chat-tts-voice">TTS voice</label>
+                  <select
+                    id="chat-tts-voice"
+                    value={
+                      selectedTtsVoiceOptions.includes(selectedTtsVoice)
+                        ? selectedTtsVoice
+                        : ""
+                    }
+                    onChange={(event) =>
+                      setState((prev) => ({
+                        ...prev,
+                        voiceModel: event.target.value,
+                      }))
+                    }
+                  >
+                    {!selectedTtsVoiceOptions.includes(selectedTtsVoice) && (
+                      <option value="">
+                        {selectedTtsVoice
+                          ? `${selectedTtsVoice} (not valid for selected TTS)`
+                          : "default voice"}
+                      </option>
+                    )}
+                    {selectedTtsVoiceOptions.map((voice) => (
+                      <option key={voice} value={voice}>
+                        {voice}
+                      </option>
+                    ))}
+                  </select>
                   <label htmlFor="chat-output-volume">speaker level</label>
                   <input
                     id="chat-output-volume"
@@ -7291,6 +8286,93 @@ const Chat = ({
                       </button>
                     ))}
                   </div>
+                  <div className="chat-settings-label-row">
+                    <label>memory</label>
+                    <Tooltip title={RAG_TOOLTIP_TEXT} placement="top" arrow>
+                      <span
+                        className="chat-settings-help"
+                        tabIndex={0}
+                        role="note"
+                        aria-label={RAG_TOOLTIP_TEXT}
+                      >
+                        ?
+                      </span>
+                    </Tooltip>
+                  </div>
+                  <div className="chat-settings-toggle-stack">
+                    <label className="chat-settings-toggle" title={RAG_TOOLTIP_TEXT}>
+                      <input
+                        type="checkbox"
+                        checked={textRagEnabled}
+                        onChange={(event) =>
+                          setRagEnabled("textRagEnabled", event.target.checked)
+                        }
+                      />
+                      <span>
+                        <strong>text models</strong>
+                        <small>similar text memories</small>
+                      </span>
+                    </label>
+                    <label
+                      className="chat-settings-mini-field"
+                      title={`Text retrieval model: ${ragEmbeddingModel}`}
+                    >
+                      <span>text retrieval model</span>
+                      <select
+                        value={ragEmbeddingModel}
+                        disabled={!textRagEnabled}
+                        onChange={(event) =>
+                          setRagModel("rag_embedding_model", event.target.value)
+                        }
+                      >
+                        {RAG_TEXT_MODEL_OPTIONS.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {optionLabelWithLane(option)}
+                          </option>
+                        ))}
+                        {!RAG_TEXT_MODEL_OPTIONS.some(
+                          (option) => option.value === ragEmbeddingModel,
+                        ) && (
+                          <option value={ragEmbeddingModel}>{ragEmbeddingModel}</option>
+                        )}
+                      </select>
+                    </label>
+                    <label className="chat-settings-toggle" title={RAG_TOOLTIP_TEXT}>
+                      <input
+                        type="checkbox"
+                        checked={visionRagEnabled}
+                        onChange={(event) =>
+                          setRagEnabled("visionRagEnabled", event.target.checked)
+                        }
+                      />
+                      <span>
+                        <strong>vision models</strong>
+                        <small>similar image memories</small>
+                      </span>
+                    </label>
+                    <label
+                      className="chat-settings-mini-field"
+                      title={`Vision retrieval model: ${ragClipModel}`}
+                    >
+                      <span>vision retrieval model</span>
+                      <select
+                        value={ragClipModel}
+                        disabled={!visionRagEnabled}
+                        onChange={(event) =>
+                          setRagModel("rag_clip_model", event.target.value)
+                        }
+                      >
+                        {RAG_VISION_MODEL_OPTIONS.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {optionLabelWithLane(option)}
+                          </option>
+                        ))}
+                        {!RAG_VISION_MODEL_OPTIONS.some(
+                          (option) => option.value === ragClipModel,
+                        ) && <option value={ragClipModel}>{ragClipModel}</option>}
+                      </select>
+                    </label>
+                  </div>
                 </>
               )}
               {chatSettingsSection === "workflow" && (
@@ -7317,6 +8399,13 @@ const Chat = ({
                   <span className="chat-settings-note">
                     Default balances quality. Architect plans more. Mini is for short execution bursts.
                   </span>
+                  <button
+                    type="button"
+                    className="chat-settings-link"
+                    onClick={openWorkflowSettings}
+                  >
+                    open workflow editor
+                  </button>
                 </>
               )}
             </div>
@@ -7514,26 +8603,67 @@ const Chat = ({
         )}
       {liveStreamingIndicator}
       <div className="chat-box" ref={chatBoxRef}>
-        {state.conversation.length === 0 && (
+        {conversationMessages.length === 0 && (
           <p className="placeholder">Start chatting!</p>
         )}
-        {state.conversation.map((msg, idx) => {
-          const ragMatches = getMessageRagMatches(msg);
+        {visibleConversationMessages.map((msg, visibleIdx) => {
+          const idx = visibleWindowStart + visibleIdx;
+          const isAssistantMessage = msg?.role === "ai" || msg?.role === "assistant";
+          const isRegeneratingMessage = Boolean(
+            isAssistantMessage &&
+            msg?.id &&
+            regeneratingMessageId === msg.id,
+          );
+          const displayMsg = isRegeneratingMessage
+            ? {
+                ...msg,
+                text: "",
+                content: "",
+                thoughts: [],
+                tools: [],
+                ragMatches: [],
+                rag: [],
+                metadata: mergeAssistantMessageMetadata(msg?.metadata, {
+                  status: "regenerating",
+                  tool_response_pending: false,
+                  tool_continued: false,
+                  tool_continuation_phases: [],
+                  tool_continuation_text: "",
+                  tool_prelude_text: "",
+                }),
+              }
+            : msg;
+          const ragMatches = isRegeneratingMessage ? [] : getMessageRagMatches(displayMsg);
           const fragmentKey = msg && msg.id ? msg.id : idx;
-          const previousTimestamp = idx > 0 ? state.conversation[idx - 1]?.timestamp : null;
+          const previousTimestamp =
+            visibleIdx > 0 ? visibleConversationMessages[visibleIdx - 1]?.timestamp : null;
           const timestampLabel = msg?.timestamp
             ? formatMessageTimestampLabel(msg.timestamp, previousTimestamp)
             : "";
           const timestampTitle = msg?.timestamp ? formatMessageTimestampTitle(msg.timestamp) : "";
           const isActiveMessage = msg && msg.id && msg.id === activeMessageId;
-          const thoughtBlocks = isActiveMessage ? buildThoughtBlocks(msg.thoughts) : [];
-          const resolvedTools = resolveMessageTools(msg);
+          const thoughtBlocks =
+            isActiveMessage && !isRegeneratingMessage
+              ? buildThoughtBlocks(displayMsg.thoughts)
+              : [];
+          const resolvedTools = isRegeneratingMessage ? [] : resolveMessageTools(displayMsg);
           const messageSourceLabel =
-            msg && (msg.role === "ai" || msg.role === "assistant") ? getMessageSourceLabel(msg) : "";
+            isAssistantMessage ? getMessageSourceLabel(displayMsg) : "";
           const messageStatusBadge =
-            msg && (msg.role === "ai" || msg.role === "assistant")
-              ? getMessageStatusBadge(msg)
+            isAssistantMessage
+              ? getMessageStatusBadge(displayMsg)
               : null;
+          const toolContinuationRenderState = isRegeneratingMessage
+            ? null
+            : getToolContinuationRenderState(displayMsg);
+          const messageMetadataRows =
+            isAssistantMessage
+              ? buildMessageMetadataRows(displayMsg, {
+                  sourceLabel: messageSourceLabel,
+                  toolCount: resolvedTools.length,
+                  ragCount: ragMatches.length,
+                })
+              : [];
           const messageId = msg?.id || msg?.message_id || null;
           const subchatLinks =
             messageId &&
@@ -7546,7 +8676,11 @@ const Chat = ({
               <div
               ref={(el) => {
                 if (msg && msg.id) {
-                  messageRefs.current[msg.id] = el;
+                  if (el) {
+                    messageRefs.current[msg.id] = el;
+                  } else {
+                    delete messageRefs.current[msg.id];
+                  }
                 }
               }}
               onClick={(event) => {
@@ -7568,7 +8702,35 @@ const Chat = ({
                   ))}
                 </div>
               )}
-              {renderContent(msg, idx, resolvedTools)}
+              <RagContextPanel
+                matches={ragMatches}
+                defaultOpen={false}
+                className="message-rag-context"
+                onToggle={(open) => {
+                  if (!open || !msg?.id) return;
+                  if (typeof requestAnimationFrame === "function") {
+                    requestAnimationFrame(() =>
+                      scrollMessageIntoView(msg.id, "smooth", { block: "start" }),
+                    );
+                  } else {
+                    setTimeout(
+                      () => scrollMessageIntoView(msg.id, "smooth", { block: "start" }),
+                      0,
+                    );
+                  }
+                }}
+              />
+              {toolContinuationRenderState
+                ? toolContinuationRenderState.prelude
+                  ? renderContent(
+                      { ...displayMsg, text: toolContinuationRenderState.prelude },
+                      idx,
+                      resolvedTools,
+                    )
+                  : null
+                : isRegeneratingMessage
+                  ? null
+                  : renderContent(displayMsg, idx, resolvedTools)}
               {(() => {
                 if (!Array.isArray(msg.attachments) || !msg.attachments.length) return null;
                 const attachmentsList = msg.attachments;
@@ -7654,23 +8816,6 @@ const Chat = ({
               </div>
             );
           })()}
-          <RagContextPanel
-            matches={ragMatches}
-            defaultOpen={false}
-            onToggle={(open) => {
-              if (!open || !msg?.id) return;
-              if (typeof requestAnimationFrame === "function") {
-                requestAnimationFrame(() =>
-                  scrollMessageIntoView(msg.id, "smooth", { block: "start" }),
-                );
-              } else {
-                setTimeout(
-                  () => scrollMessageIntoView(msg.id, "smooth", { block: "start" }),
-                  0,
-                );
-              }
-            }}
-          />
               {subchatLinks.length > 0 && (
                 <div className="inline-subchat-list" aria-label="Subchats">
                   <div className="inline-subchat-toolbar">
@@ -7728,7 +8873,9 @@ const Chat = ({
               {shouldShowInlineToolsForMessage(msg, idx) && resolvedTools.length > 0 && (() => {
                 const toolCollapseKey = msg.id || msg.message_id || fragmentKey;
                 const hasActionableTools = resolvedTools.some(isActionableToolStatus);
-                const defaultToolsCollapsed = collapseAllTools && !hasActionableTools;
+                const defaultToolsCollapsed = toolContinuationRenderState
+                  ? !hasActionableTools
+                  : collapseAllTools && !hasActionableTools;
                 const toolsCollapsed = Object.prototype.hasOwnProperty.call(
                   collapsedTools,
                   toolCollapseKey,
@@ -7740,7 +8887,7 @@ const Chat = ({
                   <div
                     className={`inline-tool-list${isActiveMessage ? " active" : ""}${
                       hasActionableTools ? " has-actionable-tools" : ""
-                    }`}
+                    }${toolContinuationRenderState ? " is-phase-batch" : ""}`}
                   >
                     <div className="inline-tool-toolbar">
                       <button
@@ -7749,8 +8896,12 @@ const Chat = ({
                         onClick={() => toggleToolCollapse(toolCollapseKey)}
                       >
                         {toolsCollapsed
-                          ? `show tools (${toolCount})`
-                          : "hide tools"}
+                          ? `${
+                              toolContinuationRenderState ? "show all tools" : "show tools"
+                            } (${toolCount})`
+                          : toolContinuationRenderState
+                            ? "hide all tools"
+                            : "hide tools"}
                       </button>
                     </div>
                     {!toolsCollapsed && resolvedTools.map((tool, i) => {
@@ -8412,6 +9563,13 @@ const Chat = ({
                   </div>
                 );
               })()}
+              {toolContinuationRenderState &&
+                renderToolContinuationPhases(
+                  msg,
+                  idx,
+                  resolvedTools,
+                  toolContinuationRenderState,
+                )}
               {isStreaming &&
                 idx === state.conversation.length - 1 &&
                 msg.role === "ai" && <span className="spinner" />}
@@ -8483,6 +9641,16 @@ const Chat = ({
                         : `Speak this response. ${ttsRouteTooltip}`;
                     return (
                     <div className="message-actions">
+                      {messageMetadataRows.length > 0 && (
+                        <StateInspector
+                          title="Message metadata"
+                          summary="Routing, retrieval, and tool details for this response."
+                          rows={messageMetadataRows}
+                          label="i"
+                          className="message-state-inspector"
+                          ariaLabel="Show message metadata"
+                        />
+                      )}
                       {canContinueMessage(msg) && (
                         <Tooltip
                           title={
@@ -8590,7 +9758,7 @@ const Chat = ({
                 </div>
               )}
               </div>
-            {idx < state.conversation.length - 1 && (
+            {visibleIdx < visibleConversationMessages.length - 1 && (
               <Divider className="chat-divider" />
             )}
             </React.Fragment>
@@ -8743,6 +9911,12 @@ const Chat = ({
             }}
             onKeyDown={handleComposerResizeKeyDown}
           />
+          {audioRecorderStatus && (
+            <div className="input-status-strip" role="status" aria-live="polite">
+              <span className="input-status-dot" aria-hidden="true" />
+              <span>{audioRecorderStatus}</span>
+            </div>
+          )}
           {inputAlerts.length > 0 && (
             <div className="input-alert-stack" aria-live="polite">
               {inputAlerts.map((message, index) => (
@@ -8757,15 +9931,22 @@ const Chat = ({
             </div>
           )}
           {banner && (
-            <div className="alert" role="status" style={{ marginBottom: 8 }}>
-              <strong>{banner.message}</strong>
-              {banner.hint && <span style={{ marginLeft: 8 }}>{banner.hint}</span>}
-              <span style={{ marginLeft: 8, display: 'inline-flex', gap: 6 }}>
-                {banner.actions && banner.actions.map((a, i) => (
-                  <button key={i} className="chip" onClick={a.onClick}>{a.label}</button>
-                ))}
-              </span>
-              <button className="chip" style={{ float: 'right' }} onClick={() => setBanner(null)}>dismiss</button>
+            <div className="alert input-banner" role="status">
+              <div className="input-banner-copy">
+                <strong>{banner.message}</strong>
+                {banner.hint && <span>{banner.hint}</span>}
+              </div>
+              <div className="input-banner-actions">
+                {banner.actions &&
+                  banner.actions.map((a, i) => (
+                    <button key={i} className="chip" onClick={a.onClick}>
+                      {a.label}
+                    </button>
+                  ))}
+                <button className="chip" onClick={() => setBanner(null)}>
+                  dismiss
+                </button>
+              </div>
             </div>
           )}
           {liveTranscriptVisible && (
@@ -8845,49 +10026,57 @@ const Chat = ({
             <div className="composer-meta-row">
               {attachments.length > 0 && (
                 <div className="attachments-row" aria-live="polite">
-                  {attachments.map((att) => (
-                    <div
-                      key={att.id}
-                      className="attachment-chip"
-                      title={att.file?.name || "attachment"}
-                      onClick={() => window.open(att.remoteUrl || att.url, "_blank", "noopener")}
-                      role="button"
-                      tabIndex={0}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" || e.key === " ") {
-                          e.preventDefault();
-                          window.open(att.remoteUrl || att.url, "_blank", "noopener");
+                  {attachments.map((att) => {
+                    const attachmentUrl = att.remoteUrl || att.url;
+                    const attachmentName = att.file?.name || att.name || "attachment";
+                    const showImagePreview =
+                      attachmentLooksImage(att) && Boolean(attachmentUrl);
+                    return (
+                      <div
+                        key={att.id}
+                        className="attachment-chip"
+                        title={attachmentName}
+                        onClick={() =>
+                          window.open(attachmentUrl, "_blank", "noopener")
                         }
-                      }}
-                    >
-                      {att.file && att.file.type?.startsWith("image") ? (
-                        <img src={att.url} alt="preview" className="chip-thumb" />
-                      ) : (
-                        <span className="chip-icon" aria-hidden>
-                          <AttachFileIcon fontSize="inherit" />
-                        </span>
-                      )}
-                      <span className="chip-name">
-                        {truncateFilename(att.file?.name || att.name)}
-                      </span>
-                      {att.uploading && (
-                        <span className="chip-uploading" aria-live="polite">
-                          uploading{"\u2026"}
-                        </span>
-                      )}
-                      <button
-                        type="button"
-                        className="chip-remove"
-                        aria-label={`Remove ${att.file?.name || "attachment"}`}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          removeAttachment(att.id);
+                        role="button"
+                        tabIndex={0}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            window.open(attachmentUrl, "_blank", "noopener");
+                          }
                         }}
                       >
-                        <CloseIcon fontSize="small" />
-                      </button>
-                    </div>
-                  ))}
+                        {showImagePreview ? (
+                          <img src={attachmentUrl} alt="preview" className="chip-thumb" />
+                        ) : (
+                          <span className="chip-icon" aria-hidden>
+                            <AttachFileIcon fontSize="inherit" />
+                          </span>
+                        )}
+                        <span className="chip-name">
+                          {truncateFilename(attachmentName)}
+                        </span>
+                        {att.uploading && (
+                          <span className="chip-uploading" aria-live="polite">
+                            uploading{"\u2026"}
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          className="chip-remove"
+                          aria-label={`Remove ${attachmentName}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            removeAttachment(att.id);
+                          }}
+                        >
+                          <CloseIcon fontSize="small" />
+                        </button>
+                      </div>
+                    );
+                  })}
                 </div>
               )}
               {hasImageAttachments && (
@@ -8988,20 +10177,26 @@ const Chat = ({
                       ? "Stop recording audio message"
                       : audioTranscribing
                         ? "Transcribing audio..."
-                      : "Record audio message"
+                        : liveStreamingActive
+                          ? "Live streaming mode is using the microphone"
+                          : "Record audio message"
                   }
                 >
-                  <IconButton
-                    onClick={toggleAudioRecording}
-                    color={audioRecording ? "error" : "default"}
-                    aria-label="record audio message"
-                    className={`action-icon audio-record-toggle${
-                      audioRecording ? " is-recording" : ""
-                    }${audioTranscribing ? " is-transcribing" : ""}`}
-                    disabled={audioTranscribing}
-                  >
-                    <MicIcon />
-                  </IconButton>
+                  <span>
+                    <IconButton
+                      onClick={toggleAudioRecording}
+                      color={audioRecording ? "error" : "default"}
+                      aria-label="record audio message"
+                      className={`action-icon audio-record-toggle${
+                        audioRecording ? " is-recording" : ""
+                      }${audioTranscribing ? " is-transcribing" : ""}${
+                        liveStreamingActive ? " is-live-disabled" : ""
+                      }`}
+                      disabled={audioTranscribing || liveStreamingActive}
+                    >
+                      <MicIcon />
+                    </IconButton>
+                  </span>
                 </Tooltip>
                 <Tooltip
                   title={

@@ -47,7 +47,12 @@ def _safe_dotenv_values(path: Path) -> dict:
 
 def _load_text_asset(path: Path) -> str:
     text = path.read_text(encoding="utf-8")
-    return " ".join(line.strip() for line in text.splitlines() if line.strip())
+    lines = [line.rstrip() for line in text.splitlines()]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines)
 
 
 def _is_legacy_conversations_override(value: Optional[str]) -> bool:
@@ -230,6 +235,32 @@ def _env_str(name: str) -> Optional[str]:
     return value or None
 
 
+HARMONY_FORMAT_MODES = {"auto", "enabled", "disabled"}
+
+
+def normalize_harmony_format_mode(value: Optional[str], default: str = "auto") -> str:
+    raw = str(value or "").strip().lower()
+    if raw in HARMONY_FORMAT_MODES:
+        return raw
+    if raw in {"1", "true", "yes", "on"}:
+        return "enabled"
+    if raw in {"0", "false", "no", "off"}:
+        return "disabled"
+    if default in HARMONY_FORMAT_MODES:
+        return default
+    return "auto"
+
+
+def _harmony_format_mode_from_env() -> str:
+    explicit = os.getenv("HARMONY_FORMAT_MODE")
+    if explicit is not None:
+        return normalize_harmony_format_mode(explicit, "auto")
+    legacy = os.getenv("HARMONY_FORMAT")
+    if legacy is not None:
+        return normalize_harmony_format_mode(legacy, "auto")
+    return "auto"
+
+
 def _normalize_rag_clip_model(value: str) -> str:
     """Normalize CLIP model names and reject non-CLIP vision-model drift."""
     cleaned = str(value or "").strip()
@@ -246,7 +277,8 @@ def _normalize_rag_clip_model(value: str) -> str:
 
 
 def load_config():
-    harmony_format = os.getenv("HARMONY_FORMAT", "false").lower() == "true"
+    harmony_format_mode = _harmony_format_mode_from_env()
+    harmony_format = harmony_format_mode != "disabled"
     dev_mode = os.getenv("FLOAT_DEV_MODE", "false").lower() == "true"
     data_dir_env = os.getenv("FLOAT_DATA_DIR")
     data_dir = Path(data_dir_env).expanduser() if data_dir_env else DEFAULT_DATA_DIR
@@ -374,6 +406,7 @@ def load_config():
         ),
         "allow_remote_code": _env_bool("ALLOW_TRANSFORMERS_REMOTE_CODE", True),
         "harmony_format": harmony_format,
+        "harmony_format_mode": harmony_format_mode,
         "server_url": os.getenv("SERVER_URL", ""),
         "mcp_url": os.getenv("MCP_SERVER_URL"),
         "mcp_token": os.getenv("MCP_API_TOKEN", ""),
@@ -386,7 +419,7 @@ def load_config():
         # Default OpenAI TTS voice. 'nova' was not a valid voice name.
         "voice_model": os.getenv("VOICE_MODEL", "alloy"),
         "stream_backend": os.getenv("FLOAT_STREAM_BACKEND", "api"),
-        "realtime_model": os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime"),
+        "realtime_model": os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2"),
         "openai_provider_transport": os.getenv(
             "FLOAT_OPENAI_PROVIDER_TRANSPORT", "http"
         )
@@ -412,6 +445,13 @@ def load_config():
         "realtime_voice": os.getenv(
             "OPENAI_REALTIME_VOICE",
             os.getenv("VOICE_MODEL", "alloy"),
+        ),
+        "realtime_transcription_model": os.getenv(
+            "OPENAI_REALTIME_TRANSCRIPTION_MODEL", ""
+        ).strip(),
+        "realtime_tracing": os.getenv("OPENAI_REALTIME_TRACING", "").strip().lower(),
+        "realtime_transcription_logprobs": _env_bool(
+            "OPENAI_REALTIME_TRANSCRIPTION_LOGPROBS", False
         ),
         "live_agent_mode": os.getenv("FLOAT_LIVE_AGENT_MODE", "local").strip().lower()
         or "local",
@@ -506,6 +546,40 @@ def load_config():
         "reflection_store_path": reflection_store_path,
         "reflection_scheduler_enabled": _env_bool(
             "FLOAT_REFLECTION_SCHEDULER_ENABLED", False
+        ),
+        "background_autonomy_enabled": _env_bool(
+            "FLOAT_BACKGROUND_AUTONOMY_ENABLED", False
+        ),
+        "background_autonomy_sandbox_processes": _env_bool(
+            "FLOAT_BACKGROUND_AUTONOMY_SANDBOX_PROCESSES", True
+        ),
+        "background_autonomy_mode": os.getenv(
+            "FLOAT_BACKGROUND_AUTONOMY_MODE", "overnight"
+        ),
+        "background_autonomy_interval_seconds": _env_int(
+            "FLOAT_BACKGROUND_AUTONOMY_INTERVAL_SECONDS", 900
+        ),
+        "background_autonomy_max_reflections_per_tick": _env_int(
+            "FLOAT_BACKGROUND_AUTONOMY_MAX_REFLECTIONS_PER_TICK", 1
+        ),
+        "background_autonomy_max_runtime_seconds": _env_int(
+            "FLOAT_BACKGROUND_AUTONOMY_MAX_RUNTIME_SECONDS", 1800
+        ),
+        "background_autonomy_satisfied_threshold": _env_float(
+            "FLOAT_BACKGROUND_AUTONOMY_SATISFIED_THRESHOLD", 0.80
+        ),
+        "background_autonomy_basic_tick_count": _env_int(
+            "FLOAT_BACKGROUND_AUTONOMY_BASIC_TICK_COUNT", 2
+        ),
+        "background_autonomy_basic_tick_seconds": _env_int(
+            "FLOAT_BACKGROUND_AUTONOMY_BASIC_TICK_SECONDS", 300
+        ),
+        "background_autonomy_min_priority": _env_float(
+            "FLOAT_BACKGROUND_AUTONOMY_MIN_PRIORITY", 0.05
+        ),
+        "background_autonomy_store_path": os.getenv(
+            "FLOAT_BACKGROUND_AUTONOMY_STORE",
+            str(databases_dir / "background_autonomy_state.json"),
         ),
         # Default system prompt describing Float's current tool/runtime behavior.
         "system_prompt": os.getenv(

@@ -30,6 +30,10 @@ def _sign(tool_name: str, args: dict):
     return generate_signature("tester", tool_name, normalized)
 
 
+def _settings_with_modules(modules):
+    return {"enabled_workflow_modules": list(modules)}
+
+
 def test_tool_help_returns_rich_single_tool_entry():
     from app.tools.tool_help import tool_help
 
@@ -156,9 +160,11 @@ def test_help_special_modules_returns_workflow_catalog():
     assert entry["name"] == "modules"
     assert isinstance(entry.get("workflows"), list)
     assert isinstance(entry.get("modules"), list)
+    assert "tool_names" in entry["modules"][0]
     notes = " ".join(str(note) for note in entry.get("notes", []))
     assert "workflow" in notes.lower()
     assert "add-ons" in notes.lower()
+    assert "read_capability_docs" in notes
 
 
 def test_help_special_skills_returns_skill_catalog():
@@ -176,10 +182,11 @@ def test_help_special_skills_returns_skill_catalog():
     entry = result["tools"][0]
     assert entry["name"] == "skills"
     assert "skills_root" in entry
+    assert "skills_roots" in entry
     notes = " ".join(str(note) for note in entry.get("notes", []))
     lowered = notes.lower()
     assert "markdown" in lowered
-    assert "not yet dynamically injected" in lowered
+    assert "read_capability_docs" in lowered
 
 
 def test_tool_info_special_modules_returns_catalog_entry():
@@ -261,6 +268,8 @@ def test_tool_help_create_task_mentions_reminders_and_actions():
     lowered = notes.lower()
     assert "reminder" in lowered
     assert "actions" in lowered
+    assert "start_at" in lowered
+    assert "time_zone" in lowered
 
 
 def test_tool_help_read_file_mentions_chunked_usage():
@@ -310,35 +319,61 @@ def test_tool_help_includes_catalog_metadata():
     assert "computer.navigate" in notes
 
 
-def test_tool_help_system_prompt_mentions_file_workflow(monkeypatch):
+def test_base_system_prompt_is_structured_and_general(monkeypatch):
     from app import config
 
     monkeypatch.delenv("SYSTEM_PROMPT", raising=False)
     prompt = config.load_config()["system_prompt"]
+    assert "\n\n**personality:" in prompt
     assert "help" in prompt
     assert "tool_help" in prompt
     assert "tool_info" in prompt
-    assert "call `help` or `tool_help` with `{}`" in prompt
-    assert "only pass `failed_tool_name`, `failed_args`, and `failed_error`" in prompt
-    assert "list_dir" in prompt
-    assert "read_file" in prompt
-    assert "start_line" in prompt
-    assert "line_count" in prompt
-    assert "max_chars" in prompt
-    assert "write_file" in prompt
-    assert "list_actions" in prompt
-    assert "read_action_diff" in prompt
-    assert "revert_actions" in prompt
-    assert "computer.observe" in prompt
-    assert "computer.act" in prompt
-    assert "shell.exec" in prompt
-    assert "patch.apply" in prompt
-    assert "mcp.call" in prompt
+    assert "for obvious actionable requests" in prompt
+    assert "claim durable changes only after a successful durable tool result" in prompt
+    assert "float's personality is light, clever, curious and helpful." in prompt
+    assert "memory.*" not in prompt
+    assert "open_url" not in prompt
+    assert "shell.exec" not in prompt
+    assert "patch.apply" not in prompt
+    assert "mcp.call" not in prompt
     assert "stub only" not in prompt
 
 
-def test_tool_help_computer_observe_mentions_session_state():
+def test_tool_help_patch_apply_matches_text_write_schema(monkeypatch):
     from app.tools.tool_help import tool_help
+    from app.utils import user_settings
+
+    monkeypatch.setattr(
+        user_settings, "load_settings", lambda: _settings_with_modules(["computer_use"])
+    )
+
+    args = {
+        "tool_name": "patch.apply",
+        "detail": "rich",
+        "include_schema": True,
+        "max_tools": 20,
+    }
+    signature = _sign("tool_help", args)
+    result = tool_help(user="tester", signature=signature, **args)
+    entry = result["tools"][0]
+    notes = " ".join(str(note) for note in entry.get("notes", []))
+    examples = entry.get("examples") or []
+    schema = entry.get("schema") or {}
+
+    assert "text file helper" in notes
+    assert "not a git-style patch engine" in notes
+    assert schema.get("required") == ["path", "content"]
+    assert examples and all("patch" not in example for example in examples)
+    assert all("path" in example and "content" in example for example in examples)
+
+
+def test_tool_help_computer_observe_mentions_session_state(monkeypatch):
+    from app.tools.tool_help import tool_help
+    from app.utils import user_settings
+
+    monkeypatch.setattr(
+        user_settings, "load_settings", lambda: _settings_with_modules(["computer_use"])
+    )
 
     args = {
         "tool_name": "computer.observe",
@@ -375,8 +410,13 @@ def test_tool_help_names_list_mode_honors_limit():
     assert "list_actions" in result["more_tools"]
 
 
-def test_tool_help_names_list_mode_surfaces_tail_tools_when_truncated():
+def test_tool_help_names_list_mode_surfaces_tail_tools_when_truncated(monkeypatch):
     from app.tools.tool_help import tool_help
+    from app.utils import user_settings
+
+    monkeypatch.setattr(
+        user_settings, "load_settings", lambda: _settings_with_modules(["computer_use"])
+    )
 
     args = {
         "tool_name": "",
@@ -409,8 +449,13 @@ def test_tool_help_brief_list_mode_returns_summaries():
     assert "schema" not in result["tools"][0]
 
 
-def test_tool_help_fuzzy_filter_lists_computer_tools():
+def test_tool_help_fuzzy_filter_lists_computer_tools(monkeypatch):
     from app.tools.tool_help import tool_help
+    from app.utils import user_settings
+
+    monkeypatch.setattr(
+        user_settings, "load_settings", lambda: _settings_with_modules(["computer_use"])
+    )
 
     args = {
         "tool_name": "computer",
@@ -425,6 +470,29 @@ def test_tool_help_fuzzy_filter_lists_computer_tools():
     assert result["count"] <= 6
     assert "computer.session.start" in result["tools"]
     assert all("computer" in name for name in result["tools"])
+
+
+def test_tool_help_hides_disabled_module_tools(monkeypatch):
+    from app.tools.tool_help import tool_help
+    from app.utils import user_settings
+
+    monkeypatch.setattr(
+        user_settings, "load_settings", lambda: _settings_with_modules([])
+    )
+
+    args = {
+        "tool_name": "computer",
+        "detail": "names",
+        "include_schema": False,
+        "max_tools": 6,
+    }
+    signature = _sign("tool_help", args)
+    result = tool_help(user="tester", signature=signature, **args)
+
+    assert "computer.session.start" not in result.get("tools", [])
+    suite_names = {suite["name"] for suite in result.get("suites", [])}
+    assert "computer.*" not in suite_names
+    assert all("computer" not in str(name) for name in result.get("available", []))
 
 
 def test_tool_help_family_filter_lists_file_tools():
@@ -488,8 +556,13 @@ def test_tool_info_family_query_returns_family_menu():
     )
 
 
-def test_help_alias_uses_compact_defaults():
+def test_help_alias_uses_compact_defaults(monkeypatch):
     from app.tools.tool_help import help_tool
+    from app.utils import user_settings
+
+    monkeypatch.setattr(
+        user_settings, "load_settings", lambda: _settings_with_modules(["computer_use"])
+    )
 
     args = {}
     signature = _sign("help", args)
@@ -503,9 +576,7 @@ def test_help_alias_uses_compact_defaults():
     suite_names = {suite["name"] for suite in result.get("suites", [])}
     assert {"compact_conversation.*", "computer.*", "capture.*"} <= suite_names
     compact_suite = next(
-        suite
-        for suite in result["suites"]
-        if suite["name"] == "compact_conversation.*"
+        suite for suite in result["suites"] if suite["name"] == "compact_conversation.*"
     )
     assert "compact_conversation_plan" in compact_suite["exact_tools"]
     assert "detail='brief'" in compact_suite["hint"]

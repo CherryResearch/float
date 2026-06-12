@@ -29,6 +29,7 @@ def test_tool_specs_endpoint_returns_schemas(tmp_path, monkeypatch):
         "help",
         "tool_help",
         "tool_info",
+        "read_capability_docs",
         "list_actions",
         "read_action_diff",
         "revert_actions",
@@ -112,6 +113,17 @@ def test_tool_specs_endpoint_returns_schemas(tmp_path, monkeypatch):
     assert "failed_tool_name" in tool_info_props
     assert "failed_args" in tool_info_props
     assert "failed_error" in tool_info_props
+    capability_docs = next(
+        (t for t in tools if t.get("name") == "read_capability_docs"), None
+    )
+    assert capability_docs is not None
+    capability_docs_props = capability_docs["parameters"].get("properties") or {}
+    assert "action" in capability_docs_props
+    assert "scope" in capability_docs_props
+    assert "doc_id" in capability_docs_props
+    assert "query" in capability_docs_props
+    assert "start_line" in capability_docs_props
+    assert "line_count" in capability_docs_props
     list_actions = next((t for t in tools if t.get("name") == "list_actions"), None)
     assert list_actions is not None
     list_actions_props = list_actions["parameters"].get("properties") or {}
@@ -140,6 +152,8 @@ def test_tool_specs_endpoint_returns_schemas(tmp_path, monkeypatch):
     reflect_props = reflect["parameters"].get("properties") or {}
     assert "question" in reflect_props
     assert "patience" in reflect_props
+    assert "patience_budget" in reflect_props
+    assert "oneOf" in reflect_props["patience"]
     assert "run_now" in reflect_props
     list_reflections = next(
         (t for t in tools if t.get("name") == "list_reflections"), None
@@ -160,6 +174,10 @@ def test_tool_specs_endpoint_returns_schemas(tmp_path, monkeypatch):
     assert "start_time" in create_task_props
     assert "start" in create_task_props
     assert "grounded_at" in create_task_props
+    assert "start_at" in create_task_props
+    assert "end_at" in create_task_props
+    assert "tz" in create_task_props
+    assert "time_zone" in create_task_props
     assert "status" in create_task_props
     list_tasks = next((t for t in tools if t.get("name") == "list_tasks"), None)
     assert list_tasks is not None
@@ -236,6 +254,8 @@ def test_tool_specs_endpoint_returns_schemas(tmp_path, monkeypatch):
     live_names = {tool.get("name") for tool in live_resp.json().get("tools", [])}
     assert {"help", "tool_help", "tool_info", "read_file", "list_dir"} <= live_names
     assert "remember" in live_names
+    assert all("." not in str(name or "") for name in live_names)
+    assert "capture.list" not in live_names
     assert "write_file" not in live_names
     assert "computer.act" not in live_names
 
@@ -244,6 +264,7 @@ def test_tool_specs_endpoint_returns_schemas(tmp_path, monkeypatch):
             "tool_policies": {
                 "write_file": {"workflow": "both", "approval": "low"},
                 "read_file": {"workflow": "disabled", "approval": "low"},
+                "mcp.call": {"workflow": "both", "approval": "low"},
             }
         }
     )
@@ -254,3 +275,4 @@ def test_tool_specs_endpoint_returns_schemas(tmp_path, monkeypatch):
     }
     assert "write_file" in overridden_names
     assert "read_file" not in overridden_names
+    assert "mcp.call" not in overridden_names

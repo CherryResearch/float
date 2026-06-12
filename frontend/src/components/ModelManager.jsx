@@ -127,6 +127,19 @@ const ModelManager = () => {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
   }
 
+  const modelSecondaryText = (model) => {
+    const info = modelInfo[model];
+    if (!info) return '...';
+    const meta = info.metadata || {};
+    const parts = [
+      formatBytes(info.size || 0),
+      meta.family,
+      info.local_loader,
+      info.lane,
+    ].filter(Boolean);
+    return parts.join(' / ');
+  };
+
   const getButtonState = (model) => {
     const status = modelStatus[model];
     if (downloading[model]) {
@@ -182,7 +195,7 @@ const ModelManager = () => {
               const buttonState = getButtonState(model);
               return (
                 <ListItem key={model}>
-                  <ListItemText primary={model} secondary={modelInfo[model] ? formatBytes(modelInfo[model].size) : '...'} />
+                  <ListItemText primary={model} secondary={modelSecondaryText(model)} />
                   <Button
                     variant="contained"
                     style={buttonState.style}

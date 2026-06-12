@@ -173,6 +173,58 @@ def test_provider_snapshot_does_not_resurrect_ready_state_from_cache():
     assert runtime["inventory_stale"] is True
 
 
+def test_quick_provider_status_skips_model_inventory_refresh():
+    from app.local_providers.manager import LocalProviderManager
+
+    class _FakeAdapter:
+        def __init__(self):
+            self.list_calls = 0
+
+        def detect_installation(self, cfg):
+            return {"ok": True, "installed": True, "binary": "fake"}
+
+        def resolve_base_url(self, cfg, *, with_v1):
+            return "http://127.0.0.1:1234/v1" if with_v1 else "http://127.0.0.1:1234"
+
+        def poll_status(self, cfg, *, quick=False):
+            assert quick is True
+            return {
+                "ok": True,
+                "server_running": False,
+                "model_loaded": False,
+                "loaded_model": None,
+                "context_length": None,
+                "details": {},
+            }
+
+        def list_models(self, cfg):
+            self.list_calls += 1
+            raise AssertionError("quick status should not refresh model inventory")
+
+        def capabilities(self, cfg):
+            return {}
+
+    manager = LocalProviderManager(
+        lambda: {
+            "local_provider": "lmstudio",
+            "local_provider_mode": "local-managed",
+            "local_provider_host": "127.0.0.1",
+            "local_provider_port": 1234,
+            "local_provider_api_token": "",
+            "local_provider_preferred_model": "",
+        }
+    )
+    fake_adapter = _FakeAdapter()
+    manager._adapters["lmstudio"] = fake_adapter
+
+    runtime = manager.provider_status("lmstudio", quick=True)
+
+    assert runtime["provider"] == "lmstudio"
+    assert runtime["server_running"] is False
+    assert runtime["inventory_source"] == "unknown"
+    assert fake_adapter.list_calls == 0
+
+
 def test_provider_manager_shutdown_stops_owned_models_and_servers():
     from app.local_providers.manager import LocalProviderManager
 

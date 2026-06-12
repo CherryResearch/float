@@ -23,6 +23,7 @@ describe("modelFiltering", () => {
       "all-MiniLM-L6-v2",
       "whisper-small",
       "clip-vit-base-patch32",
+      "paligemma2-3b-pt-224",
       "kokoro",
       "voxtral-mini-3b-2507",
     ];
@@ -34,12 +35,10 @@ describe("modelFiltering", () => {
       "whisper-small",
     ]);
     expect(filterAvailableModelsForField("vision_model", models)).toEqual([
-      "clip-vit-base-patch32",
+      "paligemma2-3b-pt-224",
     ]);
     expect(filterAvailableModelsForField("tts_model", models)).toEqual(["kokoro"]);
-    expect(filterAvailableModelsForField("voice_model", models)).toEqual([
-      "voxtral-mini-3b-2507",
-    ]);
+    expect(filterAvailableModelsForField("voice_model", models)).toEqual([]);
   });
 
   it("allows opt-in unfiltered lists", () => {

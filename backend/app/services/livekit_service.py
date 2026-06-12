@@ -10,10 +10,15 @@ import jwt
 
 DEFAULT_REALTIME_SESSION_URL = "https://api.openai.com/v1/realtime/client_secrets"
 DEFAULT_REALTIME_CONNECT_URL = "https://api.openai.com/v1/realtime/calls"
-DEFAULT_REALTIME_MODEL = "gpt-realtime"
+DEFAULT_REALTIME_MODEL = "gpt-realtime-2"
 DEFAULT_REALTIME_VOICE = "alloy"
-DEFAULT_REALTIME_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
+DEFAULT_REALTIME_TRANSCRIPTION_MODEL = "gpt-realtime-whisper"
 DEFAULT_LIVE_AGENT_MODE = "local"
+REALTIME_TRANSCRIPTION_MODELS = {
+    "gpt-realtime-whisper",
+    "gpt-4o-transcribe",
+    "gpt-4o-mini-transcribe",
+}
 REALTIME_VOICE_OPTIONS = {
     "alloy",
     "ash",
@@ -49,8 +54,44 @@ def _normalize_live_agent_mode(value: Any) -> str:
     return DEFAULT_LIVE_AGENT_MODE
 
 
+def _realtime_transcription_model_from_stt(value: Any) -> str:
+    raw = str(value or "").strip()
+    normalized = raw.lower()
+    if not normalized:
+        return ""
+    if normalized.startswith("api:"):
+        raw = raw[4:].strip()
+        normalized = raw.lower()
+    if normalized in REALTIME_TRANSCRIPTION_MODELS:
+        return raw
+    if normalized.startswith("gpt-4o") and "transcribe" in normalized:
+        return raw
+    return ""
+
+
+def _normalize_realtime_reasoning_effort(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"low", "medium", "high", "xhigh"}:
+        return raw
+    return ""
+
+
+def _realtime_model_supports_reasoning(value: Any) -> bool:
+    normalized = str(value or "").strip().lower()
+    return normalized.startswith("gpt-realtime-2")
+
+
+def _normalize_realtime_tracing(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"auto", "true", "1", "yes", "on"}:
+        return "auto"
+    return ""
+
+
 class LiveSessionTransportAdapter(Protocol):
-    def connect(self, identity: str, room: str) -> Dict[str, Any]:
+    def connect(
+        self, identity: str, room: str, *, reasoning_effort: str | None = None
+    ) -> Dict[str, Any]:
         """Return transport-specific connection details."""
 
 
@@ -58,15 +99,21 @@ class OpenAIRealtimeTransportAdapter:
     def __init__(self, service: "LiveKitService") -> None:
         self.service = service
 
-    def connect(self, identity: str, room: str) -> Dict[str, Any]:
-        return self.service._create_realtime_session(identity, room)
+    def connect(
+        self, identity: str, room: str, *, reasoning_effort: str | None = None
+    ) -> Dict[str, Any]:
+        return self.service._create_realtime_session(
+            identity, room, reasoning_effort=reasoning_effort
+        )
 
 
 class LiveKitTransportAdapter:
     def __init__(self, service: "LiveKitService") -> None:
         self.service = service
 
-    def connect(self, identity: str, room: str) -> Dict[str, Any]:
+    def connect(
+        self, identity: str, room: str, *, reasoning_effort: str | None = None
+    ) -> Dict[str, Any]:
         self.service.create_room(room)
         token = self.service.generate_token(identity, room)
         return {
@@ -82,7 +129,9 @@ class LocalBridgeTransportAdapter:
     def __init__(self, service: "LiveKitService") -> None:
         self.service = service
 
-    def connect(self, identity: str, room: str) -> Dict[str, Any]:
+    def connect(
+        self, identity: str, room: str, *, reasoning_effort: str | None = None
+    ) -> Dict[str, Any]:
         return {
             "provider": "float-local-live",
             "transport": "local-bridge",
@@ -116,7 +165,9 @@ class LiveKitService:
 
         # OpenAI Realtime specific configuration
         self.openai_api_key = config.get("api_key") or os.getenv("OPENAI_API_KEY", "")
-        self.realtime_model = config.get("realtime_model", DEFAULT_REALTIME_MODEL)
+        self.realtime_model = _first_non_empty(
+            config.get("realtime_model"), DEFAULT_REALTIME_MODEL
+        )
         self.realtime_voice = config.get(
             "realtime_voice",
             config.get("voice_model", DEFAULT_REALTIME_VOICE),
@@ -136,12 +187,31 @@ class LiveKitService:
         self.realtime_connect_url = config.get(
             "realtime_connect_url", DEFAULT_REALTIME_CONNECT_URL
         )
+        explicit_realtime_stt = str(
+            config.get("realtime_transcription_model")
+            or os.getenv("OPENAI_REALTIME_TRANSCRIPTION_MODEL", "")
+        ).strip()
+        inherited_realtime_stt = _realtime_transcription_model_from_stt(
+            config.get("stt_model")
+        )
         self.realtime_transcription_model = (
-            str(
-                config.get("realtime_transcription_model")
-                or os.getenv("OPENAI_REALTIME_TRANSCRIPTION_MODEL", "")
-            ).strip()
+            explicit_realtime_stt
+            or inherited_realtime_stt
             or DEFAULT_REALTIME_TRANSCRIPTION_MODEL
+        )
+        self.realtime_reasoning_effort = _normalize_realtime_reasoning_effort(
+            config.get("realtime_reasoning_effort")
+            or os.getenv("OPENAI_REALTIME_REASONING_EFFORT", "")
+        )
+        self.realtime_tracing = _normalize_realtime_tracing(
+            config.get("realtime_tracing") or os.getenv("OPENAI_REALTIME_TRACING", "")
+        )
+        self.realtime_transcription_logprobs = bool(
+            config.get("realtime_transcription_logprobs")
+            or str(os.getenv("OPENAI_REALTIME_TRANSCRIPTION_LOGPROBS", ""))
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"}
         )
         self.realtime_timeout = int(os.getenv("OPENAI_REALTIME_TIMEOUT", "10"))
         self.realtime_ttl_seconds = int(os.getenv("OPENAI_REALTIME_TTL_SECONDS", "600"))
@@ -237,10 +307,13 @@ class LiveKitService:
             "multimodal_model": multimodal_model,
             "caption_model": self.caption_model,
             "stt_model": _first_non_empty(self.config.get("stt_model")),
+            "realtime_transcription_model": self.realtime_transcription_model,
             "tts_model": _first_non_empty(self.config.get("tts_model")),
             "voice_model": _first_non_empty(voice, self.config.get("voice_model")),
             "supports_visual_input": bool(multimodal_model or self.caption_model),
         }
+        if self.realtime_reasoning_effort:
+            runtime["realtime_reasoning_effort"] = self.realtime_reasoning_effort
         return runtime
 
     def _attach_live_runtime(
@@ -282,7 +355,9 @@ class LiveKitService:
             return normalized
         return DEFAULT_REALTIME_VOICE
 
-    def _create_realtime_session(self, identity: str, room: str) -> Dict[str, Any]:
+    def _create_realtime_session(
+        self, identity: str, room: str, *, reasoning_effort: str | None = None
+    ) -> Dict[str, Any]:
         if not self.openai_api_key:
             raise RuntimeError("OPENAI_API_KEY is required for realtime streaming")
 
@@ -309,6 +384,18 @@ class LiveKitService:
         instructions = str(self.config.get("system_prompt") or "").strip()
         if instructions:
             session_payload["instructions"] = instructions
+        effective_reasoning_effort = (
+            _normalize_realtime_reasoning_effort(reasoning_effort)
+            or self.realtime_reasoning_effort
+        )
+        if effective_reasoning_effort and _realtime_model_supports_reasoning(
+            self.realtime_model
+        ):
+            session_payload["reasoning"] = {"effort": effective_reasoning_effort}
+        if self.realtime_tracing:
+            session_payload["tracing"] = self.realtime_tracing
+        if self.realtime_transcription_logprobs:
+            session_payload["include"] = ["item.input_audio_transcription.logprobs"]
         payload = {
             "session": session_payload,
         }
@@ -352,16 +439,30 @@ class LiveKitService:
             client_secret = data["client_secret"].get("value")
         elif isinstance(data.get("client_secret"), str):
             client_secret = data["client_secret"]
+        elif isinstance(session_data, dict) and isinstance(
+            session_data.get("client_secret"), dict
+        ):
+            client_secret = session_data["client_secret"].get("value")
+        elif isinstance(session_data, dict) and isinstance(
+            session_data.get("client_secret"), str
+        ):
+            client_secret = session_data["client_secret"]
         if not client_secret:
             raise RuntimeError(
                 "OpenAI Realtime session response did not include a client secret"
             )
-        return self._attach_live_runtime(
+        client_secret_expires_at = None
+        if isinstance(session_data, dict) and isinstance(
+            session_data.get("client_secret"), dict
+        ):
+            client_secret_expires_at = session_data["client_secret"].get("expires_at")
+        result = self._attach_live_runtime(
             {
                 "provider": "openai-realtime",
                 "url": self.realtime_connect_url,
                 "client_secret": client_secret,
                 "expires_at": data.get("expires_at")
+                or client_secret_expires_at
                 or (
                     session_data.get("expires_at")
                     if isinstance(session_data, dict)
@@ -382,14 +483,24 @@ class LiveKitService:
             ),
             voice=voice,
         )
+        runtime = result.get("runtime")
+        if (
+            isinstance(runtime, dict)
+            and effective_reasoning_effort
+            and _realtime_model_supports_reasoning(self.realtime_model)
+        ):
+            runtime["realtime_reasoning_effort"] = effective_reasoning_effort
+        return result
 
     # ------------------------------------------------------------------
-    def connect(self, identity: str, room: str) -> Dict[str, Any]:
+    def connect(
+        self, identity: str, room: str, *, reasoning_effort: str | None = None
+    ) -> Dict[str, Any]:
         """Return connection details for the configured streaming backend."""
         adapter = self._adapters.get(self.mode)
         if adapter is None:
             raise RuntimeError(f"Unsupported live streaming backend: {self.mode}")
-        payload = adapter.connect(identity, room)
+        payload = adapter.connect(identity, room, reasoning_effort=reasoning_effort)
         provider = _first_non_empty(payload.get("provider"))
         response_model = _first_non_empty(
             payload.get("response_model"), payload.get("model")

@@ -26,7 +26,8 @@ def reflect(
     title: str | object = _DEFAULT,
     source_thread_id: str | object = _DEFAULT,
     source: str | object = _DEFAULT,
-    patience: int | object = _DEFAULT,
+    patience: int | Dict[str, Any] | object = _DEFAULT,
+    patience_budget: Optional[Dict[str, Any]] | object = _DEFAULT,
     memory_keys: Optional[list[str]] | object = _DEFAULT,
     event_id: str | object = _DEFAULT,
     run_now: bool | object = _DEFAULT,
@@ -45,6 +46,8 @@ def reflect(
         payload["source"] = source
     if patience is not _DEFAULT:
         payload["patience"] = patience
+    if patience_budget is not _DEFAULT:
+        payload["patience_budget"] = patience_budget
     if memory_keys is not _DEFAULT:
         payload["memory_keys"] = memory_keys
     if event_id is not _DEFAULT:
@@ -55,7 +58,8 @@ def reflect(
     title_text = "" if title is _DEFAULT else str(title or "")
     thread_id = "" if source_thread_id is _DEFAULT else str(source_thread_id or "")
     source_text = "user" if source is _DEFAULT else str(source or "user")
-    patience_value = 1 if patience is _DEFAULT else int(patience or 0)
+    patience_value = 1 if patience is _DEFAULT else patience
+    patience_budget_value = None if patience_budget is _DEFAULT else patience_budget
     keys = [] if memory_keys is _DEFAULT or memory_keys is None else list(memory_keys)
     event_text = "" if event_id is _DEFAULT else str(event_id or "")
     run_now_flag = False if run_now is _DEFAULT else bool(run_now)
@@ -65,6 +69,9 @@ def reflect(
         source_thread_id=thread_id,
         source=source_text,
         patience=patience_value,
+        patience_budget=(
+            patience_budget_value if isinstance(patience_budget_value, dict) else None
+        ),
         memory_keys=keys,
         event_id=event_text,
         metadata={"created_by": "tool", "user": user},

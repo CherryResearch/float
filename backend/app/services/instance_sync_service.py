@@ -1810,6 +1810,17 @@ class InstanceSyncService:
                         }
                     )
                 sections[section] = updated
+        deletions = namespaced.get("deletions")
+        if isinstance(deletions, dict):
+            for section in ("conversations", "memories", "knowledge", "calendar"):
+                raw_ids = deletions.get(section)
+                if not isinstance(raw_ids, list):
+                    continue
+                deletions[section] = [
+                    _prefix_token(namespace, str(item_id or "").strip())
+                    for item_id in raw_ids
+                    if str(item_id or "").strip()
+                ]
         namespaced["namespace"] = {
             "namespace": namespace,
             "source_label": source_label or namespace,
@@ -2568,11 +2579,20 @@ class InstanceSyncService:
                 ]
                 continue
             if isinstance(payload, list):
-                sections[section] = [
-                    record
-                    for record in payload
-                    if self._snapshot_record_sync_id(section, record) in selected_ids
-                ]
+                selected_records: List[Dict[str, Any]] = []
+                existing_ids: set[str] = set()
+                for record in payload:
+                    record_id = self._snapshot_record_sync_id(section, record)
+                    if record_id:
+                        existing_ids.add(record_id)
+                    if record_id in selected_ids and isinstance(record, dict):
+                        selected_records.append(record)
+                sections[section] = selected_records
+                missing_ids = sorted(selected_ids - existing_ids)
+                if missing_ids:
+                    deletions = filtered.setdefault("deletions", {})
+                    if isinstance(deletions, dict):
+                        deletions[section] = missing_ids
                 continue
             if isinstance(payload, dict):
                 record_id = self._snapshot_record_sync_id(section, payload)
@@ -2580,6 +2600,152 @@ class InstanceSyncService:
                     payload if record_id and record_id in selected_ids else {}
                 )
         return filtered
+
+    def _snapshot_deletion_ids(
+        self,
+        snapshot: Dict[str, Any],
+    ) -> Dict[str, List[str]]:
+        raw_deletions = snapshot.get("deletions") if isinstance(snapshot, dict) else {}
+        if not isinstance(raw_deletions, dict):
+            return {}
+        normalized: Dict[str, List[str]] = {}
+        for section in self.normalize_sections(raw_deletions.keys()):
+            raw_ids = raw_deletions.get(section)
+            if not isinstance(raw_ids, Iterable) or isinstance(raw_ids, (str, bytes)):
+                continue
+            seen: set[str] = set()
+            ids: List[str] = []
+            for item_id in raw_ids:
+                clean_id = str(item_id or "").strip()
+                if not clean_id or clean_id in seen:
+                    continue
+                seen.add(clean_id)
+                ids.append(clean_id)
+            if ids:
+                normalized[section] = ids
+        return normalized
+
+    def _conversation_name_for_sync_id(self, sync_id: str) -> str:
+        needle = str(sync_id or "").strip()
+        if not needle:
+            return ""
+        for entry in conversation_store.list_conversations(include_metadata=True):
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "").strip()
+            if not name:
+                continue
+            if str(entry.get("id") or "").strip() == needle:
+                return name
+            if needle in {name, f"name:{name}"}:
+                return name
+        return ""
+
+    def _delete_attachment_for_sync_id(self, sync_id: str) -> bool:
+        content_hash = str(sync_id or "").strip().lower()
+        if not content_hash:
+            return False
+        meta = _load_attachment_meta(content_hash)
+        filename = _safe_attachment_filename(meta.get("filename"), content_hash)
+        deleted = False
+        target = _resolve_attachment_target(content_hash, filename=filename)
+        if target is not None and target.exists():
+            try:
+                target.unlink()
+                deleted = True
+            except Exception:
+                logger.debug("Failed to delete synced attachment file", exc_info=True)
+        for candidate in (BLOBS_DIR / content_hash, BLOBS_DIR / f"{content_hash}.json"):
+            if candidate.exists():
+                try:
+                    candidate.unlink()
+                    deleted = True
+                except Exception:
+                    logger.debug(
+                        "Failed to delete synced attachment metadata", exc_info=True
+                    )
+        try:
+            knowledge_store_module.KnowledgeStore().delete_source(
+                f"attachment:{content_hash}"
+            )
+        except Exception:
+            logger.debug("Failed to delete attachment knowledge mirror", exc_info=True)
+        return deleted
+
+    def _delete_section_items(
+        self, section: str, sync_ids: List[str]
+    ) -> Dict[str, Any]:
+        deleted_ids: List[str] = []
+        skipped_ids: List[str] = []
+        if not sync_ids:
+            return {"deleted": 0, "skipped": 0, "deleted_ids": []}
+        if section == "conversations":
+            for sync_id in sync_ids:
+                name = self._conversation_name_for_sync_id(sync_id)
+                if not name:
+                    skipped_ids.append(sync_id)
+                    continue
+                conversation_store.delete_conversation(name)
+                deleted_ids.append(sync_id)
+        elif section == "memories":
+            store = memory_store.load()
+            changed = False
+            for sync_id in sync_ids:
+                if sync_id not in store:
+                    skipped_ids.append(sync_id)
+                    continue
+                store.pop(sync_id, None)
+                changed = True
+                deleted_ids.append(sync_id)
+                try:
+                    knowledge_store_module.KnowledgeStore().delete_source(
+                        f"memory:{sync_id}"
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to delete memory knowledge mirror", exc_info=True
+                    )
+            if changed:
+                memory_store.save(store)
+        elif section == "knowledge":
+            store = knowledge_store_module.KnowledgeStore()
+            for sync_id in sync_ids:
+                if store.delete_identifier(sync_id):
+                    deleted_ids.append(sync_id)
+                else:
+                    skipped_ids.append(sync_id)
+        elif section == "attachments":
+            for sync_id in sync_ids:
+                if self._delete_attachment_for_sync_id(sync_id):
+                    deleted_ids.append(sync_id)
+                else:
+                    skipped_ids.append(sync_id)
+        elif section == "calendar":
+            current = set(calendar_store.list_events())
+            for sync_id in sync_ids:
+                if sync_id not in current:
+                    skipped_ids.append(sync_id)
+                    continue
+                calendar_store.delete_event(sync_id)
+                deleted_ids.append(sync_id)
+                try:
+                    knowledge_store_module.KnowledgeStore().delete_source(
+                        f"calendar_event:{sync_id}"
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to delete calendar knowledge mirror", exc_info=True
+                    )
+        else:
+            skipped_ids.extend(sync_ids)
+        result: Dict[str, Any] = {
+            "deleted": len(deleted_ids),
+            "skipped": len(skipped_ids),
+            "deleted_ids": deleted_ids,
+        }
+        if skipped_ids:
+            result["skipped_ids"] = skipped_ids
+        return result
 
     def merge_snapshot(
         self,
@@ -2635,17 +2801,31 @@ class InstanceSyncService:
                 source_label=source_label_value,
             )
             sections = working_snapshot.get("sections") or {}
+        deletion_ids = self._snapshot_deletion_ids(working_snapshot)
         result: Dict[str, Any] = {
             "applied_at": _now_iso(),
             "sections": {},
             "notes": [],
             "effective_namespace": effective_namespace or None,
         }
-        for section in self.normalize_sections(sections.keys()):
+        section_keys = list(sections.keys()) + list(deletion_ids.keys())
+        for section in self.normalize_sections(section_keys):
             payload = sections.get(section)
-            if payload is None:
-                continue
-            merged = self._merge_section(section, payload)
+            merged = (
+                self._merge_section(section, payload)
+                if payload is not None
+                else {"applied": 0, "skipped": 0}
+            )
+            section_deletions = self._delete_section_items(
+                section,
+                deletion_ids.get(section) or [],
+            )
+            if section_deletions.get("deleted") or section_deletions.get("skipped"):
+                merged["deleted"] = int(section_deletions.get("deleted") or 0)
+                merged["delete_skipped"] = int(section_deletions.get("skipped") or 0)
+                merged["deleted_ids"] = section_deletions.get("deleted_ids") or []
+                if section_deletions.get("skipped_ids"):
+                    merged["delete_skipped_ids"] = section_deletions["skipped_ids"]
             result["sections"][section] = merged
             notes = merged.get("notes")
             if isinstance(notes, list):

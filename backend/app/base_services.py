@@ -41,6 +41,13 @@ from app.provider_transports.openai_responses_ws import (
     OpenAIResponsesWebSocketError,
     OpenAIResponsesWebSocketTransport,
 )
+from app.provider_transports.openai_responses_ws import (
+    extract_response_text as _extract_responses_visible_text,
+)
+from app.provider_transports.openai_responses_ws import (
+    extract_response_tool_text as _extract_responses_tool_text,
+)
+from app.utils import blob_store
 from app.utils.blob_store import get_blob as load_blob
 from app.utils.graph_store import GraphStore
 from app.utils.hardware import gpu_memory_snapshot, system_memory_snapshot
@@ -456,6 +463,7 @@ from workers.multimodal import (
     VisionCaptioner,
     is_placeholder_caption,
     placeholder_caption,
+    resolve_vision_caption_model,
 )
 
 from . import config as app_config
@@ -484,6 +492,8 @@ _VISION_NATIVE_MODEL_HINTS = (
     "vision",
     "vlm",
     "gemini",
+    "gemma-4",
+    "gemma4",
     "claude-3",
     "claude-4",
     "paligemma",
@@ -811,6 +821,217 @@ def _extract_attachment_hash(url_value: Any) -> Optional[str]:
     return None
 
 
+def _extract_capture_id(url_value: Any) -> Optional[str]:
+    if not url_value:
+        return None
+    try:
+        parsed = urlparse(str(url_value))
+        path = parsed.path or ""
+    except Exception:
+        path = str(url_value)
+    segments = [segment for segment in path.split("/") if segment]
+    for idx, segment in enumerate(segments):
+        if segment == "captures" and idx + 1 < len(segments):
+            candidate = segments[idx + 1]
+            if candidate and candidate not in {"upload", "content"}:
+                return candidate
+    return None
+
+
+def _image_mime_hint(entry: Dict[str, Any]) -> str:
+    mime = str(
+        entry.get("type") or entry.get("content_type") or entry.get("mime_type") or ""
+    ).strip()
+    if mime:
+        return mime.lower()
+    guessed, _ = mimetypes.guess_type(
+        str(entry.get("name") or entry.get("filename") or entry.get("url") or "")
+    )
+    return str(guessed or "").lower()
+
+
+def _is_image_attachment(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    mime = _image_mime_hint(entry)
+    return bool(mime and mime.startswith("image/"))
+
+
+def get_capture_service():
+    from app.services.capture_service import get_capture_service as _get_capture_service
+
+    return _get_capture_service()
+
+
+def _read_safe_attachment_path(path_value: Any) -> Optional[bytes]:
+    raw_value = str(path_value or "").strip()
+    if not raw_value:
+        return None
+    if raw_value.lower().startswith(("http://", "https://", "data:")):
+        return None
+
+    candidates: List[Path] = []
+    try:
+        managed_target = blob_store.resolve_managed_path(raw_value)
+        if managed_target is not None:
+            candidates.append(managed_target)
+    except Exception:
+        pass
+
+    try:
+        raw_path = Path(raw_value)
+    except Exception:
+        raw_path = None
+    if raw_path is not None:
+        try:
+            candidates.append(
+                raw_path.resolve()
+                if raw_path.is_absolute()
+                else (blob_store.REPO_ROOT / raw_path).resolve()
+            )
+        except Exception:
+            pass
+
+    allowed_roots: List[Path] = []
+    for root_factory in (
+        blob_store._resolve_data_files_root,
+        blob_store._resolve_managed_data_root,
+    ):
+        try:
+            allowed_roots.append(root_factory().resolve())
+        except Exception:
+            pass
+
+    seen: Set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            target = candidate.resolve()
+        except Exception:
+            target = candidate
+        allowed = False
+        for root in allowed_roots:
+            try:
+                target.relative_to(root)
+                allowed = True
+                break
+            except Exception:
+                continue
+        if not allowed:
+            continue
+        try:
+            if target.exists() and target.is_file():
+                return target.read_bytes()
+        except Exception:
+            continue
+    return None
+
+
+def _read_capture_service_path(service: Any, path_value: Any) -> Optional[bytes]:
+    if service is None or path_value is None:
+        return None
+    try:
+        target = Path(path_value).resolve()
+        files_root = Path(getattr(service, "files_root")).resolve()
+        target.relative_to(files_root)
+    except Exception:
+        return None
+    try:
+        if target.exists() and target.is_file():
+            return target.read_bytes()
+    except Exception:
+        return None
+    return None
+
+
+def _resolve_capture_attachment_bytes(
+    att: Dict[str, Any], content_hash: Optional[str]
+) -> Optional[bytes]:
+    capture_id = (
+        str(att.get("capture_id") or att.get("captureId") or "").strip()
+        or _extract_capture_id(att.get("url"))
+        or _extract_capture_id(att.get("remoteUrl"))
+    )
+    try:
+        service = get_capture_service()
+    except Exception:
+        service = None
+
+    target: Optional[Path] = None
+    if service is not None and capture_id:
+        try:
+            target = service.capture_path(capture_id)
+        except Exception:
+            target = None
+    if target is not None:
+        raw = _read_capture_service_path(service, target)
+        if raw is not None:
+            return raw
+
+    if service is not None and content_hash:
+        try:
+            target = service.capture_path_for_content_hash(content_hash)
+        except Exception:
+            target = None
+        if target is not None:
+            raw = _read_capture_service_path(service, target)
+            if raw is not None:
+                return raw
+    return None
+
+
+def _resolve_attachment_bytes(att: Dict[str, Any]) -> Tuple[Optional[bytes], str]:
+    content_hash = (
+        str(att.get("content_hash") or att.get("contentHash") or "").strip()
+        or _extract_attachment_hash(att.get("url"))
+        or _extract_attachment_hash(att.get("remoteUrl"))
+    )
+    if content_hash:
+        try:
+            return load_blob(content_hash), "blob"
+        except Exception:
+            pass
+
+    raw = _resolve_capture_attachment_bytes(att, content_hash)
+    if raw is not None:
+        return raw, "capture"
+
+    for key in ("relative_path", "relativePath", "path"):
+        raw = _read_safe_attachment_path(att.get(key))
+        if raw is not None:
+            return raw, key
+
+    if content_hash:
+        return None, "missing_blob"
+    if (
+        att.get("capture_id")
+        or att.get("captureId")
+        or _extract_capture_id(att.get("url"))
+    ):
+        return None, "missing_capture"
+    return None, "missing_image_reference"
+
+
+def _count_native_image_message_parts(messages: Sequence[Dict[str, Any]]) -> int:
+    total = 0
+    try:
+        for msg in messages:
+            content = msg.get("content") if isinstance(msg, dict) else None
+            if not isinstance(content, list):
+                continue
+            total += sum(
+                1
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "image_url"
+            )
+    except Exception:
+        return 0
+    return total
+
+
 def _open_local_image(raw: bytes):
     try:
         from PIL import Image
@@ -1043,25 +1264,11 @@ class LLMService:
             if key in seen_keys:
                 continue
             seen_keys.add(key)
-            content_hash = entry.get("content_hash") or _extract_attachment_hash(
-                entry.get("url")
-            )
-            if content_hash:
-                try:
-                    raw = load_blob(content_hash)
-                except Exception:
-                    _add_ignored(label, "missing_blob")
-                    continue
+            raw, reason = _resolve_attachment_bytes(entry)
+            if raw is not None:
                 _maybe_open_image_bytes(raw, label)
                 continue
-            path_value = str(entry.get("path") or "").strip()
-            if path_value:
-                try:
-                    _maybe_open_image_bytes(Path(path_value).read_bytes(), label)
-                except Exception:
-                    _add_ignored(label, "missing_file")
-                continue
-            _add_ignored(label, "missing_image_reference")
+            _add_ignored(label, reason or "missing_image_reference")
 
         try:
             context_images = (
@@ -2320,6 +2527,9 @@ class LLMService:
         )
         captured_stream_events: List[Dict[str, Any]] = []
         final_response_payload: Optional[Dict[str, Any]] = None
+        response_item_phase_by_index: Dict[int, str] = {}
+        response_item_phase_by_id: Dict[str, str] = {}
+        response_tool_text_parts: List[str] = []
 
         def _extract_output_ids(raw_output: Any) -> List[str]:
             if not isinstance(raw_output, list):
@@ -2375,6 +2585,40 @@ class LLMService:
                 extracted_output_ids = _extract_output_ids(source.get("output"))
                 if extracted_output_ids:
                     output_ids = extracted_output_ids
+
+        def _remember_response_item(item: Any, output_index: Any = None) -> None:
+            if not isinstance(item, dict):
+                return
+            phase = str(item.get("phase") or item.get("channel") or "").strip().lower()
+            if not phase:
+                return
+            if isinstance(output_index, int):
+                response_item_phase_by_index[output_index] = phase
+            item_id = str(item.get("id") or "").strip()
+            if item_id:
+                response_item_phase_by_id[item_id] = phase
+
+        def _response_event_phase(event: Dict[str, Any]) -> str:
+            phase = (
+                str(event.get("phase") or event.get("channel") or "").strip().lower()
+            )
+            if phase:
+                return phase
+            output_index = event.get("output_index")
+            if isinstance(output_index, int):
+                phase = response_item_phase_by_index.get(output_index, "")
+                if phase:
+                    return phase
+            item_id = str(event.get("item_id") or "").strip()
+            if item_id:
+                return response_item_phase_by_id.get(item_id, "")
+            return ""
+
+        def _is_response_tool_text_event(event: Dict[str, Any], text: str) -> bool:
+            phase = _response_event_phase(event)
+            if phase in {"analysis", "commentary", "tool", "tool_call"}:
+                return True
+            return self._parse_inline_tool_call(text) is not None
 
         def _append_text(text: str) -> None:
             nonlocal output_source
@@ -2584,8 +2828,53 @@ class LLMService:
                         saw_response_stream = True
                     is_delta = lowered.endswith(".delta")
                     if is_response or is_reasoning:
+                        if lowered in {
+                            "response.output_item.added",
+                            "response.output_item.done",
+                        }:
+                            _remember_response_item(
+                                chunk.get("item"),
+                                chunk.get("output_index"),
+                            )
+                        elif lowered in {
+                            "response.content_part.added",
+                            "response.content_part.done",
+                        }:
+                            pass
+                        elif lowered == "response.output_text.delta":
+                            delta = chunk.get("delta")
+                            if isinstance(delta, dict):
+                                text_delta = str(
+                                    delta.get("text")
+                                    or delta.get("content")
+                                    or delta.get("output_text")
+                                    or ""
+                                )
+                            elif isinstance(delta, str):
+                                text_delta = delta
+                            else:
+                                text_delta = str(
+                                    chunk.get("output_text") or chunk.get("text") or ""
+                                )
+                            if text_delta:
+                                if _is_response_tool_text_event(chunk, text_delta):
+                                    response_tool_text_parts.append(text_delta)
+                                else:
+                                    current_source = "responses"
+                                    try:
+                                        _append_text(text_delta)
+                                    finally:
+                                        current_source = None
+                        elif lowered == "response.output_text.done":
+                            text_done = chunk.get("text")
+                            if isinstance(text_done, str) and text_done:
+                                if _is_response_tool_text_event(chunk, text_done):
+                                    if not response_tool_text_parts:
+                                        response_tool_text_parts.append(text_done)
+                        elif lowered in {"response.completed", "response.done"}:
+                            pass
                         # Avoid double-counting Responses API "done" payloads after deltas.
-                        if is_reasoning or is_delta or not text_parts:
+                        elif is_reasoning or is_delta or not text_parts:
                             current_source = "responses"
                             try:
                                 _process_stream_payload(
@@ -2826,6 +3115,14 @@ class LLMService:
             if isinstance(lm_tool_calls, list) and not tool_calls_accum:
                 tool_calls_accum = lm_tool_calls
 
+        if isinstance(final_response_payload, dict) and final_response_payload:
+            final_visible_text = _extract_responses_visible_text(final_response_payload)
+            final_tool_text = _extract_responses_tool_text(final_response_payload)
+            if final_tool_text and not response_tool_text_parts:
+                response_tool_text_parts.append(final_tool_text)
+            if final_visible_text and not text_parts:
+                text_parts.append(final_visible_text)
+
         text = "".join(text_parts).strip()
         thought = "".join(part.get("text", "") for part in analysis_trace).strip()
 
@@ -2847,8 +3144,34 @@ class LLMService:
                     tools_used.append({"name": name, "args": parsed_args})
 
         inline_tool_payloads: List[str] = []
-        if not tools_used and text:
-            cleaned_text, inline_candidates = self._extract_inline_tool_calls(text)
+        response_tool_text = "".join(response_tool_text_parts).strip()
+        visible_tool_cleaned = text
+        visible_inline_candidates: List[Dict[str, Any]] = []
+        text_is_only_inline_tools = False
+        if response_tool_text and text:
+            (
+                visible_tool_cleaned,
+                visible_inline_candidates,
+            ) = self._extract_inline_tool_calls(text)
+            text_is_only_inline_tools = (
+                bool(visible_inline_candidates)
+                and not re.sub(
+                    r"\[\[tool_call:\d+\]\]", "", visible_tool_cleaned
+                ).strip()
+            )
+        inline_tool_source = (
+            response_tool_text
+            if response_tool_text and text_is_only_inline_tools
+            else (
+                "\n".join(part for part in (response_tool_text, text) if part).strip()
+                if response_tool_text
+                else text
+            )
+        )
+        if not tools_used and inline_tool_source:
+            cleaned_text, inline_candidates = self._extract_inline_tool_calls(
+                inline_tool_source
+            )
             if inline_candidates:
                 for candidate in inline_candidates:
                     tools_used.append(
@@ -2857,17 +3180,24 @@ class LLMService:
                     raw_payload = candidate.get("raw")
                     if isinstance(raw_payload, str) and raw_payload:
                         inline_tool_payloads.append(raw_payload)
-                text = cleaned_text.strip()
+                if response_tool_text:
+                    text = (
+                        ""
+                        if text_is_only_inline_tools
+                        else visible_tool_cleaned.strip()
+                    )
+                else:
+                    text = cleaned_text.strip()
             else:
                 harmony_text, harmony_candidates = self._extract_harmony_tool_calls(
-                    text
+                    inline_tool_source
                 )
                 if harmony_candidates:
                     for candidate in harmony_candidates:
                         tools_used.append(
                             {"name": candidate["name"], "args": candidate["args"]}
                         )
-                    text = harmony_text.strip()
+                    text = text.strip() if response_tool_text else harmony_text.strip()
 
         if (not text or not text.strip()) and tools_used:
             text = " ".join(
@@ -3119,6 +3449,9 @@ class LLMService:
         attachment_queue: List[Dict[str, Any]] = [
             att for att in attachments_param if isinstance(att, dict)
         ]
+        request_image_attachment_count = sum(
+            1 for att in attachment_queue if _is_image_attachment(att)
+        )
         reasoning = kwargs.pop("reasoning", None)
         vision_workflow = _normalize_vision_workflow(
             kwargs.pop("vision_workflow", None)
@@ -3126,12 +3459,10 @@ class LLMService:
         vision_fallback_details: List[Dict[str, Any]] = []
         vision_fallback_seen: Set[str] = set()
         vision_captioner: Optional[VisionCaptioner] = None
-        configured_vision_model = str(self.config.get("vision_model") or "").strip()
-        if not configured_vision_model or "clip" in configured_vision_model.lower():
-            configured_vision_model = (
-                str(os.getenv("VISION_CAPTION_MODEL") or "").strip()
-                or "google/paligemma2-3b-pt-224"
-            )
+        configured_vision_model = resolve_vision_caption_model(
+            str(self.config.get("vision_model") or "").strip(),
+            str(os.getenv("VISION_CAPTION_MODEL") or "").strip(),
+        )
 
         def _coerce_iso_timestamp(metadata: Any) -> Optional[str]:
             if not isinstance(metadata, dict):
@@ -3223,15 +3554,12 @@ class LLMService:
             content_hash = att.get("content_hash") or _extract_hash_from_url(
                 att.get("url")
             )
-            if not content_hash:
-                return None
-            try:
-                raw = load_blob(content_hash)
-            except Exception:
+            raw, reason = _resolve_attachment_bytes(att)
+            if raw is None:
                 logger.debug(
-                    "LLMService: failed to load attachment %s",
-                    content_hash,
-                    exc_info=True,
+                    "LLMService: failed to resolve image attachment %s (%s)",
+                    content_hash or att.get("capture_id") or att.get("url"),
+                    reason,
                 )
                 return None
             mime = (
@@ -3259,12 +3587,10 @@ class LLMService:
             label = att.get("name") or "image"
             ref = att.get("url") or att.get("remoteUrl") or ""
             content_hash = att.get("content_hash") or _extract_hash_from_url(ref)
-            raw: Optional[bytes] = None
-            if content_hash:
-                try:
-                    raw = load_blob(content_hash)
-                except Exception:
-                    raw = None
+            capture_id = str(
+                att.get("capture_id") or att.get("captureId") or ""
+            ).strip() or _extract_capture_id(ref)
+            raw, _resolve_reason = _resolve_attachment_bytes(att)
             caption = ""
             placeholder = False
             caption_model = configured_vision_model or "vision-captioner"
@@ -3284,17 +3610,23 @@ class LLMService:
                     caption = ""
                     placeholder = False
             if not caption:
-                ref_key = (content_hash or "")[:8] or hashlib.sha256(
+                ref_key = (content_hash or capture_id or "")[:8] or hashlib.sha256(
                     label.encode("utf-8")
                 ).hexdigest()[:8]
                 caption = placeholder_caption(ref_key)
                 placeholder = True
-            detail_key = str(content_hash or label).strip().lower()
+            detail_key = str(content_hash or capture_id or ref or label).strip().lower()
             existing_detail = next(
                 (
                     item
                     for item in vision_fallback_details
-                    if str(item.get("content_hash") or item.get("name") or "")
+                    if str(
+                        item.get("content_hash")
+                        or item.get("capture_id")
+                        or item.get("url")
+                        or item.get("name")
+                        or ""
+                    )
                     .strip()
                     .lower()
                     == detail_key
@@ -3314,6 +3646,8 @@ class LLMService:
                         "index": entry_index,
                         "name": label,
                         "content_hash": content_hash,
+                        "capture_id": capture_id,
+                        "url": ref,
                         "caption": caption,
                         "placeholder": placeholder,
                         "caption_model": caption_model,
@@ -3649,6 +3983,50 @@ class LLMService:
             else:
                 normalized_messages.append({"role": "user", "content": str(msg)})
         messages = normalized_messages
+
+        if (
+            supports_native_images
+            and request_image_attachment_count > 0
+            and _count_native_image_message_parts(messages) == 0
+        ):
+            vision_meta: Dict[str, Any] = {
+                "workflow": vision_workflow,
+                "native_image_input": False,
+                "fallback_used": bool(vision_fallback_details),
+                "fallback_images": len(vision_fallback_details),
+                "error": "image_attachment_resolution_failed",
+            }
+            if vision_fallback_details:
+                vision_meta["fallback_attachments"] = [
+                    {
+                        "name": item.get("name"),
+                        "content_hash": item.get("content_hash"),
+                        "capture_id": item.get("capture_id"),
+                        "caption": item.get("caption"),
+                        "placeholder": item.get("placeholder"),
+                        "caption_model": item.get("caption_model"),
+                    }
+                    for item in vision_fallback_details
+                ]
+            return {
+                "text": (
+                    "Image upload failed before model dispatch: the camera image was "
+                    "attached, but Float could not resolve its bytes for native vision input."
+                ),
+                "thought": "",
+                "tools_used": [],
+                "metadata": {
+                    "error": "Image attachment could not be resolved for native vision input",
+                    "category": "vision_attachment_resolution_error",
+                    "image_attachments": request_image_attachment_count,
+                    "supports_images": True,
+                    "hint": (
+                        "Retry the camera capture. If it repeats, the transient capture "
+                        "metadata or file may be missing."
+                    ),
+                    "vision": vision_meta,
+                },
+            }
 
         structured_content_present = any(
             isinstance(m.get("content"), list) for m in messages
@@ -4294,43 +4672,11 @@ class LLMService:
         # Extract assistant reply and any reasoning/thought content
         thought = ""
         message: Dict[str, Any] = {}
+        response_tool_text = ""
         if url.endswith(suffix_resp):
             # OpenAI Responses API style payload
-            text = data.get("output_text", "")
-            if not text:
-                output = data.get("output")
-                if isinstance(output, list):
-                    collected: list[str] = []
-                    for item in output:
-                        if not isinstance(item, dict):
-                            continue
-                        content = item.get("content")
-                        if isinstance(content, list):
-                            for part in content:
-                                if (
-                                    isinstance(part, dict)
-                                    and part.get("type") == "output_text"
-                                ):
-                                    collected.append(str(part.get("text", "")))
-                                elif (
-                                    isinstance(part, dict)
-                                    and part.get("type") == "text"
-                                ):
-                                    collected.append(str(part.get("text", "")))
-                        elif isinstance(content, str):
-                            collected.append(content)
-                    text = "".join(collected)
-            if not text:
-                response_obj = data.get("response")
-                if isinstance(response_obj, dict):
-                    try:
-                        text = response_obj.get("output_text", "") or "".join(
-                            part.get("text", "")
-                            for part in response_obj.get("content", [])
-                            if isinstance(part, dict)
-                        )
-                    except Exception:
-                        pass
+            text = _extract_responses_visible_text(data)
+            response_tool_text = _extract_responses_tool_text(data)
         else:
             # Chat Completions style payload
             choice = (
@@ -4407,8 +4753,33 @@ class LLMService:
                 tools_used.append({"name": name, "args": args})
 
         inline_tool_payloads: List[str] = []
-        if not tools_used and text:
-            cleaned_text, inline_candidates = self._extract_inline_tool_calls(text)
+        visible_tool_cleaned = text
+        visible_inline_candidates: List[Dict[str, Any]] = []
+        text_is_only_inline_tools = False
+        if response_tool_text and text:
+            (
+                visible_tool_cleaned,
+                visible_inline_candidates,
+            ) = self._extract_inline_tool_calls(text)
+            text_is_only_inline_tools = (
+                bool(visible_inline_candidates)
+                and not re.sub(
+                    r"\[\[tool_call:\d+\]\]", "", visible_tool_cleaned
+                ).strip()
+            )
+        inline_tool_source = (
+            response_tool_text
+            if response_tool_text and text_is_only_inline_tools
+            else (
+                "\n".join(part for part in (response_tool_text, text) if part).strip()
+                if response_tool_text
+                else text
+            )
+        )
+        if not tools_used and inline_tool_source:
+            cleaned_text, inline_candidates = self._extract_inline_tool_calls(
+                inline_tool_source
+            )
             if inline_candidates:
                 for candidate in inline_candidates:
                     tools_used.append(
@@ -4417,17 +4788,24 @@ class LLMService:
                     raw_payload = candidate.get("raw")
                     if isinstance(raw_payload, str) and raw_payload:
                         inline_tool_payloads.append(raw_payload)
-                text = cleaned_text.strip()
+                if response_tool_text:
+                    text = (
+                        ""
+                        if text_is_only_inline_tools
+                        else visible_tool_cleaned.strip()
+                    )
+                else:
+                    text = cleaned_text.strip()
             else:
                 harmony_text, harmony_candidates = self._extract_harmony_tool_calls(
-                    text
+                    inline_tool_source
                 )
                 if harmony_candidates:
                     for candidate in harmony_candidates:
                         tools_used.append(
                             {"name": candidate["name"], "args": candidate["args"]}
                         )
-                    text = harmony_text.strip()
+                    text = text.strip() if response_tool_text else harmony_text.strip()
 
         if (not text or not text.strip()) and tools_used:
             text = " ".join(
@@ -4480,19 +4858,7 @@ class LLMService:
             result["metadata"]["inline_tool_payload"] = inline_tool_payloads[0]
             if len(inline_tool_payloads) > 1:
                 result["metadata"]["inline_tool_payloads"] = inline_tool_payloads
-        native_image_parts = 0
-        try:
-            for msg in messages:
-                content = msg.get("content") if isinstance(msg, dict) else None
-                if not isinstance(content, list):
-                    continue
-                native_image_parts += sum(
-                    1
-                    for part in content
-                    if isinstance(part, dict) and part.get("type") == "image_url"
-                )
-        except Exception:
-            native_image_parts = 0
+        native_image_parts = _count_native_image_message_parts(messages)
         if native_image_parts or vision_fallback_details or vision_workflow != "auto":
             vision_meta: Dict[str, Any] = {
                 "workflow": vision_workflow,
@@ -4505,6 +4871,7 @@ class LLMService:
                     {
                         "name": item.get("name"),
                         "content_hash": item.get("content_hash"),
+                        "capture_id": item.get("capture_id"),
                         "caption": item.get("caption"),
                         "placeholder": item.get("placeholder"),
                         "caption_model": item.get("caption_model"),

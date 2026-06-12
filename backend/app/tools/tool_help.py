@@ -8,14 +8,17 @@ from __future__ import annotations
 
 import json
 from difflib import get_close_matches
-from pathlib import Path
 from typing import Any, Dict, List
 
-from app import config as app_config
 from app.tool_catalog import get_tool_catalog_entry
 from app.tool_specs import BUILTIN_TOOL_SPECS
-from app.utils import verify_signature
-from app.workflow_profiles import workflow_catalog_payload
+from app.utils import user_settings, verify_signature
+from app.workflow_profiles import (
+    normalize_module_id,
+    skill_catalog_payload,
+    tool_module_ids,
+    workflow_catalog_payload,
+)
 
 _DEFAULT_DISCOVERY_PRIORITY = [
     "help",
@@ -46,6 +49,7 @@ _DISCOVERY_OVERFLOW_PRIORITY = [
     *_DEFAULT_DISCOVERY_PRIORITY,
 ]
 _DEFAULT_HELP_HIDDEN_NAMES = {
+    "read_capability_docs",
     "memory.save",
     "create_event",
     "open_url",
@@ -183,6 +187,10 @@ _TOOL_FAMILY_ALIASES: Dict[str, tuple[str, ...]] = {
     "thread": ("threads",),
     "tool": ("help",),
     "tools": ("help",),
+    "doc": ("docs",),
+    "docs": ("docs",),
+    "documentation": ("docs",),
+    "capabilities": ("docs",),
     "undo": ("history",),
     "url": ("web",),
     "urls": ("web",),
@@ -200,7 +208,8 @@ _TOOL_NOTES: Dict[str, Dict[str, Any]] = {
             "Default list mode returns a curated menu and suite summaries; use detail='brief' for one-line descriptions or pass a family/tool name for exact members.",
             "Only add `failed_tool_name`, `failed_args`, and `failed_error` when recovering from a real failed tool call; ordinary discovery should stay on the plain menu path.",
             "If browser or desktop control is needed, inspect `computer.session.start` first, then follow with `computer.navigate`, `computer.observe`, or `computer.act`.",
-            "Pass `tool_name='modules'` to inspect live workflows, enabled modules, and packaged add-ons, or `tool_name='skills'` to inspect packaged skill files.",
+            "Pass `tool_name='modules'` to inspect live workflows, grouped module tool sets, and packaged add-ons.",
+            "Use `read_capability_docs` when tool metadata is too terse and the model needs curated module, UI, or function-description docs without broad file access.",
         ],
         "examples": [
             {},
@@ -211,7 +220,7 @@ _TOOL_NOTES: Dict[str, Dict[str, Any]] = {
             },
             {"tool_name": "computer.session.start"},
             {"tool_name": "modules"},
-            {"tool_name": "skills"},
+            {"tool_name": "read_capability_docs"},
         ],
     },
     "tool_info": {
@@ -281,7 +290,8 @@ _TOOL_NOTES: Dict[str, Dict[str, Any]] = {
             "Use detail='brief' when descriptions are needed, then `tool_info` with one exact name for schema.",
             "If a previous tool call failed, you can pass `failed_tool_name`, `failed_args`, and `failed_error` to get a one-line recovery breadcrumb without losing the menu.",
             "Prefer calling this over hand-listing tool handles from memory when the user asks what float can do.",
-            "Pass `tool_name='modules'` for workflow/module/add-on state or `tool_name='skills'` for packaged skill-file discovery.",
+            "Pass `tool_name='modules'` for workflow/module/add-on state.",
+            "Use `read_capability_docs` for deeper module, UI, and function-description docs; that tool is the curated-docs lane between terse tool metadata and broad file reads.",
             "If the user is asking about Float itself, its setup, or project layout, inspect the repo's root `README.md`; because that file is outside the managed `data/` sandbox, prefer `shell.exec` over `read_file` for that path.",
             "If the user asks for reminders, tasks, events, or scheduling, inspect `create_task` and `list_tasks` before claiming no scheduler exists.",
             "Check runtime and sandbox metadata before assuming shell, REPL, Python, network, or filesystem access.",
@@ -439,15 +449,22 @@ _TOOL_NOTES: Dict[str, Dict[str, Any]] = {
     },
     "patch.apply": {
         "notes": [
-            "Applies a structured patch through the same approval-aware path as other mutating tools.",
-            "Use this when the runtime exposes patch editing directly and you want one atomic diff instead of ad hoc shell edits.",
+            "Writes or appends text content through the same approval-aware path as other mutating tools.",
+            "This is a text file helper with `path`, `content`, and optional `mode`; it is not a git-style patch engine.",
         ],
         "safety": [
             "Mutates local files.",
         ],
         "examples": [
             {
-                "patch": "*** Begin Patch\n*** Update File: data/workspace/note.txt\n@@\n-old\n+new\n*** End Patch\n"
+                "path": "data/workspace/note.txt",
+                "content": "Updated note",
+                "mode": "replace",
+            },
+            {
+                "path": "data/workspace/log.md",
+                "content": "\n- New line",
+                "mode": "append",
             },
         ],
     },
@@ -496,6 +513,7 @@ _TOOL_NOTES: Dict[str, Dict[str, Any]] = {
             "Stores memory entries with optional sensitivity and importance controls.",
             "Writes the exact value into the durable memory store and keeps a canonical retrieval record in SQLite.",
             "Safe text values are mirrored into vector snippets by default; protected/secret values are not mirrored unless explicitly requested.",
+            "When the user does not supply a key, infer a short stable snake_case key from the memory content and intent.",
         ],
         "safety": [
             "Do not store secrets in plain text unless explicitly requested.",
@@ -557,6 +575,7 @@ _TOOL_NOTES: Dict[str, Dict[str, Any]] = {
         "notes": [
             "This is the built-in way to create reminder-style tasks and upcoming events inside Float.",
             "It accepts unix timestamps, ISO datetimes, simple natural-language times, and `{date, time, timezone}` style objects when paired with `timezone` or `grounded_at`.",
+            "Start aliases accepted by the runtime and schema are `start_time`, `start`, `starts_at`, `start_at`, and `when`; timezone aliases are `timezone`, `tz`, and `time_zone`.",
             "Use `actions` to attach structured follow-up prompts or tool calls that should run from the saved task later.",
         ],
         "examples": [
@@ -635,11 +654,24 @@ _TOOL_NOTES: Dict[str, Dict[str, Any]] = {
 
 
 def _available_tool_names() -> List[str]:
-    return [
-        str(name)
-        for name in BUILTIN_TOOL_SPECS.keys()
-        if isinstance(name, str) and name.strip()
-    ]
+    try:
+        settings_payload = user_settings.load_settings()
+    except Exception:
+        settings_payload = {}
+    enabled_modules = {
+        normalize_module_id(str(item or "").strip())
+        for item in (settings_payload.get("enabled_workflow_modules") or [])
+        if normalize_module_id(str(item or "").strip())
+    }
+    names: List[str] = []
+    for name in BUILTIN_TOOL_SPECS.keys():
+        if not isinstance(name, str) or not name.strip():
+            continue
+        modules = tool_module_ids(name)
+        if modules and not any(module_id in enabled_modules for module_id in modules):
+            continue
+        names.append(str(name))
+    return [str(name) for name in names]
 
 
 def _default_discovery_suite_entries(available: List[str]) -> List[Dict[str, Any]]:
@@ -919,9 +951,7 @@ def _tool_name_suggestions(
         seen.add(resolved)
         suggestions.append(resolved)
 
-    for name in _compat_tool_name_suggestions(
-        requested_name, available, limit=limit
-    ):
+    for name in _compat_tool_name_suggestions(requested_name, available, limit=limit):
         _add(name)
         if len(suggestions) >= limit:
             return suggestions[:limit]
@@ -1102,47 +1132,6 @@ def _build_tool_entry(
     return base
 
 
-def _skills_root() -> Path:
-    return (app_config.REPO_ROOT / "modules" / "skills").resolve()
-
-
-def _read_skill_summary(path: Path) -> str:
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except Exception:
-        return ""
-    for raw_line in lines:
-        line = str(raw_line or "").strip()
-        if not line:
-            continue
-        if line.startswith("#"):
-            continue
-        return line
-    return ""
-
-
-def _skills_catalog_payload() -> Dict[str, Any]:
-    root = _skills_root()
-    entries: List[Dict[str, Any]] = []
-    if root.exists():
-        for path in sorted(root.glob("*.md")):
-            if path.name.lower() == "readme.md":
-                continue
-            entries.append(
-                {
-                    "id": path.stem,
-                    "label": path.stem.replace("_", " "),
-                    "path": str(path),
-                    "summary": _read_skill_summary(path),
-                }
-            )
-    return {
-        "skills_root": str(root),
-        "skills": entries,
-        "count": len(entries),
-    }
-
-
 def _build_special_entry(
     name: str,
     *,
@@ -1179,9 +1168,10 @@ def _build_special_entry(
             ]
             return entry
         entry["notes"] = [
-            "Modules are live workflow capabilities such as computer use, camera capture, memory promotion, and host shell access.",
+            "Modules are grouped runtime capability packs that can enable multiple concrete tools and one or more packaged skill/docs references.",
             "Workflows choose behavior style and default enabled modules for a run.",
             "Add-ons are packaged manifests discoverable from the repo and optional local data overrides.",
+            "Use read_capability_docs for the underlying packaged markdown guidance instead of pulling long doc bodies through tool_help.",
         ]
         entry["workflows"] = catalog.get("workflows", [])
         entry["modules"] = catalog.get("modules", [])
@@ -1199,13 +1189,13 @@ def _build_special_entry(
             }
         return entry
     if normalized == "skills":
-        catalog = _skills_catalog_payload()
+        catalog = skill_catalog_payload()
         entry = {
             "name": "skills",
-            "status": "partial",
+            "status": "live",
             "category": "runtime",
-            "summary": "Packaged skill markdown files available in this repo.",
-            "description": "These are repo-shipped guidance files, not first-class executable tools.",
+            "summary": "Packaged markdown skill files available to runtime workflows and discovery.",
+            "description": "These are markdown guidance assets, not standalone executable tools.",
         }
         if detail in {"names", "brief"}:
             entry["skills"] = [
@@ -1214,18 +1204,21 @@ def _build_special_entry(
                 if isinstance(item, dict)
             ]
             entry["skills_root"] = catalog.get("skills_root")
+            entry["skills_roots"] = catalog.get("skills_roots", [])
             return entry
         entry["notes"] = [
-            "Skills are markdown guidance files stored under the repo's modules/skills directory.",
-            "They are discoverable here, but they are not yet dynamically injected as a full runtime capability layer.",
+            "Skills are packaged markdown docs stored under tracked repo roots and optional local data-module overrides.",
+            "Use read_capability_docs to list, search, and read those curated docs directly; this tool_help entry stays metadata-only.",
         ]
         entry["skills_root"] = catalog.get("skills_root")
+        entry["skills_roots"] = catalog.get("skills_roots", [])
         entry["skills"] = catalog.get("skills", [])
         if include_schema:
             entry["schema"] = {
                 "type": "object",
                 "properties": {
                     "skills_root": {"type": "string"},
+                    "skills_roots": {"type": "array"},
                     "skills": {"type": "array"},
                 },
             }
@@ -1278,9 +1271,7 @@ def _tool_menu_payload(
     families = _tool_family_summaries(available)
     if families:
         response["families"] = families
-    remaining_count = len(omitted_names) + (
-        len(hidden_names) if default_menu else 0
-    )
+    remaining_count = len(omitted_names) + (len(hidden_names) if default_menu else 0)
     if remaining_count:
         response["remaining_count"] = remaining_count
     if omitted_names:
@@ -1366,7 +1357,9 @@ def _run_tool_help(
                 response["failed_call"] = recovery_line
             return response
         if requested_name not in BUILTIN_TOOL_SPECS:
-            compat_suggestions = _compat_tool_name_suggestions(requested_name, available)
+            compat_suggestions = _compat_tool_name_suggestions(
+                requested_name, available
+            )
             if compat_suggestions:
                 response = {
                     "query": payload,

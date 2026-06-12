@@ -8,6 +8,17 @@ const DEVICE_ID_KEY = "device_id";
 const DEVICE_TOKEN_KEY = "device_token";
 const DEVICE_PUBLIC_KEY_KEY = "device_public_key";
 
+const createClientId = (prefix = "device") => {
+  if (
+    typeof globalThis !== "undefined" &&
+    globalThis.crypto &&
+    typeof globalThis.crypto.randomUUID === "function"
+  ) {
+    return `${prefix}-${globalThis.crypto.randomUUID()}`;
+  }
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+};
+
 export const getStoredDevice = () => ({
   id: localStorage.getItem(DEVICE_ID_KEY) || null,
   token: localStorage.getItem(DEVICE_TOKEN_KEY) || null,
@@ -52,7 +63,7 @@ export const issueToken = async (
 export const ensureDeviceAndToken = async () => {
   let { id, token, publicKey } = getStoredDevice();
   if (!id || !publicKey) {
-    publicKey = crypto.randomUUID();
+    publicKey = createClientId("device");
     id = await registerDevice(publicKey, navigator.userAgent.slice(0, 60), {
       instance_sync: true,
       requested_scopes: ["sync", "stream"],

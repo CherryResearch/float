@@ -318,9 +318,27 @@ describe("TopBar local runtime entries", () => {
       serverUrl: "http://127.0.0.1:1234",
     });
 
-    expect(screen.getByPlaceholderText("server/lan url")).toHaveValue(
-      "http://127.0.0.1:1234",
-    );
+    const serverUrlInput = screen.getByLabelText("Server/LAN URL");
+    expect(serverUrlInput).toHaveValue("http://127.0.0.1:1234");
+    const backendModeButton = screen.getByRole("button", { name: "Backend mode" });
+    expect(
+      serverUrlInput.compareDocumentPosition(backendModeButton) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    const valueSetter = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      "value",
+    ).set;
+    act(() => {
+      valueSetter.call(serverUrlInput, "http://127.0.0.1:1234/v1");
+    });
+    fireEvent.blur(serverUrlInput);
+    await waitFor(() => {
+      expect(axiosMocks.post).toHaveBeenCalledWith("/api/settings", {
+        server_url: "http://127.0.0.1:1234/v1",
+      });
+    });
+
     const select = await screen.findByRole("combobox");
     expect(select).toHaveDisplayValue("\u25cf gpt-oss-20b");
 
@@ -341,7 +359,7 @@ describe("TopBar local runtime entries", () => {
     ).toBeInTheDocument();
   });
 
-  it("offers the loaded server model and clears stale static selections", async () => {
+  it("offers the loaded server model and selects it when server default is active", async () => {
     axiosMocks.get.mockImplementation((url) => {
       if (url === "/api/settings") {
         return Promise.resolve({ data: { devices: [], default_device: null } });
@@ -365,7 +383,7 @@ describe("TopBar local runtime entries", () => {
     });
     const { setState, state } = renderTopBar({
       backendMode: "server",
-      transformerModel: "gpt-oss-20b",
+      transformerModel: "",
       serverUrl: "http://127.0.0.1:1234",
     });
 
@@ -379,5 +397,48 @@ describe("TopBar local runtime entries", () => {
       });
       expect(updaterCall).toBeTruthy();
     });
+  });
+
+  it("does not replace an explicit server model just because inventory differs", async () => {
+    axiosMocks.get.mockImplementation((url) => {
+      if (url === "/api/settings") {
+        return Promise.resolve({ data: { devices: [], default_device: null } });
+      }
+      if (url === "/api/models/registered") {
+        return Promise.resolve({ data: { models: [] } });
+      }
+      if (url === "/api/transformers/models") {
+        return Promise.resolve({ data: { models: [] } });
+      }
+      if (url === "/api/llm/server/models") {
+        return Promise.resolve({
+          data: {
+            models: ["google/gemma-4-12b"],
+            loaded_model: "google/gemma-4-12b",
+            reachable: true,
+          },
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    const { setState, state } = renderTopBar({
+      backendMode: "server",
+      transformerModel: "gpt-oss-20b",
+      serverUrl: "http://127.0.0.1:1234",
+    });
+
+    expect(
+      await screen.findByRole("option", { name: "\u25cf google/gemma-4-12b" }),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(axiosMocks.get).toHaveBeenCalledWith("/api/llm/server/models", {
+        params: { server_url: "http://127.0.0.1:1234" },
+      });
+    });
+    const replacementCall = setState.mock.calls.find(([arg]) => {
+      if (typeof arg !== "function") return false;
+      return arg(state).transformerModel === "google/gemma-4-12b";
+    });
+    expect(replacementCall).toBeUndefined();
   });
 });

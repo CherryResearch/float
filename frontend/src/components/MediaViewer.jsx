@@ -681,7 +681,7 @@ const MediaViewer = ({
     };
   }, [activeHash, open]);
 
-  const handleViewerWheel = (event) => {
+  const handleViewerWheel = useCallback((event) => {
     if (!isZoomable) return;
     if (event.ctrlKey) {
       event.preventDefault();
@@ -697,7 +697,16 @@ const MediaViewer = ({
     event.preventDefault();
     event.stopPropagation();
     panByWheel(-horizontalDelta * 0.45, -verticalDelta * 0.45);
-  };
+  }, [adjustZoom, isZoomable, panByWheel, zoom]);
+
+  useEffect(() => {
+    const node = mediaWrapperRef.current;
+    if (!open || !node) return undefined;
+    node.addEventListener("wheel", handleViewerWheel, { passive: false });
+    return () => {
+      node.removeEventListener("wheel", handleViewerWheel);
+    };
+  }, [handleViewerWheel, open]);
 
   const beginPan = (event) => {
     if (!isZoomable || zoom <= 1.01) return;
@@ -1319,8 +1328,6 @@ const MediaViewer = ({
                     isPanning ? " is-panning" : ""
                   }`}
                   style={viewerMediaWrapperStyle}
-                  onWheelCapture={handleViewerWheel}
-                  onWheel={handleViewerWheel}
                   onPointerDown={beginPan}
                   onPointerMove={movePan}
                   onPointerUp={endPan}

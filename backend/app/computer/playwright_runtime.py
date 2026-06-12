@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import os
 import shutil
 import tempfile
 import time
@@ -31,13 +33,32 @@ class PlaywrightComputerRuntime(ComputerRuntime):
     def available(self) -> bool:
         return sync_playwright is not None
 
+    @staticmethod
+    def _prepare_playwright_loop_policy() -> None:
+        if os.name != "nt":
+            return
+        policy_cls = getattr(asyncio, "WindowsProactorEventLoopPolicy", None)
+        if policy_cls is None:
+            return
+        current_policy = asyncio.get_event_loop_policy()
+        if isinstance(current_policy, policy_cls):
+            return
+        asyncio.set_event_loop_policy(policy_cls())
+
     def _ensure_playwright(self):
         if sync_playwright is None:
             raise RuntimeError(
                 "Playwright is not installed. Install the 'playwright' package and run 'playwright install chromium'."
             )
         if self._playwright is None:
-            self._playwright = sync_playwright().start()
+            self._prepare_playwright_loop_policy()
+            try:
+                self._playwright = sync_playwright().start()
+            except Exception as exc:
+                normalized_exc = self._coerce_start_error(exc)
+                if normalized_exc is exc:
+                    raise
+                raise normalized_exc from exc
         return self._playwright
 
     def _page_handle(self, session_id: str) -> Dict[str, Any]:
@@ -83,6 +104,12 @@ class PlaywrightComputerRuntime(ComputerRuntime):
             return RuntimeError(
                 "Playwright browser binaries are not installed. "
                 "Run 'playwright install chromium' and try again."
+            )
+        if isinstance(exc, NotImplementedError):
+            return RuntimeError(
+                "Playwright could not start a browser process from this server thread. "
+                "On Windows this usually means the asyncio event loop policy does not "
+                "support subprocesses."
             )
         compact = " ".join(detail.split())
         if compact:

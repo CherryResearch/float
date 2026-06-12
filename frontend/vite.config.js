@@ -2,6 +2,12 @@ import { defineConfig, createLogger } from "vite";
 import react from "@vitejs/plugin-react";
 
 const backendTarget = `http://localhost:${process.env.BACKEND_PORT || 8000}`;
+const configuredHost = process.env.VITE_HOST?.trim();
+const configuredAllowedHosts = (process.env.VITE_ALLOWED_HOSTS || '')
+  .split(',')
+  .map((host) => host.trim())
+  .filter(Boolean);
+const allowedHosts = Array.from(new Set(['.ts.net', ...configuredAllowedHosts]));
 const connectionErrorCodes = new Set(['ECONNREFUSED', 'ECONNRESET']);
 const STARTUP_COLOR = '\x1b[33m';
 const COLOR_RESET = '\x1b[0m';
@@ -67,6 +73,8 @@ export default defineConfig({
   customLogger,
   plugins: [react()],
   server: {
+    ...(configuredHost ? { host: configuredHost } : {}),
+    ...(allowedHosts.length ? { allowedHosts } : {}),
     // Use VITE_PORT env var or default to 5173
     port: parseInt(process.env.VITE_PORT, 10) || 5173,
     proxy: {

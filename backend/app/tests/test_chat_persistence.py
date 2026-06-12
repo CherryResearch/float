@@ -15,7 +15,7 @@ def add_backend_to_sys_path():
         sys.path.insert(0, backend_dir)
 
 
-def _pin_default_workflow_settings(monkeypatch, tmp_path):
+def _pin_default_workflow_settings(monkeypatch, tmp_path, enabled_modules=None):
     from app.utils import user_settings
 
     monkeypatch.setattr(
@@ -25,7 +25,10 @@ def _pin_default_workflow_settings(monkeypatch, tmp_path):
         raising=False,
     )
     user_settings.save_settings(
-        {"default_workflow": "default", "enabled_workflow_modules": []}
+        {
+            "default_workflow": "default",
+            "enabled_workflow_modules": list(enabled_modules or []),
+        }
     )
 
 
@@ -65,6 +68,76 @@ def test_chat_persists_assistant_updates(monkeypatch, tmp_path):
     ai = next(m for m in messages if m.get("id") == "m1")
     assert ai.get("text") == "ok"
     assert (ai.get("metadata") or {}).get("status") == "complete"
+
+
+def test_chat_marks_resolved_inline_read_tools_for_continuation(monkeypatch, tmp_path):
+    monkeypatch.setenv("FLOAT_CONV_DIR", str(tmp_path))
+    conv_store = importlib.import_module("app.utils.conversation_store")
+    importlib.reload(conv_store)
+
+    from app import routes
+    from app.base_services import ModelContext
+
+    routes.llm_service.contexts = {"default": ModelContext(system_prompt="")}
+
+    def fake_generate(
+        prompt, session_id=None, model=None, attachments=None, context=None, **kwargs
+    ):
+        return {
+            "text": "I do not have fresh tool results yet.",
+            "thought": "",
+            "tools_used": [{"name": "recall", "args": {"key": "recent"}}],
+            "metadata": {
+                "inline_tool_payload": '{"tool":"recall","args":{"key":"recent"}}'
+            },
+        }
+
+    async def fake_register_tool_proposals(*args, **kwargs):
+        return [
+            {
+                "id": "tool-1",
+                "name": "recall",
+                "args": {"key": "recent"},
+                "status": "invoked",
+                "result": {
+                    "status": "invoked",
+                    "ok": True,
+                    "data": {"matches": [{"snippet": "one useful note"}]},
+                },
+            }
+        ]
+
+    monkeypatch.setattr(routes.llm_service, "generate", fake_generate)
+    monkeypatch.setattr(
+        routes, "_register_tool_proposals", fake_register_tool_proposals
+    )
+
+    app = importlib.import_module("app.main").app
+    app.state.pending_tools = {}
+    client = TestClient(app)
+    resp = client.post(
+        "/chat",
+        json={
+            "message": "search memory",
+            "session_id": "sess",
+            "message_id": "m1",
+            "use_rag": False,
+        },
+    )
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["message"].startswith("Tool results:")
+    metadata = payload.get("metadata") or {}
+    assert metadata.get("tool_response_pending") is True
+    assert metadata.get("inline_tool_continuation_pending") is True
+
+    messages = conv_store.load_conversation("sess")
+    ai = next(m for m in messages if m.get("id") == "m1")
+    assert ai.get("text", "").startswith("Tool results:")
+    saved_meta = ai.get("metadata") or {}
+    assert saved_meta.get("tool_response_pending") is True
+    assert saved_meta.get("inline_tool_continuation_pending") is True
 
 
 def test_chat_missing_mode_defaults_to_configured_api_not_service_mode(
@@ -877,6 +950,10 @@ def test_chat_tool_proposals_emit_review_notification(monkeypatch, tmp_path):
     assert notifications[0]["title"] == "Tool review needed"
     assert notifications[0]["data"]["tool_names"] == ["search_web"]
     assert notifications[0]["data"]["tool_ids"]
+    assert notifications[0]["data"]["tool_args"] == [
+        {"query": "tacos", "max_results": 2, "region": "us-en"}
+    ]
+    assert notifications[0]["data"]["tool_statuses"] == ["proposed"]
 
 
 def test_chat_tool_proposals_skip_review_notification_when_disabled(
@@ -1945,10 +2022,10 @@ def test_chat_text_turn_filters_computer_capture_scope(monkeypatch, tmp_path):
         if isinstance(tool, dict) and isinstance(tool.get("name"), str)
     ]
     assert tool_names == ["help", "remember"]
-    assert (
-        "Do not propose or call open_url, computer.*, camera.capture, or capture.*"
-        not in (ctx.system_prompt)
+    assert "Browser, desktop, and camera control are out of scope" not in (
+        ctx.system_prompt
     )
+    assert "open_url" not in ctx.system_prompt
     scope_messages = [
         msg
         for msg in ctx.messages
@@ -1957,9 +2034,9 @@ def test_chat_text_turn_filters_computer_capture_scope(monkeypatch, tmp_path):
         and (msg.get("metadata") or {}).get("turn_message_key") == "turn_scope"
     ]
     assert scope_messages
-    assert (
-        "Do not propose or call open_url, computer.*, camera.capture, or capture.*"
-        in str(scope_messages[-1].get("content") or "")
+    assert "Turn mode: text/knowledge." in str(scope_messages[-1].get("content") or "")
+    assert "Browser, desktop, and camera control are out of scope" in str(
+        scope_messages[-1].get("content") or ""
     )
     system_text = " ".join(
         str(msg.get("content") or "")
@@ -1983,7 +2060,9 @@ def test_chat_computer_turn_keeps_computer_capture_scope(monkeypatch, tmp_path):
     from app import routes
     from app.base_services import ModelContext
 
-    _pin_default_workflow_settings(monkeypatch, tmp_path)
+    _pin_default_workflow_settings(
+        monkeypatch, tmp_path, enabled_modules=["computer_use"]
+    )
     tool_defs = [
         {"name": "help", "description": "help", "parameters": {}},
         {"name": "open_url", "description": "open", "parameters": {}},
@@ -2029,10 +2108,7 @@ def test_chat_computer_turn_keeps_computer_capture_scope(monkeypatch, tmp_path):
     assert "computer.observe" in tool_names
     assert "camera.capture" in tool_names
     assert "capture.list" in tool_names
-    assert (
-        "browser, desktop, or capture tools are in scope"
-        not in ctx.system_prompt.lower()
-    )
+    assert "turn mode: computer/capture" not in ctx.system_prompt.lower()
     scope_messages = [
         msg
         for msg in ctx.messages
@@ -2041,7 +2117,7 @@ def test_chat_computer_turn_keeps_computer_capture_scope(monkeypatch, tmp_path):
         and (msg.get("metadata") or {}).get("turn_message_key") == "turn_scope"
     ]
     assert scope_messages
-    assert "Browser, desktop, and capture tools are in scope for this turn." in str(
+    assert "Turn mode: computer/capture." in str(
         scope_messages[-1].get("content") or ""
     )
     system_text = " ".join(
@@ -2054,8 +2130,73 @@ def test_chat_computer_turn_keeps_computer_capture_scope(monkeypatch, tmp_path):
         in system_text
     )
     assert "Computer Use" in system_text
-    assert (ctx.metadata.get("workflow") or {}).get("modules") == [
-        "camera_capture",
-        "computer_use",
-        "memory_promotion",
+    assert (ctx.metadata.get("workflow") or {}).get("modules") == ["computer_use"]
+
+
+def test_chat_computer_request_with_disabled_module_hides_computer_tools(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLOAT_CONV_DIR", str(tmp_path))
+    conv_store = importlib.import_module("app.utils.conversation_store")
+    importlib.reload(conv_store)
+
+    from app import routes
+    from app.base_services import ModelContext
+
+    _pin_default_workflow_settings(monkeypatch, tmp_path)
+    tool_defs = [
+        {"name": "help", "description": "help", "parameters": {}},
+        {"name": "tool_help", "description": "tool help", "parameters": {}},
+        {"name": "read_capability_docs", "description": "docs", "parameters": {}},
+        {"name": "computer.observe", "description": "observe", "parameters": {}},
+        {"name": "camera.capture", "description": "capture", "parameters": {}},
     ]
+    routes.llm_service.contexts = {
+        "default": ModelContext(system_prompt=""),
+        "sess": ModelContext(system_prompt="", tools=tool_defs),
+    }
+    captured = {}
+
+    def fake_generate(
+        prompt, session_id=None, model=None, attachments=None, context=None, **kwargs
+    ):
+        captured["context"] = context
+        return {"text": "ok", "thought": "", "tools_used": [], "metadata": {}}
+
+    monkeypatch.setattr(routes.llm_service, "generate", fake_generate)
+
+    app = importlib.import_module("app.main").app
+    app.state.pending_tools = {}
+    client = TestClient(app)
+    resp = client.post(
+        "/chat",
+        json={
+            "message": "take control of my computer and inspect the screen",
+            "session_id": "sess",
+            "message_id": "m1",
+            "use_rag": False,
+        },
+    )
+    assert resp.status_code == 200
+
+    ctx = captured.get("context")
+    assert ctx is not None
+    tool_names = [
+        tool.get("name")
+        for tool in ctx.tools
+        if isinstance(tool, dict) and isinstance(tool.get("name"), str)
+    ]
+    assert tool_names == ["help", "tool_help", "read_capability_docs"]
+    assert (ctx.metadata.get("workflow") or {}).get("modules") == []
+    assert ctx.metadata.get("disabled_modules") == ["computer_use"]
+    system_text = " ".join(
+        str(msg.get("content") or "")
+        for msg in ctx.messages
+        if isinstance(msg, dict) and msg.get("role") == "system"
+    )
+    assert "disabled workflow module(s): Computer Use" in system_text
+    assert "Capability docs remain readable via skills:computer_use." in system_text
+    assert (
+        "Computer observations and camera captures are transient by default."
+        not in system_text
+    )

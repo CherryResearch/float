@@ -15,22 +15,40 @@ const MODEL_SIZE_RANK = {
 };
 
 const DIRECT_LOCAL_GEMMA_MODELS = new Set([
-  "gemma-3",
-  "gemma-3-270m",
-  "gemma-3-12b-it",
-  "gemma-3-27b-it",
   "gemma-4-E2B-it",
+  "gemma-4-12B-it-qat-q4_0",
 ]);
 
 const PROVIDER_FIRST_GEMMA_MODELS = new Set([
+  "gemma-4-12B-it",
   "gemma-4-E4B-it",
+  "gemma-4-12B-it-qat-q4_0-gguf",
   "gemma-4-26B-A4B-it",
   "gemma-4-31B-it",
 ]);
 
 const DOWNLOADABLE_PROVIDER_MODELS = new Set([
+  "gemma-4-12B-it",
   "gemma-4-E4B-it",
+  "gemma-4-12B-it-qat-q4_0-gguf",
 ]);
+
+const DOWNLOADABLE_UTILITY_MODELS = new Set([
+  "all-MiniLM-L6-v2",
+  "all-mpnet-base-v2",
+  "embeddinggemma-300m",
+  "privacy-filter",
+]);
+
+const DIRECT_LOCAL_GEMMA_MODEL_IDS = new Set(
+  Array.from(DIRECT_LOCAL_GEMMA_MODELS).map((model) => model.toLowerCase()),
+);
+const PROVIDER_FIRST_GEMMA_MODEL_IDS = new Set(
+  Array.from(PROVIDER_FIRST_GEMMA_MODELS).map((model) => model.toLowerCase()),
+);
+const DOWNLOADABLE_PROVIDER_MODEL_IDS = new Set(
+  Array.from(DOWNLOADABLE_PROVIDER_MODELS).map((model) => model.toLowerCase()),
+);
 
 export const SUGGESTED_LOCAL_MODELS = [
   "gpt-oss-20b",
@@ -41,15 +59,15 @@ export const SUGGESTED_LOCAL_MODELS = [
   "Qwen3-235B-A22B-Instruct-2507",
   "mistral-7b-instruct-v0.3",
   "mixtral-8x7b-instruct-v0.1",
-  "gemma-3-270m",
-  "gemma-3-12b-it",
-  "gemma-3-27b-it",
   "gemma-4-E2B-it",
+  "gemma-4-12B-it-qat-q4_0",
 ];
 
 export const SUGGESTED_SERVER_MODELS = [
   ...SUGGESTED_LOCAL_MODELS,
+  "gemma-4-12B-it",
   "gemma-4-E4B-it",
+  "gemma-4-12B-it-qat-q4_0-gguf",
   "gemma-4-26B-A4B-it",
   "gemma-4-31B-it",
 ];
@@ -152,13 +170,13 @@ export const isGemmaFamilyModel = (value) => {
 export const isDirectLocalGemmaModel = (value) => {
   const raw = typeof value === "string" ? value.trim() : "";
   if (!raw) return false;
-  return DIRECT_LOCAL_GEMMA_MODELS.has(raw);
+  return DIRECT_LOCAL_GEMMA_MODELS.has(raw) || DIRECT_LOCAL_GEMMA_MODEL_IDS.has(raw.toLowerCase());
 };
 
 export const isProviderFirstGemmaModel = (value) => {
   const raw = typeof value === "string" ? value.trim() : "";
   if (!raw) return false;
-  return PROVIDER_FIRST_GEMMA_MODELS.has(raw);
+  return PROVIDER_FIRST_GEMMA_MODELS.has(raw) || PROVIDER_FIRST_GEMMA_MODEL_IDS.has(raw.toLowerCase());
 };
 
 export const isKnownDirectDownloadModel = (value) => {
@@ -170,14 +188,22 @@ export const isKnownDirectDownloadModel = (value) => {
 export const isKnownDownloadableModel = (value) => {
   const raw = typeof value === "string" ? value.trim() : "";
   if (!raw) return false;
-  return isKnownDirectDownloadModel(raw) || DOWNLOADABLE_PROVIDER_MODELS.has(raw);
+  const normalized = raw.toLowerCase();
+  return (
+    isKnownDirectDownloadModel(raw)
+    || DOWNLOADABLE_PROVIDER_MODELS.has(raw)
+    || DOWNLOADABLE_PROVIDER_MODEL_IDS.has(normalized)
+    || DOWNLOADABLE_UTILITY_MODELS.has(raw)
+    || DOWNLOADABLE_UTILITY_MODELS.has(normalized)
+  );
 };
 
 export const resolveLocalCatalogModelId = (value) => {
   const raw = _cleanModelValue(value);
   if (!raw) return "";
-  if (!raw.includes("/")) return raw;
-  const tail = raw.split("/").filter(Boolean).pop();
+  const withoutLane = /^[a-z]+:/i.test(raw) ? raw.split(":").slice(1).join(":").trim() : raw;
+  if (!withoutLane.includes("/")) return withoutLane;
+  const tail = withoutLane.split("/").filter(Boolean).pop();
   return tail ? tail.trim() : raw;
 };
 

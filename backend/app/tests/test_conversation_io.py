@@ -152,7 +152,11 @@ def test_list_openai_json_candidates():
 
     payload = {
         "conversations": [
-            {"id": "conv-1", "title": "One", "messages": [{"role": "user", "text": "a"}]},
+            {
+                "id": "conv-1",
+                "title": "One",
+                "messages": [{"role": "user", "text": "a"}],
+            },
             {
                 "uuid": "conv-2",
                 "name": "Two",
@@ -177,6 +181,58 @@ def test_list_openai_json_candidates():
     assert detected[1]["message_count"] == 1
 
 
+def test_json_candidate_summary_ignores_metadata_only_entries():
+    import json
+
+    payload = {
+        "conversations": [
+            {
+                "id": "conv-1",
+                "title": "One",
+                "messages": [{"role": "user", "text": "a"}],
+            },
+            {
+                "id": "meta-sidecar",
+                "title": "Metadata",
+                "metadata": {"source": "sidecar"},
+            },
+        ]
+    }
+    summary = conversation_io.summarize_openai_conversation_json_candidates(
+        json.dumps(payload).encode("utf-8")
+    )
+
+    assert summary["importable_conversation_count"] == 1
+    assert summary["ignored_json_entry_count"] == 1
+    assert [item["path"] for item in summary["detected_files"]] == ["conv-1"]
+
+
+def test_zip_candidate_summary_counts_ignored_metadata_json():
+    import io
+    import json
+    import zipfile
+
+    zipped = io.BytesIO()
+    with zipfile.ZipFile(zipped, "w") as archive:
+        archive.writestr(
+            "conversations/session-1.json",
+            json.dumps({"messages": [{"role": "user", "text": "conversation"}]}),
+        )
+        archive.writestr(
+            "conversations/session-1.meta.json",
+            json.dumps({"id": "sidecar", "message_count": 1}),
+        )
+
+    summary = conversation_io.summarize_openai_conversation_zip_candidates(
+        zipped.getvalue()
+    )
+
+    assert summary["importable_conversation_count"] == 1
+    assert summary["ignored_json_file_count"] == 1
+    assert summary["ignored_json_files"] == ["conversations/session-1.meta.json"]
+    assert summary["detected_files"][0]["path"] == "conversations/session-1.json"
+
+
 def test_extract_openai_json_conversations_selected():
     import json
 
@@ -190,7 +246,10 @@ def test_extract_openai_json_conversations_selected():
             {
                 "id": "conv-2",
                 "title": "Two",
-                "messages": [{"role": "user", "text": "b"}, {"role": "assistant", "text": "c"}],
+                "messages": [
+                    {"role": "user", "text": "b"},
+                    {"role": "assistant", "text": "c"},
+                ],
             },
         ]
     }

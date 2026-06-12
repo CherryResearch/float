@@ -122,6 +122,34 @@ def test_reflection_hard_stop_and_json_fallback(tmp_path, monkeypatch):
     assert blocked["status"] == "not_runnable"
 
 
+def test_reflection_patience_budget_counts_reasoning_turns(tmp_path, monkeypatch):
+    monkeypatch.setattr(reflection_module, "try_ingest_text", lambda *a, **k: None)
+    monkeypatch.setattr(reflection_module, "get_rag_service", lambda *a, **k: None)
+
+    service = ReflectionService(
+        {"reflection_store_path": str(tmp_path / "reflections.sqlite3")},
+        llm_generate=lambda *a, **k: None,
+    )
+    task = service.create_task(
+        question="How much room should this reflection get?",
+        patience=0,
+        patience_budget={
+            "profile": "custom",
+            "max_reasoning_turns": 5,
+            "max_runtime_seconds": 900,
+            "max_context_tokens": 24000,
+            "reserve_output_tokens": 1200,
+        },
+        utility=0.8,
+        uncertainty=0.8,
+    )
+
+    assert task["patience"] == 0
+    assert task["patience_budget"]["profile"] == "custom"
+    assert task["patience_budget"]["max_reasoning_turns"] == 5
+    assert service._depth_budget(task) == 5
+
+
 def test_scheduler_tick_seeds_safe_memory_candidates(tmp_path, monkeypatch):
     monkeypatch.setattr(reflection_module, "try_ingest_text", lambda *a, **k: None)
     monkeypatch.setattr(reflection_module, "get_rag_service", lambda *a, **k: None)

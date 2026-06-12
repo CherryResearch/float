@@ -776,6 +776,138 @@ def test_attachment_rehydrate_preserves_existing_generated_caption(client, monke
     assert meta["placeholder_caption"] is False
 
 
+def test_configured_caption_model_ignores_clip_env(client, monkeypatch):
+    from app import routes
+
+    monkeypatch.setenv("VISION_CAPTION_MODEL", "clip-vit-base-patch32")
+    monkeypatch.setattr(
+        routes.app_config,
+        "load_config",
+        lambda: {"vision_model": "clip-vit-base-patch32"},
+    )
+
+    assert routes._configured_vision_caption_model() == "google/paligemma2-3b-pt-224"
+
+
+def test_attachment_rehydrate_retries_low_quality_generated_caption(
+    client, monkeypatch
+):
+    from app import routes
+
+    content_hash = "lowqualitycaptionhash"
+    target = routes._resolve_data_files_root() / "uploads" / content_hash / "image.png"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"image bytes")
+    routes._write_attachment_meta(
+        content_hash,
+        {
+            "filename": "image.png",
+            "content_type": "image/png",
+            "relative_path": f"uploads/{content_hash}/image.png",
+            "caption": "caption\n# , # , # , # , # , # , # , # , # , #",
+            "caption_model": "google/paligemma2-3b-pt-224",
+            "caption_status": "generated",
+            "placeholder_caption": False,
+        },
+    )
+
+    calls = []
+
+    class FakeRagService:
+        def ingest_text(self, text, metadata):
+            calls.append((text, dict(metadata)))
+            return "caption-doc"
+
+    monkeypatch.setattr(routes, "_get_rag_service", lambda: FakeRagService())
+    monkeypatch.setattr(routes, "_get_clip_rag_service", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        routes,
+        "_generate_image_caption",
+        lambda *_args, **_kwargs: (
+            "striped tiger illustration on a pale background",
+            False,
+            "google/paligemma2-3b-pt-224",
+        ),
+    )
+
+    resp = client.post(
+        "/attachments/rag/rehydrate",
+        json={"content_hashes": [content_hash]},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"scanned": 1, "reindexed": 1}
+    assert calls[0][0] == "striped tiger illustration on a pale background"
+    meta = routes._read_attachment_meta(content_hash)
+    assert meta["caption"] == "striped tiger illustration on a pale background"
+    assert meta["caption_status"] == "generated"
+    assert meta["placeholder_caption"] is False
+    assert meta["index_status"] == "partial"
+    assert meta["index_warning"] == "clip_index_unavailable"
+
+
+def test_attachment_indexing_preserves_manual_caption_written_during_generation(
+    client, monkeypatch
+):
+    from app import routes
+
+    content_hash = "manualracecaptionhash"
+    routes._write_attachment_meta(
+        content_hash,
+        {
+            "filename": "image.png",
+            "content_type": "image/png",
+            "caption_status": "pending",
+            "index_status": "indexing",
+        },
+    )
+    calls = []
+
+    class FakeRagService:
+        def ingest_text(self, text, metadata):
+            calls.append((text, dict(metadata)))
+            return "caption-doc"
+
+    def fake_generate(*_args, **_kwargs):
+        routes._write_attachment_meta(
+            content_hash,
+            {
+                "filename": "image.png",
+                "content_type": "image/png",
+                "caption": "manual caption written during background work",
+                "caption_model": "manual-caption",
+                "caption_status": "manual",
+                "placeholder_caption": False,
+            },
+        )
+        return (
+            "auto caption should not win",
+            False,
+            "google/paligemma2-3b-pt-224",
+        )
+
+    monkeypatch.setattr(routes, "_get_rag_service", lambda: FakeRagService())
+    monkeypatch.setattr(routes, "_get_clip_rag_service", lambda **_kwargs: None)
+    monkeypatch.setattr(routes, "_generate_image_caption", fake_generate)
+
+    result = routes._caption_and_index_image_bytes(
+        b"image bytes",
+        filename="image.png",
+        content_type="image/png",
+        content_hash=content_hash,
+    )
+
+    assert result["caption"] == "manual caption written during background work"
+    assert result["caption_model"] == "manual-caption"
+    assert calls[0][0] == "manual caption written during background work"
+    assert calls[0][1]["caption_model"] == "manual-caption"
+    meta = routes._read_attachment_meta(content_hash)
+    assert meta["caption"] == "manual caption written during background work"
+    assert meta["caption_model"] == "manual-caption"
+    assert meta["caption_status"] == "manual"
+    assert meta["index_status"] == "partial"
+
+
 def test_attachment_rehydrate_limits_to_requested_hashes(client, monkeypatch):
     from app import routes
 

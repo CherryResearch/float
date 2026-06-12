@@ -44,6 +44,22 @@ def _make_service(monkeypatch, payload):
     return service
 
 
+def _make_responses_service(monkeypatch, payload):
+    service = LLMService(
+        config={
+            "api_key": "test",
+            "api_url": "http://test/v1/responses",
+            "api_model": "gpt-5.5",
+        }
+    )
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        return DummyResponse(payload)
+
+    monkeypatch.setattr("app.base_services.http_session.post", fake_post)
+    return service
+
+
 def test_tool_calls_parsed(monkeypatch):
     payload = {
         "choices": [
@@ -148,6 +164,79 @@ def test_inline_tool_payload_preserves_text_and_multiple(monkeypatch):
     assert '"tool"' not in result["text"]
     payloads = result["metadata"].get("inline_tool_payloads") or []
     assert len(payloads) == 2
+
+
+def test_responses_commentary_tool_text_is_not_visible(monkeypatch):
+    payload = {
+        "output": [
+            {"type": "reasoning", "summary": []},
+            {
+                "type": "message",
+                "phase": "commentary",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": json.dumps(
+                            {
+                                "tool": "remember",
+                                "args": {
+                                    "key": "snack",
+                                    "value": "saffron toast",
+                                },
+                            }
+                        ),
+                    }
+                ],
+            },
+            {
+                "type": "message",
+                "phase": "final_answer",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "Remembered the snack note.",
+                    }
+                ],
+            },
+        ]
+    }
+    svc = _make_responses_service(monkeypatch, payload)
+    result = svc._generate_via_api("hi", ModelContext())
+
+    assert result["text"] == "Remembered the snack note."
+    assert "[[tool_call" not in result["text"]
+    assert result["tools_used"] == [
+        {"name": "remember", "args": {"key": "snack", "value": "saffron toast"}}
+    ]
+    assert result["metadata"].get("inline_tool_payload")
+
+
+def test_responses_tool_only_output_stays_continuable(monkeypatch):
+    payload = {
+        "output": [
+            {
+                "type": "message",
+                "phase": "final_answer",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": json.dumps(
+                            {"tool": "recall", "args": {"key": "snack"}}
+                        ),
+                    }
+                ],
+            }
+        ]
+    }
+    svc = _make_responses_service(monkeypatch, payload)
+    result = svc._generate_via_api("hi", ModelContext())
+
+    assert result["text"] == "[[tool_call:0]]"
+    assert result["tools_used"] == [{"name": "recall", "args": {"key": "snack"}}]
+    assert result["metadata"].get("inline_tool_payload")
 
 
 def test_harmony_tool_call_parsed(monkeypatch):

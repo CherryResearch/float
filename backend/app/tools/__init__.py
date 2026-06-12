@@ -8,6 +8,7 @@ from . import actions as action_tools
 from . import browser
 from . import calendar as calendar_tools
 from . import (
+    capability_docs,
     computer_tools,
     conversations,
     crawler,
@@ -66,6 +67,7 @@ BUILTIN_TOOLS: Dict[str, Callable[..., Any]] = {
     "help": help_tools.help_tool,
     "tool_help": help_tools.tool_help,
     "tool_info": help_tools.tool_info,
+    "read_capability_docs": capability_docs.read_capability_docs,
 }
 
 

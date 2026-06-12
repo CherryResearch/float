@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import requests
-
 from app import config as app_config
 from app.model_registry import resolve_model_alias
 
@@ -19,6 +18,55 @@ logger = logging.getLogger(__name__)
 _PIPELINE_CACHE: Dict[str, Any] = {}
 _KITTEN_CACHE: Dict[str, Any] = {}
 _KOKORO_CACHE: Dict[str, Any] = {}
+OPENAI_TTS_FORMATS = {"mp3", "opus", "aac", "flac", "wav", "pcm"}
+LOCAL_TTS_FORMATS = {"wav", "wave"}
+OPENAI_TTS_VOICES = {
+    "alloy",
+    "ash",
+    "ballad",
+    "coral",
+    "echo",
+    "fable",
+    "marin",
+    "nova",
+    "onyx",
+    "sage",
+    "shimmer",
+    "verse",
+    "cedar",
+}
+OPENAI_TTS_LEGACY_VOICES = {
+    "alloy",
+    "ash",
+    "coral",
+    "echo",
+    "fable",
+    "nova",
+    "onyx",
+    "sage",
+    "shimmer",
+}
+
+
+def _is_openai_tts_model(model_name: str) -> bool:
+    normalized = str(model_name or "").strip().lower()
+    return normalized.startswith("tts-") or (
+        normalized.startswith("gpt-4o") and "tts" in normalized
+    )
+
+
+def _normalize_audio_format(audio_format: str, *, default: str = "wav") -> str:
+    normalized = str(audio_format or default).strip().lower() or default
+    if normalized == "wave":
+        return "wav"
+    return normalized
+
+
+def _openai_voice_options_for_model(model_name: str) -> set[str]:
+    normalized = str(model_name or "").strip().lower()
+    if normalized in {"tts-1", "tts-1-hd"}:
+        return OPENAI_TTS_LEGACY_VOICES
+    return OPENAI_TTS_VOICES
 
 
 @dataclass
@@ -31,7 +79,9 @@ class TtsResult:
     voice: Optional[str] = None
 
 
-def _resolve_local_model_dir(model_name: str, search_dirs: list[Path]) -> Optional[Path]:
+def _resolve_local_model_dir(
+    model_name: str, search_dirs: list[Path]
+) -> Optional[Path]:
     for root in search_dirs:
         candidate = root / model_name
         if candidate.exists() and candidate.is_dir():
@@ -124,22 +174,33 @@ class TTSService:
         if not tts_model:
             raise RuntimeError("No TTS model configured")
         voice_model = (voice or cfg.get("voice_model") or "").strip() or None
+        normalized_format = _normalize_audio_format(audio_format)
 
-        if tts_model.lower().startswith("tts-"):
+        if _is_openai_tts_model(tts_model):
+            if normalized_format not in OPENAI_TTS_FORMATS:
+                supported = ", ".join(sorted(OPENAI_TTS_FORMATS))
+                raise ValueError(
+                    f"Unsupported OpenAI TTS audio_format '{audio_format}'. "
+                    f"Use one of: {supported}."
+                )
             return self._synthesize_openai(
                 text,
                 cfg,
                 model=tts_model,
                 voice=voice_model,
-                audio_format=audio_format,
+                audio_format=normalized_format,
             )
 
+        if normalized_format not in LOCAL_TTS_FORMATS:
+            raise ValueError(
+                f"Local TTS only supports wav output; '{audio_format}' was requested."
+            )
         return self._synthesize_local(
             text,
             cfg,
             model=tts_model,
             voice=voice_model,
-            audio_format=audio_format,
+            audio_format=normalized_format,
         )
 
     def _synthesize_openai(
@@ -155,7 +216,7 @@ class TTSService:
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is required for API TTS")
         headers = {"Authorization": f"Bearer {api_key}"}
-        allowed_voices = {"alloy", "nova", "shimmer", "echo", "fable", "onyx"}
+        allowed_voices = _openai_voice_options_for_model(model)
         selected_voice = (voice or "").strip().lower()
         if selected_voice and selected_voice not in allowed_voices:
             selected_voice = "alloy"
@@ -194,9 +255,15 @@ class TTSService:
         search_dirs = app_config.model_search_dirs(cfg.get("models_folder"))
         resolved_dir = _resolve_local_model_dir(model, search_dirs)
         if resolved_dir is None and model_id:
-            resolved_dir = _resolve_local_model_dir(os.path.basename(str(model_id)), search_dirs)
+            resolved_dir = _resolve_local_model_dir(
+                os.path.basename(str(model_id)), search_dirs
+            )
         load_target = str(resolved_dir) if resolved_dir is not None else str(model_id)
-        token = (cfg.get("hf_token") or "").strip() or os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
+        token = (
+            (cfg.get("hf_token") or "").strip()
+            or os.getenv("HUGGINGFACE_HUB_TOKEN")
+            or os.getenv("HF_TOKEN")
+        )
         if token:
             os.environ.setdefault("HUGGINGFACE_HUB_TOKEN", token)
             os.environ.setdefault("HF_TOKEN", token)
@@ -245,8 +312,8 @@ class TTSService:
             raise RuntimeError("Local TTS did not return audio")
         if not sample_rate:
             sample_rate = 22050
-        if audio_format.lower() not in {"wav", "wave"}:
-            raise RuntimeError("Only wav output is supported for local TTS")
+        if audio_format.lower() not in LOCAL_TTS_FORMATS:
+            raise ValueError("Only wav output is supported for local TTS")
         wav_bytes = _encode_wav(audio, int(sample_rate))
         return TtsResult(
             audio=wav_bytes,
@@ -265,8 +332,8 @@ class TTSService:
         voice: Optional[str],
         audio_format: str,
     ) -> TtsResult:
-        if audio_format.lower() not in {"wav", "wave"}:
-            raise RuntimeError("Only wav output is supported for local TTS")
+        if audio_format.lower() not in LOCAL_TTS_FORMATS:
+            raise ValueError("Only wav output is supported for local TTS")
         try:
             from kittentts import KittenTTS
         except Exception as exc:
@@ -320,8 +387,8 @@ class TTSService:
         voice: Optional[str],
         audio_format: str,
     ) -> TtsResult:
-        if audio_format.lower() not in {"wav", "wave"}:
-            raise RuntimeError("Only wav output is supported for local TTS")
+        if audio_format.lower() not in LOCAL_TTS_FORMATS:
+            raise ValueError("Only wav output is supported for local TTS")
         try:
             from kokoro import KPipeline
         except Exception as exc:
@@ -363,9 +430,31 @@ class TTSService:
                     last_exc = exc
                     continue
             if pipeline is None:
-                raise RuntimeError("Failed to initialize Kokoro pipeline.") from last_exc
+                raise RuntimeError(
+                    "Failed to initialize Kokoro pipeline."
+                ) from last_exc
         voice_id = voice or "af_heart"
-        if not voice_id.startswith(("af_", "am_", "bf_", "bm_", "jf_", "jm_", "zf_", "zm_", "ef_", "em_", "ff_", "hf_", "hm_", "if_", "im_", "pf_", "pm_")):
+        if not voice_id.startswith(
+            (
+                "af_",
+                "am_",
+                "bf_",
+                "bm_",
+                "jf_",
+                "jm_",
+                "zf_",
+                "zm_",
+                "ef_",
+                "em_",
+                "ff_",
+                "hf_",
+                "hm_",
+                "if_",
+                "im_",
+                "pf_",
+                "pm_",
+            )
+        ):
             voice_id = "af_heart"
         try:
             generator = pipeline(text, voice=voice_id)

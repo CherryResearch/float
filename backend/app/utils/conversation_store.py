@@ -179,12 +179,16 @@ def _iter_conversation_files() -> List[Path]:
     if not CONV_DIR.exists():
         return []
     files: List[Path] = []
-    for path in CONV_DIR.rglob("*.json"):
-        if path.name.endswith(".meta.json"):
-            continue
-        if not _looks_like_conversation_array_file(path):
-            continue
-        files.append(path)
+    for root, dirs, filenames in os.walk(CONV_DIR):
+        dirs[:] = [name for name in dirs if name != ".context_snapshots"]
+        root_path = Path(root)
+        for filename in filenames:
+            if not filename.endswith(".json") or filename.endswith(".meta.json"):
+                continue
+            path = root_path / filename
+            if not _looks_like_conversation_array_file(path):
+                continue
+            files.append(path)
     return files
 
 

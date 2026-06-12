@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
 
+from app.model_registry import resolve_model_alias
 from app.utils import user_settings
 
 logger = logging.getLogger(__name__)
@@ -88,6 +89,7 @@ def _settings(settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     loaded = _load_settings(settings)
     mode = normalize_mode(loaded.get("privacy_filter_mode", DEFAULT_MODE))
     model = str(loaded.get("privacy_filter_model") or DEFAULT_MODEL).strip()
+    model = str(resolve_model_alias(model) or model or DEFAULT_MODEL).strip()
     try:
         min_score = float(loaded.get("privacy_filter_min_score", DEFAULT_MIN_SCORE))
     except Exception:

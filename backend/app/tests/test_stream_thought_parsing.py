@@ -122,3 +122,72 @@ def test_streaming_dedupes_repeated_scalar_response_text_within_chunk(monkeypatc
 
     out = _run_stream(monkeypatch, lines)
     assert out and out.get("text") == "I will use the computer tools."
+
+
+def test_streaming_hides_responses_commentary_tool_text(monkeypatch):
+    tool_payload = {"tool": "remember", "args": {"key": "snack", "value": "toast"}}
+    final_text = "Remembered the snack note."
+    lines = _build_sse_lines(
+        {
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "msg_tool",
+                "type": "message",
+                "phase": "commentary",
+                "content": [],
+            },
+        },
+        {
+            "type": "response.output_text.delta",
+            "output_index": 1,
+            "item_id": "msg_tool",
+            "delta": json.dumps(tool_payload),
+        },
+        {
+            "type": "response.output_item.added",
+            "output_index": 2,
+            "item": {
+                "id": "msg_final",
+                "type": "message",
+                "phase": "final_answer",
+                "content": [],
+            },
+        },
+        {
+            "type": "response.output_text.delta",
+            "output_index": 2,
+            "item_id": "msg_final",
+            "delta": final_text,
+        },
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "output": [
+                    {
+                        "id": "msg_tool",
+                        "type": "message",
+                        "phase": "commentary",
+                        "content": [
+                            {"type": "output_text", "text": json.dumps(tool_payload)}
+                        ],
+                    },
+                    {
+                        "id": "msg_final",
+                        "type": "message",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": final_text}],
+                    },
+                ],
+            },
+        },
+    )
+
+    out = _run_stream(monkeypatch, lines)
+
+    assert out and out.get("text") == final_text
+    assert out.get("tools_used") == [
+        {"name": "remember", "args": {"key": "snack", "value": "toast"}}
+    ]
+    assert "[[tool_call" not in out.get("text", "")

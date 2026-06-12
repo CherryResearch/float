@@ -1072,7 +1072,7 @@ def test_filter_snapshot_by_item_selections_keeps_selected_records(
     filtered = service.filter_snapshot_by_item_selections(
         snapshot,
         {
-            "conversations": ["conv-2"],
+            "conversations": ["conv-2", "conv-deleted"],
             "graph": ["claim:claim-1"],
             "settings": ["settings"],
         },
@@ -1088,6 +1088,63 @@ def test_filter_snapshot_by_item_selections_keeps_selected_records(
         "node-1"
     ]
     assert filtered["sections"]["settings"]["sync_id"] == "settings"
+    assert filtered["deletions"]["conversations"] == ["conv-deleted"]
+
+
+def test_merge_snapshot_applies_selected_deletions(tmp_path, monkeypatch):
+    modules = _configure_paths(tmp_path, monkeypatch)
+    service = modules["InstanceSyncService"]()
+    write_conversation = modules["_write_conversation_snapshot"]
+    conversation_store = modules["conversation_store"]
+    memory_store = modules["memory_store"]
+    calendar_store = modules["calendar_store"]
+    knowledge_store = modules["KnowledgeStore"]()
+
+    write_conversation(
+        name="notes/remove-me",
+        messages=[{"role": "user", "content": "remove"}],
+        metadata={"id": "conv-remove", "updated_at": "2026-03-25T00:00:00+00:00"},
+    )
+    memory_store.save({"memory-remove": {"value": "remove", "updated_at": 1.0}})
+    knowledge_store.upsert_document(
+        source="doc/remove",
+        text="remove",
+        metadata={"updated_at": 1.0},
+        chunk_texts=["remove"],
+        knowledge_id="knowledge-remove",
+    )
+    calendar_store.save_event(
+        "event-remove",
+        {"title": "Remove", "updated_at": "2026-03-25T00:00:00+00:00"},
+    )
+
+    result = service.merge_snapshot(
+        {
+            "sections": {
+                "conversations": [],
+                "memories": [],
+                "knowledge": [],
+                "calendar": [],
+            },
+            "deletions": {
+                "conversations": ["conv-remove"],
+                "memories": ["memory-remove"],
+                "knowledge": ["knowledge-remove"],
+                "calendar": ["event-remove"],
+            },
+        }
+    )
+
+    assert result["sections"]["conversations"]["deleted"] == 1
+    assert result["sections"]["memories"]["deleted"] == 1
+    assert result["sections"]["knowledge"]["deleted"] == 1
+    assert result["sections"]["calendar"]["deleted"] == 1
+    assert "notes/remove-me" not in {
+        item["name"] for item in conversation_store.list_conversations()
+    }
+    assert "memory-remove" not in memory_store.load()
+    assert knowledge_store.get_item("knowledge-remove") is None
+    assert "event-remove" not in calendar_store.list_events()
 
 
 def test_build_manifest_filters_by_workspace_selection(tmp_path, monkeypatch):

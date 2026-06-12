@@ -2,7 +2,11 @@ from app.services import privacy_filter_service as privacy_filter
 
 
 def test_privacy_filter_auto_escalates_to_secret(monkeypatch):
+    observed = {}
+
     def fake_classifier(_model):
+        observed["model"] = _model
+
         def classify(_text, aggregation_strategy="simple"):
             assert aggregation_strategy == "simple"
             return [{"entity_group": "secret", "score": 0.99, "start": 0, "end": 8}]
@@ -21,6 +25,27 @@ def test_privacy_filter_auto_escalates_to_secret(monkeypatch):
     assert decision.applied_sensitivity == "secret"
     assert decision.applied_source == "privacy_filter"
     assert decision.labels == ["secret"]
+    assert observed["model"] == "openai/privacy-filter"
+
+
+def test_privacy_filter_resolves_download_alias(monkeypatch):
+    observed = {}
+
+    def fake_classifier(model):
+        observed["model"] = model
+        return lambda _text, aggregation_strategy="simple": []
+
+    monkeypatch.setattr(privacy_filter, "_get_classifier", fake_classifier)
+
+    privacy_filter.decide_sensitivity(
+        "plain text",
+        settings={
+            "privacy_filter_mode": "always",
+            "privacy_filter_model": "privacy-filter",
+        },
+    )
+
+    assert observed["model"] == "openai/privacy-filter"
 
 
 def test_privacy_filter_respects_user_sensitivity_in_always_mode(monkeypatch):
