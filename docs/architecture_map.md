@@ -47,7 +47,8 @@ Float keeps these concepts separate:
 Gemma 4 is lane-scoped:
 
 - `gemma-4-E2B-it` is the current direct-local target.
-- `gemma-4-E4B-it`, `gemma-4-26B-A4B-it`, and `gemma-4-31B-it` are provider/server-first.
+- `gemma-4-E2B-it-qat-q4_0` and `gemma-4-12B-it-qat-q4_0` are direct-local QAT aliases for unquantized Hugging Face checkpoints.
+- `gemma-4-E2B-it-qat-q4_0-gguf`, `gemma-4-E4B-it-qat-q4_0-gguf`, `gemma-4-12B-it-qat-q4_0-gguf`, `gemma-4-26B-A4B-it-qat-q4_0-gguf`, and `gemma-4-31B-it-qat-q4_0-gguf` are provider/server-first.
 - Raw GGUF weights should run behind LM Studio, Ollama, or another OpenAI-compatible server, not the direct local Transformers path.
 
 ## Data And Storage Model

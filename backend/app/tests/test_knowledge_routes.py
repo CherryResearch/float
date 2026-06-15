@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 import types
 from pathlib import Path
@@ -223,6 +224,49 @@ def test_knowledge_update_rewrites_local_workspace_text_file(client, tmp_path):
     assert fetch_resp.status_code == 200
     payload = (fetch_resp.json().get("metadatas") or [{}])[0]
     assert payload.get("source_last_saved_at")
+
+
+def test_workspace_files_list_serve_and_edit_managed_roots(client):
+    data_root = Path(os.environ["FLOAT_DATA_DIR"])
+    files_doc = data_root / "files" / "workspace" / "notes" / "alpha.md"
+    files_doc.parent.mkdir(parents=True, exist_ok=True)
+    files_doc.write_text("# Alpha\n\nworkspace body", encoding="utf-8")
+    tool_doc = data_root / "workspace" / "tool-note.txt"
+    tool_doc.parent.mkdir(parents=True, exist_ok=True)
+    tool_doc.write_text("tool workspace body", encoding="utf-8")
+
+    listing = client.get("/knowledge/workspace-files")
+    assert listing.status_code == 200
+    entries = listing.json()["entries"]
+    assert any(
+        entry["root"] == "files"
+        and entry["path"] == "notes/alpha.md"
+        and entry["type"] == "file"
+        for entry in entries
+    )
+    assert any(
+        entry["root"] == "tool"
+        and entry["path"] == "tool-note.txt"
+        and entry["type"] == "file"
+        for entry in entries
+    )
+
+    file_resp = client.get("/knowledge/workspace-file/files/notes/alpha.md")
+    assert file_resp.status_code == 200
+    assert "workspace body" in file_resp.text
+
+    edit_resp = client.put(
+        "/knowledge/workspace-file/tool/tool-note.txt",
+        json={"text": "edited tool workspace body"},
+    )
+    assert edit_resp.status_code == 200
+    assert tool_doc.read_text(encoding="utf-8") == "edited tool workspace body"
+
+
+def test_workspace_file_routes_reject_path_escape(client):
+    resp = client.get("/knowledge/workspace-file/files/%2E%2E/%2E%2E/secret.txt")
+    assert resp.status_code == 400
+    assert "outside root" in str(resp.json().get("detail", "")).lower()
 
 
 def test_knowledge_file_rejects_non_local_source(client):

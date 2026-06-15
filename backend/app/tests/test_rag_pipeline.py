@@ -367,6 +367,172 @@ def test_chat_rag_filters_excluded_and_sensitive(monkeypatch, client):
     assert "secret" not in sources
 
 
+def test_chat_rag_plaintext_fallback_searches_saved_conversations(
+    monkeypatch, client, tmp_path
+):
+    monkeypatch.setattr(routes.conversation_store, "CONV_DIR", tmp_path)
+    routes.conversation_store.save_conversation(
+        "recipes/soup-chat",
+        [
+            {
+                "id": "msg-1",
+                "role": "assistant",
+                "text": "The gochujang fennel soup used toasted sesame oil.",
+            }
+        ],
+    )
+    routes.conversation_store.merge_metadata(
+        "recipes/soup-chat",
+        {"privacy_mode": "default", "sensitivity": "personal"},
+    )
+
+    class EmptyRAG:
+        embedding_model = "simple"
+
+        def query(self, text, top_k=3):
+            return []
+
+        def trace(self, doc_id):
+            return None
+
+    monkeypatch.setattr(routes, "_get_rag_service", lambda: EmptyRAG())
+    monkeypatch.setattr(
+        routes, "_get_clip_rag_service", lambda *, raise_http=False: None
+    )
+    monkeypatch.setattr(routes.llm_service, "mode", "api", raising=False)
+    monkeypatch.setitem(client.app.state.config, "rag_chat_min_similarity", 0.45)
+
+    def fake_generate(
+        prompt,
+        session_id="default",
+        model=None,
+        attachments=None,
+        context=None,
+        **kwargs,
+    ):
+        return {
+            "text": "Found the soup note.",
+            "thought": "",
+            "tools_used": [],
+            "metadata": {},
+        }
+
+    monkeypatch.setattr(routes.llm_service, "generate", fake_generate)
+
+    response = client.post(
+        "/chat",
+        json={
+            "message": "Do we have anything about gochujang soup?",
+            "session_id": "sess-plaintext-fallback",
+            "use_rag": True,
+        },
+    )
+
+    assert response.status_code == 200
+    rag_section = response.json()["metadata"].get("rag") or {}
+    matches = rag_section.get("matches") or []
+    assert matches
+    match = matches[0]
+    assert match["source"] == "conversation:recipes/soup-chat"
+    assert match["metadata"]["retrieved_via"] == "plaintext_conversation"
+    assert "gochujang fennel soup" in match["text"]
+
+
+def test_chat_rag_plaintext_fallback_respects_conversation_privacy(
+    monkeypatch, client, tmp_path
+):
+    monkeypatch.setattr(routes.conversation_store, "CONV_DIR", tmp_path)
+    routes.conversation_store.save_conversation(
+        "open-soup",
+        [
+            {
+                "id": "open-msg",
+                "role": "assistant",
+                "text": "Public soup note with miso and fennel.",
+            }
+        ],
+    )
+    routes.conversation_store.merge_metadata(
+        "open-soup",
+        {"privacy_mode": "default", "sensitivity": "personal"},
+    )
+    routes.conversation_store.save_conversation(
+        "protected-soup",
+        [
+            {
+                "id": "protected-msg",
+                "role": "assistant",
+                "text": "Protected soup note with a private address.",
+            }
+        ],
+    )
+    routes.conversation_store.merge_metadata(
+        "protected-soup",
+        {"privacy_mode": "protected", "sensitivity": "protected"},
+    )
+    routes.conversation_store.save_conversation(
+        "secret-soup",
+        [
+            {
+                "id": "secret-msg",
+                "role": "assistant",
+                "text": "Secret soup note with an API token.",
+            }
+        ],
+    )
+    routes.conversation_store.merge_metadata(
+        "secret-soup",
+        {"privacy_mode": "secret", "sensitivity": "secret"},
+    )
+
+    class EmptyRAG:
+        embedding_model = "simple"
+
+        def query(self, text, top_k=3):
+            return []
+
+        def trace(self, doc_id):
+            return None
+
+    monkeypatch.setattr(routes, "_get_rag_service", lambda: EmptyRAG())
+    monkeypatch.setattr(
+        routes, "_get_clip_rag_service", lambda *, raise_http=False: None
+    )
+    monkeypatch.setattr(routes.llm_service, "mode", "api", raising=False)
+
+    def fake_generate(
+        prompt,
+        session_id="default",
+        model=None,
+        attachments=None,
+        context=None,
+        **kwargs,
+    ):
+        return {"text": "ok", "thought": "", "tools_used": [], "metadata": {}}
+
+    monkeypatch.setattr(routes.llm_service, "generate", fake_generate)
+
+    response = client.post(
+        "/chat",
+        json={
+            "message": "Find the soup note",
+            "session_id": "sess-privacy-fallback",
+            "use_rag": True,
+        },
+    )
+
+    assert response.status_code == 200
+    rag_section = response.json()["metadata"].get("rag") or {}
+    sources = {
+        match.get("source")
+        for match in rag_section.get("matches") or []
+        if isinstance(match, dict)
+    }
+    assert "conversation:open-soup" in sources
+    assert "conversation:protected-soup" not in sources
+    assert "conversation:secret-soup" not in sources
+
+
 def test_chat_rag_respects_text_and_vision_request_toggles(monkeypatch, client):
     calls = {"text": 0, "clip": 0}
 

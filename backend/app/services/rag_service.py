@@ -1157,6 +1157,8 @@ class RAGService:
                 self.embedding_model.split(":", 1)[1].strip()
                 or "text-embedding-3-large"
             )
+            if self._api_embedding_privacy_blocked(text):
+                return _simple_embed(text)
             api_key = self._resolve_embedding_api_key()
             if not api_key:
                 logger.warning(
@@ -1232,6 +1234,59 @@ class RAGService:
         if model_name in {"simple", "hash"}:
             return len(_simple_embed(""))
         return None
+
+    def _api_embedding_privacy_blocked(self, text: str) -> bool:
+        """Return True when local privacy preflight should stop a remote embed."""
+
+        try:
+            settings = privacy_filter_service.user_settings.load_settings()
+        except Exception:
+            settings = {}
+        if not isinstance(settings, dict):
+            settings = {}
+
+        filter_mode = privacy_filter_service.normalize_mode(
+            settings.get("privacy_filter_mode")
+        )
+        if filter_mode == "off":
+            return False
+
+        classifier_settings = dict(settings)
+
+        decision = privacy_filter_service.decide_sensitivity(
+            text,
+            settings=classifier_settings,
+            purpose="api_embedding",
+        )
+        if decision.status == "unavailable":
+            logger.warning(
+                "API embedding privacy preflight unavailable for %s; using hash fallback.",
+                self.embedding_model,
+            )
+            return True
+        suggested = privacy_filter_service.normalize_sensitivity(
+            decision.suggested_sensitivity
+        )
+        if not suggested:
+            return False
+        min_sensitivity = (
+            privacy_filter_service.normalize_sensitivity(
+                settings.get("privacy_filter_route_min_sensitivity")
+            )
+            or "protected"
+        )
+        suggested_rank = int(privacy_filter_service.SENSITIVITY_RANK.get(suggested, 0))
+        minimum_rank = int(
+            privacy_filter_service.SENSITIVITY_RANK.get(min_sensitivity, 2)
+        )
+        if suggested_rank < minimum_rank:
+            return False
+        logger.info(
+            "API embedding privacy preflight blocked %s text for %s; using hash fallback.",
+            suggested,
+            self.embedding_model,
+        )
+        return True
 
     def _init_backend(self, backend: str, url: Optional[str], api_key: Optional[str]):
         embed_fn = self._embed_text

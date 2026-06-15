@@ -538,6 +538,56 @@ body.dark-mode .settings-container {
   line-height: 1.45;
 }
 
+.workflow-pack-manager {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 72%, transparent);
+  border-radius: 10px;
+  background: color-mix(in oklab, var(--glass-panel-bg) 50%, transparent);
+}
+
+.workflow-pack-manager--flat {
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.workflow-pack-grid {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.8fr) minmax(220px, 1.6fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.workflow-pack-grid .field-label {
+  margin-top: 0;
+}
+
+.workflow-pack-grid input[type="text"] {
+  min-width: 0;
+  margin: 0;
+}
+
+.workflow-pack-actions,
+.workflow-pack-overwrite {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.workflow-pack-overwrite {
+  color: var(--color-text-muted);
+  font-size: 0.86rem;
+}
+
+.workflow-pack-overwrite input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+}
+
 .settings-container label {
   display: block;
   margin-top: 10px;
@@ -2088,8 +2138,13 @@ body.dark-mode .model-lane-switch {
 
   .tool-browser-limit-row,
   .tool-browser-policy-grid,
-  .tool-browser-detail-grid {
+  .tool-browser-detail-grid,
+  .workflow-pack-grid {
     grid-template-columns: 1fr;
+  }
+
+  .workflow-pack-actions {
+    justify-content: flex-start;
   }
 
   .settings-subcard {

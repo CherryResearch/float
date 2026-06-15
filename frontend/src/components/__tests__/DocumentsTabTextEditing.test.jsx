@@ -119,4 +119,66 @@ describe("DocumentsTab text editing", () => {
     expect(within(inspector).getByText(/PDF files are view-only here\./i)).toBeInTheDocument();
     expect(within(inspector).queryByRole("button", { name: /edit/i })).not.toBeInTheDocument();
   });
+
+  it("opens and edits raw workspace files that are not indexed knowledge rows", async () => {
+    vi.spyOn(axios, "get").mockImplementation((url) => {
+      if (url === "/api/knowledge/list") {
+        return Promise.resolve({ data: { ids: [], metadatas: [] } });
+      }
+      if (url === "/api/knowledge/workspace-files") {
+        return Promise.resolve({
+          data: {
+            entries: [
+              {
+                root: "tool",
+                root_label: "Tool workspace",
+                root_path: "data/workspace",
+                path: "notes/raw.txt",
+                display_path: "data/workspace/notes/raw.txt",
+                name: "raw.txt",
+                type: "file",
+                size_bytes: 12,
+                modified_at: 1781444527,
+              },
+            ],
+          },
+        });
+      }
+      if (url === "/api/attachments") {
+        return Promise.resolve({ data: { attachments: [] } });
+      }
+      if (url === "/api/knowledge/workspace-file/tool/notes/raw.txt") {
+        return Promise.resolve({ data: "raw workspace body" });
+      }
+      return Promise.reject(new Error(`Unexpected GET ${url}`));
+    });
+    vi.spyOn(axios, "put").mockResolvedValue({ data: { status: "updated" } });
+
+    render(
+      <MemoryRouter>
+        <DocumentsTab />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: /raw\.txt/i }));
+
+    expect(await screen.findByText("Plain text document")).toBeInTheDocument();
+    const inspector = screen.getByText("Plain text document").closest("section");
+    expect(within(inspector).getByText(/data\/workspace\/notes\/raw\.txt/i)).toBeInTheDocument();
+
+    fireEvent.click(within(inspector).getByRole("button", { name: /edit text/i }));
+    fireEvent.change(within(inspector).getByRole("textbox"), {
+      target: { value: "updated raw workspace body" },
+    });
+    await act(async () => {
+      fireEvent.click(within(inspector).getByRole("button", { name: /save text/i }));
+    });
+
+    await waitFor(() => {
+      expect(axios.put).toHaveBeenCalledWith(
+        "/api/knowledge/workspace-file/tool/notes/raw.txt",
+        { text: "updated raw workspace body" },
+      );
+    });
+  });
 });

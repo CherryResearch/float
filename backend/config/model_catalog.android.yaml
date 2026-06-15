@@ -12,16 +12,27 @@ models:
       api: gpt-5-mini
       server_lan: gemma-4-12B-it-qat-q4_0-gguf
     allowed_provider_models:
+      - gemma-4-E2B-it-qat-q4_0-gguf
+      - gemma-4-E4B-it-qat-q4_0-gguf
       - gemma-4-12B-it-qat-q4_0-gguf
-      - gemma-4-12B-it
-      - gemma-4-E4B-it
     hidden_provider_models:
       - gemma-4-E2B-it
-      - gemma-4-26B-A4B-it
-      - gemma-4-31B-it
-    blocked_local_models:
-      - gemma-4-E2B-it
-      - gemma-4-12B-it-qat-q4_0
+      - gemma-4-E2B-it-qat-q4_0
+      - gemma-4-12B-it
       - gemma-4-E4B-it
       - gemma-4-26B-A4B-it
+      - gemma-4-26B-A4B-it-qat-q4_0-gguf
       - gemma-4-31B-it
+      - gemma-4-31B-it-qat-q4_0-gguf
+    blocked_local_models:
+      - gemma-4-E2B-it
+      - gemma-4-E2B-it-qat-q4_0
+      - gemma-4-12B-it-qat-q4_0
+      - gemma-4-E4B-it
+      - gemma-4-E2B-it-qat-q4_0-gguf
+      - gemma-4-E4B-it-qat-q4_0-gguf
+      - gemma-4-12B-it-qat-q4_0-gguf
+      - gemma-4-26B-A4B-it
+      - gemma-4-26B-A4B-it-qat-q4_0-gguf
+      - gemma-4-31B-it
+      - gemma-4-31B-it-qat-q4_0-gguf

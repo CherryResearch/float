@@ -4,6 +4,8 @@
   gap: 0.35rem;
   margin-top: 0.5rem;
   position: relative;
+  width: min(420px, 100%);
+  max-width: 100%;
 }
 
 .media-preview {
@@ -11,7 +13,7 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: min(420px, 100%);
+  width: 100%;
   max-width: 100%;
   aspect-ratio: 4 / 3;
   border-radius: 12px;
@@ -39,6 +41,12 @@
 
 .media-preview audio {
   width: 100%;
+}
+
+.media-preview--audio {
+  aspect-ratio: auto;
+  min-height: 72px;
+  padding: 0.75rem;
 }
 
 .generic-placeholder {
@@ -312,8 +320,19 @@
   max-height: min(50vh, calc(90vh - 360px));
 }
 
+.viewer-media.audio-player {
+  width: min(640px, 100%);
+  height: 54px;
+  min-height: 54px;
+}
+
 .preview-media.video-player {
   pointer-events: none;
+}
+
+.preview-media.audio-player {
+  width: 100%;
+  min-height: 44px;
 }
 
 .viewer-link-out {

@@ -127,15 +127,21 @@ The provider path uses an OpenAI-compatible transport such as `http://<host>:<po
 If local Transformers fails on BF16/MXFP4/CUDA mismatches, switch to a managed quantized runtime such as `lmstudio` or `ollama`.
 If the model you have is a raw `.gguf`, do not treat it like a direct local Transformers checkpoint. Run it behind LM Studio, Ollama, or another OpenAI-compatible server first.
 
+Current dev caveat: direct local Transformers inference is best-effort until the
+dev environment has a CUDA-enabled PyTorch stack and a validated target hardware
+profile. For serious local implementations and QA, prefer a hosted local
+runtime such as LM Studio, Ollama, llama.cpp, or another OpenAI-compatible
+server.
+
 ### Gemma 4 runtime lanes
 
 Gemma 4 now follows an explicit three-lane split in Float:
 
 - `Cloud API`: keep OpenAI Realtime for live voice and live-session transport.
-- `Server/LAN`: use LM Studio or another OpenAI-compatible endpoint for larger Gemma 4 deployments such as `gemma-4-E4B-it`, `gemma-4-26B-A4B-it`, and `gemma-4-31B-it`.
-- `Local (on-device)`: direct local Transformers support now targets `gemma-4-E2B-it` as the first real Gemma 4 checkpoint.
+- `Server/LAN`: use LM Studio, llama.cpp, Ollama, or another OpenAI-compatible endpoint for Gemma 4 QAT GGUF deployments such as `gemma-4-E4B-it-qat-q4_0-gguf`, `gemma-4-12B-it-qat-q4_0-gguf`, `gemma-4-26B-A4B-it-qat-q4_0-gguf`, and `gemma-4-31B-it-qat-q4_0-gguf`.
+- `Local (on-device)`: direct local Transformers support targets `gemma-4-E2B-it` plus the unquantized QAT aliases `gemma-4-E2B-it-qat-q4_0` and `gemma-4-12B-it-qat-q4_0`.
 
-Direct local Gemma 4 uses Hugging Face's multimodal `AutoProcessor` + `AutoModelForImageTextToText` path, so `gemma-4-E2B-it` can handle text-only turns and still-image plus text turns locally. The larger Gemma 4 checkpoints remain provider/server-first in this pass and are intentionally not exposed as built-in direct-download recommendations. Gemma also informs local live/multimodal experiments, but live voice remains API-first in this patch.
+Direct local Gemma 4 uses Hugging Face's multimodal `AutoProcessor` + `AutoModelForImageTextToText` path, so the E2B lane can handle text-only turns and still-image plus text turns locally. The GGUF QAT aliases remain provider/server-first; for example, `gemma-4-12B-it-qat-q4_0-gguf` resolves to the official Hugging Face repo `google/gemma-4-12B-it-qat-q4_0-gguf`. Gemma also informs local live/multimodal experiments, but live voice remains API-first in this patch.
 
 Routing snapshot:
 
@@ -345,7 +351,7 @@ Float's runtime selectors are lane-based rather than a fixed model zoo. The tabl
 | Surface | Current primary paths | Notes |
 | --- | --- | --- |
 | Chat LLM | Cloud API default `gpt-5.4`; direct local default `gpt-oss-20b`; custom OpenAI-compatible API, Server/LAN, LM Studio, or Ollama endpoints. | Chat can route through API, direct local Transformers, managed local providers, or Server/LAN. Runtime parity is still in progress. |
-| Gemma 4 | Direct local `gemma-4-E2B-it`; larger Gemma 4 checkpoints through Server/LAN or managed providers. | Still-image plus text is the current local target. Live/multimodal work is experimental. |
+| Gemma 4 | Direct local `gemma-4-E2B-it` / QAT unquantized aliases; QAT GGUF aliases through Server/LAN or managed providers. | Still-image plus text is the current local target. GGUF runs behind an OpenAI-compatible provider. |
 | Speech and live voice | OpenAI Realtime for live voice; OpenAI TTS/STT by default; local voice paths remain experimental. | Browser microphone and transcript behavior still need live smoke testing after changes. |
 | Retrieval and memory | SQLite durable store, Chroma retrieval mirror, optional provider embeddings, and optional Weaviate backend. | Durable memories and vector retrieval are deliberately separate so private or long-form text does not have to be mirrored everywhere. |
 | Attachments and media | Images, PDFs, and common audio files through chat attachments and the media viewer. | Captions, retrieval indexing, and media metadata are visible in the UI but still evolving. |
@@ -451,6 +457,10 @@ Additional local/server options are allowed through custom endpoints, managed pr
 > GPT-OSS can handle roughly 7B-20B locally on a modern GPU. 120B-class models usually require a remote GPT-OSS server or multi-GPU setup.
 
 ## Contributing
+
+Please start with [CONTRIBUTING.md](CONTRIBUTING.md). It covers public tracker
+links, QA reports, code/docs contributions, dataset proposals, and future
+fine-tuning/model-adapter contribution rules.
 
 External contributions are accepted only after the contributor agrees to the
 repository's assignment terms in [CLA.md](CLA.md). Accepted contributions are

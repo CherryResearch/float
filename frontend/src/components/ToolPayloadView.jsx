@@ -86,6 +86,73 @@ const domainFromUrl = (url) => {
   }
 };
 
+const normalizePathText = (value) =>
+  typeof value === "string" ? value.trim().replace(/\\/g, "/") : "";
+
+const stripWorkspaceTail = (value, marker) => {
+  const normalized = normalizePathText(value);
+  const lower = normalized.toLowerCase();
+  const idx = lower.lastIndexOf(marker);
+  if (idx === -1) return "";
+  return normalized.slice(idx + marker.length).replace(/^\/+/, "");
+};
+
+const buildWorkspaceDocsHref = (value, context = {}) => {
+  const normalized = normalizePathText(value);
+  if (!normalized || normalized === "." || normalized.includes("\n")) return "";
+  const lower = normalized.toLowerCase();
+  const contextRoot = normalizePathText(context?.root).toLowerCase();
+  const contextScope = String(context?.scope || "").trim().toLowerCase();
+  const hasExtension = /\/?[^/]+\.[a-z0-9]{1,12}$/i.test(normalized);
+
+  let focus = "";
+  if (lower.startsWith("data/files/workspace/")) {
+    focus = normalized;
+  } else if (lower.startsWith("files/workspace/")) {
+    focus = `data/${normalized}`;
+  } else if (lower.startsWith("data/workspace/")) {
+    focus = normalized;
+  } else {
+    const filesTail = stripWorkspaceTail(normalized, "/data/files/workspace/");
+    const toolTail = stripWorkspaceTail(normalized, "/data/workspace/");
+    if (filesTail) focus = `data/files/workspace/${filesTail}`;
+    if (!focus && toolTail) focus = `data/workspace/${toolTail}`;
+  }
+
+  if (!focus && lower.startsWith("tool-workspace/")) {
+    focus = normalized;
+  }
+  if (!focus && lower.startsWith("workspace/")) {
+    if (contextRoot.endsWith("/data/workspace") || contextScope === "data") {
+      focus = `data/${normalized}`;
+    } else {
+      focus = `data/files/${normalized}`;
+    }
+  }
+  if (!focus && contextScope === "workspace" && hasExtension && !normalized.includes("://")) {
+    focus = `data/workspace/${normalized.replace(/^\.\/+/, "")}`;
+  }
+  if (!focus) return "";
+  return `/knowledge?tab=documents&id=${encodeURIComponent(focus)}`;
+};
+
+const renderMaybeWorkspaceLink = (value, context = {}) => {
+  if (typeof value !== "string") return stringifyValue(value);
+  const href = buildWorkspaceDocsHref(value, context);
+  if (!href) return value;
+  return (
+    <a className="tool-workspace-link" href={href} title="Open in Knowledge > documents">
+      {value}
+    </a>
+  );
+};
+
+function renderPayloadValue(value, context = {}) {
+  if (Array.isArray(value)) return renderArrayPayload(value, context);
+  if (isPlainObject(value)) return renderKeyValueList(value, context);
+  return renderMaybeWorkspaceLink(value, context);
+}
+
 const normalizeSearchItem = (item) => {
   if (!isPlainObject(item)) return null;
   const title = getString(item.title || item.name || item.label || "");
@@ -381,24 +448,25 @@ export const extractCapturePayload = (payload, toolName) => {
   };
 };
 
-const renderKeyValueList = (payload) => {
+const renderKeyValueList = (payload, parentContext = {}) => {
   const entries = Object.entries(payload || {}).filter(([, val]) => typeof val !== "undefined");
   if (!entries.length) {
     return <div className="tool-payload-empty">No details.</div>;
   }
+  const context = { ...parentContext, ...payload };
   return (
     <dl className="tool-kv">
       {entries.map(([key, val]) => (
         <div key={key} className="tool-kv-row">
           <dt>{key}</dt>
-          <dd>{stringifyValue(val)}</dd>
+          <dd>{renderPayloadValue(val, context)}</dd>
         </div>
       ))}
     </dl>
   );
 };
 
-const renderArrayPayload = (payload) => {
+const renderArrayPayload = (payload, parentContext = {}) => {
   if (!Array.isArray(payload) || !payload.length) {
     return <div className="tool-payload-empty">No items.</div>;
   }
@@ -411,7 +479,7 @@ const renderArrayPayload = (payload) => {
     return (
       <ul className="tool-list">
         {payload.map((item, idx) => (
-          <li key={`tool-list-${idx}`}>{stringifyValue(item)}</li>
+          <li key={`tool-list-${idx}`}>{renderMaybeWorkspaceLink(item, parentContext)}</li>
         ))}
       </ul>
     );
@@ -420,7 +488,7 @@ const renderArrayPayload = (payload) => {
     <div className="tool-list">
       {payload.map((item, idx) => (
         <div key={`tool-list-${idx}`} className="tool-list-item">
-          {isPlainObject(item) ? renderKeyValueList(item) : stringifyValue(item)}
+          {renderPayloadValue(item, parentContext)}
         </div>
       ))}
     </div>

@@ -16,21 +16,28 @@ const MODEL_SIZE_RANK = {
 
 const DIRECT_LOCAL_GEMMA_MODELS = new Set([
   "gemma-4-E2B-it",
+  "gemma-4-E2B-it-qat-q4_0",
   "gemma-4-12B-it-qat-q4_0",
 ]);
 
 const PROVIDER_FIRST_GEMMA_MODELS = new Set([
+  "gemma-4-E2B-it-qat-q4_0-gguf",
+  "gemma-4-E4B-it-qat-q4_0-gguf",
+  "gemma-4-12B-it-qat-q4_0-gguf",
+  "gemma-4-26B-A4B-it-qat-q4_0-gguf",
+  "gemma-4-31B-it-qat-q4_0-gguf",
   "gemma-4-12B-it",
   "gemma-4-E4B-it",
-  "gemma-4-12B-it-qat-q4_0-gguf",
   "gemma-4-26B-A4B-it",
   "gemma-4-31B-it",
 ]);
 
 const DOWNLOADABLE_PROVIDER_MODELS = new Set([
-  "gemma-4-12B-it",
-  "gemma-4-E4B-it",
+  "gemma-4-E2B-it-qat-q4_0-gguf",
+  "gemma-4-E4B-it-qat-q4_0-gguf",
   "gemma-4-12B-it-qat-q4_0-gguf",
+  "gemma-4-26B-A4B-it-qat-q4_0-gguf",
+  "gemma-4-31B-it-qat-q4_0-gguf",
 ]);
 
 const DOWNLOADABLE_UTILITY_MODELS = new Set([
@@ -60,14 +67,19 @@ export const SUGGESTED_LOCAL_MODELS = [
   "mistral-7b-instruct-v0.3",
   "mixtral-8x7b-instruct-v0.1",
   "gemma-4-E2B-it",
+  "gemma-4-E2B-it-qat-q4_0",
   "gemma-4-12B-it-qat-q4_0",
 ];
 
 export const SUGGESTED_SERVER_MODELS = [
   ...SUGGESTED_LOCAL_MODELS,
+  "gemma-4-E2B-it-qat-q4_0-gguf",
+  "gemma-4-E4B-it-qat-q4_0-gguf",
+  "gemma-4-12B-it-qat-q4_0-gguf",
+  "gemma-4-26B-A4B-it-qat-q4_0-gguf",
+  "gemma-4-31B-it-qat-q4_0-gguf",
   "gemma-4-12B-it",
   "gemma-4-E4B-it",
-  "gemma-4-12B-it-qat-q4_0-gguf",
   "gemma-4-26B-A4B-it",
   "gemma-4-31B-it",
 ];

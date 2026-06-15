@@ -6,4 +6,8 @@ For the user, the intended model is: keep the built-in tools stable, adjust the 
 
 Module storage follows the same tracked-vs-local split as themes and skills. Repo-shipped add-ons use `modules/addons/{addon}/config.json`; local editable add-on config uses `data/modules/addons/{addon}/config.json`; local skill markdown overrides use `data/modules/skills/{skill_id}.md`. Settings should show disabled modules as installed but off: their docs can still explain the capability, but their tools should not be sent to the model until the module is enabled.
 
+Settings also has the local pack transfer path: preview/import a module-pack folder into `data/modules/addons/{addon}/`, preview/import a standalone skill markdown file into `data/modules/skills/{skill_id}.md`, and export local/imported packs or local skill docs back to a workspace folder. Imported add-on folders may contain markdown under `skills/`; those files are mirrored into `data/modules/skills/` so normal skill discovery can use them instead of inventing a second nested skill loader.
+
+Float ships a `float_self_knowledge` skill as a model-readable overview of the shipped app. It is meant to make high-level self-research easier through `read_capability_docs` while keeping feature overviews, function descriptions, skills, and tools as separate concepts.
+
 float ships with a small set of built-in themes and paired dark/light presentation. If a user wants a personal variation rather than editing the built-in files, the intended flow is to create a custom theme in Settings, choose the palette slots there, and keep that saved theme in `data/themes/` instead of in the tracked frontend source tree.
