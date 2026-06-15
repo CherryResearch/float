@@ -67,6 +67,30 @@ describe("DocumentsTab upload helpers", () => {
     });
   });
 
+  it("deduplicates repeated gallery badges and cache-busts preview urls", () => {
+    const attachment = {
+      content_hash: "hash-3",
+      filename: "placeholder.png",
+      url: "/api/attachments/hash-3/placeholder.png",
+      size: 4096,
+      uploaded_at: "2026-06-14T15:09:00Z",
+      origin: "upload",
+      caption_status: "missing",
+      index_status: "missing",
+      placeholder_caption: true,
+    };
+
+    expect(buildAttachmentViewerItems([attachment])[0].src).toBe(
+      "/api/attachments/hash-3/placeholder.png?v=4096%3A2026-06-14T15%3A09%3A00Z",
+    );
+    expect(describeAttachmentCard(attachment, "unsorted").badges.map((badge) => badge.label)).toEqual([
+      "unsorted",
+      "upload",
+      "missing",
+      "placeholder",
+    ]);
+  });
+
   it("matches focused docs by absolute file path when opening from work history links", () => {
     const docs = [
       {

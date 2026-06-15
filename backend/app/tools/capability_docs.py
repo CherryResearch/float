@@ -15,6 +15,7 @@ from app.utils import user_settings, verify_signature
 from app.workflow_profiles import (
     list_skills,
     local_skills_root,
+    markdown_summary_from_text,
     normalize_module_id,
     repo_skills_root,
     workflow_catalog_payload,
@@ -66,12 +67,7 @@ def _normalize_scope(value: Any) -> str:
 
 
 def _read_summary(text: str) -> str:
-    for raw_line in text.splitlines():
-        line = str(raw_line or "").strip()
-        if not line or line.startswith("#"):
-            continue
-        return line
-    return ""
+    return markdown_summary_from_text(text)
 
 
 def _doc_id(scope: str, stem: str) -> str:

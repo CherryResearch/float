@@ -21,13 +21,21 @@ const DOC_SEARCH_MODES = {
 const ATTACHMENT_FOLDER_ASSIGNMENTS_STORAGE_KEY =
   "documentsAttachmentFolderAssignments";
 const ATTACHMENT_FOLDER_ORDER_STORAGE_KEY = "documentsAttachmentFolderOrder";
+const ATTACHMENT_GALLERY_COLUMNS_STORAGE_KEY = "documentsAttachmentGalleryColumns";
 const ATTACHMENT_FOLDER_ALL = "__all__";
 const ATTACHMENT_FOLDER_UNSORTED = "__unsorted__";
+const ATTACHMENT_GALLERY_COLUMN_OPTIONS = [2, 4, 8];
 
 const DOC_IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "svg", "webp"]);
 const DOC_VIDEO_EXTENSIONS = new Set(["mp4", "webm"]);
 const DOC_AUDIO_EXTENSIONS = new Set(["mp3", "wav"]);
 const TEXT_NOTE_DOC_KINDS = new Set(["note", "text", "markdown"]);
+const WORKSPACE_FILE_DOC_KIND = "workspace_file";
+const DOCUMENTS_TREE_LEVEL_OFFSET = 16;
+const WORKSPACE_ROOT_PREFIX = {
+  files: "data/files/workspace",
+  tool: "data/workspace",
+};
 
 const formatBytes = (value) => {
   if (typeof value !== "number" || Number.isNaN(value)) return "";
@@ -53,9 +61,29 @@ const formatTimestamp = (value) => {
   }
 };
 
+const normalizeAttachmentGalleryColumns = (value) => {
+  const parsed = Number(value);
+  return ATTACHMENT_GALLERY_COLUMN_OPTIONS.includes(parsed) ? parsed : 2;
+};
+
+const attachmentPreviewUrl = (att) => {
+  const url = String(att?.url || "").trim();
+  if (!url) return "";
+  const version = [
+    typeof att.size === "number" ? att.size : "",
+    att.uploaded_at || "",
+    att.indexed_at || "",
+    att.caption_recorded_at || "",
+  ]
+    .filter(Boolean)
+    .join(":");
+  if (!version) return url;
+  return `${url}${url.includes("?") ? "&" : "?"}v=${encodeURIComponent(version)}`;
+};
+
 export const buildAttachmentViewerItems = (items = []) =>
   items.map((att) => ({
-    src: att.url,
+    src: attachmentPreviewUrl(att),
     alt: att.filename || att.content_hash,
     label: att.filename || att.content_hash,
     size: typeof att.size === "number" ? att.size : null,
@@ -97,7 +125,7 @@ export const describeAttachmentCard = (attachment, folderLabel) => {
     !att.capture_source && att.origin ? att.origin : "",
     pathLabel || "",
   ].filter(Boolean);
-  const badges = [
+  const rawBadges = [
     {
       key: "folder",
       label: folderLabel,
@@ -156,6 +184,13 @@ export const describeAttachmentCard = (attachment, folderLabel) => {
         }
       : null,
   ].filter(Boolean);
+  const seenBadgeLabels = new Set();
+  const badges = rawBadges.filter((badge) => {
+    const key = String(badge.label || "").trim().toLowerCase();
+    if (!key || seenBadgeLabels.has(key)) return false;
+    seenBadgeLabels.add(key);
+    return true;
+  });
   return { label, captionText, secondaryMeta, badges };
 };
 
@@ -236,8 +271,26 @@ const getSafeUiUrl = (value) => {
   return "";
 };
 
+const encodeWorkspacePath = (value) =>
+  normalizePath(value)
+    .split("/")
+    .filter(Boolean)
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+
+const getWorkspaceFileUrl = (doc) => {
+  if (!doc?.workspaceFile || !doc.workspaceRoot || !doc.workspacePath) return "";
+  return `/api/knowledge/workspace-file/${encodeURIComponent(doc.workspaceRoot)}/${encodeWorkspacePath(doc.workspacePath)}`;
+};
+
+const getWorkspaceRevealUrl = (doc) => {
+  if (!doc?.workspaceFile || !doc.workspaceRoot || !doc.workspacePath) return "";
+  return `/api/knowledge/workspace-reveal/${encodeURIComponent(doc.workspaceRoot)}/${encodeWorkspacePath(doc.workspacePath)}`;
+};
+
 const getDocOpenUrl = (doc) => {
   if (!doc || typeof doc !== "object") return "";
+  if (doc.workspaceFile) return getWorkspaceFileUrl(doc);
   const meta = doc.meta && typeof doc.meta === "object" ? doc.meta : {};
   const directUrl = getSafeUiUrl(meta.url);
   if (directUrl) return directUrl;
@@ -416,6 +469,72 @@ const classifyDocSource = (meta) => {
   };
 };
 
+const normalizeWorkspaceEntryPath = (value) =>
+  normalizePath(value).replace(/^\/+/, "").replace(/\/+$/, "");
+
+const workspaceEntryKey = (root, path) => {
+  const safeRoot = String(root || "").trim().toLowerCase();
+  const safePath = normalizeWorkspaceEntryPath(path).toLowerCase();
+  return safeRoot && safePath ? `${safeRoot}:${safePath}` : "";
+};
+
+const workspaceKeyFromDocMeta = (meta) => {
+  if (!meta || typeof meta !== "object") return "";
+  const candidates = [
+    meta.relative_path,
+    meta.source,
+    meta.root_source,
+    meta.filename,
+  ]
+    .map((value) => normalizeWorkspaceEntryPath(value))
+    .filter(Boolean);
+  for (const candidate of candidates) {
+    const lower = candidate.toLowerCase();
+    const dataFiles = "data/files/workspace/";
+    const files = "files/workspace/";
+    const dataWorkspace = "data/workspace/";
+    const toolWorkspace = "tool-workspace/";
+    const workspace = "workspace/";
+    if (lower.startsWith(dataFiles)) return workspaceEntryKey("files", candidate.slice(dataFiles.length));
+    if (lower.startsWith(files)) return workspaceEntryKey("files", candidate.slice(files.length));
+    if (lower.startsWith(dataWorkspace)) return workspaceEntryKey("tool", candidate.slice(dataWorkspace.length));
+    if (lower.startsWith(toolWorkspace)) return workspaceEntryKey("tool", candidate.slice(toolWorkspace.length));
+    if (lower.startsWith(workspace)) return workspaceEntryKey("files", candidate.slice(workspace.length));
+  }
+  return "";
+};
+
+const buildWorkspaceFileDoc = (entry) => {
+  const root = entry?.root === "tool" ? "tool" : "files";
+  const path = normalizeWorkspaceEntryPath(entry?.path || "");
+  if (!path) return null;
+  const name = entry?.name || path.split("/").pop() || path;
+  const relativePath = root === "tool" ? `tool-workspace/${path}` : `workspace/${path}`;
+  const rootPrefix = WORKSPACE_ROOT_PREFIX[root] || WORKSPACE_ROOT_PREFIX.files;
+  return {
+    id: `workspace-file:${root}:${path}`,
+    meta: {
+      title: name,
+      filename: name,
+      source: `${rootPrefix}/${path}`,
+      relative_path: relativePath,
+      kind: WORKSPACE_FILE_DOC_KIND,
+      type: "document",
+      workspace_root: root,
+      workspace_root_label: entry?.root_label || "",
+      size_bytes: typeof entry?.size_bytes === "number" ? entry.size_bytes : null,
+      modified_at: entry?.modified_at || null,
+    },
+    workspaceFile: true,
+    workspaceRoot: root,
+    workspacePath: path,
+    workspaceRootLabel: entry?.root_label || "",
+    workspaceDisplayPath: entry?.display_path || `${rootPrefix}/${path}`,
+    sizeBytes: typeof entry?.size_bytes === "number" ? entry.size_bytes : null,
+    modifiedAt: entry?.modified_at || null,
+  };
+};
+
 const normalizeFocusValue = (value) => {
   if (typeof value !== "string") return "";
   const stripped = stripDataFilesPrefix(value);
@@ -457,12 +576,17 @@ export const resolveFocusedDoc = (docs = [], focusId = "") => {
 const DocumentsTab = ({ focusId = null }) => {
   const navigate = useNavigate();
   const [docs, setDocs] = useState([]);
+  const [workspaceEntries, setWorkspaceEntries] = useState([]);
+  const [workspaceListTruncated, setWorkspaceListTruncated] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchMode, setSearchMode] = useState(DOC_SEARCH_MODES.CATALOG);
-  const [sortBy, setSortBy] = useState("id");
+  const [sortBy, setSortBy] = useState("title");
   const [sortDir, setSortDir] = useState("asc");
   const [docViewMode, setDocViewMode] = useState("folders");
   const [collapsedDocFolders, setCollapsedDocFolders] = useState(() => new Set());
+  const [stickyDocFolder, setStickyDocFolder] = useState(null);
+  const folderTreeRef = useRef(null);
+  const pendingStickyParentPathRef = useRef(null);
   const [showArchived, setShowArchived] = useState(false);
   const [showMemoryItems, setShowMemoryItems] = useState(false);
   const [showExternalItems, setShowExternalItems] = useState(false);
@@ -514,6 +638,16 @@ const DocumentsTab = ({ focusId = null }) => {
   const [attachmentQuery, setAttachmentQuery] = useState("");
   const [attachmentsIndexBusy, setAttachmentsIndexBusy] = useState(false);
   const [attachmentsIndexStatus, setAttachmentsIndexStatus] = useState(null);
+  const [attachmentGalleryColumns, setAttachmentGalleryColumns] = useState(() => {
+    if (typeof localStorage === "undefined") return 2;
+    try {
+      return normalizeAttachmentGalleryColumns(
+        localStorage.getItem(ATTACHMENT_GALLERY_COLUMNS_STORAGE_KEY),
+      );
+    } catch {
+      return 2;
+    }
+  });
   const [attachmentFolderAssignments, setAttachmentFolderAssignments] = useState(() => {
     if (typeof localStorage === "undefined") return {};
     try {
@@ -585,15 +719,34 @@ const DocumentsTab = ({ focusId = null }) => {
   }, [uploadPreview]);
 
   const loadDocs = useCallback(async () => {
-    try {
-      const res = await axios.get("/api/knowledge/list");
-      const ids = res.data?.ids || [];
-      const metas = res.data?.metadatas || [];
-      const list = ids.map((id, i) => ({ id, meta: metas[i] || {} }));
-      setDocs(list);
-    } catch {
-      // ignore
-    }
+    const [knowledgeResult, workspaceResult] = await Promise.allSettled([
+      axios.get("/api/knowledge/list"),
+      axios.get("/api/knowledge/workspace-files"),
+    ]);
+    const ids =
+      knowledgeResult.status === "fulfilled" ? knowledgeResult.value.data?.ids || [] : [];
+    const metas =
+      knowledgeResult.status === "fulfilled" ? knowledgeResult.value.data?.metadatas || [] : [];
+    const list = ids.map((id, i) => ({ id, meta: metas[i] || {} }));
+    const entries =
+      workspaceResult.status === "fulfilled"
+        ? workspaceResult.value.data?.entries || []
+        : [];
+    const safeEntries = Array.isArray(entries) ? entries : [];
+    const indexedWorkspaceKeys = new Set(
+      list.map((doc) => workspaceKeyFromDocMeta(doc.meta)).filter(Boolean),
+    );
+    const rawWorkspaceDocs = safeEntries
+      .filter((entry) => entry?.type === "file")
+      .filter((entry) => !indexedWorkspaceKeys.has(workspaceEntryKey(entry.root, entry.path)))
+      .map(buildWorkspaceFileDoc)
+      .filter(Boolean);
+    setWorkspaceEntries(safeEntries);
+    setWorkspaceListTruncated(
+      workspaceResult.status === "fulfilled" &&
+        workspaceResult.value.data?.truncated === true,
+    );
+    setDocs([...list, ...rawWorkspaceDocs]);
   }, []);
 
   const loadAttachments = useCallback(async () => {
@@ -628,6 +781,19 @@ const DocumentsTab = ({ focusId = null }) => {
     setActiveDocError(mode === "edit" && !profile.editable ? profile.helperText : "");
     setActiveDocLoading(true);
     try {
+      if (doc.workspaceFile) {
+        const url = getWorkspaceFileUrl(doc);
+        if (!url || !profile.editable) {
+          setActiveDocBody("");
+          return;
+        }
+        const res = await axios.get(url, {
+          responseType: "text",
+          transformResponse: [(data) => data],
+        });
+        setActiveDocBody(String(res.data || ""));
+        return;
+      }
       const res = await axios.get(`/api/knowledge/${encodeURIComponent(String(doc.id))}`);
       const text = String(res.data?.documents?.[0] || "");
       setActiveDocBody(text);
@@ -670,6 +836,18 @@ const DocumentsTab = ({ focusId = null }) => {
       // ignore persistence errors
     }
   }, [attachmentFolderOrder]);
+
+  useEffect(() => {
+    if (typeof localStorage === "undefined") return;
+    try {
+      localStorage.setItem(
+        ATTACHMENT_GALLERY_COLUMNS_STORAGE_KEY,
+        String(attachmentGalleryColumns),
+      );
+    } catch {
+      // ignore persistence errors
+    }
+  }, [attachmentGalleryColumns]);
 
   useEffect(() => {
     const validKeys = new Set(attachments.map((att) => attachmentKeyOf(att)).filter(Boolean));
@@ -930,7 +1108,10 @@ const DocumentsTab = ({ focusId = null }) => {
     if (!doc?.id) return;
     setActionStatus("");
     try {
-      const res = await axios.get(`/api/knowledge/reveal/${encodeURIComponent(String(doc.id))}`);
+      const revealUrl = doc.workspaceFile
+        ? getWorkspaceRevealUrl(doc)
+        : `/api/knowledge/reveal/${encodeURIComponent(String(doc.id))}`;
+      const res = await axios.get(revealUrl);
       const payload = res.data || {};
       const path = typeof payload.path === "string" ? payload.path : "";
       const opened =
@@ -1172,7 +1353,14 @@ const DocumentsTab = ({ focusId = null }) => {
       const meta = d?.meta && typeof d.meta === "object" ? d.meta : {};
       const folderPath = getDocFolderPath(meta);
       const baseName = getDocBaseName(meta);
-      const sourceInfo = classifyDocSource(meta);
+      const sourceInfo = d?.workspaceFile
+        ? {
+            isMemory: false,
+            isFilesystem: true,
+            isExternal: false,
+            isDerived: false,
+          }
+        : classifyDocSource(meta);
       return {
         ...d,
         meta,
@@ -1254,20 +1442,44 @@ const DocumentsTab = ({ focusId = null }) => {
   }, [docs]);
 
   const folderTree = useMemo(() => {
+    const isFilteringCatalog =
+      searchMode === DOC_SEARCH_MODES.CATALOG && Boolean(searchQuery.trim());
     const createNode = (name, path) => ({
       name,
       path,
       documents: [],
       children: new Map(),
-      sortKey: 0,
       totalCount: 0,
+      explicitDirectory: false,
     });
     const root = createNode("", "");
+    const ensureFolderPath = (path) => {
+      const segments = splitFolderPath(path);
+      let node = root;
+      segments.forEach((segment) => {
+        const childPath = node.path ? `${node.path}/${segment}` : segment;
+        if (!node.children.has(segment)) {
+          node.children.set(segment, createNode(segment, childPath));
+        }
+        node = node.children.get(segment);
+      });
+      node.explicitDirectory = true;
+      return node;
+    };
+    if (!isFilteringCatalog) {
+      workspaceEntries
+        .filter((entry) => entry?.type === "directory")
+        .forEach((entry) => {
+          const path = normalizeWorkspaceEntryPath(entry.path);
+          if (!path) return;
+          const prefix = entry.root === "tool" ? "tool-workspace" : "workspace";
+          ensureFolderPath(`${prefix}/${path}`);
+        });
+    }
     filteredDocs.forEach((doc, index) => {
       const segments = splitFolderPath(doc.folderPath);
       if (!segments.length) {
         root.documents.push({ doc, index });
-        root.sortKey = Math.max(root.sortKey, index);
         return;
       }
       let node = root;
@@ -1277,7 +1489,6 @@ const DocumentsTab = ({ focusId = null }) => {
           node.children.set(segment, createNode(segment, childPath));
         }
         node = node.children.get(segment);
-        node.sortKey = Math.max(node.sortKey, index);
       });
       node.documents.push({ doc, index });
     });
@@ -1289,19 +1500,25 @@ const DocumentsTab = ({ focusId = null }) => {
       node.totalCount =
         node.documents.length +
         children.reduce((sum, child) => sum + (child.totalCount || 0), 0);
-      const childMax = children.reduce(
-        (max, child) => Math.max(max, child.sortKey || 0),
-        0,
-      );
-      node.sortKey = Math.max(node.sortKey || 0, childMax);
       node.childList = children.sort(
-        (a, b) => (b.sortKey || 0) - (a.sortKey || 0) || a.name.localeCompare(b.name),
+        (a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" }),
       );
       return node;
     };
 
     return finalize(root);
-  }, [filteredDocs]);
+  }, [filteredDocs, searchMode, searchQuery, workspaceEntries]);
+
+  const docFolderKeys = useMemo(() => {
+    const keys = [];
+    const visit = (node, isRoot = false) => {
+      if (!node) return;
+      if (!isRoot && node.path) keys.push(node.path);
+      (node.childList || []).forEach((child) => visit(child));
+    };
+    visit(folderTree, true);
+    return keys;
+  }, [folderTree]);
 
   const toggleDocFolder = useCallback((path) => {
     setCollapsedDocFolders((prev) => {
@@ -1314,6 +1531,131 @@ const DocumentsTab = ({ focusId = null }) => {
       return next;
     });
   }, []);
+
+  const toggleStickyDocFolder = useCallback(
+    (folder) => {
+      if (!folder?.path) return;
+      const segments = folder.path.split("/").filter(Boolean);
+      pendingStickyParentPathRef.current =
+        !folder.collapsed && segments.length > 1
+          ? segments.slice(0, -1).join("/")
+          : null;
+      toggleDocFolder(folder.path);
+    },
+    [toggleDocFolder],
+  );
+
+  const collapseAllDocFolders = useCallback(() => {
+    setCollapsedDocFolders(new Set(docFolderKeys));
+  }, [docFolderKeys]);
+
+  const expandAllDocFolders = useCallback(() => {
+    setCollapsedDocFolders(new Set());
+  }, []);
+
+  const syncStickyDocFolder = useCallback(() => {
+    const tree = folderTreeRef.current;
+    if (!tree || docViewMode !== "folders") {
+      setStickyDocFolder(null);
+      return;
+    }
+
+    const treeRect = tree.getBoundingClientRect();
+    const anchorY = treeRect.top + 1;
+    const folderNodes = Array.from(
+      tree.querySelectorAll(".documents-folder-node[data-folder-path]"),
+    );
+    let activeFolder = null;
+
+    folderNodes.forEach((node) => {
+      const nodeRect = node.getBoundingClientRect();
+      if (nodeRect.top > anchorY || nodeRect.bottom <= anchorY) return;
+      const row = Array.from(node.children).find((child) =>
+        child.classList?.contains("documents-folder-row"),
+      );
+      if (!row) return;
+      const rowRect = row.getBoundingClientRect();
+      const depth = Number(node.dataset.folderDepth || 0);
+      const path = node.dataset.folderPath || "";
+      if (!path) return;
+      if (!activeFolder || depth >= activeFolder.depth) {
+        activeFolder = {
+          path,
+          name:
+            node.dataset.folderName
+            || row.querySelector(".documents-folder-name")?.textContent?.trim()
+            || path.split("/").pop()
+            || path,
+          count:
+            node.dataset.folderCount
+            || row.querySelector(".documents-folder-count")?.textContent?.trim()
+            || "",
+          depth,
+          collapsed: row.getAttribute("aria-expanded") === "false",
+          rowTop: rowRect.top,
+        };
+      }
+    });
+
+    const next =
+      activeFolder && tree.scrollTop > 0 && activeFolder.rowTop <= treeRect.top + 1
+        ? activeFolder
+        : null;
+    setStickyDocFolder((prev) => {
+      if (!prev && !next) return prev;
+      if (
+        prev &&
+        next &&
+        prev.path === next.path &&
+        prev.name === next.name &&
+        prev.count === next.count &&
+        prev.depth === next.depth &&
+        prev.collapsed === next.collapsed
+      ) {
+        return prev;
+      }
+      return next;
+    });
+  }, [docViewMode]);
+
+  const handleFolderTreeScroll = useCallback(() => {
+    syncStickyDocFolder();
+  }, [syncStickyDocFolder]);
+
+  useEffect(() => {
+    if (docViewMode !== "folders") {
+      setStickyDocFolder(null);
+      return undefined;
+    }
+    const frame = window.requestAnimationFrame(syncStickyDocFolder);
+    return () => window.cancelAnimationFrame(frame);
+  }, [collapsedDocFolders, docViewMode, folderTree, syncStickyDocFolder]);
+
+  useEffect(() => {
+    const parentPath = pendingStickyParentPathRef.current;
+    pendingStickyParentPathRef.current = null;
+    if (!parentPath || docViewMode !== "folders") return undefined;
+
+    const frame = window.requestAnimationFrame(() => {
+      const tree = folderTreeRef.current;
+      if (!tree) return;
+      const parentNode = Array.from(
+        tree.querySelectorAll(".documents-folder-node[data-folder-path]"),
+      ).find((node) => node.dataset.folderPath === parentPath);
+      const parentRow = parentNode
+        ? Array.from(parentNode.children).find((child) =>
+            child.classList?.contains("documents-folder-row"),
+          )
+        : null;
+      if (!parentRow) return;
+      const treeRect = tree.getBoundingClientRect();
+      const rowRect = parentRow.getBoundingClientRect();
+      tree.scrollTop += rowRect.top - treeRect.top;
+      window.requestAnimationFrame(syncStickyDocFolder);
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, [collapsedDocFolders, docViewMode, syncStickyDocFolder]);
 
   const closeDocInspector = useCallback(() => {
     if (activeDocSaving) return;
@@ -1349,7 +1691,10 @@ const DocumentsTab = ({ focusId = null }) => {
     setActiveDocSaving(true);
     setActiveDocError("");
     try {
-      await axios.put(`/api/knowledge/${encodeURIComponent(String(activeDoc.id))}`, {
+      const saveUrl = activeDoc.workspaceFile
+        ? getWorkspaceFileUrl(activeDoc)
+        : `/api/knowledge/${encodeURIComponent(String(activeDoc.id))}`;
+      await axios.put(saveUrl, {
         text: activeDocBody,
       });
       await loadDocs();
@@ -1470,6 +1815,16 @@ const DocumentsTab = ({ focusId = null }) => {
     () => buildAttachmentViewerItems(filteredAttachments),
     [filteredAttachments],
   );
+  const attachmentGalleryLevel = Math.max(
+    0,
+    ATTACHMENT_GALLERY_COLUMN_OPTIONS.indexOf(attachmentGalleryColumns),
+  );
+  const updateAttachmentGalleryColumns = useCallback((event) => {
+    const nextIndex = Number(event.target.value);
+    setAttachmentGalleryColumns(
+      ATTACHMENT_GALLERY_COLUMN_OPTIONS[nextIndex] || 2,
+    );
+  }, []);
 
   const docCountLabel = useMemo(() => {
     const count = filteredDocs.length;
@@ -1515,6 +1870,9 @@ const DocumentsTab = ({ focusId = null }) => {
     if (actionStatus) {
       lines.push(`Last action: ${actionStatus}`);
     }
+    if (workspaceListTruncated) {
+      lines.push("Workspace list truncated; narrow the search or folder view.");
+    }
     return lines.join("\n");
   }, [
     actionStatus,
@@ -1527,6 +1885,7 @@ const DocumentsTab = ({ focusId = null }) => {
     showDerivedItems,
     showExternalItems,
     showMemoryItems,
+    workspaceListTruncated,
   ]);
   const activeDocOpenUrl = useMemo(() => getDocOpenUrl(activeDoc), [activeDoc]);
   const activeDocPreviewKind = useMemo(() => getDocPreviewKind(activeDoc), [activeDoc]);
@@ -1950,8 +2309,9 @@ const DocumentsTab = ({ focusId = null }) => {
         </section>
       )}
 
+      <section className={`documents-browser${activeDoc ? " has-active-doc" : ""}`}>
       {activeDoc ? (
-        <section className="doc-inspector-panel" aria-live="polite">
+        <section className="doc-inspector-panel documents-browser-details" aria-live="polite">
           <div className="doc-inspector-header">
             <div className="doc-inspector-title-wrap">
               <h3>{activeDoc.meta?.title || activeDoc.baseName || activeDoc.id}</h3>
@@ -2099,13 +2459,66 @@ const DocumentsTab = ({ focusId = null }) => {
         </section>
       ) : null}
 
+      <div className="documents-browser-list">
+      <div className="documents-browser-controls">
+        <div className="documents-browser-count">
+          {workspaceListTruncated ? "Workspace list truncated" : docCountLabel}
+        </div>
+        <div className="documents-browser-control-buttons" role="group" aria-label="Folder tree controls">
+          <button
+            type="button"
+            onClick={expandAllDocFolders}
+            disabled={!docFolderKeys.length}
+            title="Expand all folders in the current document tree"
+          >
+            expand all
+          </button>
+          <button
+            type="button"
+            onClick={collapseAllDocFolders}
+            disabled={!docFolderKeys.length}
+            title="Collapse all folders in the current document tree"
+          >
+            collapse all
+          </button>
+        </div>
+      </div>
       {filteredDocs.length ? (
         docViewMode === "folders" ? (
-          <div className="documents-folder-tree">
+          <div
+            className="documents-folder-tree"
+            ref={folderTreeRef}
+            onScroll={handleFolderTreeScroll}
+          >
+            {stickyDocFolder ? (
+              <div className="documents-folder-sticky-slot">
+                <button
+                  type="button"
+                  className={`documents-folder-row documents-folder-sticky-overlay${
+                    stickyDocFolder.collapsed ? " collapsed" : ""
+                  }`}
+                  style={{
+                    "--folder-depth": stickyDocFolder.depth,
+                    "--folder-offset": `${
+                      Math.max(0, stickyDocFolder.depth - 1) * DOCUMENTS_TREE_LEVEL_OFFSET
+                    }px`,
+                  }}
+                  onClick={() => toggleStickyDocFolder(stickyDocFolder)}
+                  aria-expanded={!stickyDocFolder.collapsed}
+                  title={stickyDocFolder.path}
+                >
+                  <span className="documents-folder-caret" aria-hidden="true">
+                    {stickyDocFolder.collapsed ? ">" : "v"}
+                  </span>
+                  <span className="documents-folder-name">{stickyDocFolder.name}</span>
+                  <span className="documents-folder-count">{stickyDocFolder.count}</span>
+                </button>
+              </div>
+            ) : null}
             {renderFolderNode(folderTree, 0, true)}
           </div>
         ) : (
-          <table>
+          <table className="documents-table">
             <thead>
               <tr>
                 <th>id</th>
@@ -2152,9 +2565,11 @@ const DocumentsTab = ({ focusId = null }) => {
                         open location
                       </button>
                     ) : null}
-                    <button type="button" onClick={() => deleteDoc(d)} title="Delete document">
-                      delete
-                    </button>
+                    {!d.workspaceFile ? (
+                      <button type="button" onClick={() => deleteDoc(d)} title="Delete document">
+                        delete
+                      </button>
+                    ) : null}
                   </td>
                 </tr>
               ))}
@@ -2164,8 +2579,13 @@ const DocumentsTab = ({ focusId = null }) => {
       ) : (
         <div className="status-note">No documents match this view.</div>
       )}
+      </div>
+      </section>
 
-      <section className="attachments-panel">
+      <section
+        className="attachments-panel"
+        data-gallery-density={attachmentGalleryColumns}
+      >
         <div className="attachments-header">
           <h3>files</h3>
           <div className="attachments-controls">
@@ -2191,6 +2611,26 @@ const DocumentsTab = ({ focusId = null }) => {
             >
               {attachmentsIndexBusy ? "memorizing..." : "memorize"}
             </button>
+          </div>
+        </div>
+        <div className="attachments-gallery-toolbar">
+          <label className="attachments-gallery-density">
+            <span>tile density</span>
+            <input
+              type="range"
+              min="0"
+              max={ATTACHMENT_GALLERY_COLUMN_OPTIONS.length - 1}
+              step="1"
+              value={attachmentGalleryLevel}
+              onChange={updateAttachmentGalleryColumns}
+              aria-label="Gallery tiles per row"
+            />
+            <strong>{attachmentGalleryColumns} per row</strong>
+          </label>
+          <div className="attachments-gallery-density-marks" aria-hidden="true">
+            {ATTACHMENT_GALLERY_COLUMN_OPTIONS.map((columnCount) => (
+              <span key={`gallery-density-${columnCount}`}>{columnCount}</span>
+            ))}
           </div>
         </div>
         {attachmentsIndexStatus ? (
@@ -2276,16 +2716,25 @@ const DocumentsTab = ({ focusId = null }) => {
               const folderLabel =
                 folderName === ATTACHMENT_FOLDER_UNSORTED ? "unsorted" : folderName;
               const card = describeAttachmentCard(att, folderLabel);
+              const cardTooltip = [
+                card.label,
+                card.badges.length
+                  ? `Tags: ${card.badges.map((badge) => badge.label).join(", ")}`
+                  : "",
+                card.captionText ? `Caption: ${card.captionText}` : "",
+                card.secondaryMeta.length ? card.secondaryMeta.join(" | ") : "",
+              ].filter(Boolean).join("\n");
               return (
                 <div
                   key={key}
                   className={`attachments-card${attachmentDragHash === key ? " is-dragging" : ""}`}
+                  title={cardTooltip}
                   draggable={Boolean(assignmentKey)}
                   onDragStart={(event) => handleAttachmentDragStart(event, att)}
                   onDragEnd={clearAttachmentDragState}
                 >
                   <MediaViewer
-                    src={att.url}
+                    src={attachmentPreviewUrl(att)}
                     alt={label}
                     showLink={false}
                     contextItems={attachmentViewerItems}
@@ -2296,29 +2745,29 @@ const DocumentsTab = ({ focusId = null }) => {
                       <span className="attachment-name" title={card.label}>
                         {card.label}
                       </span>
-                      <div className="attachment-topline-meta">
-                        <div className="attachment-badges">
-                          {card.badges.map((badge) => (
-                            <span
-                              key={badge.key}
-                              className={badge.className}
-                              title={badge.title}
-                            >
-                              {badge.label}
-                            </span>
-                          ))}
-                        </div>
-                        <div className="attachment-actions">
-                          <button
-                            type="button"
-                            onClick={() => revealAttachment(att)}
-                            title="Reveal upload location in your OS file browser. If blocked, location text appears above."
-                          >
-                            reveal
-                          </button>
-                        </div>
+                      <div className="attachment-actions">
+                        <button
+                          type="button"
+                          onClick={() => revealAttachment(att)}
+                          title="Reveal upload location in your OS file browser. If blocked, location text appears above."
+                        >
+                          reveal
+                        </button>
                       </div>
                     </div>
+                    {card.badges.length ? (
+                      <div className="attachment-badges">
+                        {card.badges.map((badge) => (
+                          <span
+                            key={badge.key}
+                            className={badge.className}
+                            title={badge.title}
+                          >
+                            {badge.label}
+                          </span>
+                        ))}
+                      </div>
+                    ) : null}
                     {card.captionText ? (
                       <div className="attachment-caption-line" title={card.captionText}>
                         <span className="attachment-caption-text">{card.captionText}</span>
@@ -2326,7 +2775,7 @@ const DocumentsTab = ({ focusId = null }) => {
                     ) : null}
                     {card.secondaryMeta.length ? (
                       <div className="attachment-secondary-line" title={card.secondaryMeta.join(" | ")}>
-                        {card.secondaryMeta.join(" • ")}
+                        {card.secondaryMeta.join(" | ")}
                       </div>
                     ) : (
                       <div className="attachment-secondary-line attachment-secondary-line--empty" />
@@ -2359,31 +2808,35 @@ const DocumentsTab = ({ focusId = null }) => {
 
   function renderDocRow(doc, depth) {
     const displayTitle = doc.meta?.title || doc.baseName || doc.id;
-    const source = doc.meta?.source || doc.baseName || "-";
+    const source = doc.workspaceDisplayPath || doc.meta?.source || doc.baseName || "-";
     const kind =
       doc.meta?.kind
         || (Array.isArray(doc.meta?.tags) ? doc.meta.tags.join(", ") : "-");
+    const sizeLabel = doc.sizeBytes ? formatBytes(doc.sizeBytes) : "";
+    const modifiedLabel = doc.modifiedAt
+      ? formatTimestamp(new Date(doc.modifiedAt * 1000).toISOString())
+      : "";
     return (
       <div
         key={`doc-${doc.id}`}
-        className="documents-doc-row"
-        style={depth ? { paddingLeft: depth * 14 } : undefined}
+        className={`documents-doc-row${activeDoc?.id === doc.id ? " active" : ""}`}
+        style={depth ? { "--doc-depth": depth } : undefined}
       >
-        <div className="documents-doc-main">
-          <button
-            type="button"
-            className="documents-doc-title"
-            onClick={() => openDoc(doc)}
-            title={displayTitle}
-          >
-            {displayTitle}
-          </button>
+        <button
+          type="button"
+          className="documents-doc-title"
+          onClick={() => openDoc(doc)}
+          title={source}
+        >
+          <span className="documents-doc-title-text">{displayTitle}</span>
+        </button>
+        <div className="documents-doc-meta">
           <span className="documents-doc-source" title={source}>
             {source}
           </span>
-        </div>
-        <div className="documents-doc-meta">
           <span className="documents-doc-kind">{kind}</span>
+          {sizeLabel ? <span className="documents-doc-size">{sizeLabel}</span> : null}
+          {modifiedLabel ? <span className="documents-doc-modified">{modifiedLabel}</span> : null}
           <div className="documents-doc-actions">
             <button type="button" onClick={() => openDoc(doc)} title="Open document inspector">
               inspect
@@ -2407,9 +2860,11 @@ const DocumentsTab = ({ focusId = null }) => {
                 open location
               </button>
             ) : null}
-            <button type="button" onClick={() => deleteDoc(doc)} title="Delete document">
-              delete
-            </button>
+            {!doc.workspaceFile ? (
+              <button type="button" onClick={() => deleteDoc(doc)} title="Delete document">
+                delete
+              </button>
+            ) : null}
           </div>
         </div>
       </div>
@@ -2419,15 +2874,6 @@ const DocumentsTab = ({ focusId = null }) => {
   function renderFolderNode(node, depth, isRoot = false) {
     const key = isRoot ? "__root__" : node.path;
     const collapsed = collapsedDocFolders.has(key);
-    const isTopLevelFolder = !isRoot && !node.path.includes("/");
-    const shouldCollapseTopLevelScaffold =
-      isTopLevelFolder &&
-      node.documents.length === 0 &&
-      (node.childList || []).length === 1;
-    if (shouldCollapseTopLevelScaffold) {
-      const [collapsedChild] = node.childList || [];
-      return collapsedChild ? renderFolderNode(collapsedChild, depth) : null;
-    }
     const childList = node.childList || [];
     const hasDocuments = node.documents.length > 0;
     const hasChildren = childList.length > 0;
@@ -2437,12 +2883,23 @@ const DocumentsTab = ({ focusId = null }) => {
     const shouldRenderRow = !isRoot || hasDocuments;
     const shouldShowChildren = !collapsed || !shouldRenderRow;
     return (
-      <div key={`folder-${key || "root"}`} className="documents-folder-node">
+      <div
+        key={`folder-${key || "root"}`}
+        className="documents-folder-node"
+        data-folder-path={!isRoot && shouldRenderRow ? key : undefined}
+        data-folder-name={!isRoot && shouldRenderRow ? label : undefined}
+        data-folder-count={!isRoot && shouldRenderRow ? count : undefined}
+        data-folder-depth={!isRoot && shouldRenderRow ? depth : undefined}
+      >
         {shouldRenderRow ? (
           <button
             type="button"
             className={`documents-folder-row${collapsed ? " collapsed" : ""}`}
-            style={{ paddingLeft: Math.max(depth * 14, 0) }}
+            style={{
+              "--folder-depth": depth,
+              "--folder-offset": `${Math.max(0, depth - 1) * DOCUMENTS_TREE_LEVEL_OFFSET}px`,
+              zIndex: 20 + depth,
+            }}
             onClick={() => toggleDocFolder(key)}
             aria-expanded={!collapsed}
             title={!isRoot ? node.path : undefined}
@@ -2455,7 +2912,7 @@ const DocumentsTab = ({ focusId = null }) => {
           </button>
         ) : null}
         {shouldShowChildren && (
-          <div className="documents-folder-children">
+          <div className={`documents-folder-children${isRoot ? " root" : ""}`}>
             {hasDocuments ? node.documents.map(({ doc }) => renderDocRow(doc, depth + 1)) : null}
             {childList.map((child) => renderFolderNode(child, depth + 1))}
           </div>

@@ -423,10 +423,34 @@ class LocalProviderManager:
         cached_models = None if force else self._cached_models(provider_key)
         should_refresh_models = refresh_models or (cached_models is None and not quick)
 
+        cached_runtime = None if force else self._cached_runtime(provider_key)
         current = adapter.poll_status(cfg, quick=quick)
-        runtime = self._merge_cached_runtime(provider_key, current)
-        inventory_reachable = None
+        runtime = self._merge_cached_runtime(
+            provider_key,
+            current,
+            cached=cached_runtime,
+        )
+        current_inventory_reachable = (
+            current.get("inventory_reachable") if isinstance(current, dict) else None
+        )
+        inventory_reachable = (
+            bool(current_inventory_reachable)
+            if isinstance(current_inventory_reachable, bool)
+            else None
+        )
         models_source = "cache" if cached_models is not None else "unknown"
+        current_models = self._clean_models(current)
+        if quick and inventory_reachable and current_models:
+            cached_models = current_models
+            self._store_models(provider_key, current_models)
+            models_source = "quick"
+            if not _normalize_model_name(runtime.get("loaded_model")):
+                cached_loaded = _normalize_model_name(
+                    (cached_runtime or {}).get("loaded_model")
+                )
+                if cached_loaded and cached_loaded in current_models:
+                    runtime["loaded_model"] = cached_loaded
+                    runtime["model_loaded"] = True
         if should_refresh_models:
             listed_result = adapter.list_models(cfg)
             inventory_reachable = bool(

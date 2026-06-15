@@ -169,6 +169,10 @@ from app.workflow_profiles import (
     capture_policy_prompt,
     continue_transition_allowed,
     delete_local_skill_doc,
+    export_addon_pack,
+    export_skill_markdown,
+    import_addon_pack,
+    import_skill_markdown,
     normalize_module_id,
     normalize_skill_id,
     resolve_modules,
@@ -1094,6 +1098,11 @@ def _privacy_route_check_for_message(
     config_payload: Dict[str, Any] | None = None,
 ) -> Optional[Dict[str, Any]]:
     settings_data = settings_payload if isinstance(settings_payload, dict) else {}
+    if (
+        privacy_filter_service.normalize_mode(settings_data.get("privacy_filter_mode"))
+        == "off"
+    ):
+        return None
     if (
         _normalize_privacy_route_mode(
             settings_data.get("privacy_filter_route_private_mode")
@@ -5997,9 +6006,11 @@ async def generate(request: Request, payload: GenerateRequest = Body(...)):
                     "mode": mode_used,
                     "model_requested": payload.model,
                     "model_resolved": effective_model,
-                    "provider": provider_target.get("provider")
-                    if isinstance(provider_target, dict)
-                    else None,
+                    "provider": (
+                        provider_target.get("provider")
+                        if isinstance(provider_target, dict)
+                        else None
+                    ),
                 },
             )
         except Exception:
@@ -6122,30 +6133,38 @@ async def generate(request: Request, payload: GenerateRequest = Body(...)):
                 response_meta.setdefault("server_url", provider_target.get("base_url"))
                 response_meta.setdefault(
                     "provider_runtime",
-                    provider_target.get("runtime")
-                    if isinstance(provider_target.get("runtime"), dict)
-                    else {},
+                    (
+                        provider_target.get("runtime")
+                        if isinstance(provider_target.get("runtime"), dict)
+                        else {}
+                    ),
                 )
             mismatch_error = _apply_model_mismatch_error(
                 response_meta,
                 mode=mode_used,
-                provider=provider_target.get("provider")
-                if isinstance(provider_target, dict)
-                else None,
+                provider=(
+                    provider_target.get("provider")
+                    if isinstance(provider_target, dict)
+                    else None
+                ),
             )
             if mismatch_error:
                 response["text"] = mismatch_error
             usage_stats = _normalize_usage_counts(
-                response_meta.get("usage")
-                if isinstance(response_meta.get("usage"), dict)
-                else None,
+                (
+                    response_meta.get("usage")
+                    if isinstance(response_meta.get("usage"), dict)
+                    else None
+                ),
                 payload.prompt or "",
                 response.get("text") or "",
             )
             merged_usage = _merge_usage(
-                response_meta.get("usage")
-                if isinstance(response_meta.get("usage"), dict)
-                else None,
+                (
+                    response_meta.get("usage")
+                    if isinstance(response_meta.get("usage"), dict)
+                    else None
+                ),
                 usage_stats,
             )
             if merged_usage is not None:
@@ -6640,6 +6659,32 @@ class WorkflowSkillDocPayload(BaseModel):
     body: str
 
 
+class WorkflowModulePackImportPayload(BaseModel):
+    source_path: str
+    addon_id: Optional[str] = None
+    dry_run: bool = True
+    overwrite: bool = False
+
+
+class WorkflowModulePackExportPayload(BaseModel):
+    destination_path: str
+    dry_run: bool = True
+    overwrite: bool = False
+
+
+class WorkflowSkillImportPayload(BaseModel):
+    source_path: str
+    skill_id: Optional[str] = None
+    dry_run: bool = True
+    overwrite: bool = False
+
+
+class WorkflowSkillExportPayload(BaseModel):
+    destination_path: str
+    dry_run: bool = True
+    overwrite: bool = False
+
+
 @router.get("/workflows/skills")
 async def workflows_skills_catalog():
     return skill_catalog_payload(include_body=False)
@@ -6677,6 +6722,61 @@ async def workflows_skill_doc_delete(skill_id: str):
         raise HTTPException(status_code=400, detail="Invalid skill id")
     try:
         return delete_local_skill_doc(normalized)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/workflows/module-packs/import")
+async def workflows_module_pack_import(payload: WorkflowModulePackImportPayload):
+    try:
+        return import_addon_pack(
+            payload.source_path,
+            addon_id=payload.addon_id,
+            dry_run=payload.dry_run,
+            overwrite=payload.overwrite,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/workflows/module-packs/{addon_id}/export")
+async def workflows_module_pack_export(
+    addon_id: str,
+    payload: WorkflowModulePackExportPayload,
+):
+    try:
+        return export_addon_pack(
+            addon_id,
+            payload.destination_path,
+            dry_run=payload.dry_run,
+            overwrite=payload.overwrite,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/workflows/skills/import")
+async def workflows_skill_import(payload: WorkflowSkillImportPayload):
+    try:
+        return import_skill_markdown(
+            payload.source_path,
+            skill_id=payload.skill_id,
+            dry_run=payload.dry_run,
+            overwrite=payload.overwrite,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/workflows/skills/{skill_id}/export")
+async def workflows_skill_export(skill_id: str, payload: WorkflowSkillExportPayload):
+    try:
+        return export_skill_markdown(
+            skill_id,
+            payload.destination_path,
+            dry_run=payload.dry_run,
+            overwrite=payload.overwrite,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -7633,15 +7733,16 @@ async def chat(request: Request, chat_request: ChatRequest):
                     ),
                     reverse=True,
                 )
+
+                def _score_ok(item: Dict[str, Any]) -> bool:
+                    raw = item.get("score")
+                    if not isinstance(raw, (int, float)):
+                        return True
+                    sim = max(0.0, min(1.0, float(raw)))
+                    return sim >= rag_min_similarity
+
                 if rag_min_similarity > 0:
                     filtered: list[Dict[str, Any]] = []
-
-                    def _score_ok(item: Dict[str, Any]) -> bool:
-                        raw = item.get("score")
-                        if not isinstance(raw, (int, float)):
-                            return True
-                        sim = max(0.0, min(1.0, float(raw)))
-                        return sim >= rag_min_similarity
 
                     for item in combined:
                         if not isinstance(item, dict):
@@ -7649,6 +7750,45 @@ async def chat(request: Request, chat_request: ChatRequest):
                         if _score_ok(item):
                             filtered.append(item)
                     combined = filtered
+                if text_rag_enabled and rag_top_k > 0 and not combined:
+                    plaintext_matches = _search_plaintext_conversations_for_rag(
+                        chat_request.message,
+                        limit=max(rag_query_top_k, rag_top_k, 1),
+                        external_llm=external_llm,
+                        workspace_profiles=workspace_recall_profiles,
+                    )
+                    for match in plaintext_matches:
+                        if not isinstance(match, dict):
+                            continue
+                        meta = (
+                            match.get("metadata")
+                            if isinstance(match.get("metadata"), dict)
+                            else {}
+                        )
+                        if _blocked(meta):
+                            continue
+                        match_id = str(match.get("id") or "")
+                        if match_id and match_id in seen_ids:
+                            continue
+                        dedupe_key = _rag_match_key(match)
+                        if dedupe_key and dedupe_key in seen_match_keys:
+                            continue
+                        if match_id:
+                            seen_ids.add(match_id)
+                        if dedupe_key:
+                            seen_match_keys.add(dedupe_key)
+                        reranked = _rerank_chat_match(match)
+                        if rag_min_similarity > 0 and not _score_ok(reranked):
+                            continue
+                        combined.append(reranked)
+                    combined.sort(
+                        key=lambda item: (
+                            float(item.get("score"))
+                            if isinstance(item.get("score"), (int, float))
+                            else 0.0
+                        ),
+                        reverse=True,
+                    )
                 rag_matches = combined[:rag_top_k]
             except HTTPException:
                 rag_matches = []
@@ -8344,9 +8484,11 @@ async def chat(request: Request, chat_request: ChatRequest):
             metadata_update.setdefault("server_url", provider_target.get("base_url"))
             metadata_update.setdefault(
                 "provider_runtime",
-                provider_target.get("runtime")
-                if isinstance(provider_target.get("runtime"), dict)
-                else {},
+                (
+                    provider_target.get("runtime")
+                    if isinstance(provider_target.get("runtime"), dict)
+                    else {}
+                ),
             )
         status_value = _response_status_value(metadata_update)
         metadata_update["status"] = status_value
@@ -8384,25 +8526,31 @@ async def chat(request: Request, chat_request: ChatRequest):
         mismatch_error = _apply_model_mismatch_error(
             metadata_update,
             mode=mode_used,
-            provider=provider_target.get("provider")
-            if isinstance(provider_target, dict)
-            else None,
+            provider=(
+                provider_target.get("provider")
+                if isinstance(provider_target, dict)
+                else None
+            ),
         )
         if mismatch_error:
             text = mismatch_error
             response["text"] = text
         metadata_update.setdefault("updated_at", trace_time)
         usage_stats = _normalize_usage_counts(
-            metadata_update.get("usage")
-            if isinstance(metadata_update.get("usage"), dict)
-            else None,
+            (
+                metadata_update.get("usage")
+                if isinstance(metadata_update.get("usage"), dict)
+                else None
+            ),
             chat_request.message or "",
             text,
         )
         merged_usage = _merge_usage(
-            metadata_update.get("usage")
-            if isinstance(metadata_update.get("usage"), dict)
-            else None,
+            (
+                metadata_update.get("usage")
+                if isinstance(metadata_update.get("usage"), dict)
+                else None
+            ),
             usage_stats,
         )
         if merged_usage is not None:
@@ -8487,9 +8635,11 @@ async def chat(request: Request, chat_request: ChatRequest):
             tool_payloads = response.get("tools_used") or []
             if computer_session:
                 tool_payloads = [
-                    _inject_session_into_tool_args(tool, computer_session.get("id"))
-                    if isinstance(tool, dict)
-                    else tool
+                    (
+                        _inject_session_into_tool_args(tool, computer_session.get("id"))
+                        if isinstance(tool, dict)
+                        else tool
+                    )
                     for tool in tool_payloads
                 ]
             response["tools_used"] = await _register_tool_proposals(
@@ -8542,9 +8692,11 @@ async def chat(request: Request, chat_request: ChatRequest):
             message_id,
             {
                 "text": response.get("text") or text,
-                "metadata": response.get("metadata")
-                if isinstance(response.get("metadata"), dict)
-                else {},
+                "metadata": (
+                    response.get("metadata")
+                    if isinstance(response.get("metadata"), dict)
+                    else {}
+                ),
                 "updated_at": time.time(),
                 "iso_timestamp": iso_response_ts,
             },
@@ -9809,9 +9961,11 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
         metadata_update.setdefault("server_url", provider_target.get("base_url"))
         metadata_update.setdefault(
             "provider_runtime",
-            provider_target.get("runtime")
-            if isinstance(provider_target.get("runtime"), dict)
-            else {},
+            (
+                provider_target.get("runtime")
+                if isinstance(provider_target.get("runtime"), dict)
+                else {}
+            ),
         )
     status_value = _response_status_value(metadata_update)
     metadata_update["status"] = status_value
@@ -9848,9 +10002,11 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
     mismatch_error = _apply_model_mismatch_error(
         metadata_update,
         mode=mode_used,
-        provider=provider_target.get("provider")
-        if isinstance(provider_target, dict)
-        else None,
+        provider=(
+            provider_target.get("provider")
+            if isinstance(provider_target, dict)
+            else None
+        ),
     )
     if mismatch_error:
         text = mismatch_error
@@ -9871,16 +10027,20 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
             "tool_continue_semantic_signature"
         ] = tool_continue_semantic_signature
     usage_stats = _normalize_usage_counts(
-        metadata_update.get("usage")
-        if isinstance(metadata_update.get("usage"), dict)
-        else None,
+        (
+            metadata_update.get("usage")
+            if isinstance(metadata_update.get("usage"), dict)
+            else None
+        ),
         tool_prompt_text if tool_prompt_text else "continue",
         text,
     )
     merged_usage = _merge_usage(
-        metadata_update.get("usage")
-        if isinstance(metadata_update.get("usage"), dict)
-        else None,
+        (
+            metadata_update.get("usage")
+            if isinstance(metadata_update.get("usage"), dict)
+            else None
+        ),
         usage_stats,
     )
     if merged_usage is not None:
@@ -10332,12 +10492,12 @@ async def memory_upsert(request: Request, key: str, payload: MemoryItemUpsert):
     privacy_decision = privacy_filter_service.decide_sensitivity(
         _memory_value_to_text(payload.value),
         explicit_sensitivity=explicit_sensitivity,
-        existing_sensitivity=existing.get("sensitivity")
-        if isinstance(existing, dict)
-        else None,
-        existing_sensitivity_source=existing.get("sensitivity_source")
-        if isinstance(existing, dict)
-        else None,
+        existing_sensitivity=(
+            existing.get("sensitivity") if isinstance(existing, dict) else None
+        ),
+        existing_sensitivity_source=(
+            existing.get("sensitivity_source") if isinstance(existing, dict) else None
+        ),
         purpose="memory",
     )
     effective_sensitivity = (
@@ -11619,9 +11779,11 @@ async def resolve_client_tool(request: Request, payload: ToolClientResolve):
                 "type": "tool",
                 "id": payload.request_id,
                 "name": rec["name"],
-                "args": payload.args
-                if isinstance(payload.args, dict)
-                else rec.get("args", {}),
+                "args": (
+                    payload.args
+                    if isinstance(payload.args, dict)
+                    else rec.get("args", {})
+                ),
                 "result": result_payload,
                 "chain_id": rec.get("chain_id"),
                 "message_id": rec.get("message_id"),
@@ -12229,6 +12391,241 @@ def _conversation_message_text(message: Dict[str, Any]) -> str:
     if isinstance(text, str):
         return text
     return ""
+
+
+def _plaintext_query_terms(query: Any) -> list[str]:
+    text = str(query or "").strip().lower()
+    if not text:
+        return []
+    terms: list[str] = []
+    seen: set[str] = set()
+    for token in re.split(r"[^a-z0-9]+", text):
+        if len(token) < 3 or token in _TITLE_STOPWORDS or token in seen:
+            continue
+        seen.add(token)
+        terms.append(token)
+    return terms
+
+
+def _plaintext_conversation_sensitivity(meta: Dict[str, Any]) -> str:
+    sensitivity = str(meta.get("sensitivity") or "").strip().lower()
+    if sensitivity:
+        return sensitivity
+    return conversation_store.conversation_privacy_to_sensitivity(
+        meta.get("privacy_mode")
+    )
+
+
+def _plaintext_conversation_blocked(
+    name: str,
+    meta: Dict[str, Any],
+    *,
+    external_llm: bool,
+    workspace_profiles: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    if not isinstance(meta, dict):
+        meta = {}
+    if meta.get("rag_excluded") or meta.get("excluded"):
+        return True
+    sensitivity = _plaintext_conversation_sensitivity(meta)
+    if sensitivity == "secret":
+        return True
+    if external_llm and sensitivity == "protected":
+        return True
+    if (
+        workspace_item_exclusion_reason(
+            namespace=meta.get("source_sync_namespace"),
+            values=[
+                name,
+                meta.get("name"),
+                meta.get("path"),
+                meta.get("display_name"),
+                meta.get("title"),
+            ],
+            profiles=workspace_profiles,
+            purpose="default_recall",
+        )
+        is not None
+    ):
+        return True
+    return False
+
+
+def _plaintext_message_blocked(
+    message: Dict[str, Any],
+    *,
+    external_llm: bool,
+) -> bool:
+    meta = message.get("metadata") if isinstance(message, dict) else None
+    if not isinstance(meta, dict):
+        return False
+    if meta.get("rag_excluded") or meta.get("excluded"):
+        return True
+    sensitivity = str(meta.get("sensitivity") or "").strip().lower()
+    if sensitivity == "secret":
+        return True
+    if external_llm and sensitivity == "protected":
+        return True
+    return False
+
+
+def _plaintext_match_score(
+    query: Any,
+    terms: list[str],
+    text: str,
+    title: str = "",
+) -> float:
+    text_lower = text.lower()
+    title_lower = title.lower()
+    query_lower = str(query or "").strip().lower()
+    term_hits = sum(1 for term in terms if term in text_lower)
+    title_hits = sum(1 for term in terms if term in title_lower)
+    exact_bonus = 0.12 if query_lower and query_lower in text_lower else 0.0
+    if term_hits <= 0 and exact_bonus <= 0:
+        return 0.0
+    score = 0.58 + min(0.28, term_hits * 0.08) + min(0.08, title_hits * 0.04)
+    return max(0.0, min(0.96, score + exact_bonus))
+
+
+def _plaintext_match_snippet(
+    text: str,
+    terms: list[str],
+    *,
+    limit: int = 900,
+) -> str:
+    cleaned = " ".join(str(text or "").split())
+    if len(cleaned) <= limit:
+        return cleaned
+    lowered = cleaned.lower()
+    positions = [lowered.find(term) for term in terms if term and term in lowered]
+    first_hit = min((pos for pos in positions if pos >= 0), default=0)
+    start = max(0, first_hit - 220)
+    end = min(len(cleaned), start + limit)
+    start = max(0, end - limit)
+    snippet = cleaned[start:end].strip()
+    if start > 0:
+        snippet = "..." + snippet
+    if end < len(cleaned):
+        snippet = snippet.rstrip() + "..."
+    return snippet
+
+
+def _search_plaintext_conversations_for_rag(
+    query: Any,
+    *,
+    limit: int = 3,
+    external_llm: bool = True,
+    workspace_profiles: Optional[List[Dict[str, Any]]] = None,
+    max_conversations: int = 250,
+) -> list[Dict[str, Any]]:
+    """Search saved conversation JSON as a narrow fallback for missed RAG hits."""
+
+    terms = _plaintext_query_terms(query)
+    query_text = str(query or "").strip()
+    if not terms or not query_text:
+        return []
+    try:
+        raw_entries = conversation_store.list_conversations(include_metadata=True)
+    except Exception:
+        return []
+    entries: list[Dict[str, Any]] = []
+    for raw in raw_entries:
+        if isinstance(raw, dict):
+            name = str(raw.get("name") or raw.get("path") or "").strip()
+            if name:
+                entries.append(dict(raw))
+        elif isinstance(raw, str) and raw.strip():
+            entries.append({"name": raw.strip(), "path": raw.strip()})
+    entries.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+
+    ranked: list[tuple[float, str, int, Dict[str, Any]]] = []
+    scanned = 0
+    for entry in entries:
+        if scanned >= max_conversations:
+            break
+        name = str(entry.get("name") or entry.get("path") or "").strip()
+        if not name:
+            continue
+        scanned += 1
+        try:
+            full_meta = conversation_store.get_metadata(name)
+        except Exception:
+            full_meta = {}
+        meta = dict(full_meta if isinstance(full_meta, dict) else {})
+        meta.setdefault("name", name)
+        meta.setdefault("path", entry.get("path") or name)
+        meta.setdefault("display_name", entry.get("display_name") or name)
+        meta["privacy_mode"] = conversation_store.normalize_conversation_privacy_mode(
+            meta.get("privacy_mode")
+        )
+        if _plaintext_conversation_blocked(
+            name,
+            meta,
+            external_llm=external_llm,
+            workspace_profiles=workspace_profiles,
+        ):
+            continue
+        try:
+            messages = conversation_store.load_conversation(name)
+        except Exception:
+            continue
+        if not isinstance(messages, list):
+            continue
+        title = str(meta.get("display_name") or name)
+        for idx, message in enumerate(messages):
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").strip().lower()
+            if role and role not in {"user", "assistant", "system"}:
+                continue
+            if _plaintext_message_blocked(message, external_llm=external_llm):
+                continue
+            text = _conversation_message_text(message)
+            if not text.strip():
+                continue
+            score = _plaintext_match_score(query_text, terms, text, title)
+            if score <= 0:
+                continue
+            match_meta = {
+                "kind": "conversation",
+                "source": f"conversation:{name}",
+                "root_source": f"conversation:{name}",
+                "conversation_id": name,
+                "title": title,
+                "role": role or "message",
+                "retrieved_via": "plaintext_conversation",
+                "privacy_mode": meta.get("privacy_mode"),
+                "sensitivity": _plaintext_conversation_sensitivity(meta),
+            }
+            message_id = message.get("id")
+            if isinstance(message_id, str) and message_id.strip():
+                match_meta["message_id"] = message_id.strip()
+            ranked.append(
+                (
+                    score,
+                    str(meta.get("updated_at") or entry.get("updated_at") or ""),
+                    idx,
+                    {
+                        "id": "plaintext-conversation:"
+                        + hashlib.sha1(f"{name}:{idx}".encode("utf-8")).hexdigest(),
+                        "text": _plaintext_match_snippet(text, terms),
+                        "metadata": match_meta,
+                        "score": score,
+                    },
+                )
+            )
+    ranked.sort(key=lambda row: (row[0], row[1], -row[2]), reverse=True)
+    results: list[Dict[str, Any]] = []
+    seen_sources: set[str] = set()
+    for _score, _updated_at, _idx, match in ranked:
+        source = str((match.get("metadata") or {}).get("source") or "")
+        if source in seen_sources:
+            continue
+        seen_sources.add(source)
+        results.append(match)
+        if len(results) >= max(1, limit):
+            break
+    return results
 
 
 def _conversation_base_name(name: str) -> str:
@@ -13438,12 +13835,16 @@ def _sync_ownership_summary(
         "outbound_target": {
             "mode": outbound_mode,
             "remote_url": remote_url,
-            "peer_id": str(default_peer.get("id") or "").strip()
-            if isinstance(default_peer, dict)
-            else "",
-            "peer_label": str(default_peer.get("label") or "").strip()
-            if isinstance(default_peer, dict)
-            else "",
+            "peer_id": (
+                str(default_peer.get("id") or "").strip()
+                if isinstance(default_peer, dict)
+                else ""
+            ),
+            "peer_label": (
+                str(default_peer.get("label") or "").strip()
+                if isinstance(default_peer, dict)
+                else ""
+            ),
         },
         "push_review_mode": "auto_accept" if auto_accept_push else "review_required",
         "saved_peer_count": len(saved_peers),
@@ -15297,9 +15698,9 @@ def _tailscale_self_status() -> Dict[str, Any]:
         "dns_name": dns_name,
         "tailscale_ip": tailscale_ip,
         "hostname": str(self_info.get("HostName") or "").strip(),
-        "error": ""
-        if host
-        else "Tailscale is running, but no tailnet host was reported.",
+        "error": (
+            "" if host else "Tailscale is running, but no tailnet host was reported."
+        ),
     }
 
 
@@ -15379,9 +15780,11 @@ def _mobile_float_serve_status(
         "url": url,
         "target": target,
         "serve_status": serve_text,
-        "status_text": "running"
-        if running
-        else ("ready" if host and frontend_port else "not ready"),
+        "status_text": (
+            "running"
+            if running
+            else ("ready" if host and frontend_port else "not ready")
+        ),
         "warning": warning,
         "state_path": str(_mobile_float_state_path()),
     }
@@ -16932,6 +17335,24 @@ class KnowledgeCleanupPayload(BaseModel):
     tag_derived_items: bool = True
 
 
+class WorkspaceFileUpdatePayload(BaseModel):
+    text: str
+
+
+def _resolve_data_root() -> Path:
+    cfg = app_config.load_config()
+    data_dir = Path(cfg.get("data_dir") or app_config.DEFAULT_DATA_DIR)
+    if not data_dir.is_absolute():
+        data_dir = (app_config.REPO_ROOT / data_dir).resolve()
+    else:
+        try:
+            data_dir = data_dir.resolve()
+        except Exception:
+            pass
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir
+
+
 def _resolve_data_files_path(path: Optional[str]) -> Path:
     files_dir = _resolve_data_files_root()
     if path:
@@ -16952,15 +17373,7 @@ def _resolve_data_files_path(path: Optional[str]) -> Path:
 
 
 def _resolve_data_files_root() -> Path:
-    cfg = app_config.load_config()
-    data_dir = Path(cfg.get("data_dir") or app_config.DEFAULT_DATA_DIR)
-    if not data_dir.is_absolute():
-        data_dir = (app_config.REPO_ROOT / data_dir).resolve()
-    else:
-        try:
-            data_dir = data_dir.resolve()
-        except Exception:
-            pass
+    data_dir = _resolve_data_root()
     files_dir = (data_dir / "files").resolve()
     files_dir.mkdir(parents=True, exist_ok=True)
     for dirname in ("uploads", "screenshots", "downloaded", "workspace"):
@@ -17248,6 +17661,110 @@ def _path_to_file_uri(path_value: Path) -> str:
             return f"file:{quote(normalized, safe='/:')}"
         return f"file:///{quote(normalized, safe='/:')}"
     return f"file://{quote(normalized, safe='/:')}"
+
+
+def _workspace_browser_roots() -> Dict[str, Dict[str, Any]]:
+    data_dir = _resolve_data_root()
+    files_workspace = (_resolve_data_files_root() / "workspace").resolve()
+    tool_workspace = (data_dir / "workspace").resolve()
+    files_workspace.mkdir(parents=True, exist_ok=True)
+    tool_workspace.mkdir(parents=True, exist_ok=True)
+    return {
+        "files": {
+            "label": "Files workspace",
+            "path": files_workspace,
+            "display_root": "data/files/workspace",
+        },
+        "tool": {
+            "label": "Tool workspace",
+            "path": tool_workspace,
+            "display_root": "data/workspace",
+        },
+    }
+
+
+def _resolve_workspace_browser_root(root_key: str) -> Dict[str, Any]:
+    key = str(root_key or "").strip().lower()
+    roots = _workspace_browser_roots()
+    root = roots.get(key)
+    if not root:
+        raise HTTPException(status_code=400, detail="Unknown workspace root")
+    return {"key": key, **root}
+
+
+def _is_hidden_workspace_path(path_value: Path) -> bool:
+    return any(part.startswith(".") for part in path_value.parts if part not in {"."})
+
+
+def _workspace_relative_path(path_value: Path, root: Path) -> str:
+    try:
+        rel = path_value.relative_to(root)
+    except Exception:
+        return ""
+    return rel.as_posix()
+
+
+def _resolve_workspace_browser_path(
+    root_key: str, relative_path: str = ""
+) -> Dict[str, Any]:
+    root_info = _resolve_workspace_browser_root(root_key)
+    root = root_info["path"]
+    raw = str(relative_path or "").strip().replace("\\", "/")
+    if raw in {"", "."}:
+        candidate = root
+    else:
+        path_obj = Path(raw)
+        if path_obj.is_absolute():
+            raise HTTPException(
+                status_code=400, detail="Workspace path must be relative"
+            )
+        candidate = root / path_obj
+    try:
+        resolved = candidate.resolve()
+    except Exception:
+        resolved = candidate
+    try:
+        rel = resolved.relative_to(root)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Workspace path is outside root")
+    return {**root_info, "target": resolved, "relative_path": rel.as_posix()}
+
+
+def _workspace_file_entry(
+    root_key: str, root_info: Dict[str, Any], path_value: Path
+) -> Dict[str, Any]:
+    root = root_info["path"]
+    rel_path = _workspace_relative_path(path_value, root)
+    try:
+        stat = path_value.stat()
+        modified_at = float(stat.st_mtime)
+        size_bytes = int(stat.st_size) if path_value.is_file() else None
+    except Exception:
+        modified_at = None
+        size_bytes = None
+    entry = {
+        "id": f"workspace-file:{root_key}:{rel_path}",
+        "root": root_key,
+        "root_label": root_info["label"],
+        "root_path": root_info["display_root"],
+        "path": rel_path,
+        "display_path": (
+            f'{root_info["display_root"]}/{rel_path}'
+            if rel_path
+            else root_info["display_root"]
+        ),
+        "name": path_value.name or root_info["label"],
+        "type": "directory" if path_value.is_dir() else "file",
+        "modified_at": modified_at,
+    }
+    if size_bytes is not None:
+        entry["size_bytes"] = size_bytes
+    return entry
+
+
+def _workspace_file_media_type(target: Path) -> str:
+    guessed_type, _ = mimetypes.guess_type(target.name)
+    return guessed_type or "application/octet-stream"
 
 
 @router.post("/knowledge/add")
@@ -18631,6 +19148,107 @@ async def knowledge_rag_rehydrate(payload: KnowledgeRagRehydrate):
         except Exception:
             pass
     return {"scanned": scanned, "reindexed": updated}
+
+
+@router.get("/knowledge/workspace-files")
+async def knowledge_workspace_files(
+    include_hidden: bool = False,
+    max_entries: int = 2000,
+):
+    """List managed workspace files for the Documents browser."""
+    roots = _workspace_browser_roots()
+    limit = max(1, min(int(max_entries or 2000), 5000))
+    entries: List[Dict[str, Any]] = []
+    truncated = False
+    for root_key, root_info in roots.items():
+        root_path = root_info["path"]
+        try:
+            candidates = sorted(
+                root_path.rglob("*"),
+                key=lambda item: (
+                    item.is_file(),
+                    _workspace_relative_path(item, root_path).lower(),
+                ),
+            )
+        except Exception:
+            continue
+        for candidate in candidates:
+            rel = _workspace_relative_path(candidate, root_path)
+            if not rel:
+                continue
+            if not include_hidden and _is_hidden_workspace_path(Path(rel)):
+                continue
+            if len(entries) >= limit:
+                truncated = True
+                break
+            entries.append(_workspace_file_entry(root_key, root_info, candidate))
+        if truncated:
+            break
+    return {
+        "roots": [
+            {
+                "root": key,
+                "root_label": value["label"],
+                "root_path": value["display_root"],
+            }
+            for key, value in roots.items()
+        ],
+        "entries": entries,
+        "count": len(entries),
+        "truncated": truncated,
+    }
+
+
+@router.get("/knowledge/workspace-file/{root_key}/{relative_path:path}")
+async def knowledge_workspace_file(root_key: str, relative_path: str):
+    """Serve a file from one of the managed workspace roots."""
+    resolved = _resolve_workspace_browser_path(root_key, relative_path)
+    target = resolved["target"]
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="Workspace file not found")
+    return FileResponse(path=str(target), media_type=_workspace_file_media_type(target))
+
+
+@router.put("/knowledge/workspace-file/{root_key}/{relative_path:path}")
+async def knowledge_workspace_file_update(
+    root_key: str,
+    relative_path: str,
+    payload: WorkspaceFileUpdatePayload,
+):
+    """Edit a text-like file in one of the managed workspace roots."""
+    resolved = _resolve_workspace_browser_path(root_key, relative_path)
+    target = resolved["target"]
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="Workspace file not found")
+    suffix = target.suffix.lower().lstrip(".")
+    if suffix not in _EDITABLE_KNOWLEDGE_TEXT_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Only markdown, text, and CSV-like workspace files can be edited inline",
+        )
+    target.write_text(payload.text, encoding="utf-8")
+    return {
+        "status": "updated",
+        "root": resolved["key"],
+        "path": resolved["relative_path"],
+    }
+
+
+@router.get("/knowledge/workspace-reveal/{root_key}/{relative_path:path}")
+async def knowledge_workspace_file_reveal(root_key: str, relative_path: str):
+    """Reveal a managed workspace file or folder in the host file browser."""
+    resolved = _resolve_workspace_browser_path(root_key, relative_path)
+    target = resolved["target"]
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Workspace path not found")
+    opened = _open_path_in_system_file_browser(target)
+    folder = target if target.is_dir() else target.parent
+    return {
+        "path": str(target),
+        "folder": str(folder),
+        "open_uri": _path_to_file_uri(folder),
+        "opened": opened,
+    }
 
 
 class KnowledgeUpdate(BaseModel):
@@ -21056,9 +21674,9 @@ def _job_progress(job: dict) -> dict:
             allow_patterns = job.get("allow_patterns")
             downloaded = _folder_size_bytes(
                 p,
-                include_patterns=allow_patterns
-                if isinstance(allow_patterns, list)
-                else None,
+                include_patterns=(
+                    allow_patterns if isinstance(allow_patterns, list) else None
+                ),
             )
     except Exception:
         downloaded = 0
@@ -22995,12 +23613,16 @@ async def _apply_agent_console_control(
             "agent_label": record.get("label") or agent_id,
             "agent_status": next_status,
             "content": message,
-            "workflow": record.get("workflow")
-            if isinstance(record.get("workflow"), dict)
-            else None,
-            "provenance": record.get("provenance")
-            if isinstance(record.get("provenance"), dict)
-            else None,
+            "workflow": (
+                record.get("workflow")
+                if isinstance(record.get("workflow"), dict)
+                else None
+            ),
+            "provenance": (
+                record.get("provenance")
+                if isinstance(record.get("provenance"), dict)
+                else None
+            ),
             "handoff": handoff,
             "controls": updated_controls,
             "note": note or None,
@@ -23137,20 +23759,26 @@ async def get_task_status(task_id: str, request: Request):
             "agent_label": "Celery task chain",
             "content": f"Task chain state: {state}",
             "result_ready": "result" in data,
-            "workflow": existing_record.get("workflow")
-            if isinstance(existing_record, dict)
-            else None,
-            "provenance": existing_record.get("provenance")
-            if isinstance(existing_record, dict)
-            else None,
-            "handoff": existing_record.get("handoff")
-            if isinstance(existing_record, dict)
-            else None,
+            "workflow": (
+                existing_record.get("workflow")
+                if isinstance(existing_record, dict)
+                else None
+            ),
+            "provenance": (
+                existing_record.get("provenance")
+                if isinstance(existing_record, dict)
+                else None
+            ),
+            "handoff": (
+                existing_record.get("handoff")
+                if isinstance(existing_record, dict)
+                else None
+            ),
             "controls": controls_for_status(
                 console_status,
-                existing=existing_controls
-                if isinstance(existing_controls, dict)
-                else None,
+                existing=(
+                    existing_controls if isinstance(existing_controls, dict) else None
+                ),
             ),
         },
         default_agent=f"task:{task_id}",

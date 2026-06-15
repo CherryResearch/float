@@ -185,7 +185,7 @@ Conversation sidecar metadata can exist without a matching conversation JSON fil
 | `/api/models/reveal/{model_name}` | `GET` | Reveal local model path. |
 | `/api/models/{model_name}` | `DELETE` | Delete a local model payload. |
 
-Current API defaults focus on `gpt-5.4`; direct-local Gemma 4 targets `gemma-4-E2B-it`; larger Gemma 4 checkpoints are provider/server-first.
+Current API defaults focus on `gpt-5.4`; direct-local Gemma 4 targets `gemma-4-E2B-it` plus unquantized QAT aliases, while QAT GGUF Gemma 4 aliases are provider/server-first.
 
 ## Trusted Devices And Sync
 

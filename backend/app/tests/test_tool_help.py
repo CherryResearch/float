@@ -183,6 +183,8 @@ def test_help_special_skills_returns_skill_catalog():
     assert entry["name"] == "skills"
     assert "skills_root" in entry
     assert "skills_roots" in entry
+    skill_ids = [item.get("id") for item in entry.get("skills", [])]
+    assert "float_self_knowledge" in skill_ids
     notes = " ".join(str(note) for note in entry.get("notes", []))
     lowered = notes.lower()
     assert "markdown" in lowered

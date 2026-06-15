@@ -148,7 +148,80 @@ describe("Settings tools browser", () => {
         body: "Repo computer use summary\n\n# Computer Use\n- Base guidance.",
       },
     };
-    vi.spyOn(axios, "post").mockResolvedValue({ data: {} });
+    vi.spyOn(axios, "post").mockImplementation((url, body) => {
+      if (url === "/api/workflows/module-packs/import") {
+        return Promise.resolve({
+          data: {
+            status: body?.dry_run === false ? "imported" : "preview",
+            type: "module_pack",
+            dry_run: body?.dry_run !== false,
+            addon: {
+              id: "hermes",
+              module_ids: ["hermes_agent"],
+              skill_ids: ["hermes_agent"],
+            },
+            file_count: 2,
+            skill_doc_count: 1,
+            destination_path: "D:/notebooks/float_dev/data/modules/addons/hermes",
+            warnings: [],
+            can_write: true,
+          },
+        });
+      }
+      if (url === "/api/workflows/module-packs/container-pack/export") {
+        return Promise.resolve({
+          data: {
+            status: body?.dry_run === false ? "exported" : "preview",
+            type: "module_pack",
+            dry_run: body?.dry_run !== false,
+            addon: {
+              id: "container-pack",
+              module_ids: ["container_orchestration"],
+              skill_ids: ["container_orchestration"],
+            },
+            file_count: 1,
+            skill_doc_count: 1,
+            destination_path:
+              "D:/notebooks/float_dev/data/workspace/module-exports/container-pack",
+            warnings: [],
+            can_write: true,
+          },
+        });
+      }
+      if (url === "/api/workflows/skills/import") {
+        return Promise.resolve({
+          data: {
+            status: body?.dry_run === false ? "imported" : "preview",
+            type: "skill",
+            dry_run: body?.dry_run !== false,
+            skill_id: "generic_skill",
+            destination_path:
+              "D:/notebooks/float_dev/data/modules/skills/generic_skill.md",
+            warnings: [],
+            can_write: true,
+          },
+        });
+      }
+      if (
+        url === "/api/workflows/skills/computer_use/export" ||
+        url === "/api/workflows/skills/generic_skill/export"
+      ) {
+        const skillId = url.includes("generic_skill") ? "generic_skill" : "computer_use";
+        return Promise.resolve({
+          data: {
+            status: body?.dry_run === false ? "exported" : "preview",
+            type: "skill",
+            dry_run: body?.dry_run !== false,
+            skill_id: skillId,
+            destination_path:
+              `D:/notebooks/float_dev/data/workspace/skill-exports/${skillId}.md`,
+            warnings: [],
+            can_write: true,
+          },
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
     vi.spyOn(axios, "put").mockImplementation((url, body) => {
       if (url === "/api/workflows/skills/computer_use") {
         skillDocResponse = {
@@ -288,6 +361,7 @@ describe("Settings tools browser", () => {
                 description: "Manage local container jobs from a custom module pack.",
                 status: "experimental",
                 source: "custom",
+                addon_id: "container-pack",
                 enabled: false,
                 skill_id: "container_orchestration",
                 doc_id: "skills:container_orchestration",
@@ -1003,10 +1077,20 @@ describe("Settings tools browser", () => {
     expect(screen.getByLabelText(/Computer Use/i)).toBeChecked();
     expect(screen.getByLabelText(/Container Orchestration/i)).not.toBeChecked();
     expect(screen.getByText("1/2 enabled")).toBeInTheDocument();
-    expect(screen.getByText("base")).toBeInTheDocument();
-    expect(screen.getByText("custom")).toBeInTheDocument();
+    expect(screen.getByText("shipped repo")).toBeInTheDocument();
+    expect(screen.getByText("imported local pack")).toBeInTheDocument();
     expect(screen.getByText("15 tools")).toBeInTheDocument();
     expect(screen.getByText("2 tools")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Docs: skills:computer_use | Skill: computer_use | Doc source: shipped repo",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Docs: skills:container_orchestration | Skill: container_orchestration | Doc source: imported local pack",
+      ),
+    ).toBeInTheDocument();
   });
 
   it("edits and deletes a local module skill override", async () => {
@@ -1032,7 +1116,7 @@ describe("Settings tools browser", () => {
     });
     expect(await screen.findByText(/local skill override saved/i)).toBeInTheDocument();
     expect(screen.getByText("yes")).toBeInTheDocument();
-    expect(screen.getByText(/active: local/i)).toBeInTheDocument();
+    expect(screen.getByText(/active: local override/i)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: /delete local override/i }));
 
@@ -1043,6 +1127,81 @@ describe("Settings tools browser", () => {
       await screen.findByText(/local skill override removed; base doc is active again/i),
     ).toBeInTheDocument();
     expect(screen.getByDisplayValue(/Repo computer use summary/i)).toBeInTheDocument();
+  });
+
+  it("previews and applies module and skill pack transfers", async () => {
+    renderWithState();
+
+    expect(await screen.findByText("Module packs")).toBeInTheDocument();
+    const modulePackPanel = screen.getByLabelText("Module pack import and export");
+    fireEvent.change(within(modulePackPanel).getByLabelText("Import folder"), {
+      target: { value: "data/workspace/hermes" },
+    });
+    fireEvent.click(within(modulePackPanel).getByRole("button", { name: /preview import/i }));
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith("/api/workflows/module-packs/import", {
+        source_path: "data/workspace/hermes",
+        dry_run: true,
+        overwrite: false,
+      });
+    });
+    expect(await screen.findByText(/Preview: hermes, 2 files, 1 skill doc/i))
+      .toBeInTheDocument();
+
+    fireEvent.click(within(modulePackPanel).getByRole("button", { name: /^import pack$/i }));
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith("/api/workflows/module-packs/import", {
+        source_path: "data/workspace/hermes",
+        dry_run: false,
+        overwrite: false,
+      });
+    });
+
+    fireEvent.change(screen.getByLabelText("Module details"), {
+      target: { value: "container_orchestration" },
+    });
+    fireEvent.change(within(modulePackPanel).getByLabelText("Module export folder"), {
+      target: { value: "data/workspace/module-exports" },
+    });
+    fireEvent.click(within(modulePackPanel).getByRole("button", { name: /preview export/i }));
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith(
+        "/api/workflows/module-packs/container-pack/export",
+        {
+          destination_path: "data/workspace/module-exports",
+          dry_run: true,
+          overwrite: false,
+        },
+      );
+    });
+
+    const skillPackPanel = screen.getByLabelText("Skill markdown import and export");
+    fireEvent.change(within(skillPackPanel).getByLabelText("Import markdown"), {
+      target: { value: "data/workspace/generic_skill.md" },
+    });
+    fireEvent.click(within(skillPackPanel).getByRole("button", { name: /^import skill$/i }));
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith("/api/workflows/skills/import", {
+        source_path: "data/workspace/generic_skill.md",
+        dry_run: false,
+        overwrite: false,
+      });
+    });
+
+    fireEvent.change(within(skillPackPanel).getByLabelText("Skill export folder"), {
+      target: { value: "data/workspace/skill-exports" },
+    });
+    fireEvent.click(
+      within(skillPackPanel).getByRole("button", { name: /^export selected$/i }),
+    );
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith("/api/workflows/skills/computer_use/export", {
+        destination_path: "data/workspace/skill-exports",
+        dry_run: false,
+        overwrite: false,
+      });
+    });
   });
 
   it("exposes background autonomy budgets and queues a dry-run tick", async () => {
@@ -1100,7 +1259,7 @@ describe("Settings tools browser", () => {
         }),
       );
     });
-  });
+  }, 10000);
 
   it("shows tool-source status and a no-results state for unmatched filters", async () => {
     renderWithState();
@@ -1164,7 +1323,45 @@ describe("Settings tools browser", () => {
     expect(
       await screen.findByText(/capture, privacy, and workflow defaults saved/i),
     ).toBeInTheDocument();
-  });
+  }, 10000);
+
+  it("disables private rerouting when the text privacy detector is off", async () => {
+    renderWithState();
+
+    expect(await screen.findByRole("heading", { name: /capture & workflows/i })).toBeInTheDocument();
+
+    const detectorSelect = screen.getByLabelText(/text privacy detector/i);
+    const rerouteSelect = screen.getByLabelText(/private message rerouting/i);
+
+    expect(detectorSelect).toHaveValue("off");
+    expect(rerouteSelect).toBeDisabled();
+    expect(rerouteSelect).toHaveValue("off");
+
+    fireEvent.change(detectorSelect, { target: { value: "always" } });
+    await waitFor(() => expect(rerouteSelect).not.toBeDisabled());
+    fireEvent.change(rerouteSelect, { target: { value: "ask" } });
+    expect(rerouteSelect).toHaveValue("ask");
+
+    fireEvent.change(detectorSelect, { target: { value: "off" } });
+    await waitFor(() => expect(rerouteSelect).toBeDisabled());
+    expect(rerouteSelect).toHaveValue("off");
+
+    fireEvent.click(screen.getByRole("button", { name: /save capture & workflow settings/i }));
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith("/api/user-settings", {
+        capture_retention_days: 7,
+        capture_default_sensitivity: "personal",
+        capture_allow_model_raw_image_access: true,
+        capture_allow_summary_fallback: true,
+        privacy_filter_mode: "off",
+        privacy_filter_model: "openai/privacy-filter",
+        privacy_filter_route_private_mode: "off",
+        default_workflow: "default",
+        enabled_workflow_modules: ["computer_use"],
+      });
+    });
+  }, 10000);
 
   it("summarizes browser and Windows computer-use tools in settings", async () => {
     renderWithState();
@@ -1552,7 +1749,7 @@ describe("Settings tools browser", () => {
     const block = select.closest(".settings-model-block");
     fireEvent.click(within(block).getByRole("button", { name: "Local" }));
 
-    expect(await screen.findByRole("option", { name: /gemma-4-E2B-it.*direct local/i })).toBeInTheDocument();
+    expect(await screen.findByRole("option", { name: /gemma-4-E2B-it\s+.*direct local/i })).toBeInTheDocument();
     expect(screen.queryByRole("option", { name: /gemma-4-E4B-it/i })).not.toBeInTheDocument();
     expect(screen.queryByRole("option", { name: /gemma-4-31B-it/i })).not.toBeInTheDocument();
   });

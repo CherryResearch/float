@@ -162,11 +162,12 @@ class LMStudioAdapter(LocalProviderAdapter):
         cfg: Dict[str, Any],
         *,
         timeout: float = 2.5,
+        openai_compatible_only: bool = False,
     ) -> Dict[str, Any]:
         headers = self._headers(cfg)
         api_base = self.resolve_base_url(cfg, with_v1=False)
         base_v1 = self.resolve_base_url(cfg, with_v1=True)
-        if self._provider(cfg) == "custom-openai-compatible":
+        if openai_compatible_only or self._provider(cfg) == "custom-openai-compatible":
             candidates = [f"{base_v1}/models"]
         else:
             candidates = [
@@ -253,11 +254,21 @@ class LMStudioAdapter(LocalProviderAdapter):
                     context_length = int(value)
                     break
 
-        inventory_result = (
-            {"ok": False, "models": [], "items": []}
-            if quick
-            else self._inventory_snapshot(cfg, timeout=2.5)
+        status_indicates_running = bool(
+            isinstance(status_payload, dict)
+            and not str(status_payload.get("error") or "").strip()
         )
+        quick_inventory_needed = quick and not status_indicates_running
+        if quick_inventory_needed:
+            inventory_result = self._inventory_snapshot(
+                cfg,
+                timeout=0.35,
+                openai_compatible_only=True,
+            )
+        elif quick:
+            inventory_result = {"ok": False, "models": [], "items": []}
+        else:
+            inventory_result = self._inventory_snapshot(cfg, timeout=2.5)
         models = (
             inventory_result.get("models") if isinstance(inventory_result, dict) else []
         )
@@ -281,6 +292,17 @@ class LMStudioAdapter(LocalProviderAdapter):
                 if isinstance(value, str) and value.strip():
                     loaded_model = value.strip()
                     break
+        if loaded_model is None and quick_inventory_needed:
+            for item in inventory_items:
+                if not isinstance(item, dict):
+                    continue
+                value = item.get("id") or item.get("model")
+                candidate = str(value or "").strip()
+                if candidate and "embedding" not in candidate.lower():
+                    loaded_model = candidate
+                    break
+        if loaded_model is None and quick_inventory_needed and models:
+            loaded_model = str(models[0]).strip() or None
         if context_length is None and loaded_model:
             for item in inventory_items:
                 if not isinstance(item, dict):
@@ -313,24 +335,6 @@ class LMStudioAdapter(LocalProviderAdapter):
         base_v1 = self.resolve_base_url(cfg, with_v1=True)
         status_reachable = status_payload is not None
         inventory_reachable = bool(models_result.get("ok"))
-        status_indicates_running = bool(
-            isinstance(status_payload, dict)
-            and (
-                not str(status_payload.get("error") or "").strip()
-                or any(
-                    key in status_payload
-                    for key in (
-                        "loaded_model",
-                        "active_model",
-                        "current_model",
-                        "model",
-                        "status",
-                        "uptime",
-                        "version",
-                    )
-                )
-            )
-        )
         return {
             "ok": True,
             "server_running": bool(
@@ -339,6 +343,7 @@ class LMStudioAdapter(LocalProviderAdapter):
             "status_reachable": status_reachable,
             "inventory_reachable": inventory_reachable,
             "inventory_model_count": len(models),
+            "models": models,
             "model_loaded": bool(loaded_model),
             "loaded_model": loaded_model,
             "context_length": context_length,

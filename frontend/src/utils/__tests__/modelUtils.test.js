@@ -46,15 +46,23 @@ describe("modelUtils", () => {
   it("keeps provider-first Gemma 4 variants in server suggestions only", () => {
     expect(SUGGESTED_SERVER_MODELS).toEqual(
       expect.arrayContaining([
-        "gemma-4-12B-it",
+        "gemma-4-E2B-it-qat-q4_0-gguf",
+        "gemma-4-E4B-it-qat-q4_0-gguf",
         "gemma-4-12B-it-qat-q4_0-gguf",
+        "gemma-4-26B-A4B-it-qat-q4_0-gguf",
+        "gemma-4-31B-it-qat-q4_0-gguf",
+        "gemma-4-12B-it",
         "gemma-4-E4B-it",
         "gemma-4-26B-A4B-it",
         "gemma-4-31B-it",
       ]),
     );
     expect(SUGGESTED_LOCAL_MODELS).toEqual(
-      expect.arrayContaining(["gemma-4-12B-it-qat-q4_0", "gemma-4-E2B-it"]),
+      expect.arrayContaining([
+        "gemma-4-E2B-it",
+        "gemma-4-E2B-it-qat-q4_0",
+        "gemma-4-12B-it-qat-q4_0",
+      ]),
     );
     expect(SUGGESTED_LOCAL_MODELS).not.toEqual(
       expect.arrayContaining([
@@ -69,10 +77,15 @@ describe("modelUtils", () => {
   });
 
   it("treats provider-first Gemma 4 suggestions as downloadable", () => {
+    expect(isKnownDownloadableModel("gemma-4-E2B-it-qat-q4_0")).toBe(true);
     expect(isKnownDownloadableModel("gemma-4-12B-it-qat-q4_0")).toBe(true);
+    expect(isKnownDownloadableModel("gemma-4-E2B-it-qat-q4_0-gguf")).toBe(true);
+    expect(isKnownDownloadableModel("gemma-4-E4B-it-qat-q4_0-gguf")).toBe(true);
     expect(isKnownDownloadableModel("gemma-4-12B-it-qat-q4_0-gguf")).toBe(true);
-    expect(isKnownDownloadableModel("gemma-4-12B-it")).toBe(true);
-    expect(isKnownDownloadableModel("gemma-4-E4B-it")).toBe(true);
+    expect(isKnownDownloadableModel("gemma-4-26B-A4B-it-qat-q4_0-gguf")).toBe(true);
+    expect(isKnownDownloadableModel("gemma-4-31B-it-qat-q4_0-gguf")).toBe(true);
+    expect(isKnownDownloadableModel("gemma-4-12B-it")).toBe(false);
+    expect(isKnownDownloadableModel("gemma-4-E4B-it")).toBe(false);
   });
 
   it("treats utility embedding and privacy models as downloadable", () => {

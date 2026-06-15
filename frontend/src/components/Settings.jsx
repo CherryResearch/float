@@ -355,8 +355,9 @@ const CAPTURE_RETENTION_OPTIONS = [
 const PRIVACY_FILTER_MODE_OPTIONS = [
   {
     value: "off",
-    label: "Never use it",
-    description: "Do not run the automatic text privacy classifier on writes.",
+    label: "Off",
+    description:
+      "Do not run the local text privacy classifier for writes, rerouting, or API embedding preflight.",
   },
   {
     value: "auto",
@@ -423,6 +424,39 @@ const normalizeToolApproval = (value, fallback = "high") => {
   return TOOL_APPROVAL_OPTIONS.some((option) => option.value === raw)
     ? raw
     : fallback;
+};
+
+const moduleSourceClass = (value) => {
+  const source = String(value || "base").trim().toLowerCase();
+  if (source === "custom" || source === "local") return "custom";
+  if (source === "base" || source === "repo") return "base";
+  return source || "base";
+};
+
+const formatModuleSource = (value) => {
+  const source = String(value || "base").trim().toLowerCase();
+  if (source === "base" || source === "repo") return "shipped repo";
+  if (source === "custom") return "imported local pack";
+  if (source === "local") return "local override";
+  return source || "unknown source";
+};
+
+const summarizePackTransfer = (payload, fallback = "") => {
+  if (!payload || typeof payload !== "object") return fallback;
+  const status = String(payload.status || "preview");
+  if (payload.type === "skill") {
+    const skillId = payload.skill_id || "skill";
+    const destination = payload.destination_path || "";
+    const prefix = status === "preview" ? "Preview" : status;
+    return `${prefix}: ${skillId} -> ${destination}`;
+  }
+  const addon = payload.addon || {};
+  const addonId = addon.id || "module pack";
+  const fileCount = Number(payload.file_count || 0);
+  const skillCount = Number(payload.skill_doc_count || 0);
+  const destination = payload.destination_path || "";
+  const prefix = status === "preview" ? "Preview" : status;
+  return `${prefix}: ${addonId}, ${fileCount} file${fileCount === 1 ? "" : "s"}, ${skillCount} skill doc${skillCount === 1 ? "" : "s"} -> ${destination}`;
 };
 
 const BACKGROUND_AUTONOMY_MODE_OPTIONS = [
@@ -1433,6 +1467,7 @@ const Settings = () => {
   const [privacyFilterMode, setPrivacyFilterMode] = useState("off");
   const [privacyFilterModel, setPrivacyFilterModel] = useState("openai/privacy-filter");
   const [privacyRouteMode, setPrivacyRouteMode] = useState("off");
+  const privacyDetectorDisabled = normalizePrivacyFilterMode(privacyFilterMode) === "off";
   const [defaultWorkflow, setDefaultWorkflow] = useState(state.workflowProfile || "default");
   const [enabledWorkflowModules, setEnabledWorkflowModules] = useState(
     Array.isArray(state.enabledWorkflowModules) ? state.enabledWorkflowModules : [],
@@ -1447,6 +1482,18 @@ const Settings = () => {
   const [skillDocLoading, setSkillDocLoading] = useState(false);
   const [skillDocSaving, setSkillDocSaving] = useState(false);
   const [skillDocMessage, setSkillDocMessage] = useState("");
+  const [modulePackImportPath, setModulePackImportPath] = useState("");
+  const [modulePackExportPath, setModulePackExportPath] = useState("");
+  const [modulePackOverwrite, setModulePackOverwrite] = useState(false);
+  const [modulePackTransferBusy, setModulePackTransferBusy] = useState("");
+  const [modulePackTransferMessage, setModulePackTransferMessage] = useState("");
+  const [modulePackTransferPreview, setModulePackTransferPreview] = useState(null);
+  const [skillImportPath, setSkillImportPath] = useState("");
+  const [skillExportPath, setSkillExportPath] = useState("");
+  const [skillTransferOverwrite, setSkillTransferOverwrite] = useState(false);
+  const [skillTransferBusy, setSkillTransferBusy] = useState("");
+  const [skillTransferMessage, setSkillTransferMessage] = useState("");
+  const [skillTransferPreview, setSkillTransferPreview] = useState(null);
   const [captureWorkflowSaving, setCaptureWorkflowSaving] = useState(false);
   const [captureWorkflowMessage, setCaptureWorkflowMessage] = useState("");
 
@@ -4899,6 +4946,163 @@ const Settings = () => {
     }
   };
 
+  const handleModulePackImport = async (dryRun = true) => {
+    const sourcePath = modulePackImportPath.trim();
+    if (!sourcePath) {
+      setModulePackTransferMessage("Choose a module pack folder first.");
+      return;
+    }
+    setModulePackTransferBusy(dryRun ? "import-preview" : "import");
+    setModulePackTransferMessage("");
+    try {
+      const res = await axios.post("/api/workflows/module-packs/import", {
+        source_path: sourcePath,
+        dry_run: dryRun,
+        overwrite: modulePackOverwrite,
+      });
+      const payload = res?.data || null;
+      setModulePackTransferPreview(payload);
+      setModulePackTransferMessage(
+        summarizePackTransfer(
+          payload,
+          dryRun ? "Module pack preview ready." : "Module pack imported.",
+        ),
+      );
+      if (!dryRun) {
+        const moduleId = payload?.addon?.module_ids?.[0];
+        if (moduleId) {
+          setModuleDetailsId(moduleId);
+        }
+        await refreshWorkflowCatalog();
+      }
+    } catch (error) {
+      setModulePackTransferMessage(
+        error?.response?.data?.detail || "Module pack import failed.",
+      );
+    } finally {
+      setModulePackTransferBusy("");
+    }
+  };
+
+  const handleModulePackExport = async (dryRun = true) => {
+    const destinationPath = modulePackExportPath.trim();
+    if (!destinationPath) {
+      setModulePackTransferMessage("Choose an export folder first.");
+      return;
+    }
+    const selectedModule =
+      workflowModuleMap.get(moduleDetailsId) || workflowModules[0] || {};
+    const source = String(selectedModule.source || "").toLowerCase();
+    const addonId = String(selectedModule.addon_id || "").trim();
+    if (!addonId || (source !== "custom" && source !== "local")) {
+      setModulePackTransferMessage("Only imported local packs can be exported here.");
+      return;
+    }
+    setModulePackTransferBusy(dryRun ? "export-preview" : "export");
+    setModulePackTransferMessage("");
+    try {
+      const res = await axios.post(
+        `/api/workflows/module-packs/${encodeURIComponent(addonId)}/export`,
+        {
+          destination_path: destinationPath,
+          dry_run: dryRun,
+          overwrite: modulePackOverwrite,
+        },
+      );
+      const payload = res?.data || null;
+      setModulePackTransferPreview(payload);
+      setModulePackTransferMessage(
+        summarizePackTransfer(
+          payload,
+          dryRun ? "Module pack export preview ready." : "Module pack exported.",
+        ),
+      );
+    } catch (error) {
+      setModulePackTransferMessage(
+        error?.response?.data?.detail || "Module pack export failed.",
+      );
+    } finally {
+      setModulePackTransferBusy("");
+    }
+  };
+
+  const handleSkillImport = async (dryRun = true) => {
+    const sourcePath = skillImportPath.trim();
+    if (!sourcePath) {
+      setSkillTransferMessage("Choose a skill markdown file first.");
+      return;
+    }
+    setSkillTransferBusy(dryRun ? "import-preview" : "import");
+    setSkillTransferMessage("");
+    try {
+      const res = await axios.post("/api/workflows/skills/import", {
+        source_path: sourcePath,
+        dry_run: dryRun,
+        overwrite: skillTransferOverwrite,
+      });
+      const payload = res?.data || null;
+      setSkillTransferPreview(payload);
+      setSkillTransferMessage(
+        summarizePackTransfer(
+          payload,
+          dryRun ? "Skill import preview ready." : "Skill imported.",
+        ),
+      );
+      if (!dryRun) {
+        await refreshWorkflowCatalog();
+        if (payload?.skill_id) {
+          setSkillDocSelectedId(payload.skill_id);
+          fetchSkillDoc(payload.skill_id);
+        }
+      }
+    } catch (error) {
+      setSkillTransferMessage(
+        error?.response?.data?.detail || "Skill markdown import failed.",
+      );
+    } finally {
+      setSkillTransferBusy("");
+    }
+  };
+
+  const handleSkillExport = async (dryRun = true) => {
+    const destinationPath = skillExportPath.trim();
+    const normalized = String(skillDocSelectedId || "").trim();
+    if (!normalized) {
+      setSkillTransferMessage("Choose a skill doc first.");
+      return;
+    }
+    if (!destinationPath) {
+      setSkillTransferMessage("Choose a skill export folder first.");
+      return;
+    }
+    setSkillTransferBusy(dryRun ? "export-preview" : "export");
+    setSkillTransferMessage("");
+    try {
+      const res = await axios.post(
+        `/api/workflows/skills/${encodeURIComponent(normalized)}/export`,
+        {
+          destination_path: destinationPath,
+          dry_run: dryRun,
+          overwrite: skillTransferOverwrite,
+        },
+      );
+      const payload = res?.data || null;
+      setSkillTransferPreview(payload);
+      setSkillTransferMessage(
+        summarizePackTransfer(
+          payload,
+          dryRun ? "Skill export preview ready." : "Skill exported.",
+        ),
+      );
+    } catch (error) {
+      setSkillTransferMessage(
+        error?.response?.data?.detail || "Skill markdown export failed.",
+      );
+    } finally {
+      setSkillTransferBusy("");
+    }
+  };
+
 
 
   useEffect(() => {
@@ -7202,7 +7406,8 @@ const Settings = () => {
     const nextPrivacyFilterMode = normalizePrivacyFilterMode(privacyFilterMode);
     const nextPrivacyFilterModel =
       String(privacyFilterModel || "").trim() || "openai/privacy-filter";
-    const nextPrivacyRouteMode = normalizePrivacyRouteMode(privacyRouteMode);
+    const nextPrivacyRouteMode =
+      nextPrivacyFilterMode === "off" ? "off" : normalizePrivacyRouteMode(privacyRouteMode);
     setCaptureWorkflowSaving(true);
     setCaptureWorkflowMessage("");
     try {
@@ -10660,16 +10865,20 @@ const Settings = () => {
                 <label
                   className="field-label"
                   htmlFor="privacy-filter-mode"
-                  title="Automatic first-pass text privacy classification for saved memories, conversations, knowledge, and file writes."
+                  title="Local text privacy classification for saved writes, rerouting prompts, and API embedding preflight."
                 >
-                  Text privacy filter on writes
+                  Text privacy detector
                 </label>
                 <select
                   id="privacy-filter-mode"
                   value={privacyFilterMode}
-                  onChange={(event) =>
-                    setPrivacyFilterMode(normalizePrivacyFilterMode(event.target.value))
-                  }
+                  onChange={(event) => {
+                    const nextMode = normalizePrivacyFilterMode(event.target.value);
+                    setPrivacyFilterMode(nextMode);
+                    if (nextMode === "off") {
+                      setPrivacyRouteMode("off");
+                    }
+                  }}
                 >
                   {PRIVACY_FILTER_MODE_OPTIONS.map((option) => (
                     <option key={option.value} value={option.value}>
@@ -10683,8 +10892,8 @@ const Settings = () => {
                       (option) => option.value === normalizePrivacyFilterMode(privacyFilterMode),
                     )?.description
                   }{" "}
-                  Uses a local text classifier. Image access remains controlled by the
-                  raw-image and summary-fallback settings above.
+                  Uses a local text classifier. When off, private-message rerouting and
+                  API embedding preflight are disabled too.
                 </p>
                 <label
                   className="field-label"
@@ -10722,7 +10931,8 @@ const Settings = () => {
                 </label>
                 <select
                   id="privacy-route-mode"
-                  value={privacyRouteMode}
+                  value={privacyDetectorDisabled ? "off" : privacyRouteMode}
+                  disabled={privacyDetectorDisabled}
                   onChange={(event) =>
                     setPrivacyRouteMode(normalizePrivacyRouteMode(event.target.value))
                   }
@@ -10734,11 +10944,11 @@ const Settings = () => {
                   ))}
                 </select>
                 <p className="status-note" style={{ marginTop: 6 }}>
-                  {
-                    PRIVACY_ROUTE_MODE_OPTIONS.find(
-                      (option) => option.value === normalizePrivacyRouteMode(privacyRouteMode),
-                    )?.description
-                  }{" "}
+                  {privacyDetectorDisabled
+                    ? "Enable the text privacy detector before using private-message rerouting."
+                    : PRIVACY_ROUTE_MODE_OPTIONS.find(
+                        (option) => option.value === normalizePrivacyRouteMode(privacyRouteMode),
+                      )?.description}{" "}
                   The route is never automatic; it uses the same accept, edit, or deny review card.
                 </p>
                 <label
@@ -10911,12 +11121,18 @@ const Settings = () => {
                   <div className="workflow-module-list">
                     {workflowModules.map((module) => {
                       const source = String(module.source || "base").toLowerCase();
-                      const sourceLabel =
-                        source === "custom" || source === "local"
-                          ? "custom"
-                          : source === "base"
-                            ? "base"
-                            : source;
+                      const sourceLabelClass = moduleSourceClass(source);
+                      const sourceLabel = formatModuleSource(source);
+                      const linkedDocId = String(module.doc_id || "").trim();
+                      const linkedSkillId = String(
+                        module.skill_id || module.id || "",
+                      ).trim();
+                      const activeSkillSource = String(
+                        module.skill_source || module.source || "",
+                      ).trim();
+                      const activeSkillSourceLabel = activeSkillSource
+                        ? formatModuleSource(activeSkillSource)
+                        : "";
                       const toolCount = Array.isArray(module.tool_names)
                         ? module.tool_names.length
                         : 0;
@@ -10926,7 +11142,7 @@ const Settings = () => {
                             <span className="workflow-module-title">
                               <strong>{module.label || module.id}</strong>
                               <span
-                                className={`workflow-module-source workflow-module-source--${sourceLabel}`}
+                                className={`workflow-module-source workflow-module-source--${sourceLabelClass}`}
                               >
                                 {sourceLabel}
                               </span>
@@ -10941,6 +11157,14 @@ const Settings = () => {
                             </span>
                             <span className="status-note workflow-module-description">
                               {module.description || "No module description supplied."}
+                            </span>
+                            <span className="status-note workflow-module-description">
+                              {`Docs: ${linkedDocId || "unlinked"} | Skill: ${
+                                linkedSkillId || "unlisted"
+                              }`}
+                              {activeSkillSourceLabel
+                                ? ` | Doc source: ${activeSkillSourceLabel}`
+                                : ""}
                             </span>
                           </span>
                           <input
@@ -11028,6 +11252,91 @@ const Settings = () => {
                       </div>
                     );
                   })()}
+                <div className="workflow-pack-manager workflow-skill-manager--subcard" aria-label="Module pack import and export">
+                  <div className="workflow-modules-heading">
+                    <div>
+                      <div className="field-label">Module packs</div>
+                    </div>
+                    <label className="inline-flex workflow-pack-overwrite">
+                      <input
+                        type="checkbox"
+                        checked={modulePackOverwrite}
+                        onChange={(event) => setModulePackOverwrite(event.target.checked)}
+                      />
+                      <span>Overwrite</span>
+                    </label>
+                  </div>
+                  <div className="workflow-pack-grid">
+                    <label className="field-label" htmlFor="workflow-module-pack-import">
+                      Import folder
+                    </label>
+                    <input
+                      id="workflow-module-pack-import"
+                      type="text"
+                      value={modulePackImportPath}
+                      onChange={(event) => setModulePackImportPath(event.target.value)}
+                      placeholder="data/workspace/hermes-pack"
+                    />
+                    <div className="workflow-pack-actions">
+                      <button
+                        type="button"
+                        className="icon-btn"
+                        onClick={() => handleModulePackImport(true)}
+                        disabled={!!modulePackTransferBusy}
+                        style={{ marginTop: 0 }}
+                      >
+                        {modulePackTransferBusy === "import-preview" ? "Checking..." : "Preview import"}
+                      </button>
+                      <button
+                        type="button"
+                        className="icon-btn"
+                        onClick={() => handleModulePackImport(false)}
+                        disabled={!!modulePackTransferBusy}
+                        style={{ marginTop: 0 }}
+                      >
+                        {modulePackTransferBusy === "import" ? "Importing..." : "Import pack"}
+                      </button>
+                    </div>
+                    <label className="field-label" htmlFor="workflow-module-pack-export">
+                      Module export folder
+                    </label>
+                    <input
+                      id="workflow-module-pack-export"
+                      type="text"
+                      value={modulePackExportPath}
+                      onChange={(event) => setModulePackExportPath(event.target.value)}
+                      placeholder="data/workspace/module-exports"
+                    />
+                    <div className="workflow-pack-actions">
+                      <button
+                        type="button"
+                        className="icon-btn"
+                        onClick={() => handleModulePackExport(true)}
+                        disabled={!!modulePackTransferBusy}
+                        style={{ marginTop: 0 }}
+                      >
+                        {modulePackTransferBusy === "export-preview" ? "Checking..." : "Preview export"}
+                      </button>
+                      <button
+                        type="button"
+                        className="icon-btn"
+                        onClick={() => handleModulePackExport(false)}
+                        disabled={!!modulePackTransferBusy}
+                        style={{ marginTop: 0 }}
+                      >
+                        {modulePackTransferBusy === "export" ? "Exporting..." : "Export selected"}
+                      </button>
+                    </div>
+                  </div>
+                  {modulePackTransferPreview?.warnings?.length > 0 && (
+                    <p className="status-note warn">
+                      {modulePackTransferPreview.warnings.join(" ")}
+                    </p>
+                  )}
+                  {modulePackTransferMessage && (
+                    <p className="status-note">{modulePackTransferMessage}</p>
+                  )}
+                </div>
                 <div className="workflow-skill-manager workflow-skill-manager--subcard" aria-label="Module skill docs">
                   <div className="workflow-modules-heading">
                     <div>
@@ -11039,7 +11348,7 @@ const Settings = () => {
                     </div>
                     {skillDoc?.active?.source && (
                       <span className="workflow-module-count">
-                        active: {skillDoc.active.source}
+                        active: {formatModuleSource(skillDoc.active.source)}
                       </span>
                     )}
                   </div>
@@ -11127,6 +11436,91 @@ const Settings = () => {
                     >
                       Reload doc
                     </button>
+                  </div>
+                  <div className="workflow-pack-manager workflow-pack-manager--flat" aria-label="Skill markdown import and export">
+                    <div className="workflow-modules-heading">
+                      <div className="field-label">Skill packs</div>
+                      <label className="inline-flex workflow-pack-overwrite">
+                        <input
+                          type="checkbox"
+                          checked={skillTransferOverwrite}
+                          onChange={(event) =>
+                            setSkillTransferOverwrite(event.target.checked)
+                          }
+                        />
+                        <span>Overwrite</span>
+                      </label>
+                    </div>
+                    <div className="workflow-pack-grid">
+                      <label className="field-label" htmlFor="workflow-skill-import">
+                        Import markdown
+                      </label>
+                      <input
+                        id="workflow-skill-import"
+                        type="text"
+                        value={skillImportPath}
+                        onChange={(event) => setSkillImportPath(event.target.value)}
+                        placeholder="data/workspace/generic_skill.md"
+                      />
+                      <div className="workflow-pack-actions">
+                        <button
+                          type="button"
+                          className="icon-btn"
+                          onClick={() => handleSkillImport(true)}
+                          disabled={!!skillTransferBusy}
+                          style={{ marginTop: 0 }}
+                        >
+                          {skillTransferBusy === "import-preview" ? "Checking..." : "Preview import"}
+                        </button>
+                        <button
+                          type="button"
+                          className="icon-btn"
+                          onClick={() => handleSkillImport(false)}
+                          disabled={!!skillTransferBusy}
+                          style={{ marginTop: 0 }}
+                        >
+                          {skillTransferBusy === "import" ? "Importing..." : "Import skill"}
+                        </button>
+                      </div>
+                      <label className="field-label" htmlFor="workflow-skill-export">
+                        Skill export folder
+                      </label>
+                      <input
+                        id="workflow-skill-export"
+                        type="text"
+                        value={skillExportPath}
+                        onChange={(event) => setSkillExportPath(event.target.value)}
+                        placeholder="data/workspace/skill-exports"
+                      />
+                      <div className="workflow-pack-actions">
+                        <button
+                          type="button"
+                          className="icon-btn"
+                          onClick={() => handleSkillExport(true)}
+                          disabled={!!skillTransferBusy || !skillDocSelectedId}
+                          style={{ marginTop: 0 }}
+                        >
+                          {skillTransferBusy === "export-preview" ? "Checking..." : "Preview export"}
+                        </button>
+                        <button
+                          type="button"
+                          className="icon-btn"
+                          onClick={() => handleSkillExport(false)}
+                          disabled={!!skillTransferBusy || !skillDocSelectedId}
+                          style={{ marginTop: 0 }}
+                        >
+                          {skillTransferBusy === "export" ? "Exporting..." : "Export selected"}
+                        </button>
+                      </div>
+                    </div>
+                    {skillTransferPreview?.warnings?.length > 0 && (
+                      <p className="status-note warn">
+                        {skillTransferPreview.warnings.join(" ")}
+                      </p>
+                    )}
+                    {skillTransferMessage && (
+                      <p className="status-note">{skillTransferMessage}</p>
+                    )}
                   </div>
                   {skillDocMessage && <p className="status-note">{skillDocMessage}</p>}
                 </div>

@@ -225,6 +225,135 @@ def test_quick_provider_status_skips_model_inventory_refresh():
     assert fake_adapter.list_calls == 0
 
 
+def test_quick_provider_status_uses_adapter_openai_inventory_snapshot():
+    from app.local_providers.manager import LocalProviderManager
+
+    class _FakeAdapter:
+        def __init__(self):
+            self.list_calls = 0
+
+        def detect_installation(self, cfg):
+            return {"ok": True, "installed": True, "binary": "fake"}
+
+        def resolve_base_url(self, cfg, *, with_v1):
+            return "http://127.0.0.1:1234/v1" if with_v1 else "http://127.0.0.1:1234"
+
+        def poll_status(self, cfg, *, quick=False):
+            assert quick is True
+            return {
+                "ok": True,
+                "server_running": True,
+                "inventory_reachable": True,
+                "models": ["google/gemma-4-12B-it-qat-q4_0-gguf"],
+                "model_loaded": False,
+                "loaded_model": None,
+                "context_length": None,
+                "details": {},
+            }
+
+        def list_models(self, cfg):
+            self.list_calls += 1
+            raise AssertionError("quick status should not run full model refresh")
+
+        def capabilities(self, cfg):
+            return {}
+
+    manager = LocalProviderManager(
+        lambda: {
+            "local_provider": "lmstudio",
+            "local_provider_mode": "local-managed",
+            "local_provider_host": "127.0.0.1",
+            "local_provider_port": 1234,
+            "local_provider_api_token": "",
+            "local_provider_preferred_model": "",
+        }
+    )
+    fake_adapter = _FakeAdapter()
+    manager._adapters["lmstudio"] = fake_adapter
+
+    runtime = manager.provider_status("lmstudio", quick=True)
+
+    assert runtime["server_running"] is True
+    assert runtime["inventory_reachable"] is True
+    assert runtime["inventory_source"] == "quick"
+    assert runtime["inventory_model_count"] == 1
+    assert runtime["effective_model"] == "google/gemma-4-12B-it-qat-q4_0-gguf"
+    assert fake_adapter.list_calls == 0
+
+
+def test_quick_provider_status_prefers_openai_inventory_over_stale_cache():
+    from app.local_providers.manager import LocalProviderManager
+
+    class _FakeAdapter:
+        def __init__(self):
+            self.list_calls = 0
+
+        def detect_installation(self, cfg):
+            return {"ok": True, "installed": True, "binary": "fake"}
+
+        def resolve_base_url(self, cfg, *, with_v1):
+            return "http://127.0.0.1:1234/v1" if with_v1 else "http://127.0.0.1:1234"
+
+        def poll_status(self, cfg, *, quick=False):
+            assert quick is True
+            return {
+                "ok": True,
+                "server_running": True,
+                "inventory_reachable": True,
+                "models": [
+                    "google/gemma-4-12b-live-test",
+                    "google/gemma-4-31b-qat",
+                ],
+                "model_loaded": False,
+                "loaded_model": None,
+                "context_length": None,
+                "details": {},
+            }
+
+        def list_models(self, cfg):
+            self.list_calls += 1
+            raise AssertionError("quick status should not run full model refresh")
+
+        def capabilities(self, cfg):
+            return {}
+
+    manager = LocalProviderManager(
+        lambda: {
+            "local_provider": "lmstudio",
+            "local_provider_mode": "local-managed",
+            "local_provider_host": "127.0.0.1",
+            "local_provider_port": 1234,
+            "local_provider_api_token": "",
+            "local_provider_preferred_model": "",
+        }
+    )
+    fake_adapter = _FakeAdapter()
+    manager._adapters["lmstudio"] = fake_adapter
+    manager._store_runtime(
+        "lmstudio",
+        {
+            "server_running": True,
+            "model_loaded": True,
+            "loaded_model": "google/gemma-4-12b-live-test",
+            "context_length": 4096,
+        },
+    )
+    manager._store_models("lmstudio", ["stale-gemma"])
+
+    runtime = manager.provider_status("lmstudio", quick=True)
+
+    assert runtime["server_running"] is True
+    assert runtime["inventory_reachable"] is True
+    assert runtime["inventory_source"] == "quick"
+    assert runtime["inventory_stale"] is False
+    assert runtime["inventory_model_count"] == 2
+    assert runtime["loaded_model"] == "google/gemma-4-12b-live-test"
+    assert runtime["model_loaded"] is True
+    assert runtime["chat_ready"] is True
+    assert runtime["effective_model"] == "google/gemma-4-12b-live-test"
+    assert fake_adapter.list_calls == 0
+
+
 def test_provider_manager_shutdown_stops_owned_models_and_servers():
     from app.local_providers.manager import LocalProviderManager
 

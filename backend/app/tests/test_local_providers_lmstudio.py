@@ -115,6 +115,73 @@ def test_lmstudio_quick_poll_status_does_not_probe_model_inventory(monkeypatch):
     assert all("/models" not in url for url in called_urls)
 
 
+def test_lmstudio_quick_poll_status_accepts_openai_models_endpoint(monkeypatch):
+    adapter = LMStudioAdapter()
+    called_urls = []
+
+    def fake_get(url, timeout, headers=None):
+        called_urls.append(url)
+        if url.endswith("/api/v1/status"):
+            return _FakeResponse({"error": "Unexpected endpoint or method."})
+        if url.endswith("/v1/models"):
+            return _FakeResponse(
+                {
+                    "data": [
+                        {
+                            "id": "google/gemma-4-12B-it-qat-q4_0-gguf",
+                            "state": "loaded",
+                        }
+                    ]
+                }
+            )
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr("app.local_providers.lmstudio.requests.get", fake_get)
+
+    status = adapter.poll_status(_base_cfg(), quick=True)
+
+    assert status["server_running"] is True
+    assert status["status_reachable"] is True
+    assert status["inventory_reachable"] is True
+    assert status["inventory_model_count"] == 1
+    assert status["model_loaded"] is True
+    assert status["loaded_model"] == "google/gemma-4-12B-it-qat-q4_0-gguf"
+    assert called_urls == [
+        "http://127.0.0.1:1234/api/v1/status",
+        "http://127.0.0.1:1234/v1/models",
+    ]
+
+
+def test_lmstudio_quick_poll_status_uses_first_openai_model_without_state(
+    monkeypatch,
+):
+    adapter = LMStudioAdapter()
+
+    def fake_get(url, timeout, headers=None):
+        if url.endswith("/api/v1/status"):
+            return _FakeResponse({"error": "Unexpected endpoint or method."})
+        if url.endswith("/v1/models"):
+            return _FakeResponse(
+                {
+                    "data": [
+                        {"id": "google/gemma-4-12b-live-test"},
+                        {"id": "gemma-3-12b-it"},
+                    ]
+                }
+            )
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr("app.local_providers.lmstudio.requests.get", fake_get)
+
+    status = adapter.poll_status(_base_cfg(), quick=True)
+
+    assert status["server_running"] is True
+    assert status["inventory_reachable"] is True
+    assert status["inventory_model_count"] == 2
+    assert status["model_loaded"] is True
+    assert status["loaded_model"] == "google/gemma-4-12b-live-test"
+
+
 def test_lmstudio_remote_unmanaged_load_uses_http(monkeypatch):
     adapter = LMStudioAdapter()
 

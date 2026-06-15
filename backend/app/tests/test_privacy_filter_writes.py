@@ -137,6 +137,7 @@ def test_private_message_route_proposes_local_model(monkeypatch):
     result = routes._privacy_route_check_for_message(
         "api token: abc123",
         settings_payload={
+            "privacy_filter_mode": "always",
             "privacy_filter_route_private_mode": "ask",
             "privacy_filter_route_min_sensitivity": "protected",
         },
@@ -168,9 +169,35 @@ def test_private_message_route_skips_local_mode(monkeypatch):
     assert (
         routes._privacy_route_check_for_message(
             "api token: abc123",
-            settings_payload={"privacy_filter_route_private_mode": "ask"},
+            settings_payload={
+                "privacy_filter_mode": "always",
+                "privacy_filter_route_private_mode": "ask",
+            },
             mode_used="local",
             requested_model="local-private-model",
+            config_payload={"transformer_model": "local-private-model"},
+        )
+        is None
+    )
+
+
+def test_private_message_route_detector_off_skips_even_when_route_ask(monkeypatch):
+    from app import routes
+
+    def fail_classifier(_model):
+        raise AssertionError("disabled privacy detector should not load classifier")
+
+    monkeypatch.setattr(privacy_filter, "_get_classifier", fail_classifier)
+
+    assert (
+        routes._privacy_route_check_for_message(
+            "api token: abc123",
+            settings_payload={
+                "privacy_filter_mode": "off",
+                "privacy_filter_route_private_mode": "ask",
+            },
+            mode_used="api",
+            requested_model="gpt-5.4",
             config_payload={"transformer_model": "local-private-model"},
         )
         is None
