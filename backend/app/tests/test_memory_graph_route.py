@@ -70,7 +70,9 @@ def test_memory_graph_returns_hybrid_and_explicit_edges(client):
     assert {"conversation", "file", "tool"}.issubset(explicit_categories)
 
     semantic_links = [
-        link for link in links if isinstance(link, dict) and link.get("type") == "semantic"
+        link
+        for link in links
+        if isinstance(link, dict) and link.get("type") == "semantic"
     ]
     assert semantic_links
     assert all("embedding_score" in link for link in semantic_links)
@@ -169,11 +171,11 @@ def test_memory_graph_can_skip_thread_projection(client, monkeypatch):
     )
     assert resp.status_code == 200
 
-    graph_resp = client.get("/memory/graph", params={"include_thread_projection": False})
+    graph_resp = client.get(
+        "/memory/graph", params={"include_thread_projection": False}
+    )
     assert graph_resp.status_code == 200
     graph = graph_resp.json()["graph"]
 
-    assert all(
-        str(node.get("type")) != "thread" for node in (graph.get("nodes") or [])
-    )
+    assert all(str(node.get("type")) != "thread" for node in (graph.get("nodes") or []))
     assert graph.get("metadata", {}).get("thread_projection_count") == 0

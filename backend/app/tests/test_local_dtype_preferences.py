@@ -22,9 +22,7 @@ class FakeTorch:
 def test_mxfp4_prefers_bf16_when_supported(monkeypatch):
     fake_torch = FakeTorch(bf16_supported=True)
     monkeypatch.setattr("app.base_services.torch", fake_torch)
-    monkeypatch.setattr(
-        "app.base_services._mxfp4_kernels_available", lambda: True
-    )
+    monkeypatch.setattr("app.base_services._mxfp4_kernels_available", lambda: True)
     svc = LLMService(config={"local_device_map_strategy": "auto"})
     svc._local_quant_method = "mxfp4"
     model_kwargs = {}
@@ -35,9 +33,7 @@ def test_mxfp4_prefers_bf16_when_supported(monkeypatch):
 def test_mxfp4_falls_back_to_float16_when_bf16_unavailable(monkeypatch):
     fake_torch = FakeTorch(bf16_supported=False)
     monkeypatch.setattr("app.base_services.torch", fake_torch)
-    monkeypatch.setattr(
-        "app.base_services._mxfp4_kernels_available", lambda: True
-    )
+    monkeypatch.setattr("app.base_services._mxfp4_kernels_available", lambda: True)
     svc = LLMService(config={"local_device_map_strategy": "auto"})
     svc._local_quant_method = "mxfp4"
     model_kwargs = {}

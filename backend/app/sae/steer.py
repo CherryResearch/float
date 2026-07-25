@@ -52,7 +52,9 @@ def resolve_token_positions(token_positions: str, seq_len: int) -> list[int]:
     return sorted(set(positions))
 
 
-def steering_delta(decoder: list[list[float]], features: dict[int, float]) -> list[float]:
+def steering_delta(
+    decoder: list[list[float]], features: dict[int, float]
+) -> list[float]:
     sparse = [(int(feature_id), float(alpha)) for feature_id, alpha in features.items()]
     return decode_sparse(sparse_features=sparse, decoder=decoder)
 
@@ -124,13 +126,17 @@ def _parse_args() -> argparse.Namespace:
         required=True,
         help="Comma-separated overrides, e.g. 123:+0.8,91:-0.4",
     )
-    parser.add_argument("--layer", type=int, default=None, help="Layer index to target.")
+    parser.add_argument(
+        "--layer", type=int, default=None, help="Layer index to target."
+    )
     parser.add_argument(
         "--token-positions",
         default="all",
         help="Token selection: all | last | comma-list (e.g., 0,3,-1).",
     )
-    parser.add_argument("--sae-weights", help="Path to SAE weights JSON (decoder source).")
+    parser.add_argument(
+        "--sae-weights", help="Path to SAE weights JSON (decoder source)."
+    )
     parser.add_argument(
         "--activations",
         help="Offline activation record path (.json/.npz/.parquet).",
@@ -141,10 +147,18 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model", help="Live model id (future-ready path).")
     parser.add_argument("--prompt", default="", help="Prompt text for live model path.")
-    parser.add_argument("--module-target", default="resid_post", help="Hook target module.")
-    parser.add_argument("--device", default="cpu", help="Torch device for live model path.")
-    parser.add_argument("--max-new-tokens", type=int, default=48, help="Generation length.")
-    parser.add_argument("--dry-run", action="store_true", help="Print interventions only.")
+    parser.add_argument(
+        "--module-target", default="resid_post", help="Hook target module."
+    )
+    parser.add_argument(
+        "--device", default="cpu", help="Torch device for live model path."
+    )
+    parser.add_argument(
+        "--max-new-tokens", type=int, default=48, help="Generation length."
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Print interventions only."
+    )
     return parser.parse_args()
 
 
@@ -158,7 +172,9 @@ def _build_config(args: argparse.Namespace) -> SteeringConfig:
     )
 
 
-def _load_decoder_for_record(args: argparse.Namespace, record: ActivationRecord) -> list[list[float]]:
+def _load_decoder_for_record(
+    args: argparse.Namespace, record: ActivationRecord
+) -> list[list[float]]:
     if args.sae_weights:
         return load_sae_weights(args.sae_weights).decoder
     return make_identity_sae(d_model=record.d_model).decoder

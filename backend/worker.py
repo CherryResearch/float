@@ -2,9 +2,9 @@
 
 import logging
 
+from app import config as app_config
 from app.agents.engine import MultiAgentEngine  # noqa: F401  Ensure agents are loaded
 from app.tasks import celery_app
-from app import config as app_config
 from app.utils.telemetry import configure_logging, configure_tracing
 
 

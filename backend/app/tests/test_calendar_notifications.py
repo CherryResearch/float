@@ -1,8 +1,11 @@
 from datetime import datetime, timedelta, timezone
 
 import pytest
-
-from app.tasks import dispatch_due_calendar_prompts, poll_calendar_events, send_event_prompt
+from app.tasks import (
+    dispatch_due_calendar_prompts,
+    poll_calendar_events,
+    send_event_prompt,
+)
 from app.utils import calendar_store, user_settings
 
 
@@ -149,7 +152,10 @@ def test_dispatch_due_calendar_prompts_flushes_overdue_reminders(
     triggered = dispatch_due_calendar_prompts(enqueue=False)
 
     assert triggered == [
-        {"event_id": "overnight", "occ_time": pytest.approx(start.timestamp(), rel=0.001)}
+        {
+            "event_id": "overnight",
+            "occ_time": pytest.approx(start.timestamp(), rel=0.001),
+        }
     ]
     stored = calendar_store.load_event("overnight")
     assert stored["status"] == "prompted"

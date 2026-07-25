@@ -44,7 +44,10 @@ def _observe_ingestion(event: hooks.IngestionEvent) -> None:
 
 @hooks.register_hook(hooks.AFTER_RETRIEVAL_EVENT)
 def _observe_retrieval(event: hooks.RetrievalResult) -> None:
-    channel = _clean_label(event.metadata.get("channel") if isinstance(event.metadata, dict) else None, "chat")
+    channel = _clean_label(
+        event.metadata.get("channel") if isinstance(event.metadata, dict) else None,
+        "chat",
+    )
     match_count = len(event.matches or [])
     retrieval_events_total.labels(channel).inc()
     retrieval_matches_histogram.observe(match_count)

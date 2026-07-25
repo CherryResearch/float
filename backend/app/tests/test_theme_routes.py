@@ -13,7 +13,9 @@ def client(tmp_path, monkeypatch):
     from app.main import app
     from app.utils import theme_store, user_settings
 
-    monkeypatch.setattr(user_settings, "USER_SETTINGS_PATH", tmp_path / "user_settings.json")
+    monkeypatch.setattr(
+        user_settings, "USER_SETTINGS_PATH", tmp_path / "user_settings.json"
+    )
     monkeypatch.setattr(theme_store, "THEMES_DIR", tmp_path / "themes")
     return TestClient(app)
 

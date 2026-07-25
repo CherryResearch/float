@@ -100,7 +100,9 @@ def log_tool(
     if args is not None:
         payload["args"] = args
     if result is not None:
-        payload["result"] = result if isinstance(result, (str, int, float, bool)) else str(result)
+        payload["result"] = (
+            result if isinstance(result, (str, int, float, bool)) else str(result)
+        )
     if source:
         payload["source"] = source
     log_event("tool", payload)

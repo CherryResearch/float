@@ -1,3 +1,3 @@
-from .manager import LocalProviderManager, PROVIDER_MARKERS
+from .manager import PROVIDER_MARKERS, LocalProviderManager
 
 __all__ = ["LocalProviderManager", "PROVIDER_MARKERS"]

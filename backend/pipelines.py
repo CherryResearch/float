@@ -125,7 +125,9 @@ class PipelineRouter:
 
     def __init__(self, pipelines: Sequence[Pipeline] = PIPELINES) -> None:
         self.pipelines = list(pipelines)
-        self._availability: Dict[str, bool] = {pipe.name: True for pipe in self.pipelines}
+        self._availability: Dict[str, bool] = {
+            pipe.name: True for pipe in self.pipelines
+        }
 
     def set_available(self, name: str, available: bool) -> None:
         """Mark a pipeline as available or unavailable for routing."""

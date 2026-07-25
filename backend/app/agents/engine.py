@@ -2,8 +2,13 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Mapping
 
-from app.tasks import (celery_app, execute_etl_pipeline, execute_tool,
-                       generate_embedding_task, long_running_task)
+from app.tasks import (
+    celery_app,
+    execute_etl_pipeline,
+    execute_tool,
+    generate_embedding_task,
+    long_running_task,
+)
 from celery import chain
 from celery.result import AsyncResult
 
