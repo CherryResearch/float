@@ -14556,12 +14556,18 @@ def _infer_relative_from_source(source: str, files_dir: Path) -> str:
         return ""
 
     candidate = Path(source_text).expanduser()
-    if not candidate.is_absolute():
-        candidate = files_dir / candidate
-    try:
-        resolved = candidate.resolve()
-    except Exception:
+    foreign_windows_absolute = (
+        PureWindowsPath(source_text).is_absolute() and not candidate.is_absolute()
+    )
+    if foreign_windows_absolute:
         resolved = candidate
+    else:
+        if not candidate.is_absolute():
+            candidate = files_dir / candidate
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            resolved = candidate
     try:
         return _coerce_relative_files_path(str(resolved.relative_to(files_dir)))
     except Exception:
