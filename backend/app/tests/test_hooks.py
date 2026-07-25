@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from app import hooks
 import app.hooks_observers as observers
+from app import hooks
 
 
 class DummyMetric:
@@ -27,7 +27,9 @@ def test_ingestion_observer_updates_metrics(monkeypatch):
     counter = DummyMetric()
     events = []
     monkeypatch.setattr(observers, "rag_ingestion_total", counter)
-    monkeypatch.setattr(observers, "log_event", lambda name, data=None: events.append((name, data)))
+    monkeypatch.setattr(
+        observers, "log_event", lambda name, data=None: events.append((name, data))
+    )
 
     event = hooks.IngestionEvent(
         kind="document",
@@ -49,7 +51,9 @@ def test_retrieval_observer_counts_matches(monkeypatch):
     events = []
     monkeypatch.setattr(observers, "retrieval_events_total", counter)
     monkeypatch.setattr(observers, "retrieval_matches_histogram", hist)
-    monkeypatch.setattr(observers, "log_event", lambda name, data=None: events.append((name, data)))
+    monkeypatch.setattr(
+        observers, "log_event", lambda name, data=None: events.append((name, data))
+    )
 
     result = hooks.RetrievalResult(
         session_id="session",
@@ -69,7 +73,9 @@ def test_memory_write_observer_logs(monkeypatch):
     counter = DummyMetric()
     events = []
     monkeypatch.setattr(observers, "memory_writes_total", counter)
-    monkeypatch.setattr(observers, "log_event", lambda name, data=None: events.append((name, data)))
+    monkeypatch.setattr(
+        observers, "log_event", lambda name, data=None: events.append((name, data))
+    )
 
     event = hooks.MemoryWriteEvent(
         key="remember-this",
@@ -103,7 +109,9 @@ def test_error_observer_logs_and_counts(monkeypatch):
     counter = DummyMetric()
     events = []
     monkeypatch.setattr(observers, "error_events_total", counter)
-    monkeypatch.setattr(observers, "log_event", lambda name, data=None: events.append((name, data)))
+    monkeypatch.setattr(
+        observers, "log_event", lambda name, data=None: events.append((name, data))
+    )
 
     event = hooks.ErrorEvent(
         location="test",

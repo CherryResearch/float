@@ -1,6 +1,9 @@
+import json
 import sys
 import time
 from pathlib import Path
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
 def _load_modules():
@@ -9,7 +12,12 @@ def _load_modules():
         sys.path.insert(0, str(backend_dir))
     from app.services.action_history_service import ActionHistoryService
     from app.services.instance_sync_service import InstanceSyncService
-    from app.utils import calendar_store, conversation_store, memory_store, user_settings
+    from app.utils import (
+        calendar_store,
+        conversation_store,
+        memory_store,
+        user_settings,
+    )
 
     return {
         "ActionHistoryService": ActionHistoryService,
@@ -34,7 +42,9 @@ def _configure_paths(tmp_path, monkeypatch):
         "USER_SETTINGS_PATH",
         tmp_path / "user_settings.json",
     )
-    monkeypatch.setenv("FLOAT_MEMORY_FILE", str(tmp_path / "databases" / "memory.sqlite3"))
+    monkeypatch.setenv(
+        "FLOAT_MEMORY_FILE", str(tmp_path / "databases" / "memory.sqlite3")
+    )
     return modules
 
 
@@ -72,6 +82,50 @@ def test_recorded_memory_action_can_be_reverted(tmp_path, monkeypatch):
 
     assert result["status"] == "reverted"
     assert memory_store.load()["alias"]["value"] == "local"
+
+
+def test_graph_update_action_can_be_reverted(tmp_path, monkeypatch):
+    modules = _configure_paths(tmp_path, monkeypatch)
+    service = modules["ActionHistoryService"]({"data_dir": str(tmp_path / "data")})
+
+    from app.services.graph_payload_service import apply_graph_payload
+    from app.utils.graph_store import GraphStore
+
+    fixture = json.loads((FIXTURES / "basic_social_graph.json").read_text())
+    graph = GraphStore()
+    args = {
+        "nodes": fixture["nodes"],
+        "claims": fixture["claims"],
+        "source_kind": "fixture",
+        "source_ref": "basic_social_graph",
+    }
+    token = service.prepare_tool_action(
+        "graph.update",
+        args,
+        context={"conversation_id": "sess-1", "response_id": "msg-1"},
+    )
+    assert token is not None
+
+    summary = apply_graph_payload(
+        graph,
+        graph_nodes=fixture["nodes"],
+        graph_claims=fixture["claims"],
+        default_source_kind="fixture",
+        default_source_ref="basic_social_graph",
+    )
+    action = service.finalize_tool_action(token, result=summary, status="invoked")
+
+    assert action is not None
+    assert action["name"] == "graph.update"
+    assert len(action["items"]) == 14
+    assert {item["section"] for item in action["items"]} == {"graph"}
+    assert graph.summary()["node_count"] == 7
+
+    result = service.revert_actions(action_ids=[action["id"]])
+
+    assert result["status"] == "reverted"
+    assert graph.summary()["node_count"] == 0
+    assert graph.summary()["claim_count"] == 0
 
 
 def test_revert_actions_by_response_reverts_multiple_actions(tmp_path, monkeypatch):

@@ -19,13 +19,20 @@ from app.mcp_loop import start_mcp_loop
 from app.services.rag_provider import update_cached_config
 from app.utils import metrics as metrics
 from app.utils import telemetry as telemetry
-from app.utils.device_visibility import device_access_rejection_detail
+from app.utils.deployment_status import build_instance_status
+from app.utils.device_visibility import (
+    classify_host,
+    client_host,
+    device_access_rejection_detail,
+    is_trusted_frontend_proxy,
+)
 from app.utils.event_broker import EventBroker
 from app.utils.hardware import (
     detect_compute_devices,
     pick_default_device,
     torch_cuda_diagnostics,
 )
+from app.utils.network_policy import configured_cors_origins
 from app.utils.server_shutdown import shutdown_server_resources
 from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
@@ -129,8 +136,20 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-_DEVICE_ACCESS_PREFIXES = ("/devices", "/pairing", "/sync", "/gateway", "/stream")
-_DEVICE_ACCESS_EXEMPT_PATHS = {"/sync/overview", "/sync/mobile-serve/status"}
+_REMOTE_HEALTH_PATHS = {"/health"}
+_REMOTE_PEER_EXACT_ROUTES = {
+    ("POST", "/pairing/offers/accept"),
+    ("POST", "/devices/token"),
+    ("GET", "/sync/overview"),
+    ("POST", "/sync/manifest"),
+    ("POST", "/sync/export"),
+    ("POST", "/sync/ingest"),
+    ("GET", "/sync/cursor"),
+    ("POST", "/sync/changes"),
+    ("POST", "/sync/upload"),
+    ("POST", "/stream/sessions"),
+    ("POST", "/stream/candidates"),
+}
 
 
 def _normalized_device_access_path(path: str) -> str:
@@ -138,19 +157,40 @@ def _normalized_device_access_path(path: str) -> str:
     return raw[4:] if raw.startswith("/api/") else raw
 
 
-def _is_device_access_path(path: str) -> bool:
+def _is_remote_peer_access_path(path: str, method: str) -> bool:
     normalized = _normalized_device_access_path(path)
-    if normalized in _DEVICE_ACCESS_EXEMPT_PATHS:
-        return False
-    return any(
-        normalized == prefix or normalized.startswith(f"{prefix}/")
-        for prefix in _DEVICE_ACCESS_PREFIXES
-    )
+    normalized_method = str(method or "GET").strip().upper()
+    if (normalized_method, normalized) in _REMOTE_PEER_EXACT_ROUTES:
+        return True
+    if normalized_method in {"PATCH", "DELETE"} and normalized.startswith("/devices/"):
+        return normalized not in {"/devices/prune-legacy"}
+    if normalized_method == "GET" and normalized.startswith("/sync/download/"):
+        return True
+    if normalized.startswith("/stream/sessions/"):
+        return normalized_method in {"GET", "DELETE"}
+    return False
 
 
 @app.middleware("http")
 async def device_visibility_middleware(request: Request, call_next):
-    if _is_device_access_path(request.url.path):
+    normalized_path = _normalized_device_access_path(request.url.path)
+    request_scope = classify_host(client_host(request))
+    if is_trusted_frontend_proxy(request):
+        return await call_next(request)
+    if (
+        request_scope in {"lan", "public"}
+        and normalized_path not in _REMOTE_HEALTH_PATHS
+    ):
+        if not _is_remote_peer_access_path(request.url.path, request.method):
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "detail": (
+                        "This API is available through Float's local frontend proxy. "
+                        "Direct remote access is limited to paired-device endpoints."
+                    )
+                },
+            )
         detail = device_access_rejection_detail(request)
         if detail is not None:
             return JSONResponse(status_code=403, content={"detail": detail})
@@ -172,6 +212,28 @@ def health_check():
 def api_health_check():
     """Mirror the root health endpoint under /api for frontend probes."""
     return health_check()
+
+
+@app.get("/api/instance", tags=["Health"])
+def api_instance_status():
+    """Report software and data identity as equal deployment status dimensions."""
+    from app.services.instance_sync_service import InstanceSyncService
+    from app.utils import sync_checkpoint_store, user_settings
+    from app.utils.deployment_status import observe_data_revision
+
+    settings = user_settings.load_settings()
+    manifest = InstanceSyncService().build_manifest()
+    revision = observe_data_revision(dict(manifest.get("data_revision") or {}))
+    checkpoint = sync_checkpoint_store.checkpoint_summary(
+        sync_checkpoint_store.latest_checkpoint(),
+        current_revision=revision,
+    )
+    return build_instance_status(
+        settings=settings,
+        register_machine=True,
+        data_revision=revision,
+        sync_checkpoint=checkpoint,
+    )
 
 
 # Root Route
@@ -226,14 +288,17 @@ except Exception as e:
     logger.error("Error loading configuration: %s", e)
     raise
 
-# Add Middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Adjust based on security requirements
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Browser clients normally use the same-origin Vite/frontend proxy. Direct
+# browser access is opt-in and must name every allowed origin explicitly.
+cors_origins = configured_cors_origins()
+if cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # Initialize services
 try:
@@ -297,6 +362,13 @@ try:
 
         _set_action_history(action_history_service)
         logger.info("Action history tools bound to ActionHistoryService")
+    except Exception:
+        pass
+    try:
+        from app.tools.graph import set_graph_store as _set_graph_store  # type: ignore
+
+        _set_graph_store(memory_manager._graph_store)
+        logger.info("Graph tools bound to GraphStore")
     except Exception:
         pass
     try:
@@ -394,7 +466,12 @@ if __name__ == "__main__":
 
     # Disable Uvicorn's default access log; we emit structured access logs
     # via our own middleware/logger configured in telemetry.
-    uvicorn.run(app, host="0.0.0.0", port=8000, access_log=False)
+    uvicorn.run(
+        app,
+        host=os.getenv("FLOAT_BACKEND_HOST", "127.0.0.1"),
+        port=8000,
+        access_log=False,
+    )
 
 
 async def monitor_model_jobs(app: FastAPI) -> None:

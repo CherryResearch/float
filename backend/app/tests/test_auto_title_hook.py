@@ -5,7 +5,9 @@ import json
 def setup_store(tmp_path, monkeypatch):
     monkeypatch.setenv("FLOAT_CONV_DIR", str(tmp_path))
     if "app.utils.conversation_store" in importlib.sys.modules:
-        module = importlib.reload(importlib.import_module("app.utils.conversation_store"))
+        module = importlib.reload(
+            importlib.import_module("app.utils.conversation_store")
+        )
     else:
         module = importlib.import_module("app.utils.conversation_store")
     return module

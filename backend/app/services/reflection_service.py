@@ -38,6 +38,31 @@ def _clean_text(value: Any, *, limit: int = 4000) -> str:
     return text[: max(0, limit - 3)].rstrip() + "..."
 
 
+def _clean_multiline_text(value: Any, *, limit: int = 8000) -> str:
+    """Keep intentional markdown line breaks while bounding stored model output."""
+
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _skill_markdown_proposal(value: Any, *, limit: int = 8000) -> str:
+    """Accept markdown-shaped drafts and reject common provider prompt echoes."""
+
+    text = _clean_multiline_text(value, limit=limit)
+    if text.startswith("```") and text.endswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 3:
+            text = "\n".join(lines[1:-1]).strip()
+    lowered = text.lower()
+    if lowered.startswith(("you said:", "thought task:", "question:")):
+        return ""
+    if not re.search(r"(?m)^#{1,6}\s+\S", text):
+        return ""
+    return text
+
+
 def _slug(value: str, *, fallback: str = "reflection") -> str:
     text = re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
     return (text or fallback)[:48]
@@ -196,6 +221,62 @@ def _response_text(response: Any) -> str:
                     return nested
         return ""
     return str(response or "")
+
+
+def _response_thought_trace(response: Any) -> List[JsonDict]:
+    """Bound and normalize provider reasoning so reflection runs can retain it."""
+
+    if not isinstance(response, dict):
+        return []
+    raw_trace = response.get("thought_trace")
+    entries = raw_trace if isinstance(raw_trace, list) else []
+    normalized: List[JsonDict] = []
+    total_chars = 0
+    for index, item in enumerate(entries[:128]):
+        source = item if isinstance(item, dict) else {"text": item}
+        text = _clean_multiline_text(source.get("text"), limit=4000)
+        if not text:
+            continue
+        remaining = 32_000 - total_chars
+        if remaining <= 0:
+            break
+        text = text[:remaining]
+        entry: JsonDict = {"index": len(normalized), "text": text}
+        for key in ("timestamp", "created_at", "type"):
+            if source.get(key) is not None:
+                entry[key] = source.get(key)
+        normalized.append(entry)
+        total_chars += len(text)
+    if normalized:
+        return normalized
+    thought = _clean_multiline_text(response.get("thought"), limit=32_000)
+    return [{"index": 0, "text": thought}] if thought else []
+
+
+def _response_generation_metadata(response: Any) -> JsonDict:
+    if not isinstance(response, dict):
+        return {}
+    metadata = (
+        response.get("metadata") if isinstance(response.get("metadata"), dict) else {}
+    )
+    allowed = (
+        "provider",
+        "server_provider",
+        "finish_reason",
+        "termination_category",
+        "thought_trace_length",
+        "usage",
+    )
+    result = {
+        key: metadata.get(key) for key in allowed if metadata.get(key) is not None
+    }
+    requested_model = metadata.get("requested_model") or metadata.get("model_requested")
+    received_model = metadata.get("received_model") or metadata.get("model_received")
+    if requested_model is not None:
+        result["requested_model"] = requested_model
+    if received_model is not None:
+        result["received_model"] = received_model
+    return result
 
 
 def reflection_store_path(config: Optional[JsonDict] = None) -> Path:
@@ -439,9 +520,10 @@ class ReflectionService:
                 "reason": self._not_runnable_reason(task),
             }
         context = self._retrieve_context(task)
-        output = self._run_reflection_pass(task, context)
+        reflection = self._run_reflection_pass(task, context)
+        output = str(reflection.get("output") or "")
         evaluation = self._evaluate_reflection(task, output, context)
-        run = self._save_run(task, output, evaluation, context)
+        run = self._save_run(task, output, evaluation, context, reflection=reflection)
         updated_task = self._update_task_after_run(task, run, evaluation)
         return {"status": "ran", "task": updated_task, "run": run}
 
@@ -540,8 +622,16 @@ class ReflectionService:
         output: str,
         evaluation: JsonDict,
         context: JsonDict,
+        *,
+        reflection: Optional[JsonDict] = None,
     ) -> JsonDict:
         created = self.now()
+        reflection_payload = reflection if isinstance(reflection, dict) else {}
+        thought_trace = (
+            reflection_payload.get("thought_trace")
+            if isinstance(reflection_payload.get("thought_trace"), list)
+            else []
+        )
         run: JsonDict = {
             "id": f"reflection-run-{int(created * 1000)}-{uuid4().hex[:8]}",
             "task_id": task["id"],
@@ -556,6 +646,14 @@ class ReflectionService:
             "should_surface_to_user": bool(evaluation.get("should_surface_to_user")),
             "created_at": created,
             "evaluation": evaluation,
+            "thought": str(reflection_payload.get("thought") or ""),
+            "thought_trace": thought_trace,
+            "thought_trace_count": len(thought_trace),
+            "generation": (
+                reflection_payload.get("generation")
+                if isinstance(reflection_payload.get("generation"), dict)
+                else {}
+            ),
         }
         with self._connect() as conn:
             conn.execute(
@@ -1057,6 +1155,7 @@ class ReflectionService:
         context: ModelContext,
         session_id: str,
         response_format: Optional[str] = None,
+        **kwargs: Any,
     ) -> Any:
         if self.llm_generate is not None:
             return self.llm_generate(
@@ -1064,6 +1163,7 @@ class ReflectionService:
                 context=context,
                 session_id=session_id,
                 response_format=response_format,
+                **kwargs,
             )
         try:
             from app import routes as routes_module
@@ -1073,13 +1173,29 @@ class ReflectionService:
                 context=context,
                 session_id=session_id,
                 response_format=response_format,
+                **kwargs,
             )
         except Exception:
             return None
 
-    def _run_reflection_pass(self, task: JsonDict, context: JsonDict) -> str:
-        ctx = ModelContext(
-            system_prompt=(
+    def _run_reflection_pass(self, task: JsonDict, context: JsonDict) -> JsonDict:
+        task_metadata = (
+            task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+        )
+        proposal_kind = str(task_metadata.get("proposal_kind") or "").strip().lower()
+        is_skill_proposal = proposal_kind == "skill_markdown"
+        if is_skill_proposal:
+            system_prompt = (
+                "You are Float's bounded skill-drafting worker. Produce one proposed "
+                "Hermes-style markdown skill document for the requested skill id. "
+                "Return markdown only, without a code fence or surrounding commentary. "
+                "Use a clear title and concise operational sections. Preserve useful "
+                "existing guidance when supplied, but do not invent unavailable tools or "
+                "permissions. This is a proposal only: never claim it was saved, enabled, "
+                "or applied."
+            )
+        else:
+            system_prompt = (
                 "You are Float's bounded reflection worker. Given one unresolved "
                 "thought task and relevant memory, do exactly one thinking pass. "
                 "Do not solve everything. Do not start unrelated threads. Try to "
@@ -1088,7 +1204,9 @@ class ReflectionService:
                 "pass is worth it, and whether this should surface to the user. "
                 "If a child-subchat control tool is available, use it only to "
                 "return to the parent chat or request more time."
-            ),
+            )
+        ctx = ModelContext(
+            system_prompt=system_prompt,
             metadata={
                 "workflow": {
                     "id": "background_reflection",
@@ -1096,6 +1214,8 @@ class ReflectionService:
                     "supports_background": True,
                 },
                 "reflection_task_id": task.get("id"),
+                "proposal_kind": proposal_kind or None,
+                "proposal_target": task_metadata.get("skill_id") or None,
             },
         )
         prompt = (
@@ -1103,20 +1223,36 @@ class ReflectionService:
             f"Question: {task.get('question')}\n\n"
             f"Relevant context:\n{context.get('text') or '(none)'}"
         )
+        generation_kwargs: JsonDict = {}
+        requested_model = _clean_text(task_metadata.get("requested_model"), limit=500)
+        if requested_model:
+            generation_kwargs["model"] = requested_model
         response = self._generate(
             prompt,
             context=ctx,
             session_id=f"reflection:{task.get('id')}",
             response_format=None,
+            **generation_kwargs,
         )
-        text = _clean_text(_response_text(response), limit=8000)
+        cleaner = _skill_markdown_proposal if is_skill_proposal else _clean_text
+        text = cleaner(_response_text(response), limit=8000)
+        thought_trace = _response_thought_trace(response)
+        reflection = {
+            "output": text,
+            "thought": "".join(str(item.get("text") or "") for item in thought_trace),
+            "thought_trace": thought_trace,
+            "generation": _response_generation_metadata(response),
+        }
         if text:
-            return text
-        return (
+            return reflection
+        if is_skill_proposal:
+            return reflection
+        reflection["output"] = (
             "Current best synthesis: not enough model output was available for a "
             "substantive pass.\nWhat changed: no new structure.\nRemaining "
             "uncertainty: high.\nAnother pass: no.\nSurface to user: no."
         )
+        return reflection
 
     def _evaluate_reflection(
         self, task: JsonDict, output: str, context: JsonDict

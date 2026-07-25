@@ -9,27 +9,25 @@ def test_build_memory_graph_keeps_focus_key_with_small_limit(monkeypatch):
     )
     graph = memory_graph_service.build_memory_graph(
         [
-          {
-            "key": "high_priority",
-            "value": {"topic": "status"},
-            "importance": 10,
-            "updated_at": 200,
-          },
-          {
-            "key": "focused_memory",
-            "value": {"topic": "family"},
-            "importance": 1,
-            "updated_at": 100,
-          },
+            {
+                "key": "high_priority",
+                "value": {"topic": "status"},
+                "importance": 10,
+                "updated_at": 200,
+            },
+            {
+                "key": "focused_memory",
+                "value": {"topic": "family"},
+                "importance": 1,
+                "updated_at": 100,
+            },
         ],
         limit=1,
         focus_key="focused_memory",
     )
 
     labels = {
-        node["label"]
-        for node in graph["nodes"]
-        if str(node.get("type")) == "memory"
+        node["label"] for node in graph["nodes"] if str(node.get("type")) == "memory"
     }
 
     assert labels == {"focused_memory"}

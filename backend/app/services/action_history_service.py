@@ -23,7 +23,8 @@ from app.services.instance_sync_service import (
 )
 from app.services.rag_provider import get_rag_service, ingest_calendar_event
 from app.tools import calendar as calendar_tools
-from app.tools import local_files, memory as memory_tools
+from app.tools import local_files
+from app.tools import memory as memory_tools
 from app.utils import (
     blob_store,
     calendar_store,
@@ -190,7 +191,9 @@ class ActionHistoryService:
                 action_id = str(row.get("id") or "").strip()
                 if not action_id:
                     continue
-                created_at_ts = float(row.get("created_at_ts") or row.get("timestamp") or 0.0)
+                created_at_ts = float(
+                    row.get("created_at_ts") or row.get("timestamp") or 0.0
+                )
                 if created_at_ts and created_at_ts < cutoff:
                     expired_ids.append(action_id)
         if not expired_ids:
@@ -244,7 +247,9 @@ class ActionHistoryService:
             "batch_scope": action.get("batch_scope"),
         }
 
-    def _persist_action(self, action: Dict[str, Any], *, emit: bool = True) -> Dict[str, Any]:
+    def _persist_action(
+        self, action: Dict[str, Any], *, emit: bool = True
+    ) -> Dict[str, Any]:
         if not self._history_enabled():
             raise ValueError("Action history retention is disabled")
         safe_action = _json_safe(action)
@@ -278,7 +283,9 @@ class ActionHistoryService:
                     break
             if not replaced:
                 index.append(summary)
-            index.sort(key=lambda item: float(item.get("created_at_ts") or 0.0), reverse=True)
+            index.sort(
+                key=lambda item: float(item.get("created_at_ts") or 0.0), reverse=True
+            )
             self._write_index(index)
         if emit and callable(self._emit):
             try:
@@ -323,7 +330,9 @@ class ActionHistoryService:
                 break
         return out
 
-    def _lookup_conversation_label(self, conversation_id: Optional[str]) -> Optional[str]:
+    def _lookup_conversation_label(
+        self, conversation_id: Optional[str]
+    ) -> Optional[str]:
         if not conversation_id:
             return None
         try:
@@ -335,12 +344,11 @@ class ActionHistoryService:
 
     def _normalize_context(self, context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         raw = dict(context or {})
-        conversation_id = str(raw.get("conversation_id") or raw.get("session_id") or "").strip()
+        conversation_id = str(
+            raw.get("conversation_id") or raw.get("session_id") or ""
+        ).strip()
         response_id = str(
-            raw.get("response_id")
-            or raw.get("message_id")
-            or raw.get("chain_id")
-            or ""
+            raw.get("response_id") or raw.get("message_id") or raw.get("chain_id") or ""
         ).strip()
         agent_id = str(
             raw.get("agent_id")
@@ -349,9 +357,9 @@ class ActionHistoryService:
             or conversation_id
             or "orchestrator"
         ).strip()
-        conversation_label = raw.get("conversation_label") or self._lookup_conversation_label(
-            conversation_id
-        )
+        conversation_label = raw.get(
+            "conversation_label"
+        ) or self._lookup_conversation_label(conversation_id)
         response_label = raw.get("response_label")
         if not response_label and response_id:
             response_label = f"response {response_id[-8:]}"
@@ -450,16 +458,23 @@ class ActionHistoryService:
             key = str(args.get("key") or "").strip()
             if not key:
                 return None
+            sections = ["memories", "knowledge"]
+            has_graph_payload = bool(
+                args.get("graph_nodes") or args.get("graph_claims")
+            )
+            if has_graph_payload:
+                sections.append("graph")
             return {
                 "kind": "sections",
                 "name": tool_name,
                 "args": copy.deepcopy(args),
                 "context": normalized_context,
-                "sections": ["memories", "knowledge"],
-                "before": self._capture_section_snapshot(["memories", "knowledge"]),
+                "sections": sections,
+                "before": self._capture_section_snapshot(sections),
                 "match": {
                     "memory_key": key,
                     "knowledge_source": f"memory:{key}",
+                    "include_graph": has_graph_payload,
                 },
             }
         if tool_name == "memory.save":
@@ -474,17 +489,36 @@ class ActionHistoryService:
                 memory_tools._normalize_optional_str(args.get("namespace")),
                 text,
             )
+            sections = ["memories", "knowledge"]
+            has_graph_payload = bool(
+                args.get("graph_nodes") or args.get("graph_claims")
+            )
+            if has_graph_payload:
+                sections.append("graph")
             return {
                 "kind": "sections",
                 "name": tool_name,
                 "args": copy.deepcopy(args),
                 "context": normalized_context,
-                "sections": ["memories", "knowledge"],
-                "before": self._capture_section_snapshot(["memories", "knowledge"]),
+                "sections": sections,
+                "before": self._capture_section_snapshot(sections),
                 "match": {
                     "memory_key": key,
                     "knowledge_source": f"memory:{key}",
+                    "include_graph": has_graph_payload,
                 },
+            }
+        if tool_name == "graph.update":
+            if not args.get("nodes") and not args.get("claims"):
+                return None
+            return {
+                "kind": "sections",
+                "name": tool_name,
+                "args": copy.deepcopy(args),
+                "context": normalized_context,
+                "sections": ["graph"],
+                "before": self._capture_section_snapshot(["graph"]),
+                "match": {"include_graph": True},
             }
         if tool_name == "create_task":
             event_id = self._derive_calendar_event_id(args)
@@ -526,8 +560,14 @@ class ActionHistoryService:
             if section == "knowledge" and knowledge_source:
                 before_source = _lookup_snapshot_source(item.get("before"))
                 after_source = _lookup_snapshot_source(item.get("after"))
-                if before_source == knowledge_source or after_source == knowledge_source:
+                if (
+                    before_source == knowledge_source
+                    or after_source == knowledge_source
+                ):
                     out.append(item)
+                continue
+            if section == "graph" and bool(match.get("include_graph")):
+                out.append(item)
                 continue
         return out
 
@@ -550,7 +590,9 @@ class ActionHistoryService:
     ) -> str:
         if not items:
             return f"{name} completed"
-        labels = [str(item.get("label") or item.get("resource_id") or "") for item in items]
+        labels = [
+            str(item.get("label") or item.get("resource_id") or "") for item in items
+        ]
         head = labels[0] if labels else name
         change_count = len(items)
         status_label = "applied" if str(status or "").lower() == "invoked" else status
@@ -622,7 +664,9 @@ class ActionHistoryService:
             "id": str(uuid4()),
             "kind": "tool",
             "name": str(token.get("name") or ""),
-            "summary": self._build_tool_summary(str(token.get("name") or ""), items, status),
+            "summary": self._build_tool_summary(
+                str(token.get("name") or ""), items, status
+            ),
             "status": status,
             "created_at": _now_iso(),
             "created_at_ts": time.time(),
@@ -655,7 +699,9 @@ class ActionHistoryService:
     ) -> Optional[Dict[str, Any]]:
         if not self._history_enabled():
             return None
-        items = InstanceSyncService().diff_snapshots(before_snapshot, after_snapshot, sections)
+        items = InstanceSyncService().diff_snapshots(
+            before_snapshot, after_snapshot, sections
+        )
         if not items:
             return None
         normalized_context = self._normalize_context(context)
@@ -673,7 +719,9 @@ class ActionHistoryService:
             "revertible": bool(items),
             "reverted_at": None,
             "reverted_by_action_id": None,
-            "target_action_ids": [str(item) for item in (target_action_ids or []) if item],
+            "target_action_ids": [
+                str(item) for item in (target_action_ids or []) if item
+            ],
             "batch_scope": _json_safe(batch_scope) if batch_scope else None,
             **normalized_context,
         }
@@ -779,7 +827,9 @@ class ActionHistoryService:
         }
         if not target_keys:
             return []
-        earliest_ts = min(float(action.get("created_at_ts") or 0.0) for action in targets)
+        earliest_ts = min(
+            float(action.get("created_at_ts") or 0.0) for action in targets
+        )
         conflicts: List[Dict[str, Any]] = []
         for row in self.list_actions(include_reverted=True, limit=1000):
             row_id = str(row.get("id") or "")
@@ -827,7 +877,8 @@ class ActionHistoryService:
                     record
                     for record in payload
                     if isinstance(record, dict)
-                    and str(record.get("key") or record.get("sync_id") or "") == resource_id
+                    and str(record.get("key") or record.get("sync_id") or "")
+                    == resource_id
                 ),
                 None,
             )
@@ -838,7 +889,8 @@ class ActionHistoryService:
                     record
                     for record in payload
                     if isinstance(record, dict)
-                    and str(record.get("knowledge_id") or record.get("sync_id") or "") == resource_id
+                    and str(record.get("knowledge_id") or record.get("sync_id") or "")
+                    == resource_id
                 ),
                 None,
             )
@@ -870,7 +922,8 @@ class ActionHistoryService:
                     record
                     for record in payload
                     if isinstance(record, dict)
-                    and str(record.get("content_hash") or record.get("sync_id") or "") == resource_id
+                    and str(record.get("content_hash") or record.get("sync_id") or "")
+                    == resource_id
                 ),
                 None,
             )
@@ -881,7 +934,8 @@ class ActionHistoryService:
                     record
                     for record in payload
                     if isinstance(record, dict)
-                    and str(record.get("event_id") or record.get("sync_id") or "") == resource_id
+                    and str(record.get("event_id") or record.get("sync_id") or "")
+                    == resource_id
                 ),
                 None,
             )
@@ -903,8 +957,12 @@ class ActionHistoryService:
             return
         if section == "conversations":
             current = self._current_snapshot_for_item(item)
-            current_name = (current or {}).get("name") if isinstance(current, dict) else None
-            target_name = (snapshot or {}).get("name") if isinstance(snapshot, dict) else None
+            current_name = (
+                (current or {}).get("name") if isinstance(current, dict) else None
+            )
+            target_name = (
+                (snapshot or {}).get("name") if isinstance(snapshot, dict) else None
+            )
             if snapshot is None:
                 if current_name:
                     conversation_store.delete_conversation(str(current_name))
@@ -956,7 +1014,11 @@ class ActionHistoryService:
                 self._delete_attachment(resource_id)
                 return
             InstanceSyncService()._write_attachment_file(  # type: ignore[attr-defined]
-                content_hash=str(snapshot.get("content_hash") or snapshot.get("sync_id") or resource_id),
+                content_hash=str(
+                    snapshot.get("content_hash")
+                    or snapshot.get("sync_id")
+                    or resource_id
+                ),
                 filename=str(snapshot.get("filename") or resource_id),
                 metadata=dict(snapshot.get("metadata") or {}),
                 data=base64.b64decode(str(snapshot.get("content_b64") or "")),
@@ -1016,7 +1078,9 @@ class ActionHistoryService:
         if response_id:
             return f"Reverted response {str(response_id)[-8:]} ({len(targets)} actions)"
         if conversation_id:
-            label = self._lookup_conversation_label(conversation_id) or str(conversation_id)
+            label = self._lookup_conversation_label(conversation_id) or str(
+                conversation_id
+            )
             return f"Reverted conversation {label} ({len(targets)} actions)"
         if len(targets) == 1:
             target = targets[0]
@@ -1068,7 +1132,9 @@ class ActionHistoryService:
         )
         revert_items: List[Dict[str, Any]] = []
         for action in ordered_targets:
-            items = [item for item in (action.get("items") or []) if isinstance(item, dict)]
+            items = [
+                item for item in (action.get("items") or []) if isinstance(item, dict)
+            ]
             for item in reversed(items):
                 current_before = self._current_snapshot_for_item(item)
                 desired = item.get("before")
@@ -1124,27 +1190,35 @@ class ActionHistoryService:
             "id": revert_action_id,
             "kind": "revert",
             "name": "revert_actions",
-            "summary": self._build_revert_summary(ordered_targets, response_id, conversation_id),
+            "summary": self._build_revert_summary(
+                ordered_targets, response_id, conversation_id
+            ),
             "status": "applied",
             "created_at": reverted_at,
             "created_at_ts": time.time(),
             "args": _json_safe(scope),
             "result": {
-                "reverted_action_ids": [str(item.get("id") or "") for item in ordered_targets],
+                "reverted_action_ids": [
+                    str(item.get("id") or "") for item in ordered_targets
+                ],
                 "conflicts": conflicts,
             },
             "items": revert_items,
             "revertible": True,
             "reverted_at": None,
             "reverted_by_action_id": None,
-            "target_action_ids": [str(item.get("id") or "") for item in ordered_targets],
+            "target_action_ids": [
+                str(item.get("id") or "") for item in ordered_targets
+            ],
             "batch_scope": scope,
             **normalized_context,
         }
         saved = self._persist_action(action)
         return {
             "status": "reverted",
-            "reverted_action_ids": [str(item.get("id") or "") for item in ordered_targets],
+            "reverted_action_ids": [
+                str(item.get("id") or "") for item in ordered_targets
+            ],
             "conflicts": conflicts,
             "action": self._summary_from_action(saved),
         }

@@ -1,5 +1,7 @@
+import copy
 import json
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,7 +65,38 @@ def pytest_runtest_makereport(item, call):
 def pytest_sessionfinish(session, exitstatus):
     logs = getattr(session, "test_logs", [])
     conv_dir = getattr(session, "conversation_dir", CONV_ROOT)
+    conv_dir.mkdir(parents=True, exist_ok=True)
     (conv_dir / "summary.json").write_text(json.dumps(logs, indent=2))
+
+
+@pytest.fixture(autouse=True)
+def restore_shared_application_state():
+    """Keep tests using the singleton FastAPI app from leaking state."""
+    main_module = sys.modules.get("app.main")
+    app = getattr(main_module, "app", None)
+    state = getattr(getattr(app, "state", None), "_state", None)
+    if not isinstance(state, dict):
+        yield
+        return
+
+    original_state = dict(state)
+    mutable_snapshots = {}
+    for key, value in original_state.items():
+        if not isinstance(value, dict):
+            continue
+        try:
+            mutable_snapshots[key] = copy.deepcopy(value)
+        except Exception:
+            mutable_snapshots[key] = dict(value)
+
+    yield
+
+    state.clear()
+    for key, value in original_state.items():
+        if key in mutable_snapshots and isinstance(value, dict):
+            value.clear()
+            value.update(mutable_snapshots[key])
+        state[key] = value
 
 
 @pytest.fixture(autouse=True)

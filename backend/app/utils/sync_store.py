@@ -10,6 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 SYNC_PATH = app_config.DEFAULT_DATABASES_DIR / "sync_state.json"
 LEGACY_SYNC_PATH = REPO_ROOT / "sync_state.json"
 MAX_SYNC_OPERATION_HISTORY = 24
+MAX_INACTIVE_SYNC_OPERATION_AGE_SECONDS = 30 * 24 * 60 * 60
 SYNC_OPERATION_STOP_EFFECT = (
     "Stop records cancel intent and aborts the current local request where "
     "supported; remote work may continue if another device already accepted it."
@@ -200,10 +201,18 @@ def _trim_operations(
         for entry in operations.values()
         if _clean_text(entry.get("status")).lower() in active_statuses
     ]
+    cutoff = _now() - MAX_INACTIVE_SYNC_OPERATION_AGE_SECONDS
     inactive = [
         entry
         for entry in operations.values()
         if _clean_text(entry.get("status")).lower() not in active_statuses
+        and float(
+            entry.get("finished_at")
+            or entry.get("updated_at")
+            or entry.get("started_at")
+            or cutoff
+        )
+        >= cutoff
     ]
     inactive.sort(key=_operation_sort_key, reverse=True)
     kept = active + inactive[:MAX_SYNC_OPERATION_HISTORY]
@@ -376,7 +385,13 @@ def cancel_operation(operation_id: str) -> Dict[str, Any]:
 
 
 def operations_snapshot(*, recent_limit: int = 8) -> Dict[str, Any]:
-    operations = list(_load_operations(_load()).values())
+    data = _load()
+    stored_operations = _load_operations(data)
+    trimmed_operations = _trim_operations(stored_operations)
+    if set(trimmed_operations) != set(stored_operations):
+        data["sync_operations"] = trimmed_operations
+        _save(data)
+    operations = list(trimmed_operations.values())
     operations.sort(key=_operation_sort_key, reverse=True)
     active_statuses = {"running", "cancel_requested"}
     active = [

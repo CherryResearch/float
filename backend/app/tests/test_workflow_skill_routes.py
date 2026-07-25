@@ -49,6 +49,31 @@ def test_workflow_skill_doc_routes_manage_local_override(tmp_path, monkeypatch):
     assert deleted_payload["active"]["source"] == "repo"
 
 
+def test_workflow_skill_doc_route_returns_blank_payload_for_missing_valid_skill(
+    tmp_path, monkeypatch
+):
+    from app import workflow_profiles
+
+    monkeypatch.setattr(workflow_profiles.app_config, "REPO_ROOT", tmp_path)
+
+    app = importlib.import_module("app.main").app
+    client = TestClient(app)
+
+    response = client.get("/api/workflows/skills/incident_triage")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["id"] == "incident_triage"
+    assert payload["repo_exists"] is False
+    assert payload["local_exists"] is False
+    assert payload["active"] is None
+    assert (
+        payload["local_path"]
+        .replace("\\", "/")
+        .endswith("data/modules/skills/incident_triage.md")
+    )
+
+
 def test_workflow_skill_doc_routes_reject_invalid_ids(tmp_path, monkeypatch):
     from app import workflow_profiles
 
@@ -65,73 +90,100 @@ def test_workflow_skill_doc_routes_reject_invalid_ids(tmp_path, monkeypatch):
         ).status_code
         == 400
     )
+    assert client.post("/api/workflows/skills/bad$id/draft", json={}).status_code == 400
 
 
-def test_workflow_pack_routes_import_export_module_and_skill(tmp_path, monkeypatch):
+def test_workflow_skill_reflection_draft_is_audited_but_not_written(
+    tmp_path, monkeypatch
+):
     from app import workflow_profiles
 
     monkeypatch.setattr(workflow_profiles.app_config, "REPO_ROOT", tmp_path)
-    source = tmp_path / "workspace" / "hermes"
-    source.mkdir(parents=True)
-    (source / "skills").mkdir()
-    (source / "config.json").write_text(
-        """
-        {
-          "id": "hermes",
-          "modules": [{"id": "hermes_agent", "skill_id": "hermes_agent"}]
-        }
-        """,
+    repo_root = tmp_path / "modules" / "skills"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    (repo_root / "incident_triage.md").write_text(
+        "# Incident Triage\n\nInspect the highest-impact failure first.\n",
         encoding="utf-8",
     )
-    (source / "skills" / "hermes_agent.md").write_text(
-        "Hermes summary\n\n# Hermes\n",
-        encoding="utf-8",
-    )
+
+    class StubReflectionService:
+        def __init__(self):
+            self.created = None
+            self.task = None
+
+        def create_task(self, **kwargs):
+            self.created = kwargs
+            self.task = {
+                "id": "thought-skill-draft",
+                "title": kwargs["title"],
+                "question": kwargs["question"],
+                "status": "open",
+                "source": kwargs["source"],
+                "metadata": kwargs["metadata"],
+                "patience": kwargs["patience"],
+            }
+            return self.task
+
+        def get_task(self, task_id):
+            return self.task if task_id == "thought-skill-draft" else None
+
+        def run_task(self, task_id, *, force=False):
+            assert task_id == "thought-skill-draft"
+            assert force is True
+            return {
+                "status": "resolved",
+                "task": {**self.task, "status": "resolved"},
+                "run": {
+                    "id": "run-skill-draft",
+                    "created_at": 123.0,
+                    "output": "# Incident Triage\n\n## Core loop\n\n- Inspect impact first.",
+                    "compact_note": "Proposed incident triage guidance.",
+                    "should_surface_to_user": False,
+                    "thought": "Plan the operational sections.",
+                    "thought_trace": [
+                        {"index": 0, "text": "Plan the operational sections."}
+                    ],
+                    "thought_trace_count": 1,
+                    "generation": {
+                        "provider": "tinker",
+                        "requested_model": "thinkingmachines/Inkling",
+                    },
+                },
+            }
 
     app = importlib.import_module("app.main").app
+    service = StubReflectionService()
+    monkeypatch.setattr(app.state, "reflection_service", service, raising=False)
     client = TestClient(app)
 
-    preview = client.post(
-        "/api/workflows/module-packs/import",
-        json={"source_path": str(source)},
+    local_path = tmp_path / "data" / "modules" / "skills" / "incident_triage.md"
+    response = client.post(
+        "/api/workflows/skills/incident_triage/draft",
+        json={
+            "focus": "Make the loop operational.",
+            "model": "thinkingmachines/Inkling",
+        },
     )
-    assert preview.status_code == 200
-    assert preview.json()["status"] == "preview"
-    assert preview.json()["dry_run"] is True
 
-    imported = client.post(
-        "/api/workflows/module-packs/import",
-        json={"source_path": str(source), "dry_run": False},
-    )
-    assert imported.status_code == 200
-    assert imported.json()["status"] == "imported"
-
-    catalog = client.get("/api/workflows/catalog").json()
-    assert any(item["id"] == "hermes_agent" for item in catalog["modules"])
-
-    export_destination = tmp_path / "workspace" / "exports"
-    exported = client.post(
-        "/api/workflows/module-packs/hermes/export",
-        json={"destination_path": str(export_destination), "dry_run": False},
-    )
-    assert exported.status_code == 200
-    assert exported.json()["status"] == "exported"
-    assert (export_destination / "hermes" / "config.json").exists()
-    assert (export_destination / "hermes" / "skills" / "hermes_agent.md").exists()
-
-    skill_source = tmp_path / "workspace" / "generic_skill.md"
-    skill_source.write_text("Generic skill summary\n", encoding="utf-8")
-    skill_import = client.post(
-        "/api/workflows/skills/import",
-        json={"source_path": str(skill_source), "dry_run": False},
-    )
-    assert skill_import.status_code == 200
-    assert skill_import.json()["skill_id"] == "generic_skill"
-
-    skill_export_destination = tmp_path / "workspace" / "skill-exports"
-    skill_export = client.post(
-        "/api/workflows/skills/generic_skill/export",
-        json={"destination_path": str(skill_export_destination), "dry_run": False},
-    )
-    assert skill_export.status_code == 200
-    assert (skill_export_destination / "generic_skill.md").exists()
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "drafted"
+    assert payload["proposal"] == {
+        "body": "# Incident Triage\n\n## Core loop\n\n- Inspect impact first.",
+        "source": "background_reflection",
+        "requires_user_save": True,
+    }
+    assert payload["audit"]["task_id"] == "thought-skill-draft"
+    assert payload["audit"]["run_id"] == "run-skill-draft"
+    assert payload["audit"]["wrote_skill_file"] is False
+    assert payload["audit"]["reasoning_trace"] == {
+        "preserved": True,
+        "entries": 1,
+        "characters": 30,
+    }
+    assert payload["audit"]["generation"]["provider"] == "tinker"
+    assert service.created["metadata"]["proposal_kind"] == "skill_markdown"
+    assert service.created["metadata"]["requires_user_save"] is True
+    assert service.created["metadata"]["requested_model"] == "thinkingmachines/Inkling"
+    assert "Make the loop operational." in service.created["question"]
+    assert not local_path.exists()

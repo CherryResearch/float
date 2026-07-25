@@ -10,7 +10,7 @@ class ErrorBoundary extends React.Component {
     return { hasError: true, error };
   }
 
-  componentDidCatch(error, info) {
+  componentDidCatch(_error, _info) {
     // Placeholder: could log to backend later
     // console.error("ErrorBoundary", error, info);
   }

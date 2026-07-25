@@ -168,7 +168,9 @@ def pick_default_device(devices: List[Dict[str, Any]]) -> Dict[str, Any]:
     return sorted_devices[0]
 
 
-def torch_cuda_diagnostics(devices: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+def torch_cuda_diagnostics(
+    devices: Optional[List[Dict[str, Any]]] = None
+) -> Dict[str, Any]:
     """Return a summary describing Torch CUDA support and detected GPUs."""
 
     info: Dict[str, Any] = {
@@ -184,7 +186,9 @@ def torch_cuda_diagnostics(devices: Optional[List[Dict[str, Any]]] = None) -> Di
     }
 
     gpu_devices = [
-        dev for dev in (devices or []) if isinstance(dev, dict) and dev.get("type") == "cuda"
+        dev
+        for dev in (devices or [])
+        if isinstance(dev, dict) and dev.get("type") == "cuda"
     ]
     info["detected_device_count"] = len(gpu_devices)
     info["detected_device_names"] = [
@@ -262,7 +266,9 @@ def _gpu_memory_snapshot_via_nvidia_smi() -> List[Dict[str, Any]]:
         total_bytes = int(total_mb * (1024**2)) if total_mb is not None else None
         free_bytes = int(free_mb * (1024**2)) if free_mb is not None else None
         used_bytes = (
-            total_bytes - free_bytes if total_bytes is not None and free_bytes is not None else None
+            total_bytes - free_bytes
+            if total_bytes is not None and free_bytes is not None
+            else None
         )
         devices.append(
             {
@@ -294,7 +300,9 @@ def gpu_memory_snapshot(*, use_torch: bool = True) -> List[Dict[str, Any]]:
                 name = torch.cuda.get_device_name(idx)
             except Exception:
                 name = None
-            free_bytes = total_bytes = allocated_bytes = reserved_bytes = used_bytes = None
+            free_bytes = (
+                total_bytes
+            ) = allocated_bytes = reserved_bytes = used_bytes = None
             try:
                 with torch.cuda.device(idx):
                     free_bytes, total_bytes = torch.cuda.mem_get_info()  # type: ignore[attr-defined]

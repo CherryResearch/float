@@ -1,8 +1,35 @@
+<#
+.SYNOPSIS
+Captures a Float UI route with Chromium.
+
+.DESCRIPTION
+Uses the existing width and height parameters for custom captures. The Pixel9
+device profile applies Chromium's Pixel 9 viewport metrics, touch input, an
+Android mobile user agent, and the matching device scale factor. The helper
+requires a Node.js runtime with global WebSocket support (Node.js 22 or newer is
+recommended).
+
+.PARAMETER DeviceProfile
+Optional named device profile. Pixel9 uses a 412x924 CSS-pixel portrait viewport
+at DPR 2.625.
+
+.PARAMETER Landscape
+Uses the Pixel9 profile in landscape at 924x412 CSS pixels. This switch requires
+-DeviceProfile Pixel9.
+
+.EXAMPLE
+powershell -ExecutionPolicy Bypass -File scripts/capture_ui.ps1 -DeviceProfile Pixel9
+
+.EXAMPLE
+powershell -ExecutionPolicy Bypass -File scripts/capture_ui.ps1 -DeviceProfile Pixel9 -Landscape
+#>
 param(
   [string]$OutputPath = "data/screenshots/ui.png",
   [string]$Route = "/?tab=threads",
   [int]$Width = 1440,
   [int]$Height = 900,
+  [ValidateSet("None", "Pixel9")][string]$DeviceProfile = "None",
+  [switch]$Landscape,
   [int]$VirtualTimeMs = 20000,
   [int]$TimeoutSec = 90,
   [int]$FrontendPort = 0,
@@ -10,6 +37,21 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+$captureProfile = "Custom"
+$devicePixelRatio = $null
+if ($DeviceProfile -eq "Pixel9") {
+  if ($PSBoundParameters.ContainsKey("Width") -or $PSBoundParameters.ContainsKey("Height")) {
+    throw "-Width and -Height cannot be combined with -DeviceProfile Pixel9. Use the profile dimensions or omit -DeviceProfile for a custom viewport."
+  }
+
+  $captureProfile = if ($Landscape) { "Pixel 9 (landscape)" } else { "Pixel 9 (portrait)" }
+  $Width = if ($Landscape) { 924 } else { 412 }
+  $Height = if ($Landscape) { 412 } else { 924 }
+  $devicePixelRatio = 2.625
+} elseif ($Landscape) {
+  throw "-Landscape requires -DeviceProfile Pixel9."
+}
 
 function Wait-HttpReady {
   param(
@@ -88,6 +130,18 @@ function Resolve-BrowserPath {
   throw "No Chromium browser found. Install Chrome/Edge or add it to PATH."
 }
 
+function Get-Pixel9UserAgent {
+  param(
+    [Parameter(Mandatory = $true)][string]$BrowserPath
+  )
+  $browserVersion = (Get-Item -LiteralPath $BrowserPath).VersionInfo.ProductVersion
+  if (-not $browserVersion -or $browserVersion -notmatch "^(\d+)") {
+    throw "Could not determine the Chromium version for the Pixel9 mobile user agent: $BrowserPath"
+  }
+  $chromiumMajor = $Matches[1]
+  return "Mozilla/5.0 (Linux; Android 14; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$chromiumMajor.0.0.0 Mobile Safari/537.36"
+}
+
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Push-Location $repoRoot
 try {
@@ -136,17 +190,61 @@ try {
   }
 
   $windowSize = "$Width,$Height"
-  $tempProfileRoot = Join-Path ([IO.Path]::GetTempPath()) "float-headless"
-  if (-not (Test-Path $tempProfileRoot)) {
-    New-Item -Path $tempProfileRoot -ItemType Directory -Force | Out-Null
+  $mobileUserAgent = if ($DeviceProfile -eq "Pixel9") {
+    Get-Pixel9UserAgent -BrowserPath $browser
+  } else {
+    $null
   }
-  $tempProfile = Join-Path $tempProfileRoot ("profile-" + [Guid]::NewGuid().ToString("N"))
-  New-Item -Path $tempProfile -ItemType Directory -Force | Out-Null
-  try {
-    $browserOutput = & $browser "--headless=new" "--disable-gpu" "--hide-scrollbars" "--no-first-run" "--no-default-browser-check" "--user-data-dir=$tempProfile" "--virtual-time-budget=$VirtualTimeMs" "--window-size=$windowSize" "--screenshot=$resolvedOutput" $targetUrl 2>&1
+  $browserOutput = $null
+  $deviceMetrics = $null
+  if ($DeviceProfile -eq "Pixel9") {
+    $node = (Get-Command node -ErrorAction Stop).Source
+    $captureHelper = Join-Path $PSScriptRoot "capture_ui_chromium.mjs"
+    if (-not (Test-Path -LiteralPath $captureHelper)) {
+      throw "Pixel9 capture helper is missing: $captureHelper"
+    }
+    $browserOutput = & $node $captureHelper `
+      "--browser" $browser `
+      "--url" $targetUrl `
+      "--output" $resolvedOutput `
+      "--width" $Width `
+      "--height" $Height `
+      "--dpr" $devicePixelRatio `
+      "--ua" $mobileUserAgent `
+      "--timeout-ms" ($TimeoutSec * 1000) `
+      "--settle-ms" ([Math]::Min($VirtualTimeMs, 5000)) 2>&1
     $browserExitCode = $LASTEXITCODE
-  } finally {
-    Remove-Item -Path $tempProfile -Recurse -Force -ErrorAction SilentlyContinue
+    if ($browserExitCode -eq 0 -and $browserOutput) {
+      try {
+        $deviceMetrics = (($browserOutput | Out-String).Trim() | ConvertFrom-Json)
+      } catch {
+        throw "Pixel9 capture completed without readable device metrics: $browserOutput"
+      }
+    }
+  } else {
+    $tempProfileRoot = Join-Path ([IO.Path]::GetTempPath()) "float-headless"
+    if (-not (Test-Path $tempProfileRoot)) {
+      New-Item -Path $tempProfileRoot -ItemType Directory -Force | Out-Null
+    }
+    $tempProfile = Join-Path $tempProfileRoot ("profile-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -Path $tempProfile -ItemType Directory -Force | Out-Null
+    try {
+    $browserArgs = @(
+      "--headless=new"
+      "--disable-gpu"
+      "--hide-scrollbars"
+      "--no-first-run"
+      "--no-default-browser-check"
+      "--user-data-dir=$tempProfile"
+      "--virtual-time-budget=$VirtualTimeMs"
+      "--window-size=$windowSize"
+      "--screenshot=$resolvedOutput"
+    )
+    $browserOutput = & $browser @browserArgs $targetUrl 2>&1
+    $browserExitCode = $LASTEXITCODE
+    } finally {
+      Remove-Item -Path $tempProfile -Recurse -Force -ErrorAction SilentlyContinue
+    }
   }
 
   if ($browserExitCode -ne 0) {
@@ -170,6 +268,22 @@ try {
   Write-Host "Saved screenshot: $resolvedOutput"
   Write-Host "Target URL: $targetUrl"
   Write-Host "Browser: $browser"
+  Write-Host "Capture profile: $captureProfile"
+  Write-Host "Logical viewport: ${Width}x${Height} CSS px"
+  if ($devicePixelRatio) {
+    $physicalWidth = [Math]::Round($Width * $devicePixelRatio)
+    $physicalHeight = [Math]::Round($Height * $devicePixelRatio)
+    Write-Host "Device pixel ratio: $devicePixelRatio"
+    Write-Host "Expected physical raster: ${physicalWidth}x${physicalHeight} px (rounded)"
+    if ($deviceMetrics) {
+      Write-Host "Observed viewport: $($deviceMetrics.innerWidth)x$($deviceMetrics.innerHeight) CSS px"
+      Write-Host "Observed DPR: $($deviceMetrics.devicePixelRatio); coarse pointer: $($deviceMetrics.pointerCoarse); hover none: $($deviceMetrics.hoverNone)"
+      Write-Host "Document width: client $($deviceMetrics.document.clientWidth), scroll $($deviceMetrics.document.scrollWidth)"
+    }
+  } else {
+    Write-Host "Device pixel ratio: browser default"
+    Write-Host "Expected physical raster: browser default for ${Width}x${Height} window"
+  }
 } catch {
   [Console]::Error.WriteLine($_.Exception.Message)
   exit 1

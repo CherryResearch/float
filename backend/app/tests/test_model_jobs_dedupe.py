@@ -39,6 +39,7 @@ def test_model_job_create_dedupes_and_resumes(
     monkeypatch, tmp_path: Path, model_name: str
 ):
     from app import routes
+    from app.routers import model_jobs
 
     start_calls = {"count": 0, "pid": 1000}
 
@@ -49,7 +50,11 @@ def test_model_job_create_dedupes_and_resumes(
         start_calls["pid"] += 1
         return DummyProc(start_calls["pid"])
 
-    monkeypatch.setattr(routes, "_start_download_process", fake_start_download_process)
+    monkeypatch.setattr(
+        model_jobs,
+        "_start_download_process",
+        fake_start_download_process,
+    )
 
     import huggingface_hub
 

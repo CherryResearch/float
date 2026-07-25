@@ -9,6 +9,7 @@ import { GlobalContext } from "../main";
 import {
   buildModelGroups,
   DEFAULT_API_MODELS,
+  formatApiModelLabel,
   formatLocalRuntimeLabel,
   isLocalRuntimeEntry,
   LOCAL_RUNTIME_ENTRIES,
@@ -19,13 +20,14 @@ import {
   SUGGESTED_SERVER_MODELS,
   SUGGESTED_LOCAL_MODELS,
 } from "../utils/modelUtils";
+import { serverTrustWarning } from "../utils/serverPresets";
 import { providerRuntimeHasChatModel } from "../utils/providerRuntime";
 import "../styles/TopBar.css";
 
 const suggestedLangModels = SUGGESTED_LOCAL_MODELS;
 const suggestedServerModels = SUGGESTED_SERVER_MODELS;
 const mobileTopbarQuery =
-  "(max-width: 600px), (orientation: portrait) and (max-width: 900px)";
+  "(max-width: 600px), (orientation: portrait) and (max-width: 900px), (orientation: landscape) and (max-width: 1000px) and (max-height: 600px)";
 const EMPTY_GLOBAL_STATE = Object.freeze({});
 const NOOP_SET_STATE = () => {};
 const LOCAL_PROVIDER_STATUS_POLL_MS = 60000;
@@ -110,6 +112,13 @@ const TopBar = () => {
     typeof globalContext?.setState === "function"
       ? globalContext.setState
       : NOOP_SET_STATE;
+  const activeServerTrustWarning =
+    state.backendMode === "server"
+      ? serverTrustWarning({
+          server_url: state.serverUrl,
+          transformer_model: state.transformerModel,
+        })
+      : "";
   const location = useLocation();
   const currentTab = location.pathname.startsWith("/settings")
     || location.pathname.startsWith("/work-history")
@@ -135,6 +144,13 @@ const TopBar = () => {
     () => (Array.isArray(state.apiModels) ? state.apiModels : []),
     [state.apiModels],
   );
+  const apiModelAliases =
+    state.apiModelAliases && typeof state.apiModelAliases === "object"
+      ? state.apiModelAliases
+      : {};
+  const apiModelCatalog = Array.isArray(state.apiModelCatalog)
+    ? state.apiModelCatalog
+    : [];
   const apiModelsAvailableSet = useMemo(
     () => new Set(apiModelsAvailable),
     [apiModelsAvailable],
@@ -388,6 +404,16 @@ const TopBar = () => {
           aria-label="Server/LAN URL"
         />
       )}
+      {activeServerTrustWarning && (
+        <Link
+          to="/settings"
+          className="status-indicator"
+          title={activeServerTrustWarning}
+          aria-label={activeServerTrustWarning}
+        >
+          <span className="status-dot warn" aria-hidden="true" />
+        </Link>
+      )}
       <button
         type="button"
         className="chip backend-chip"
@@ -409,7 +435,14 @@ const TopBar = () => {
               {apiModelGroups.defaults.map((m) => {
                 const disabled =
                   apiModelsAvailableSet.size > 0 && !apiModelsAvailableSet.has(m);
-                const label = disabled ? `${m} (unavailable)` : m;
+                const displayLabel = formatApiModelLabel(m, {
+                  aliases: apiModelAliases,
+                  availableModels: apiModelsAvailable,
+                  catalog: apiModelCatalog,
+                });
+                const label = disabled
+                  ? `${displayLabel || m} (unavailable)`
+                  : displayLabel || m;
                 return (
                   <option key={m} value={m} disabled={disabled}>
                     {label}
@@ -423,7 +456,11 @@ const TopBar = () => {
               >
                 {apiModelGroups.extras.map((m) => (
                   <option key={m} value={m}>
-                    {m}
+                    {formatApiModelLabel(m, {
+                      aliases: apiModelAliases,
+                      availableModels: apiModelsAvailable,
+                      catalog: apiModelCatalog,
+                    }) || m}
                   </option>
                 ))}
               </optgroup>
@@ -699,6 +736,11 @@ const TopBar = () => {
         setServerStatus("offline");
         setServerInventoryModels([]);
         setServerLoadedModel("");
+        setState((prev) => ({
+          ...prev,
+          serverModelDetails: [],
+          serverInventorySource: "",
+        }));
         return;
       }
       try {
@@ -714,14 +756,31 @@ const TopBar = () => {
           typeof response?.data?.loaded_model === "string"
             ? response.data.loaded_model.trim()
             : "";
+        const modelDetails = Array.isArray(response?.data?.model_details)
+          ? response.data.model_details
+          : [];
+        const inventorySource =
+          typeof response?.data?.inventory_source === "string"
+            ? response.data.inventory_source.trim()
+            : "";
         setServerInventoryModels(models);
         setServerLoadedModel(loadedModel);
+        setState((prev) => ({
+          ...prev,
+          serverModelDetails: modelDetails,
+          serverInventorySource: inventorySource,
+        }));
         setServerStatus(response?.data?.reachable || models.length ? "online" : "offline");
       } catch {
         if (!aborted) {
           setServerStatus("offline");
           setServerInventoryModels([]);
           setServerLoadedModel("");
+          setState((prev) => ({
+            ...prev,
+            serverModelDetails: [],
+            serverInventorySource: "",
+          }));
         }
       }
     };
@@ -734,7 +793,7 @@ const TopBar = () => {
     return () => {
       aborted = true;
     };
-  }, [state.backendMode, state.serverUrl]);
+  }, [state.backendMode, state.serverUrl, setState]);
 
   useEffect(() => {
     if (state.backendMode !== "server" || !serverInventoryModels.length) {

@@ -7,14 +7,15 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import jwt
 from app import config as app_config
 from app.utils import user_settings
-
-import jwt
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEVICES_PATH = app_config.DEFAULT_DATABASES_DIR / "devices.json"
 LEGACY_DEVICES_PATH = REPO_ROOT / "devices.json"
+DEVICE_TOKEN_MIN_TTL_SECONDS = 60
+DEVICE_TOKEN_MAX_TTL_SECONDS = 3600
 
 
 @dataclass
@@ -192,6 +193,10 @@ def issue_device_token(
 ) -> str:
     secret = get_device_jwt_secret()
     now = int(time.time())
+    bounded_ttl = max(
+        DEVICE_TOKEN_MIN_TTL_SECONDS,
+        min(int(ttl_seconds or 3600), DEVICE_TOKEN_MAX_TTL_SECONDS),
+    )
     payload = {
         "iss": "float-backend",
         "sub": device_id,
@@ -199,11 +204,20 @@ def issue_device_token(
         "scopes": scopes or ["sync", "stream"],
         "iat": now,
         "nbf": now,
-        "exp": now + int(ttl_seconds),
+        "exp": now + bounded_ttl,
         "jti": str(uuid.uuid4()),
     }
     return jwt.encode(payload, secret, algorithm="HS256")
 
 
 def decode_device_token(token: str) -> Dict[str, Any]:
-    return jwt.decode(token, get_device_jwt_secret(), algorithms=["HS256"])
+    payload = jwt.decode(
+        token,
+        get_device_jwt_secret(),
+        algorithms=["HS256"],
+        issuer="float-backend",
+        options={"require": ["iss", "sub", "typ", "iat", "nbf", "exp"]},
+    )
+    if payload.get("typ") != "device":
+        raise jwt.InvalidTokenError("Invalid device token type")
+    return payload

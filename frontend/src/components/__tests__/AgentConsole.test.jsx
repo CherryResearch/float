@@ -117,6 +117,15 @@ describe("AgentConsole", () => {
           },
         });
       }
+      if (url === "/api/llm/server/models") {
+        return Promise.resolve({
+          data: {
+            reachable: true,
+            models: ["server-model"],
+            loaded_model: "server-model",
+          },
+        });
+      }
       if (typeof url === "string" && url.startsWith("/api/models/verify/")) {
         return Promise.resolve({ data: { exists: false, verified: false } });
       }
@@ -169,9 +178,10 @@ describe("AgentConsole", () => {
     expect(within(backgroundRegion).getByTitle(/0 active, 0 reflections, 0 queue updates/i)).toBeInTheDocument();
     expect(backgroundRegion.querySelector(".agent-console-pip-row")).not.toBeInTheDocument();
     const runtimePanel = screen.getByRole("heading", { name: /runtime/i }).closest("section");
-    expect(runtimePanel?.querySelectorAll(".agent-console-pip")).toHaveLength(6);
-    expect(within(runtimePanel).getByTitle(/API: test-model/i)).toBeInTheDocument();
-    expect(within(runtimePanel).getByTitle(/WebSocket: offline/i)).toBeInTheDocument();
+    expect(runtimePanel?.querySelectorAll(".agent-console-pip")).toHaveLength(4);
+    expect(within(runtimePanel).getByTitle(/Runtime lane: Cloud API/i)).toBeInTheDocument();
+    expect(within(runtimePanel).getByTitle(/Runtime model: test-model/i)).toBeInTheDocument();
+    expect(within(runtimePanel).getByTitle(/runtime availability: usable/i)).toBeInTheDocument();
     expect(within(runtimePanel).getByTitle(/Budget:/i)).toBeInTheDocument();
     expect(within(runtimePanel).getByTitle(/Retrieval: idle/i)).toBeInTheDocument();
     expect(within(runtimePanel).queryByTitle(/Background work/i)).not.toBeInTheDocument();
@@ -397,6 +407,71 @@ describe("AgentConsole", () => {
     expect(container.querySelector(".agent-tool-chat-group > .agent-chat-group-line")).not.toBeNull();
     fireEvent.click(screen.getAllByRole("button", { name: /expand agent card/i })[0]);
     expect(container.querySelector(".agent-activity .agent-chat-group-line")).toBeNull();
+  });
+
+  it("stops stream progress for terminal and unresolved conversation responses", () => {
+    const now = Date.now() / 1000;
+    const streamEvent = (id, status, offset) => ({
+      type: "stream",
+      id: `stream-${id}`,
+      status,
+      timestamp: now + offset,
+      chain_id: id,
+      message_id: id,
+    });
+    const { container } = renderWithGlobalState(
+      <AgentConsole
+        collapsed={false}
+        onToggle={() => {}}
+        streamEnabled
+        onStreamToggle={() => {}}
+        agents={[
+          {
+            id: "agent-streams",
+            label: "response activity",
+            status: "active",
+            updatedAt: now,
+            events: [
+              streamEvent("msg-active", "active", 0),
+              streamEvent("msg-error", "error", 1),
+              streamEvent("msg-timeout", "timeout", 2),
+              streamEvent("msg-unresolved", "active", 3),
+              streamEvent("msg-partial", "active", 4),
+            ],
+          },
+        ]}
+        backendReady
+      />,
+      {
+        stateOverrides: {
+          conversation: [
+            { id: "msg-active", role: "ai", metadata: { status: "streaming" } },
+            { id: "msg-error", role: "ai", metadata: {} },
+            { id: "msg-timeout", role: "ai", metadata: {} },
+            {
+              id: "msg-unresolved",
+              role: "ai",
+              metadata: { unresolved_tool_loop: true },
+            },
+            { id: "msg-partial", role: "ai", metadata: { status: "partial" } },
+          ],
+        },
+      },
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /expand agent card/i }));
+    screen
+      .getAllByRole("button", { name: /expand activity details/i })
+      .forEach((button) => fireEvent.click(button));
+
+    expect(screen.getByText("response ended with an error")).toBeInTheDocument();
+    expect(screen.getByText("response timed out")).toBeInTheDocument();
+    expect(screen.getByText("tool follow-up stopped")).toBeInTheDocument();
+    expect(screen.getByText("partial response")).toBeInTheDocument();
+    expect(container.querySelectorAll('[role="status"]')).toHaveLength(4);
+    expect(
+      screen.getAllByRole("progressbar", { name: /streaming response/i }),
+    ).toHaveLength(1);
   });
 
   it("surfaces sync reviews in the console and approves them from there", async () => {
@@ -710,9 +785,14 @@ describe("AgentConsole", () => {
     );
 
     const runtimePanel = screen.getByRole("heading", { name: /runtime/i }).closest("section");
-    expect(within(runtimePanel).getByText("server mode")).toBeInTheDocument();
-    expect(within(runtimePanel).getByTitle(/Server URL: http:\/\/float-box:8000\/v1/i)).toBeInTheDocument();
-    expect(within(runtimePanel).getByTitle(/Server model: server-model/i)).toBeInTheDocument();
+    expect(within(runtimePanel).getAllByText("Server/LAN").length).toBeGreaterThan(0);
+    expect(
+      within(runtimePanel).getByTitle(/Runtime endpoint: http:\/\/float-box:8000\/v1/i),
+    ).toBeInTheDocument();
+    expect(within(runtimePanel).getByTitle(/Runtime model: server-model/i)).toBeInTheDocument();
+    expect(
+      await within(runtimePanel).findByTitle(/runtime availability: usable/i),
+    ).toBeInTheDocument();
     expect(within(runtimePanel).getByTitle(/Budget:/i)).toBeInTheDocument();
     expect(within(runtimePanel).queryByTitle(/API model:/i)).not.toBeInTheDocument();
 
@@ -855,7 +935,7 @@ describe("AgentConsole", () => {
     await expandRuntimeDetails();
 
     expect(
-      await screen.findByTitle(/runtime status: external model loaded/i),
+      await screen.findByTitle(/runtime availability: usable/i),
     ).toBeInTheDocument();
     expect(
       screen.getByText(/switch this lane to External HTTP only before using start, stop, load, or unload here\./i),
@@ -1161,6 +1241,34 @@ describe("AgentConsole", () => {
     expect(screen.getByText(/That undo restored 15 of 54 tracked items\./i)).toBeInTheDocument();
   });
 
+  it("renders deployment metadata without offering a content diff", () => {
+    render(
+      <MemoryRouter>
+        <ActionHistoryPanel
+          actions={[
+            {
+              id: "deployment-event:event-1",
+              kind: "deployment",
+              name: "software_install",
+              summary: "Installed Float 0.1.0a1 // b-test",
+              status: "completed",
+              created_at_ts: Date.parse("2026-07-16T12:00:00Z") / 1000,
+              item_count: 0,
+              revertible: false,
+              metadata_only: true,
+            },
+          ]}
+          backendReady
+          onRefresh={() => {}}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText(/Installed Float 0\.1\.0a1 \/\/ b-test/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /show diff/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /revert action/i })).toBeDisabled();
+  });
+
   it("lets individual write items minimize, hide, and restore inside write history", () => {
     const ts = Date.parse("2026-03-24T23:38:00Z") / 1000;
     const actions = [
@@ -1447,7 +1555,28 @@ describe("AgentConsole", () => {
     fireEvent(
       window,
       new CustomEvent(TOOL_REVIEW_ACTION_EVENT, {
-        detail: { action: "accept", toolIds: ["proposal-1"] },
+        detail: {
+          action: "accept",
+          scope: "selected",
+          selectedToolId: "stale-proposal",
+          toolIds: ["proposal-1"],
+          chainId: "msg-1",
+        },
+      }),
+    );
+    expect(
+      axios.post.mock.calls.some(([url]) => url === "/api/tools/decision"),
+    ).toBe(false);
+
+    fireEvent(
+      window,
+      new CustomEvent(TOOL_REVIEW_ACTION_EVENT, {
+        detail: {
+          action: "accept",
+          scope: "selected",
+          selectedToolId: "proposal-1",
+          toolIds: ["proposal-1"],
+        },
       }),
     );
 
@@ -2356,7 +2485,7 @@ describe("AgentConsole", () => {
     );
 
     expect(
-      await screen.findByText("installed", { selector: ".runtime-panel-status" }),
+      await screen.findByText("unavailable", { selector: ".runtime-panel-status" }),
     ).toBeInTheDocument();
     await expandRuntimeDetails();
     expect(screen.getByRole("button", { name: "start" })).toBeInTheDocument();
@@ -2452,7 +2581,7 @@ describe("AgentConsole", () => {
     );
 
     expect(
-      await screen.findByText("endpoint reachable", { selector: ".runtime-panel-status" }),
+      await screen.findByText("usable", { selector: ".runtime-panel-status" }),
     ).toBeInTheDocument();
     await expandRuntimeDetails();
     expect(screen.getByText("remote endpoint")).toBeInTheDocument();
@@ -2545,7 +2674,7 @@ describe("AgentConsole", () => {
     );
 
     expect(
-      await screen.findByText("not installed", { selector: ".runtime-panel-status" }),
+      await screen.findByText("unavailable", { selector: ".runtime-panel-status" }),
     ).toBeInTheDocument();
     await expandRuntimeDetails();
     expect(await screen.findByDisplayValue("gemma-4-a")).toBeInTheDocument();
@@ -2613,15 +2742,17 @@ describe("AgentConsole", () => {
     );
 
     expect(
-      await screen.findByText("model loaded", { selector: ".runtime-panel-status" }),
+      await screen.findByText("usable", { selector: ".runtime-panel-status" }),
     ).toBeInTheDocument();
     await expandRuntimeDetails();
-    expect(
-      screen.getByText(/Last action: load#7 failed for gpt-oss-20b/i),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(/Last action: load#7 failed for gpt-oss-20b/i),
-    ).toHaveAttribute("title", expect.stringContaining("endpoint http://127.0.0.1:1234/v1/responses"));
+    const lastActionDetails = screen
+      .getAllByText(/Last action: load#7 failed for gpt-oss-20b/i)
+      .find((element) => element.classList.contains("runtime-panel-note"));
+    expect(lastActionDetails).toBeInTheDocument();
+    expect(lastActionDetails).toHaveAttribute(
+      "title",
+      expect.stringContaining("endpoint http://127.0.0.1:1234/v1/responses"),
+    );
   });
 
   it("polls provider runtime less often and only loads provider logs on demand", async () => {
@@ -2706,7 +2837,7 @@ describe("AgentConsole", () => {
     );
 
     expect(
-      await screen.findByText("model loaded", { selector: ".runtime-panel-status" }),
+      await screen.findByText("usable", { selector: ".runtime-panel-status" }),
     ).toBeInTheDocument();
     expect(intervalDelays).toContain(60000);
     expect(providerLogCalls).toHaveLength(0);
@@ -2779,10 +2910,12 @@ describe("AgentConsole", () => {
     );
 
     expect(
-      await screen.findByText("model loaded", { selector: ".runtime-panel-status" }),
+      await screen.findByText("usable", { selector: ".runtime-panel-status" }),
     ).toBeInTheDocument();
     await expandRuntimeDetails();
-    expect(screen.getByText("http://127.0.0.1:11434/v1")).toBeInTheDocument();
+    expect(
+      screen.getByTitle(/Runtime endpoint: http:\/\/127.0.0.1:11434\/v1/i),
+    ).toBeInTheDocument();
     expect(screen.getByDisplayValue("gemma-4-E2B-it-Q4_K_M")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^load$/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^unload$/i })).toBeInTheDocument();

@@ -7,16 +7,9 @@ from typing import TYPE_CHECKING, Any, Callable, Dict
 from . import actions as action_tools
 from . import browser
 from . import calendar as calendar_tools
-from . import (
-    capability_docs,
-    computer_tools,
-    conversations,
-    crawler,
-    local_files,
-    memory,
-    reflections,
-    routing,
-)
+from . import capability_docs, computer_tools, conversations, crawler
+from . import graph as graph_tools
+from . import local_files, memory, reflections, routing
 from . import subchat as subchat_tools
 from . import threads
 from . import tool_help as help_tools
@@ -57,6 +50,7 @@ BUILTIN_TOOLS: Dict[str, Callable[..., Any]] = {
     "memory.save": memory.legacy_memory_save,
     "remember": memory.remember,
     "recall": memory.recall,
+    "graph.update": graph_tools.update_graph,
     "reflect": reflections.reflect,
     "list_reflections": reflections.list_reflections,
     "list_actions": action_tools.list_actions,
@@ -86,6 +80,7 @@ __all__ = [
     "threads",
     "conversations",
     "memory",
+    "graph_tools",
     "reflections",
     "action_tools",
     "subchat_tools",

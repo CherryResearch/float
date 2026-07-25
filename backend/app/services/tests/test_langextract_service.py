@@ -1,5 +1,4 @@
-from app.services.langextract_service import (LangExtractService,  # noqa: E501
-                                              data, lx)
+from app.services.langextract_service import LangExtractService, data, lx  # noqa: E501
 
 
 def test_from_text_wraps_extract(monkeypatch):

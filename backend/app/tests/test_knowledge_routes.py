@@ -1,5 +1,4 @@
 import asyncio
-import os
 import sys
 import types
 from pathlib import Path
@@ -145,6 +144,144 @@ def test_reload_memory_manager_from_store_invokes_manager_loader():
     assert calls == ["reloaded"]
 
 
+@pytest.mark.parametrize(
+    ("filename", "content_type", "expected_method"),
+    [
+        ("profile.md", "text/markdown", "markdown"),
+        ("profile.markdown", "application/octet-stream", "markdown"),
+        ("profile-empty.md", "", "markdown"),
+        ("profile.txt", "application/octet-stream", "file"),
+    ],
+)
+def test_knowledge_upload_accepts_safe_markdown_and_text_types(
+    client, tmp_path, monkeypatch, filename, content_type, expected_method
+):
+    from app import routes
+
+    calls = []
+
+    class FakeService:
+        def ingest_markdown(self, path, metadata):
+            calls.append(("markdown", Path(path), dict(metadata)))
+            return "markdown-doc"
+
+        def ingest_file(self, path, metadata):
+            calls.append(("file", Path(path), dict(metadata)))
+            return "text-doc"
+
+    monkeypatch.setattr(routes, "_get_rag_service", lambda: FakeService())
+
+    response = client.post(
+        "/knowledge/upload",
+        files={
+            "file": (
+                filename,
+                b"# Profile\n\nLocal-first document.",
+                content_type,
+            )
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+    method, stored_path, metadata = calls[0]
+    assert method == expected_method
+    assert stored_path == tmp_path / "data_root" / "files" / "workspace" / filename
+    assert stored_path.read_text(encoding="utf-8").startswith("# Profile")
+    assert metadata["kind"] == "document"
+    assert metadata["type"] == "document"
+    assert metadata["relative_path"] == f"workspace/{filename}"
+
+
+def test_knowledge_upload_rejects_binary_markdown_before_write(
+    client, tmp_path, monkeypatch
+):
+    from app import routes
+
+    monkeypatch.setattr(
+        routes,
+        "_get_rag_service",
+        lambda: pytest.fail("Invalid Markdown must not reach knowledge ingestion"),
+    )
+
+    response = client.post(
+        "/knowledge/upload",
+        files={
+            "file": (
+                "binary.md",
+                b"\xff\xfe\x00\x01",
+                "application/octet-stream",
+            )
+        },
+    )
+
+    assert response.status_code == 400
+    assert "utf-8" in str(response.json().get("detail", "")).lower()
+    target = tmp_path / "data_root" / "files" / "workspace" / "binary.md"
+    assert not target.exists()
+
+
+def test_knowledge_upload_uses_collision_safe_document_names(
+    client, tmp_path, monkeypatch
+):
+    from app import routes
+
+    stored_paths = []
+
+    class FakeService:
+        def ingest_markdown(self, path, metadata):
+            stored_paths.append(Path(path))
+            return str(metadata["source"])
+
+    monkeypatch.setattr(routes, "_get_rag_service", lambda: FakeService())
+
+    for body in (b"first", b"second", b"third"):
+        response = client.post(
+            "/knowledge/upload",
+            files={"file": ("profile.md", body, "text/markdown")},
+        )
+        assert response.status_code == 200
+
+    assert [path.name for path in stored_paths] == [
+        "profile.md",
+        "profile-2.md",
+        "profile-3.md",
+    ]
+    assert [path.read_text(encoding="utf-8") for path in stored_paths] == [
+        "first",
+        "second",
+        "third",
+    ]
+    workspace = tmp_path / "data_root" / "files" / "workspace"
+    assert sorted(path.name for path in workspace.iterdir()) == [
+        "profile-2.md",
+        "profile-3.md",
+        "profile.md",
+    ]
+
+
+def test_knowledge_upload_rejects_markdown_mime_for_arbitrary_suffix(
+    client, tmp_path, monkeypatch
+):
+    from app import routes
+
+    monkeypatch.setattr(
+        routes,
+        "_get_rag_service",
+        lambda: pytest.fail("Rejected Markdown must not reach knowledge ingestion"),
+    )
+
+    response = client.post(
+        "/knowledge/upload",
+        files={"file": ("profile.bin", b"plain text", "text/markdown")},
+    )
+
+    assert response.status_code == 400
+    assert ".md" in str(response.json().get("detail", ""))
+    target = tmp_path / "data_root" / "files" / "workspace" / "profile.bin"
+    assert not target.exists()
+
+
 def test_knowledge_reveal_local_file_under_data_files(client, tmp_path):
     data_root = tmp_path / "data_root"
     local_doc = data_root / "files" / "downloaded" / "notes.txt"
@@ -224,49 +361,6 @@ def test_knowledge_update_rewrites_local_workspace_text_file(client, tmp_path):
     assert fetch_resp.status_code == 200
     payload = (fetch_resp.json().get("metadatas") or [{}])[0]
     assert payload.get("source_last_saved_at")
-
-
-def test_workspace_files_list_serve_and_edit_managed_roots(client):
-    data_root = Path(os.environ["FLOAT_DATA_DIR"])
-    files_doc = data_root / "files" / "workspace" / "notes" / "alpha.md"
-    files_doc.parent.mkdir(parents=True, exist_ok=True)
-    files_doc.write_text("# Alpha\n\nworkspace body", encoding="utf-8")
-    tool_doc = data_root / "workspace" / "tool-note.txt"
-    tool_doc.parent.mkdir(parents=True, exist_ok=True)
-    tool_doc.write_text("tool workspace body", encoding="utf-8")
-
-    listing = client.get("/knowledge/workspace-files")
-    assert listing.status_code == 200
-    entries = listing.json()["entries"]
-    assert any(
-        entry["root"] == "files"
-        and entry["path"] == "notes/alpha.md"
-        and entry["type"] == "file"
-        for entry in entries
-    )
-    assert any(
-        entry["root"] == "tool"
-        and entry["path"] == "tool-note.txt"
-        and entry["type"] == "file"
-        for entry in entries
-    )
-
-    file_resp = client.get("/knowledge/workspace-file/files/notes/alpha.md")
-    assert file_resp.status_code == 200
-    assert "workspace body" in file_resp.text
-
-    edit_resp = client.put(
-        "/knowledge/workspace-file/tool/tool-note.txt",
-        json={"text": "edited tool workspace body"},
-    )
-    assert edit_resp.status_code == 200
-    assert tool_doc.read_text(encoding="utf-8") == "edited tool workspace body"
-
-
-def test_workspace_file_routes_reject_path_escape(client):
-    resp = client.get("/knowledge/workspace-file/files/%2E%2E/%2E%2E/secret.txt")
-    assert resp.status_code == 400
-    assert "outside root" in str(resp.json().get("detail", "")).lower()
 
 
 def test_knowledge_file_rejects_non_local_source(client):

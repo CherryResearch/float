@@ -22,7 +22,7 @@ float leverages language models and a modular architecture to provide a platform
 - Memory + RAG with Knowledge UI, plus `threads` semantic tagging. Text-based durable memories and flexible embeddings work in tandem.
 - Attachments + media viewer for images, PDFs, and common audio formats.
 - Calendar events + scheduled actions/tasks.
-- Conversation export/import (markdown/json/text) and history management, including OpenAI-style export ZIP ingest from the History sidebar via file upload (MD/JSON/text/ZIP), currently by selecting a zip and saving a new conversation, but this flow is not yet manually tested.
+- Conversation export/import (Markdown/JSON/text) and history management, including reviewed OpenAI-style ZIP ingest from the History sidebar. Markdown and text routing have live verification, while JSON/ZIP selection and metadata filtering have targeted automated coverage; a broader manual cross-format pass remains useful.
 - Reflections: bounded background thought tasks can review recent chats, memories, or a user-supplied question, then store useful notes or follow-ups without becoming an always-on autonomous process.
 - Write history: action/write tracking with tunable retention helps inspect and recover from tool-side changes.
 
@@ -47,7 +47,7 @@ These inline tokens remain clickable until you delete the trailing space or the 
 
 ## Architecture
 
-- **Language Models**: Local Transformers checkpoints (GPT-OSS and Gemma 4 lanes first), managed local providers (LM Studio/Ollama/custom OpenAI-compatible servers), and cloud API endpoints. Defaults focus on `gpt-5.4` (API) and `gpt-oss-20b` (local). Hugging Face is used for gated local downloads, and API endpoints can be changed to other providers.
+- **Language Models**: Local Transformers checkpoints (GPT-OSS and Gemma 4 lanes first), managed local providers (LM Studio/Ollama/custom OpenAI-compatible servers), and cloud API endpoints. Defaults focus on OpenAI `chat-latest` (shown in the UI as `GPT latest (...)`) for API chat and `gpt-oss-20b` for local chat. Hugging Face is used for gated local downloads, and API endpoints can be changed to other providers.
 - **Data Store**: SQLite is the canonical store for durable memory, knowledge chunks, and the lightweight graph/claim substrate; Chroma is the local retrieval mirror, and Weaviate remains an optional vector backend. Using tool calls or manual user input, float can update, edit, store, and reason about memories. Ideally, long-form content is preserved without forcing everything into a naive vector-only search path. File-system interaction with markdown in a float workspace is being tested.
 - **Tool Calling**: Built-in tools cover discovery, memory, retrieval, web, managed file access, compaction, reflections, action history, and guarded computer/capture surfaces. MCP remains available for external tool servers but is not required for built-ins.
 - **Modular Design**: Allows for easy replacement of internal models and features.
@@ -60,7 +60,7 @@ These inline tokens remain clickable until you delete the trailing space or the 
 ### Prerequisites
 
 - **Python 3.11+**
-- **Node.js 16+** with npm (in WSL use NVM)
+- **Node.js 20+** with npm (in WSL use NVM)
 - **Redis server** (required for Celery/background workers; optional for backend/frontend-only local runs)
 - *Docker* (optional backend-image experiment; not the recommended alpha path)
 
@@ -76,21 +76,20 @@ pipx ensurepath
 poetry install
 npm install
 ```
-# Activate the project environment
-# poetry can not safely package CUDA. once you have activated the env with poetry shell, run this: 
+# Activate the project environment.
+# Poetry locks the CPU-compatible reference pair. For CUDA, replace only the
+# wheel source while keeping the versions declared in pyproject.toml aligned.
 ```bash
 poetry env activate
-# this prints the command to activate the associated env: copy and paste it e.g. & "C:\users\...pypoetry\cache\virtualenvs\ ..."
-pip install torch==2.7.1+cu128 torchvision==0.22.1+cu128 torchaudio==2.7.1+cu128 --index-url https://download.pytorch.org/whl/cu128
-```
-If pip/poetry stalls on large wheels, `uv` can install into the Poetry env:
-```bash
-poetry run uv pip install --upgrade --force-reinstall --index-url https://download.pytorch.org/whl/cu128 torch==2.7.1+cu128 torchvision==0.22.1+cu128 torchaudio==2.7.1+cu128
+# This prints the command to activate the associated environment.
+poetry run uv pip install --upgrade --force-reinstall --index-url https://download.pytorch.org/whl/cu128 torch==2.10.0 torchvision==0.25.0
 ```
 CPU-only fallback (fixes `torchvision::nms` mismatch errors):
 ```bash
-poetry run uv pip install --upgrade --force-reinstall --index-url https://download.pytorch.org/whl/cpu torch==2.7.1+cpu torchvision==0.22.1+cpu torchaudio==2.7.1+cpu
+poetry run uv pip install --upgrade --force-reinstall --index-url https://download.pytorch.org/whl/cpu torch==2.10.0 torchvision==0.25.0
 ```
+Do not mix a Torch wheel from one release pair with torchvision from another.
+`torchaudio` is not a Float dependency and does not need to be installed.
 Then launch the servers with the provided CLI:
 ```bash
 poetry run float
@@ -107,7 +106,8 @@ This installs the Playwright browser runtime, installs Chromium, and runs direct
 
 once launched, navigate to settings, and ensure the url points to https://api.openai.com/v1/responses
 then add your openai API key from platform.openai.com
-  - Float keeps a small default model list, and will also poll the configured provider for available models (via `/api/openai/models`) so current and future provider entries show up in the selectors. The API default is currently `gpt-5.4`.
+  - Float keeps only `chat-latest` as a static API fallback and polls the configured provider through `/api/openai/models` for concrete choices. The catalog prevents new selection of known deprecated or removed ids while preserving an old saved choice long enough to show a migration target. `chat-latest` is displayed as `GPT latest (model)` when provider inventory can infer the current concrete GPT family model.
+  - Under **Settings → Models & Retrieval → Model library**, paste a Hugging Face model URL or `owner/repo` to add it to your personal catalog. Choose **Direct Transformers** for compatible checkpoints or **Provider / GGUF** for weights intended for LM Studio, Ollama, or another provider. Adding the link does not download weights until you use the model download control.
 
 ### Hugging Face tokens (for gated model downloads)
 
@@ -124,24 +124,55 @@ Managed local providers:
 The provider path uses an OpenAI-compatible transport such as `http://<host>:<port>/v1`.
 `Server/LAN` is separate: it points at an already-running OpenAI-compatible server via `server_url` and does not use the local provider manager.
 
+Server/LAN settings include built-in presets for localhost LM Studio and Ollama, Tinker / Inkling, Anthropic / Claude compatibility, Gemini's OpenAI-compatible API, and OpenRouter. You can also save custom OpenAI-compatible endpoints. Presets store connection metadata and the name of an environment variable, never the API-key value itself. Tinker model refresh uses the authenticated account to list supported base models plus sampler checkpoints such as custom fine-tunes; select the returned `tinker://.../sampler_weights/...` model id like any other Server/LAN model. OpenAI remains the default Cloud API lane.
+
+Hosted Server/LAN presets expect their API key to be available to the Float backend before it starts. The preset selector does not store the secret in browser state or preset JSON. Set the matching variable in the shell that launches Float, or put it in the repository-root `.env` file (which is gitignored):
+
+| Server/LAN preset | Backend environment variable |
+| --- | --- |
+| Tinker / Inkling | `TINKER_API_KEY` |
+| Anthropic / Claude compatibility | `ANTHROPIC_API_KEY` |
+| Gemini compatibility | `GEMINI_API_KEY` |
+| OpenRouter | `OPENROUTER_API_KEY` |
+| LM Studio / Ollama localhost | Usually none |
+
+PowerShell, for the current terminal session:
+
+```powershell
+$env:TINKER_API_KEY="your-key"
+poetry run float
+```
+
+macOS/Linux:
+
+```bash
+export TINKER_API_KEY="your-key"
+poetry run float
+```
+
+Alternatively, copy `.env.example` to `.env`, fill only the keys you use, and then launch Float normally:
+
+```dotenv
+TINKER_API_KEY=your-key
+OPENROUTER_API_KEY=your-key
+```
+
+For a custom preset, enter the environment-variable name (for example, `MY_PROVIDER_API_KEY`) in the preset and define that same variable in the launch environment or root `.env`. Restart Float after adding or changing a provider key, then refresh the Server/LAN model list. Keep Cloud API credentials separate: the default OpenAI lane uses `OPENAI_API_KEY` (or the legacy `API_KEY` fallback).
+
+Provider presets are a common inference interface, not a claim of native API parity. Anthropic's direct preset uses its OpenAI SDK compatibility layer, so Claude-native-only capabilities and exact tool/structured-output semantics are outside this lane; OpenRouter or a custom compatibility gateway remains another option. Float does not include or suggest a Grok/xAI preset, model, default, or inferred credential. If a manually configured endpoint or routed model is identified as xAI / Grok, Float displays `This model may not be trustworthy.` without silently blocking the user's connection.
+
 If local Transformers fails on BF16/MXFP4/CUDA mismatches, switch to a managed quantized runtime such as `lmstudio` or `ollama`.
 If the model you have is a raw `.gguf`, do not treat it like a direct local Transformers checkpoint. Run it behind LM Studio, Ollama, or another OpenAI-compatible server first.
-
-Current dev caveat: direct local Transformers inference is best-effort until the
-dev environment has a CUDA-enabled PyTorch stack and a validated target hardware
-profile. For serious local implementations and QA, prefer a hosted local
-runtime such as LM Studio, Ollama, llama.cpp, or another OpenAI-compatible
-server.
 
 ### Gemma 4 runtime lanes
 
 Gemma 4 now follows an explicit three-lane split in Float:
 
 - `Cloud API`: keep OpenAI Realtime for live voice and live-session transport.
-- `Server/LAN`: use LM Studio, llama.cpp, Ollama, or another OpenAI-compatible endpoint for Gemma 4 QAT GGUF deployments such as `gemma-4-E4B-it-qat-q4_0-gguf`, `gemma-4-12B-it-qat-q4_0-gguf`, `gemma-4-26B-A4B-it-qat-q4_0-gguf`, and `gemma-4-31B-it-qat-q4_0-gguf`.
-- `Local (on-device)`: direct local Transformers support targets `gemma-4-E2B-it` plus the unquantized QAT aliases `gemma-4-E2B-it-qat-q4_0` and `gemma-4-12B-it-qat-q4_0`.
+- `Server/LAN`: use LM Studio or another OpenAI-compatible endpoint for larger Gemma 4 deployments such as `gemma-4-E4B-it`, `gemma-4-26B-A4B-it`, and `gemma-4-31B-it`.
+- `Local (on-device)`: direct local Transformers support now targets `gemma-4-E2B-it` as the first real Gemma 4 checkpoint.
 
-Direct local Gemma 4 uses Hugging Face's multimodal `AutoProcessor` + `AutoModelForImageTextToText` path, so the E2B lane can handle text-only turns and still-image plus text turns locally. The GGUF QAT aliases remain provider/server-first; for example, `gemma-4-12B-it-qat-q4_0-gguf` resolves to the official Hugging Face repo `google/gemma-4-12B-it-qat-q4_0-gguf`. Gemma also informs local live/multimodal experiments, but live voice remains API-first in this patch.
+Direct local Gemma 4 uses Hugging Face's multimodal `AutoProcessor` + `AutoModelForImageTextToText` path, so `gemma-4-E2B-it` can handle text-only turns and still-image plus text turns locally. The larger Gemma 4 checkpoints remain provider/server-first in this pass and are intentionally not exposed as built-in direct-download recommendations. Gemma also informs local live/multimodal experiments, but live voice remains API-first in this patch.
 
 Routing snapshot:
 
@@ -236,6 +267,8 @@ All flags are per-run; nothing is persisted except sticky port/browser state in 
 - `--skip-backend`: do not start the backend server.
 - `--skip-frontend`: do not start the frontend server.
 - `--backend-port <port>`: set backend port (default: auto-select).
+- `--backend-host <host>`: set the backend bind host (default: `127.0.0.1`).
+- `--lan`: explicitly bind the backend to `0.0.0.0`; ordinary APIs remain reachable only through Float's same-host frontend proxy, while paired-device routes keep their visibility/token checks.
 - `--frontend-port <port>`: set frontend port (default: auto-select).
 - `--sticky-ports` / `--no-sticky-ports`: reuse last ports or choose new ports each run.
 - `--no-open`: do not open a browser tab on launch.
@@ -327,11 +360,11 @@ OpenAI Realtime optional settings:
 ```env
 OPENAI_API_KEY=your_openai_key
 FLOAT_STREAM_BACKEND=api
-OPENAI_REALTIME_MODEL=gpt-realtime-2
+OPENAI_REALTIME_MODEL=gpt-realtime-2.1
 OPENAI_REALTIME_TURN_DETECTION=server_vad
 OPENAI_REALTIME_TTL_SECONDS=600
 ```
-Settings still keeps `gpt-realtime-1.5` available as a lower text-output-cost fallback.
+Settings still keeps `gpt-realtime-2.1-mini`, `gpt-realtime-2`, `gpt-realtime-mini`, and `gpt-realtime-1.5` available as fallback choices.
 
 LiveKit fallback settings:
 
@@ -350,8 +383,8 @@ Float's runtime selectors are lane-based rather than a fixed model zoo. The tabl
 
 | Surface | Current primary paths | Notes |
 | --- | --- | --- |
-| Chat LLM | Cloud API default `gpt-5.4`; direct local default `gpt-oss-20b`; custom OpenAI-compatible API, Server/LAN, LM Studio, or Ollama endpoints. | Chat can route through API, direct local Transformers, managed local providers, or Server/LAN. Runtime parity is still in progress. |
-| Gemma 4 | Direct local `gemma-4-E2B-it` / QAT unquantized aliases; QAT GGUF aliases through Server/LAN or managed providers. | Still-image plus text is the current local target. GGUF runs behind an OpenAI-compatible provider. |
+| Chat LLM | Cloud API default `chat-latest` (`GPT latest (...)` in UI); direct local default `gpt-oss-20b`; custom OpenAI-compatible API, Server/LAN, LM Studio, or Ollama endpoints. | Chat can route through API, direct local Transformers, managed local providers, or Server/LAN. Runtime parity is still in progress. |
+| Gemma 4 | Direct local `gemma-4-E2B-it`; larger Gemma 4 checkpoints through Server/LAN or managed providers. | Still-image plus text is the current local target. Live/multimodal work is experimental. |
 | Speech and live voice | OpenAI Realtime for live voice; OpenAI TTS/STT by default; local voice paths remain experimental. | Browser microphone and transcript behavior still need live smoke testing after changes. |
 | Retrieval and memory | SQLite durable store, Chroma retrieval mirror, optional provider embeddings, and optional Weaviate backend. | Durable memories and vector retrieval are deliberately separate so private or long-form text does not have to be mirrored everywhere. |
 | Attachments and media | Images, PDFs, and common audio files through chat attachments and the media viewer. | Captions, retrieval indexing, and media metadata are visible in the UI but still evolving. |
@@ -449,7 +482,7 @@ The `LLMService` can work with external models as well. Set environment variable
 
 The **Settings** selectors accept any API/local endpoint pair; defaults are predictable and user settings persist. Current main defaults:
 
-- `gpt-5.4` *(OpenAI API default)*
+- `chat-latest` *(OpenAI API rolling default, shown as `GPT latest (...)` when inventory is available)*
 - `gpt-oss-20b` *(local default)*
 
 Additional local/server options are allowed through custom endpoints, managed providers, or manually selected local checkpoints. Presets are convenience defaults, not a closed list. Hugging Face cache clutter and modality filtering are still being improved, so some downloads may need a manual HF fetch and then selection from `data/models/`.
@@ -457,10 +490,6 @@ Additional local/server options are allowed through custom endpoints, managed pr
 > GPT-OSS can handle roughly 7B-20B locally on a modern GPU. 120B-class models usually require a remote GPT-OSS server or multi-GPU setup.
 
 ## Contributing
-
-Please start with [CONTRIBUTING.md](CONTRIBUTING.md). It covers public tracker
-links, QA reports, code/docs contributions, dataset proposals, and future
-fine-tuning/model-adapter contribution rules.
 
 External contributions are accepted only after the contributor agrees to the
 repository's assignment terms in [CLA.md](CLA.md). Accepted contributions are

@@ -359,6 +359,18 @@ describe("TopBar local runtime entries", () => {
     ).toBeInTheDocument();
   });
 
+  it("surfaces the Grok trust warning from Server/LAN", () => {
+    renderTopBar({
+      backendMode: "server",
+      transformerModel: "grok-4",
+      serverUrl: "https://api.x.ai/v1",
+    });
+
+    expect(
+      screen.getByLabelText("This model may not be trustworthy."),
+    ).toHaveAttribute("href", "/settings");
+  });
+
   it("offers the loaded server model and selects it when server default is active", async () => {
     axiosMocks.get.mockImplementation((url) => {
       if (url === "/api/settings") {

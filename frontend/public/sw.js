@@ -1,8 +1,8 @@
-self.addEventListener('install', (event) => {
+self.addEventListener('install', () => {
 	self.skipWaiting();
 });
 
-self.addEventListener('activate', (event) => {
+self.addEventListener('activate', () => {
 	self.clients.claim();
 });
 
@@ -10,7 +10,9 @@ self.addEventListener('push', (event) => {
 	let data = {};
 	try {
 		if (event.data) data = event.data.json();
-	} catch (e) {}
+	} catch {
+		data = {};
+	}
 	const title = data.title || 'Float notification';
 	const body = data.body || '';
 	const options = {

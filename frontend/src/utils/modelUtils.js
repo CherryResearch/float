@@ -1,8 +1,10 @@
 export const DEFAULT_API_MODELS = [
-  "gpt-5.4",
-  "gpt-5.4-mini",
-  "gpt-5.4-nano",
+  "chat-latest",
 ];
+
+export const ROLLING_API_MODEL_ALIAS_LABELS = {
+  "chat-latest": "GPT latest",
+};
 
 const MODEL_SIZE_RANK = {
   base: 5,
@@ -16,28 +18,21 @@ const MODEL_SIZE_RANK = {
 
 const DIRECT_LOCAL_GEMMA_MODELS = new Set([
   "gemma-4-E2B-it",
-  "gemma-4-E2B-it-qat-q4_0",
   "gemma-4-12B-it-qat-q4_0",
 ]);
 
 const PROVIDER_FIRST_GEMMA_MODELS = new Set([
-  "gemma-4-E2B-it-qat-q4_0-gguf",
-  "gemma-4-E4B-it-qat-q4_0-gguf",
-  "gemma-4-12B-it-qat-q4_0-gguf",
-  "gemma-4-26B-A4B-it-qat-q4_0-gguf",
-  "gemma-4-31B-it-qat-q4_0-gguf",
   "gemma-4-12B-it",
   "gemma-4-E4B-it",
+  "gemma-4-12B-it-qat-q4_0-gguf",
   "gemma-4-26B-A4B-it",
   "gemma-4-31B-it",
 ]);
 
 const DOWNLOADABLE_PROVIDER_MODELS = new Set([
-  "gemma-4-E2B-it-qat-q4_0-gguf",
-  "gemma-4-E4B-it-qat-q4_0-gguf",
+  "gemma-4-12B-it",
+  "gemma-4-E4B-it",
   "gemma-4-12B-it-qat-q4_0-gguf",
-  "gemma-4-26B-A4B-it-qat-q4_0-gguf",
-  "gemma-4-31B-it-qat-q4_0-gguf",
 ]);
 
 const DOWNLOADABLE_UTILITY_MODELS = new Set([
@@ -67,19 +62,14 @@ export const SUGGESTED_LOCAL_MODELS = [
   "mistral-7b-instruct-v0.3",
   "mixtral-8x7b-instruct-v0.1",
   "gemma-4-E2B-it",
-  "gemma-4-E2B-it-qat-q4_0",
   "gemma-4-12B-it-qat-q4_0",
 ];
 
 export const SUGGESTED_SERVER_MODELS = [
   ...SUGGESTED_LOCAL_MODELS,
-  "gemma-4-E2B-it-qat-q4_0-gguf",
-  "gemma-4-E4B-it-qat-q4_0-gguf",
-  "gemma-4-12B-it-qat-q4_0-gguf",
-  "gemma-4-26B-A4B-it-qat-q4_0-gguf",
-  "gemma-4-31B-it-qat-q4_0-gguf",
   "gemma-4-12B-it",
   "gemma-4-E4B-it",
+  "gemma-4-12B-it-qat-q4_0-gguf",
   "gemma-4-26B-A4B-it",
   "gemma-4-31B-it",
 ];
@@ -126,6 +116,12 @@ const _parseGptSortKey = (value) => {
 export const compareModelIds = (left, right) => {
   const leftClean = _cleanModelValue(left);
   const rightClean = _cleanModelValue(right);
+  const leftAlias = ROLLING_API_MODEL_ALIAS_LABELS[leftClean.toLowerCase()];
+  const rightAlias = ROLLING_API_MODEL_ALIAS_LABELS[rightClean.toLowerCase()];
+  if (leftAlias || rightAlias) {
+    if (leftAlias && !rightAlias) return -1;
+    if (!leftAlias && rightAlias) return 1;
+  }
   const leftGpt = _parseGptSortKey(leftClean);
   const rightGpt = _parseGptSortKey(rightClean);
   if (leftGpt || rightGpt) {
@@ -133,6 +129,9 @@ export const compareModelIds = (left, right) => {
     if (!rightGpt) return -1;
     if (rightGpt.major !== leftGpt.major) return rightGpt.major - leftGpt.major;
     if (rightGpt.minor !== leftGpt.minor) return rightGpt.minor - leftGpt.minor;
+    if (Boolean(leftGpt.date) !== Boolean(rightGpt.date)) {
+      return leftGpt.date ? 1 : -1;
+    }
     if (rightGpt.sizeRank !== leftGpt.sizeRank) {
       return rightGpt.sizeRank - leftGpt.sizeRank;
     }
@@ -149,6 +148,87 @@ export const sortModelIds = (models) => _cleanModelList(models).sort(compareMode
 export const normalizeModelId = (value) => {
   if (typeof value !== "string") return "";
   return value.trim().toLowerCase();
+};
+
+export const isRollingApiModelAlias = (value) =>
+  Boolean(ROLLING_API_MODEL_ALIAS_LABELS[normalizeModelId(value)]);
+
+export const resolveApiModelAliasTarget = (
+  value,
+  { aliases = {}, availableModels = [] } = {},
+) => {
+  const model = _cleanModelValue(value);
+  const normalized = normalizeModelId(model);
+  if (!isRollingApiModelAlias(normalized)) return "";
+  const aliasMeta =
+    aliases?.[model] ||
+    aliases?.[normalized] ||
+    Object.entries(aliases || {}).find(
+      ([key]) => normalizeModelId(key) === normalized,
+    )?.[1] ||
+    {};
+  const explicitTarget = _cleanModelValue(
+    aliasMeta.target_model ||
+      aliasMeta.resolved_model ||
+      aliasMeta.model_resolved ||
+      aliasMeta.model,
+  );
+  if (explicitTarget && normalizeModelId(explicitTarget) !== normalized) {
+    return explicitTarget;
+  }
+
+  const candidates = _cleanModelList(availableModels).filter((candidate) => {
+    const candidateNormalized = normalizeModelId(candidate);
+    return (
+      candidateNormalized.startsWith("gpt-") &&
+      !isRollingApiModelAlias(candidateNormalized) &&
+      _parseModelDate(candidateNormalized) === 0
+    );
+  });
+  const fallbackCandidates = _cleanModelList(availableModels).filter((candidate) => {
+    const candidateNormalized = normalizeModelId(candidate);
+    return (
+      candidateNormalized.startsWith("gpt-") &&
+      !isRollingApiModelAlias(candidateNormalized)
+    );
+  });
+  const sorted = sortModelIds(candidates.length > 0 ? candidates : fallbackCandidates);
+  return sorted[0] || "";
+};
+
+export const formatApiModelLabel = (
+  value,
+  { aliases = {}, availableModels = [], catalog = [] } = {},
+) => {
+  const model = _cleanModelValue(value);
+  if (!model) return "";
+  const normalized = normalizeModelId(model);
+  const lifecycleEntry = (Array.isArray(catalog) ? catalog : []).find(
+    (entry) => normalizeModelId(entry?.id) === normalized,
+  );
+  const withLifecycle = (label) => {
+    const status = normalizeModelId(lifecycleEntry?.status);
+    const replacement = _cleanModelValue(lifecycleEntry?.replacement);
+    if (status === "deprecated" || status === "removed") {
+      return `${label} (${status}${replacement ? `; migrate to ${replacement}` : ""})`;
+    }
+    if (lifecycleEntry?.persisted_selected && lifecycleEntry?.available === false) {
+      return `${label} (unavailable${replacement ? `; try ${replacement}` : ""})`;
+    }
+    return label;
+  };
+  if (!isRollingApiModelAlias(normalized)) return withLifecycle(model);
+  const aliasMeta =
+    aliases?.[model] ||
+    aliases?.[normalized] ||
+    Object.entries(aliases || {}).find(
+      ([key]) => normalizeModelId(key) === normalized,
+    )?.[1] ||
+    {};
+  const label = _cleanModelValue(aliasMeta.label) || ROLLING_API_MODEL_ALIAS_LABELS[normalized];
+  const target = resolveApiModelAliasTarget(model, { aliases, availableModels });
+  const displayLabel = target ? `${label} (${target})` : `${label} (${model})`;
+  return withLifecycle(displayLabel);
 };
 
 export const isLocalRuntimeEntry = (value) =>

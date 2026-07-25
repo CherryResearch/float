@@ -4,7 +4,6 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-
 DEFAULT_DISPLAY_WIDTH = 1280
 DEFAULT_DISPLAY_HEIGHT = 720
 

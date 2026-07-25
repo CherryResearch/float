@@ -3,8 +3,8 @@ import logging
 from typing import Any
 from uuid import uuid4
 
-from fastapi import FastAPI
 from app import routes as routes_module
+from fastapi import FastAPI
 
 logger = logging.getLogger(__name__)
 

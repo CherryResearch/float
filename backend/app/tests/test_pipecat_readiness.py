@@ -1,8 +1,8 @@
 import sys
 from pathlib import Path
 
-import yaml
 import pytest
+import yaml
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -46,4 +46,3 @@ def test_pipecat_negotiate_surfaces_readiness(tmp_path: Path, monkeypatch):
     assert "readiness" in body
     assert "chat_basic" in body["readiness"]
     assert body["readiness"]["chat_basic"]["ready"] is True
-

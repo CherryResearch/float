@@ -163,6 +163,8 @@ def list_dir(
         item: Dict[str, Any] = {
             "name": entry.name,
             "path": rel_path,
+            # Keep the scoped display path while exposing the path read_file accepts.
+            "read_path": _relative_display_path(entry, data_dir),
             "type": "directory" if entry.is_dir() else "file",
         }
         try:

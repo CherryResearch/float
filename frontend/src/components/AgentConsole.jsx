@@ -27,6 +27,11 @@ import {
   formatProviderLastOperation,
   isChatCapableProviderModelName,
 } from "../utils/providerRuntime";
+import {
+  RUNTIME_AVAILABILITY,
+  RUNTIME_PANEL_LANES,
+  resolveRuntimePanelContract,
+} from "../utils/runtimePanelContract";
 import { buildProviderRuntimeInspectorRows } from "../utils/stateExplanations";
 import {
   acquireToolContinuationLock,
@@ -39,6 +44,8 @@ import {
   handleUnifiedPress,
   supportsHoverInteractions,
 } from "../utils/pointerInteractions";
+import { thinkingPayloadForMode } from "../utils/reasoningEffort";
+import { outputTokenPayload } from "../utils/generationLimits";
 import {
   normalizeToolDisplayMode,
   toolDisplayShowsConsole,
@@ -61,6 +68,7 @@ const SIDEBAR_KEYBOARD_STEP = 20;
 const SIDEBAR_KEYBOARD_STEP_FAST = 40;
 const LOCAL_RUNTIME_POLL_MS = 8000;
 const PROVIDER_RUNTIME_POLL_MS = 60000;
+const SERVER_RUNTIME_POLL_MS = 60000;
 const EMPTY_GLOBAL_STATE = Object.freeze({});
 const NOOP_SET_STATE = () => {};
 const RUNTIME_RAG_OPERATION_EVENT = "float:runtime-rag-operation";
@@ -325,6 +333,20 @@ const formatTimestamp = (timestamp) => {
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 };
 
+const RUNTIME_LANE_LABELS = Object.freeze({
+  [RUNTIME_PANEL_LANES.CLOUD_API]: "Cloud API",
+  [RUNTIME_PANEL_LANES.SERVER_LAN]: "Server/LAN",
+  [RUNTIME_PANEL_LANES.LOCAL_PROVIDER]: "Local provider",
+  [RUNTIME_PANEL_LANES.DIRECT_LOCAL]: "Direct local",
+});
+
+const runtimeAvailabilityTone = (availability) => {
+  if (availability === RUNTIME_AVAILABILITY.USABLE) return "connected";
+  if (availability === RUNTIME_AVAILABILITY.DEGRADED) return "warn";
+  if (availability === RUNTIME_AVAILABILITY.UNAVAILABLE) return "error";
+  return "loading";
+};
+
 const resolveToolDisplayName = (tool, fallback = "tool") => {
   if (!tool || typeof tool !== "object") return fallback;
   const candidates = [
@@ -486,6 +508,46 @@ const formatStreamLabel = (entry) => {
     return entry.stream_preview.trim();
   }
   return "streaming response";
+};
+
+const resolveTerminalStreamState = (entry, message = null) => {
+  if (!entry || entry.type !== "stream") return null;
+  const entryStatus = normalizeStatusValue(entry.status);
+  const metadata =
+    message?.metadata && typeof message.metadata === "object" ? message.metadata : {};
+  const messageStatus = normalizeStatusValue(metadata.status);
+  const terminalStatus = [entryStatus, messageStatus].find(
+    (status) => status === "error" || status === "timeout",
+  );
+  if (terminalStatus === "error") {
+    return {
+      status: "error",
+      summary: "response ended with an error",
+      retry: "Retry from chat.",
+    };
+  }
+  if (terminalStatus === "timeout") {
+    return {
+      status: "timeout",
+      summary: "response timed out",
+      retry: "Retry from chat.",
+    };
+  }
+  if (metadata.unresolved_tool_loop) {
+    return {
+      status: "partial",
+      summary: "tool follow-up stopped",
+      retry: "Retry continuation from chat.",
+    };
+  }
+  if (messageStatus === "partial") {
+    return {
+      status: "partial",
+      summary: "partial response",
+      retry: "Retry from chat.",
+    };
+  }
+  return null;
 };
 
 const buildEntryPreview = (entry, bodyText) => {
@@ -1199,7 +1261,6 @@ const AgentConsole = ({
   streamEnabled = true,
   onStreamToggle,
   agents = [],
-  onSelectMessage,
   onOpenConversation,
   isCalendar = false,
   events = [],
@@ -1240,6 +1301,9 @@ const AgentConsole = ({
   const [runtimeStatus, setRuntimeStatus] = React.useState(null);
   const [runtimeLoading, setRuntimeLoading] = React.useState(false);
   const [runtimeError, setRuntimeError] = React.useState("");
+  const [serverRuntime, setServerRuntime] = React.useState(null);
+  const [serverRuntimeLoading, setServerRuntimeLoading] = React.useState(false);
+  const [serverRuntimeError, setServerRuntimeError] = React.useState("");
   const [runtimePanelCollapsed, setRuntimePanelCollapsed] = React.useState(true);
   const [runtimePanelHidden, setRuntimePanelHidden] = React.useState(false);
   const [backgroundPanelCollapsed, setBackgroundPanelCollapsed] = React.useState(true);
@@ -1258,7 +1322,7 @@ const AgentConsole = ({
   const [providerStatus, setProviderStatus] = React.useState(null);
   const [providerModels, setProviderModels] = React.useState([]);
   const [providerLogs, setProviderLogs] = React.useState([]);
-  const [providerLogsCursor, setProviderLogsCursor] = React.useState(0);
+  const [, setProviderLogsCursor] = React.useState(0);
   const [providerLogsOpen, setProviderLogsOpen] = React.useState(false);
   const [providerSelectedModel, setProviderSelectedModel] = React.useState("");
   const [providerContextDraft, setProviderContextDraft] = React.useState("");
@@ -1278,7 +1342,7 @@ const AgentConsole = ({
   const [modelVerify, setModelVerify] = React.useState(null);
   const [modelVerifyError, setModelVerifyError] = React.useState("");
   const [loadPending, setLoadPending] = React.useState(false);
-  const [loadError, setLoadError] = React.useState("");
+  const [, setLoadError] = React.useState("");
   const [unloadPending, setUnloadPending] = React.useState(false);
   const [unloadError, setUnloadError] = React.useState("");
   const [resourceSnapshot, setResourceSnapshot] = React.useState([]);
@@ -1364,9 +1428,6 @@ const AgentConsole = ({
       }, 0),
     [agents],
   );
-  const pendingSyncReviewCount = Array.isArray(syncReviews?.pending)
-    ? syncReviews.pending.length
-    : 0;
   const activeAgentCount = React.useMemo(
     () =>
       (Array.isArray(agents) ? agents : []).filter(
@@ -1996,7 +2057,9 @@ const AgentConsole = ({
       if (!persist) return;
       try {
         localStorage.setItem("sidebarWidthRight", String(width));
-      } catch {}
+      } catch (err) {
+        void err;
+      }
     },
     [],
   );
@@ -2007,7 +2070,9 @@ const AgentConsole = ({
     root.style.removeProperty("--sidebar-width-right");
     try {
       localStorage.removeItem("sidebarWidthRight");
-    } catch {}
+    } catch (err) {
+      void err;
+    }
   }, []);
 
   const nudgeSidebarWidth = React.useCallback(
@@ -2528,6 +2593,7 @@ const AgentConsole = ({
       );
       setContextDirty(false);
     } catch (err) {
+      void err;
       setContextError("Unable to update context length.");
     } finally {
       setContextSaving(false);
@@ -2749,9 +2815,11 @@ const AgentConsole = ({
         const blob = new Blob([payload], { type: "application/json" });
         navigator.sendBeacon("/api/history", blob);
       } else {
-        axios.post("/api/history", { sessionId, history }).catch(() => {});
+        axios.post("/api/history", { sessionId, history }).catch((err) => void err);
       }
-    } catch {}
+    } catch (err) {
+      void err;
+    }
   }, []);
 
   const fetchRuntimeStatus = React.useCallback(async () => {
@@ -2770,11 +2838,43 @@ const AgentConsole = ({
       });
       setRuntimeStatus(res?.data?.runtime || null);
     } catch (err) {
+      void err;
       setRuntimeError("Unable to load runtime status.");
     } finally {
       setRuntimeLoading(false);
     }
   }, [backendReady, isLocalMode]);
+
+  const fetchServerRuntimeStatus = React.useCallback(
+    async ({ refresh = false } = {}) => {
+      const serverUrl =
+        typeof state.serverUrl === "string" ? state.serverUrl.trim() : "";
+      if (!backendReady || state.backendMode !== "server" || !serverUrl) {
+        setServerRuntime(null);
+        setServerRuntimeError("");
+        setServerRuntimeLoading(false);
+        return;
+      }
+      setServerRuntimeLoading(true);
+      setServerRuntimeError("");
+      try {
+        const res = await axios.get("/api/llm/server/models", {
+          params: {
+            server_url: serverUrl,
+            ...(refresh ? { refresh: true } : {}),
+          },
+        });
+        setServerRuntime(res?.data || null);
+      } catch (err) {
+        void err;
+        setServerRuntime({ reachable: false, models: [] });
+        setServerRuntimeError("Server/LAN endpoint is not reachable right now.");
+      } finally {
+        setServerRuntimeLoading(false);
+      }
+    },
+    [backendReady, state.backendMode, state.serverUrl],
+  );
 
   const fetchProviderSnapshot = React.useCallback(async ({ refresh = false } = {}) => {
     if (!backendReady || !selectedLocalProvider) return;
@@ -2786,6 +2886,7 @@ const AgentConsole = ({
       });
       applyProviderSnapshot(res?.data || {});
     } catch (err) {
+      void err;
       setProviderStatus((prev) => prev);
       setProviderModels((prev) => prev);
     }
@@ -2799,6 +2900,7 @@ const AgentConsole = ({
       });
       setProviderStatus(res?.data?.runtime || null);
     } catch (err) {
+      void err;
       setProviderStatus((prev) => prev);
     }
   }, [backendReady, selectedLocalProvider]);
@@ -2826,6 +2928,7 @@ const AgentConsole = ({
           return merged.slice(-500);
         });
       } catch (err) {
+        void err;
         if (reset) {
           providerLogsCursorRef.current = 0;
           setProviderLogs([]);
@@ -2948,6 +3051,7 @@ const AgentConsole = ({
         );
         setModelVerify(res?.data || null);
       } catch (err) {
+        void err;
         setModelVerifyError("Unable to verify local model files.");
       }
     },
@@ -2960,6 +3064,7 @@ const AgentConsole = ({
       const res = await axios.get("/api/agents/resources");
       setResourceSnapshot(res?.data?.resources || []);
     } catch (err) {
+      void err;
       setResourceSnapshot((prev) => prev);
     }
   }, [backendReady]);
@@ -2972,6 +3077,7 @@ const AgentConsole = ({
       await axios.post("/api/llm/unload-local");
       await fetchRuntimeStatus();
     } catch (err) {
+      void err;
       setUnloadError("Unable to unload local model.");
     } finally {
       setUnloadPending(false);
@@ -2986,6 +3092,7 @@ const AgentConsole = ({
       await axios.post("/api/llm/load-local");
       await fetchRuntimeStatus();
     } catch (err) {
+      void err;
       setLoadError("Unable to load local model.");
     } finally {
       setLoadPending(false);
@@ -3415,6 +3522,21 @@ const AgentConsole = ({
     isLocalMode,
     usingProviderRuntime,
   ]);
+
+  React.useEffect(() => {
+    if (!backendReady || collapsed || state.backendMode !== "server") {
+      setServerRuntime(null);
+      setServerRuntimeError("");
+      setServerRuntimeLoading(false);
+      return undefined;
+    }
+    fetchServerRuntimeStatus();
+    const serverRuntimeId = setInterval(
+      fetchServerRuntimeStatus,
+      SERVER_RUNTIME_POLL_MS,
+    );
+    return () => clearInterval(serverRuntimeId);
+  }, [backendReady, collapsed, fetchServerRuntimeStatus, state.backendMode]);
 
   React.useEffect(() => {
     if (!backendReady || collapsed || !providerLogsOpen || !usingProviderRuntime) return;
@@ -4245,9 +4367,11 @@ const AgentConsole = ({
       if (!continuationLockAcquired) return;
       toolContinueLocksRef.current.add(messageId);
       try {
-        const thinkingValue = state.thinkingMode || "auto";
-        const thinkingPayload =
-          thinkingValue === "auto" ? {} : { thinking: thinkingValue };
+        const thinkingPayload = thinkingPayloadForMode(state.thinkingMode);
+        const outputTokensPayload = outputTokenPayload(
+          state.outputTokenMode,
+          state.customOutputTokens,
+        );
         const { mode, model, workflow } = resolveContinueTarget(continueTarget);
         const res = await axios.post("/api/chat/continue", {
           session_id: sessionId,
@@ -4256,6 +4380,7 @@ const AgentConsole = ({
           mode,
           workflow,
           ...thinkingPayload,
+          ...outputTokensPayload,
           tools: batch,
         });
         toolResolutionUpdatesRef.current.delete(messageKey);
@@ -5384,7 +5509,6 @@ const AgentConsole = ({
           title={`Edit ${entry.name || "tool"} arguments before running`}
           onClick={async (event) => {
             event.stopPropagation();
-            const current = JSON.stringify(entry.args || {}, null, 2);
             setToolEditorState({
               tool: {
                   name: entry.name,
@@ -5995,7 +6119,21 @@ const AgentConsole = ({
             <ul className="agent-activity-list">
             {activityList.map((entry) => {
               const ts = formatTimestamp(entry.timestamp);
-              const status = getEffectiveToolStatus(entry) || normalizeToolStatus(entry.status) || null;
+              const chainIdentifier = entry.chain_id || entry.message_id;
+              const isStream = entry.type === "stream";
+              const streamMessage = chainIdentifier
+                ? conversationById.get(chainIdentifier) ||
+                  conversationById.get(String(chainIdentifier)) ||
+                  null
+                : null;
+              const terminalStreamState = isStream
+                ? resolveTerminalStreamState(entry, streamMessage)
+                : null;
+              const status =
+                terminalStreamState?.status ||
+                getEffectiveToolStatus(entry) ||
+                normalizeToolStatus(entry.status) ||
+                null;
               const displayStatus = status && status !== "active" ? status : null;
               const toolTone = entry.type === "tool" ? statusTone(status || entry.status || "pending") : null;
               const isProposedTool =
@@ -6010,7 +6148,6 @@ const AgentConsole = ({
                 eventAgeSeconds !== null &&
                 Number.isFinite(eventAgeSeconds) &&
                 eventAgeSeconds > 180;
-              const chainIdentifier = entry.chain_id || entry.message_id;
               const sourceLabel = (() => {
                 const direct = formatModelSourceLabel(entry.mode, entry.model);
                 if (direct) return direct;
@@ -6045,7 +6182,6 @@ const AgentConsole = ({
             };
               const displayType =
                 entry.type === "tool" ? "" : entry.type === "stream" ? "response" : entry.type;
-              const isStream = entry.type === "stream";
               const streamLabel = isStream ? formatStreamLabel(entry) : null;
               const responseHistory =
                 entry.type === "tool"
@@ -6063,7 +6199,9 @@ const AgentConsole = ({
                 entry.type === "task"
                   ? entry.content || entry.description || "Task update"
                 : isStream
-                  ? streamLabel || "streaming response"
+                  ? terminalStreamState && streamLabel === "streaming response"
+                    ? terminalStreamState.summary
+                    : streamLabel || "streaming response"
                   : entry.content || entry.text || entry.message || "...";
             const preview = collapsed ? buildEntryPreview(entry, bodyText) : null;
             const entryNameKey = normalizePreviewText(entry.name).toLowerCase();
@@ -6243,11 +6381,17 @@ const AgentConsole = ({
                     ) : entry.type === "stream" ? (
                       <div className="agent-activity-stream">
                         <div className="agent-activity-text">{bodyText}</div>
-                        <div
-                          className="agent-stream-progress"
-                          role="progressbar"
-                          aria-label="Streaming response"
-                        />
+                        {terminalStreamState ? (
+                          <div className="agent-activity-text" role="status">
+                            {terminalStreamState.retry}
+                          </div>
+                        ) : (
+                          <div
+                            className="agent-stream-progress"
+                            role="progressbar"
+                            aria-label="Streaming response"
+                          />
+                        )}
                       </div>
                     ) : (
                       <div className="agent-activity-text">{bodyText}</div>
@@ -6558,7 +6702,9 @@ const AgentConsole = ({
                   ) {
                     return { tool: parsed.tool.trim(), args: parsed.args };
                   }
-                } catch {}
+                } catch (err) {
+                  void err;
+                }
                 return null;
               })();
               const resolvedActions =
@@ -6849,12 +6995,75 @@ const AgentConsole = ({
         </div>
       );
     };
+    const renderRuntimeContractPips = (contract, compact = false) => {
+      const laneLabel = RUNTIME_LANE_LABELS[contract.lane] || contract.lane;
+      const operationStatus = String(contract.lastOperation?.status || "")
+        .trim()
+        .toLowerCase();
+      const operationTone = ["error", "failed"].includes(operationStatus)
+        ? "error"
+        : ["pending", "running", "starting", "stopping"].includes(operationStatus)
+          ? "loading"
+          : "task";
+      return (
+        <div
+          className={
+            compact
+              ? "agent-console-pip-row agent-console-pip-row--compact"
+              : "agent-console-pip-row"
+          }
+          data-runtime-lane={contract.lane}
+          data-runtime-availability={contract.availability}
+        >
+          {renderConsolePip({
+            key: "runtime-contract-lane",
+            label: "Lane",
+            value: laneLabel,
+            title: `Runtime lane: ${laneLabel}`,
+            tone: contract.lane === RUNTIME_PANEL_LANES.LOCAL_PROVIDER ? "provider" : "runtime",
+            compact,
+          })}
+          {renderConsolePip({
+            key: "runtime-contract-model",
+            label: "Model",
+            value: contract.model || "not selected",
+            title: contract.model
+              ? `Runtime model: ${contract.model}`
+              : "No runtime model selected",
+            tone: contract.model ? "connected" : "idle",
+            compact,
+          })}
+          {contract.endpoint
+            ? renderConsolePip({
+                key: "runtime-contract-endpoint",
+                label: "Endpoint",
+                value: contract.endpoint,
+                title: `Runtime endpoint: ${contract.endpoint}`,
+                tone: runtimeAvailabilityTone(contract.availability),
+                compact,
+              })
+            : null}
+          {contract.lastOperation
+            ? renderConsolePip({
+                key: "runtime-contract-operation",
+                label: "Operation",
+                value: contract.lastOperation.label,
+                title: contract.lastOperation.title,
+                tone: operationTone,
+                compact,
+              })
+            : null}
+          {renderContextBudgetPip(compact)}
+          {renderRagOperationPip(compact)}
+        </div>
+      );
+    };
     if (modeLabel !== "local") {
+      const serverMode = String(modeLabel).toLowerCase() === "server";
       const apiModel = state.apiModel || "api model not selected";
       const transformerModel = state.transformerModel || "transformer model not selected";
-      const serverModel = state.transformerModel || "server default";
+      const serverModel = serverRuntime?.loaded_model || state.transformerModel || "server default";
       const serverUrl = state.serverUrl || "server url not set";
-      const serverMode = String(modeLabel).toLowerCase() === "server";
       const wsStatus = normalizeStatusValue(state.wsStatus);
       const wsLabel =
         wsStatus === "online"
@@ -6864,81 +7073,32 @@ const AgentConsole = ({
             : wsStatus === "degraded"
               ? "degraded"
               : "offline";
-      const providerState = usingProviderRuntime && selectedLocalProvider ? providerStatus : null;
-      const providerLabel = providerState
-        ? providerState.model_loaded
-          ? "model loaded"
-          : providerState.server_running
-            ? "server running"
-            : providerState.installed
-              ? "installed"
-              : "checking"
-        : serverMode
-          ? "server/LAN"
-          : "api mode";
-      const renderApiRuntimePips = (compact = false) => (
-        <div
-          className={
-            compact
-              ? "agent-console-pip-row agent-console-pip-row--compact"
-              : "agent-console-pip-row"
-          }
-        >
-          {renderConsolePip({
-            key: serverMode ? "server-url" : "api-model",
-            label: serverMode ? "Server" : "API",
-            value: serverMode ? serverUrl : apiModel,
-            title: serverMode ? `Server URL: ${serverUrl}` : `API model: ${apiModel}`,
-            tone:
-              serverMode && serverUrl === "server url not set"
-                ? "idle"
-                : !serverMode && apiModel === "api model not selected"
-                  ? "idle"
-                  : "connected",
-            compact,
-          })}
-          {renderConsolePip({
-            key: serverMode ? "server-model" : "transformer-model",
-            label: serverMode ? "Model" : "Transformer",
-            value: serverMode ? serverModel : transformerModel,
-            title: serverMode
-              ? `Server model: ${serverModel}`
-              : `Transformer model: ${transformerModel}`,
-            tone:
-              (!serverMode && transformerModel === "transformer model not selected")
-                ? "idle"
-                : "connected",
-            compact,
-          })}
-          {renderConsolePip({
-            key: "websocket",
-            label: "WebSocket",
-            value: wsLabel,
-            title: `WebSocket: ${wsLabel}`,
-            tone: wsStatus,
-            compact,
-          })}
-          {renderConsolePip({
-            key: "provider",
-            label: "Provider",
-            value: providerLabel,
-            title: `Provider: ${providerLabel}`,
-            tone: providerState ? "connected" : "idle",
-            compact,
-          })}
-          {renderContextBudgetPip(compact)}
-          {renderRagOperationPip(compact)}
-        </div>
+      const runtimeContract = resolveRuntimePanelContract(
+        {
+          mode: serverMode ? "server" : "api",
+          apiStatus: state.apiStatus,
+          apiProviderStatus: state.apiProviderStatus,
+          apiModel: state.apiModel,
+          serverUrl: state.serverUrl,
+          transformerModel: state.transformerModel,
+          serverRuntime,
+          serverModels: serverRuntime?.models,
+          serverLoadedModel: serverRuntime?.loaded_model,
+          serverLoading: serverMode && serverRuntimeLoading,
+          serverError: serverMode ? serverRuntimeError : "",
+        },
+        runtimeNow,
       );
+      const laneLabel = RUNTIME_LANE_LABELS[runtimeContract.lane];
 
       return (
         <ConsoleObjectCard
           title="runtime"
-          subtitle={serverMode ? "server mode" : "api mode"}
+          subtitle={laneLabel}
           preview={
             serverMode
-              ? `Server ${serverUrl}; Model ${serverModel}; WebSocket ${wsLabel}; Budget ${contextBudget.pipValue}`
-              : `API ${apiModel}; Transformer ${transformerModel}; WebSocket ${wsLabel}; Budget ${contextBudget.pipValue}`
+              ? `Server ${serverUrl}; Model ${serverModel}; ${runtimeContract.availability}; Budget ${contextBudget.pipValue}`
+              : `API ${apiModel}; Transformer ${transformerModel}; ${runtimeContract.availability}; Budget ${contextBudget.pipValue}`
           }
           className="agent-runtime-panel"
           collapsed={runtimePanelCollapsed}
@@ -6949,20 +7109,38 @@ const AgentConsole = ({
           hideLabel="Hide runtime"
           controlButtonClassName="runtime-action-btn"
           symbolButtonClassName="runtime-action-symbol"
+          extraActions={
+            serverMode ? (
+              <button
+                type="button"
+                className="runtime-action-btn"
+                onClick={() => fetchServerRuntimeStatus({ refresh: true })}
+                disabled={serverRuntimeLoading}
+                aria-label="Refresh Server/LAN runtime status"
+                title="Refresh Server/LAN runtime status"
+              >
+                {serverRuntimeLoading ? "checking" : "refresh"}
+              </button>
+            ) : null
+          }
           status={
-            <div className="runtime-panel-status" title="runtime status">
-              {serverMode ? "server" : "api"}
+            <div
+              className="runtime-panel-status"
+              title={`runtime availability: ${runtimeContract.availability}`}
+              data-runtime-availability={runtimeContract.availability}
+            >
+              {runtimeContract.availability}
             </div>
           }
-          collapsedContent={renderApiRuntimePips(true)}
+          collapsedContent={renderRuntimeContractPips(runtimeContract, true)}
         >
-          {renderApiRuntimePips(false)}
+          {renderRuntimeContractPips(runtimeContract, false)}
           {renderContextBudgetBlock()}
           {renderRagOperationBlock()}
           <div className="runtime-panel-note runtime-panel-summary" role="status">
             {serverMode
-              ? `Server mode is using ${serverModel} via ${serverUrl}.`
-              : `API mode is using ${apiModel} with ${transformerModel}.`}
+              ? `Server/LAN is ${runtimeContract.availability}, using ${serverModel} via ${serverUrl}. WebSocket is ${wsLabel}.`
+              : `Cloud API is ${runtimeContract.availability}, using ${apiModel} with ${transformerModel}. WebSocket is ${wsLabel}.`}
           </div>
         </ConsoleObjectCard>
       );
@@ -7099,6 +7277,20 @@ const AgentConsole = ({
         ) ||
         runtimeError ||
         "";
+      const runtimeContract = resolveRuntimePanelContract(
+        {
+          mode: "local",
+          localModel: selectedLocalProvider,
+          providerMode: providerRuntime?.mode,
+          providerRuntime,
+          providerModels,
+          providerModel: effectiveSelectedModel,
+          providerPreferredModel: providerSelectedModel,
+          providerLoading: runtimeLoading || providerActionPending,
+          providerError: runtimeLastError,
+        },
+        runtimeNow,
+      );
       const providerRuntimeInspectorRows = buildProviderRuntimeInspectorRows({
         providerKey: selectedLocalProvider,
         providerLabel: providerLabel || selectedLocalProvider,
@@ -7179,56 +7371,6 @@ const AgentConsole = ({
         startStopAvailable || showProviderInventory || loadControlsAvailable;
       const showProviderSecondaryRow =
         (contextSupported && loadControlsAvailable) || providerLogsSupported;
-      const renderProviderRuntimePips = (compact = false) => (
-        <div
-          className={
-            compact
-              ? "agent-console-pip-row agent-console-pip-row--compact"
-              : "agent-console-pip-row"
-          }
-        >
-          {renderConsolePip({
-            key: "provider-runtime",
-            label: "Provider",
-            value: providerLabel || selectedLocalProvider,
-            title: providerLabel || selectedLocalProvider,
-            tone: "provider",
-            compact,
-          })}
-          {renderConsolePip({
-            key: "provider-model",
-            label: "Model",
-            value: loadedModel || effectiveSelectedModel || "not selected",
-            title: loadedModel
-              ? `Loaded model: ${loadedModel}`
-              : effectiveSelectedModel
-                ? `Selected model: ${effectiveSelectedModel}`
-                : "No provider model selected",
-            tone: modelLoaded ? "connected" : "runtime",
-            compact,
-          })}
-          {renderConsolePip({
-            key: "provider-status",
-            label: "Status",
-            value: providerStatusLabel,
-            title: `Provider status: ${providerStatusLabel}`,
-            tone: providerFreshnessTone === "ok" ? "connected" : providerFreshnessTone,
-            compact,
-          })}
-          {renderConsolePip({
-            key: "provider-context",
-            label: "Context",
-            value: contextLength ? formatTokenCount(contextLength) : "unset",
-            title: contextLength
-              ? `Context length: ${formatTokenCount(contextLength)}`
-              : "Context length unset",
-            tone: contextLength ? "connected" : "idle",
-            compact,
-          })}
-          {renderContextBudgetPip(compact)}
-          {renderRagOperationPip(compact)}
-        </div>
-      );
 
       return (
         <ConsoleObjectCard
@@ -7236,7 +7378,7 @@ const AgentConsole = ({
           subtitle={providerLabel || "local runtime"}
           className="agent-runtime-panel"
           collapsed={runtimePanelCollapsed}
-          preview={`${providerLabel || selectedLocalProvider}: ${providerStatusLabel}${
+          preview={`${providerLabel || selectedLocalProvider}: ${runtimeContract.availability}; ${providerStatusLabel}${
             loadedModel ? `; loaded ${loadedModel}` : ""
           }`}
           onToggleCollapsed={() => setRuntimePanelCollapsed((prev) => !prev)}
@@ -7278,12 +7420,17 @@ const AgentConsole = ({
             </>
           }
           status={
-            <div className="runtime-panel-status" title={`runtime status: ${providerStatusLabel}`}>
-              {providerStatusLabel}
+            <div
+              className="runtime-panel-status"
+              title={`runtime availability: ${runtimeContract.availability}`}
+              data-runtime-availability={runtimeContract.availability}
+            >
+              {runtimeContract.availability}
             </div>
           }
-          collapsedContent={renderProviderRuntimePips(true)}
+          collapsedContent={renderRuntimeContractPips(runtimeContract, true)}
         >
+          {renderRuntimeContractPips(runtimeContract, false)}
           <div className="runtime-model-row">
             <span className="runtime-model-name" title={providerLabel || selectedLocalProvider}>
               {providerLabel || selectedLocalProvider}
@@ -7691,15 +7838,18 @@ const AgentConsole = ({
       });
     };
 
-    const statusText = !backendReady
-      ? "offline"
-      : runtimeLoading
-        ? "updating..."
-        : loadState === "loading"
-          ? "loading..."
-        : runtimeError
-          ? "offline"
-          : "live";
+    const runtimeContract = resolveRuntimePanelContract(
+      {
+        mode: "local",
+        localRuntimeKind: "direct",
+        localModel: modelName,
+        runtime,
+        localLoading: runtimeLoading || loadPending || unloadPending,
+        localError: !backendReady ? "Backend unavailable" : loadError,
+      },
+      runtimeNow,
+    );
+    const statusText = runtimeContract.availability;
 
     const actionPending = loadPending || unloadPending;
     const actionLabel = isLoaded
@@ -7772,47 +7922,6 @@ const AgentConsole = ({
         </div>
       </div>
     );
-    const renderDirectRuntimePips = (compact = false) => (
-      <div className="runtime-model-row runtime-model-row--compact">
-        {renderConsolePip({
-          key: "runtime-model",
-          label: "Runtime",
-          value: hasModel ? modelName : "local model",
-          title: hasModel ? `local model: ${modelName}` : "no local model selected",
-          tone: "runtime",
-          compact,
-        })}
-        {renderConsolePip({
-          key: "runtime-loaded",
-          label: "Loaded",
-          value: activeModelId || "none",
-          title: activeModelDiffers
-            ? `loaded model: ${activeModelId}`
-            : "No alternate model loaded",
-          tone: activeModelDiffers ? "provider" : "runtime",
-          compact,
-        })}
-        {renderConsolePip({
-          key: "runtime-ctx",
-          label: "Context",
-          value: tokenLimit ? formatTokenCount(tokenLimit) : "unset",
-          title: "Max context length",
-          tone: "task",
-          compact,
-        })}
-        {renderConsolePip({
-          key: "runtime-device",
-          label: "Device",
-          value: runtime?.model_device || "n/a",
-          title: "Model device",
-          tone: "provider",
-          compact,
-        })}
-        {renderContextBudgetPip(compact)}
-        {renderRagOperationPip(compact)}
-      </div>
-    );
-
     return (
       <ConsoleObjectCard
         title="runtime"
@@ -7844,93 +7953,22 @@ const AgentConsole = ({
           ) : null
         }
         status={
-          <div className="runtime-panel-status" title={`runtime status: ${statusText}`}>
+          <div
+            className="runtime-panel-status"
+            title={`runtime availability: ${statusText}`}
+            data-runtime-availability={statusText}
+          >
             {statusText}
           </div>
         }
         collapsedContent={
           <>
-            {renderDirectRuntimePips(true)}
+            {renderRuntimeContractPips(runtimeContract, true)}
             {directRuntimeSummary}
           </>
         }
       >
-        {runtimePanelCollapsed ? (
-          <div className="runtime-model-row runtime-model-row--compact">
-            {renderConsolePip({
-              key: "runtime-model",
-              label: "Runtime",
-              value: hasModel ? modelName : "local model",
-              title: hasModel ? `local model: ${modelName}` : "no local model selected",
-              tone: "runtime",
-              compact: true,
-            })}
-            {renderConsolePip({
-              key: "runtime-loaded",
-              label: "Loaded",
-              value: activeModelId || "none",
-              title: activeModelDiffers ? `loaded model: ${activeModelId}` : "No alternate model loaded",
-              tone: activeModelDiffers ? "provider" : "runtime",
-              compact: true,
-            })}
-            {renderConsolePip({
-              key: "runtime-ctx",
-              label: "Context",
-              value: tokenLimit ? formatTokenCount(tokenLimit) : "unset",
-              title: "Max context length",
-              tone: "task",
-              compact: true,
-            })}
-            {renderConsolePip({
-              key: "runtime-device",
-              label: "Device",
-              value: runtime?.model_device || "n/a",
-              title: "Model device",
-              tone: "provider",
-              compact: true,
-            })}
-            {renderContextBudgetPip(true)}
-            {renderRagOperationPip(true)}
-          </div>
-        ) : null}
-        {runtimePanelCollapsed ? (
-          <div className="runtime-panel-note runtime-panel-summary" role="status">
-            <div className="runtime-model-row">
-              <span
-                className="runtime-model-name"
-                title={hasModel ? `local model: ${modelName}` : "no local model selected"}
-              >
-                {hasModel ? modelName : "local model"}
-              </span>
-              {activeModelDiffers ? (
-                <span className="runtime-pill" title={`loaded model: ${activeModelId}`}>
-                  loaded {activeModelId}
-                </span>
-              ) : null}
-              {tokenLimit && (
-                <span className="runtime-pill" title="max context length">
-                  ctx {formatTokenCount(tokenLimit)}
-                </span>
-              )}
-              {runtime?.quant_method && (
-                <span className="runtime-pill" title="quantization method">
-                  {runtime.quant_method}
-                </span>
-              )}
-              {runtime?.model_dtype && (
-                <span className="runtime-pill" title="model dtype">
-                  dtype {runtime.model_dtype}
-                </span>
-              )}
-              {runtime?.model_device && (
-                <span className="runtime-pill" title="model device">
-                  {runtime.model_device}
-                </span>
-              )}
-            </div>
-          </div>
-        ) : (
-          <>
+        {renderRuntimeContractPips(runtimeContract, false)}
         <div className="runtime-model-row">
           <span
             className="runtime-model-name"
@@ -8160,8 +8198,6 @@ const AgentConsole = ({
             </div>
           </div>
         </div>
-          </>
-        )}
       </ConsoleObjectCard>
     );
   };

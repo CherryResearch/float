@@ -5,10 +5,8 @@ import socket
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
-from fastapi import Request
-
 from app.utils import user_settings
-
+from fastapi import Request
 
 _LOOPBACK_ALIASES = {"localhost", "testclient"}
 _TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
@@ -27,7 +25,12 @@ def load_visibility_settings() -> Dict[str, Any]:
 def _request_origin(request: Optional[Request]) -> Tuple[str, str]:
     if request is None:
         return ("http", "")
-    scheme = str(request.headers.get("x-forwarded-proto") or request.url.scheme or "http").strip() or "http"
+    scheme = (
+        str(
+            request.headers.get("x-forwarded-proto") or request.url.scheme or "http"
+        ).strip()
+        or "http"
+    )
     host = str(request.headers.get("host") or request.url.netloc or "").strip()
     if not host:
         hostname = str(request.url.hostname or "").strip()
@@ -54,7 +57,9 @@ def _format_origin(scheme: str, host: str, port: Optional[int]) -> str:
     display_host = hostname
     if ":" in hostname and not hostname.startswith("["):
         display_host = f"[{hostname}]"
-    if port and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
+    if port and not (
+        (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+    ):
         return f"{scheme}://{display_host}:{port}"
     return f"{scheme}://{display_host}"
 
@@ -62,11 +67,29 @@ def _format_origin(scheme: str, host: str, port: Optional[int]) -> str:
 def client_host(request: Optional[Request]) -> str:
     if request is None:
         return ""
-    forwarded = str(request.headers.get("x-forwarded-for") or "").split(",", 1)[0].strip()
-    if forwarded:
-        return forwarded
     client = getattr(request, "client", None)
-    return str(getattr(client, "host", "") or "").strip()
+    direct = str(getattr(client, "host", "") or "").strip()
+    # Only a same-host proxy may tell Float about the original client. A direct
+    # LAN caller can otherwise spoof X-Forwarded-For: 127.0.0.1 and bypass the
+    # visibility boundary.
+    if classify_host(direct) == "loopback":
+        forwarded = (
+            str(request.headers.get("x-forwarded-for") or "").split(",", 1)[0].strip()
+        )
+        if forwarded:
+            return forwarded
+    return direct
+
+
+def is_trusted_frontend_proxy(request: Optional[Request]) -> bool:
+    if request is None:
+        return False
+    client = getattr(request, "client", None)
+    direct = str(getattr(client, "host", "") or "").strip()
+    return (
+        classify_host(direct) == "loopback"
+        and str(request.headers.get("x-float-frontend-proxy") or "").strip() == "1"
+    )
 
 
 def classify_host(host: str) -> str:
@@ -167,7 +190,11 @@ def _preferred_lan_host(origin_host: str) -> str:
         hostname,
     ):
         cleaned = str(candidate or "").strip()
-        if not cleaned or cleaned in hostname_candidates or classify_host(cleaned) == "loopback":
+        if (
+            not cleaned
+            or cleaned in hostname_candidates
+            or classify_host(cleaned) == "loopback"
+        ):
             continue
         hostname_candidates.append(cleaned)
     for candidate in hostname_candidates:

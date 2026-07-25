@@ -352,6 +352,41 @@ def test_generate_via_api_uses_responses_tool_shape_for_gpt5(monkeypatch):
     ]
 
 
+def test_generate_via_api_parses_responses_function_call(monkeypatch):
+    function_call = {
+        "type": "function_call",
+        "id": "fc_1",
+        "call_id": "call_1",
+        "name": "tool_help",
+        "arguments": json.dumps({"tool_name": "recall"}),
+    }
+    service = _make_responses_service(
+        monkeypatch,
+        {
+            "output": [
+                function_call,
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Checking that tool."}],
+                },
+            ]
+        },
+    )
+
+    result = service._generate_via_api("help me use recall", ModelContext())
+
+    assert result["text"] == "Checking that tool."
+    assert result["tools_used"] == [
+        {
+            "name": "tool_help",
+            "args": {"tool_name": "recall"},
+            "call_id": "call_1",
+            "response_item": function_call,
+        }
+    ]
+
+
 def test_generate_via_api_uses_experimental_responses_ws_transport(monkeypatch):
     captured = {}
 

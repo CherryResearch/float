@@ -17,11 +17,12 @@ import requests
 from app.utils import blob_store, calendar_store, conversation_store
 from app.utils import graph_store as graph_store_module
 from app.utils import knowledge_store as knowledge_store_module
-from app.utils import memory_store, theme_store, user_settings
+from app.utils import memory_store, sync_checkpoint_store, theme_store, user_settings
 from app.utils.attachment_media import build_attachment_media_descriptor
 from app.utils.blob_store import BLOBS_DIR, find_asset_path
 from app.utils.blob_store import iter_attachment_hashes as iter_stored_attachment_hashes
 from app.utils.blob_store import managed_relative_path, resolve_managed_path
+from app.utils.deployment_status import deployment_identity_summary
 from app.utils.sync_paths import sync_attachment_relative_path
 from app.utils.workspace_registry import (
     resolve_workspace_selection,
@@ -49,6 +50,8 @@ SYNC_SOURCE_LINK_SECTIONS = {
     "attachments",
     "calendar",
 }
+_TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+_LOCAL_SYNC_HOST_SUFFIXES = (".local", ".test", ".float")
 ROOT_ATTACHMENT_PATH_SEGMENTS = {
     "uploads",
     "captured",
@@ -490,8 +493,12 @@ def _resolve_remote_urls(remote_url: str) -> Dict[str, str]:
         raw = f"http://{raw}"
     parsed = urlparse(raw)
     hostname = str(parsed.hostname or "").strip()
-    if not parsed.netloc or not hostname:
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or not hostname:
         raise ValueError("Remote URL is invalid")
+    if parsed.username or parsed.password:
+        raise ValueError("Remote URL must not include credentials")
+    if parsed.query or parsed.fragment:
+        raise ValueError("Remote URL must not include a query or fragment")
     if all(char.isdigit() or char == "." for char in hostname):
         try:
             ipaddress.ip_address(hostname)
@@ -499,6 +506,7 @@ def _resolve_remote_urls(remote_url: str) -> Dict[str, str]:
             raise ValueError(
                 "Remote URL looks incomplete. Use the full private address, for example 192.168.1.25:59185."
             ) from exc
+    _validate_private_sync_host(hostname)
     path = parsed.path.rstrip("/")
     if path.endswith("/api"):
         api_path = path
@@ -517,6 +525,53 @@ def _resolve_remote_urls(remote_url: str) -> Dict[str, str]:
         .rstrip("/")
     )
     return {"instance_base": instance_base, "api_base": api_base}
+
+
+def _sync_ip_is_private(value: ipaddress._BaseAddress) -> bool:
+    return value in _TAILSCALE_CGNAT or (
+        value.is_private
+        and not value.is_loopback
+        and not value.is_link_local
+        and not value.is_multicast
+        and not value.is_unspecified
+        and not value.is_reserved
+    )
+
+
+def _validate_private_sync_host(hostname: str) -> None:
+    host = str(hostname or "").strip().lower().rstrip(".")
+    if not host or host == "localhost":
+        raise ValueError("Remote sync requires a private LAN or tailnet address")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        address = None
+    if address is not None:
+        if not _sync_ip_is_private(address):
+            raise ValueError("Remote sync requires a private LAN or tailnet address")
+        return
+    resolved: List[ipaddress._BaseAddress] = []
+    try:
+        for info in socket.getaddrinfo(host, None):
+            if len(info) < 5 or not info[4]:
+                continue
+            try:
+                candidate = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
+            except ValueError:
+                continue
+            if candidate not in resolved:
+                resolved.append(candidate)
+    except OSError:
+        resolved = []
+    if resolved:
+        if not all(_sync_ip_is_private(candidate) for candidate in resolved):
+            raise ValueError("Remote sync host resolved outside the private network")
+        return
+    if "." not in host or host.endswith(_LOCAL_SYNC_HOST_SUFFIXES):
+        return
+    raise ValueError(
+        "Remote sync host did not resolve to a private LAN or tailnet address"
+    )
 
 
 class RemoteFloatClient:
@@ -640,7 +695,13 @@ class RemoteFloatClient:
                 json=json_body,
                 headers=headers,
                 timeout=self.timeout,
+                allow_redirects=False,
             )
+            if 300 <= int(getattr(response, "status_code", 0) or 0) < 400:
+                raise requests.HTTPError(
+                    "Remote redirects are not allowed",
+                    response=response,
+                )
             response.raise_for_status()
         except requests.RequestException as exc:
             self._log_request_failure(
@@ -655,22 +716,7 @@ class RemoteFloatClient:
         return payload if isinstance(payload, dict) else {}
 
     def get_sync_overview(self) -> Dict[str, Any]:
-        try:
-            response = self.session.get(
-                f"{self.api_base}/sync/overview",
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            self._log_request_failure(
-                method="get",
-                path="sync/overview",
-                with_auth=False,
-                exc=exc,
-            )
-            raise
-        payload = response.json()
-        return payload if isinstance(payload, dict) else {}
+        return self._request("get", "sync/overview", with_auth=True)
 
     def sync_device_registration(self) -> Dict[str, Any]:
         scopes = self._requested_scopes()
@@ -709,86 +755,28 @@ class RemoteFloatClient:
     def _bootstrap_token(self) -> None:
         scopes = self._requested_scopes()
         device_id = str(self._paired_device.get("remote_device_id") or "").strip()
-        if device_id:
-            try:
-                issued = self._request(
-                    "post",
-                    "devices/token",
-                    json_body={
-                        "device_id": device_id,
-                        "scopes": scopes,
-                        "ttl_seconds": 3600,
-                        "public_key": str(
-                            self._paired_device.get("public_key") or ""
-                        ).strip(),
-                    },
-                )
-                token = str(issued.get("token") or "").strip()
-                if not token:
-                    raise ValueError("Remote token issuance failed")
-                self._token = token
-                try:
-                    self._request(
-                        "patch",
-                        f"devices/{device_id}",
-                        json_body={
-                            "name": self._device_name,
-                            "capabilities": self._device_capabilities(),
-                        },
-                        with_auth=True,
-                    )
-                except requests.RequestException:
-                    pass
-                return
-            except requests.HTTPError as exc:
-                status_code = (
-                    exc.response.status_code if exc.response is not None else None
-                )
-                response_excerpt = self._response_excerpt(exc.response)
-                if (
-                    status_code == 403
-                    and "Device proof required" not in response_excerpt
-                ):
-                    raise
-                if status_code not in {400, 403, 404}:
-                    raise
-        public_key = str(self._paired_device.get("public_key") or "").strip() or str(
-            uuid.uuid4()
-        )
-        register_payload = {
-            "public_key": public_key,
-            "name": self._device_name,
-            "capabilities": self._device_capabilities(),
-        }
-        registered = self._request(
-            "post", "devices/register", json_body=register_payload
-        )
-        device = (
-            registered.get("device")
-            if isinstance(registered.get("device"), dict)
-            else {}
-        )
-        device_id = str(device.get("id") or "").strip()
-        if not device_id:
-            raise ValueError("Remote device registration did not return an id")
-        self._paired_device.update(
-            {
-                "remote_url": self.instance_base,
-                "remote_device_id": device_id,
-                "public_key": public_key,
-                "scopes": scopes,
-            }
-        )
-        issued = self._request(
-            "post",
-            "devices/token",
-            json_body={
-                "device_id": device_id,
-                "scopes": scopes,
-                "ttl_seconds": 3600,
-                "public_key": public_key,
-            },
-        )
+        public_key = str(self._paired_device.get("public_key") or "").strip()
+        if not device_id or not public_key:
+            raise ValueError(
+                "Remote pairing is required. Pair this device again with a one-time code."
+            )
+        try:
+            issued = self._request(
+                "post",
+                "devices/token",
+                json_body={
+                    "device_id": device_id,
+                    "scopes": scopes,
+                    "ttl_seconds": 3600,
+                    "public_key": public_key,
+                },
+            )
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code in {400, 403, 404}:
+                raise ValueError(
+                    "Remote pairing is no longer valid. Pair this device again with a one-time code."
+                ) from exc
+            raise
         token = str(issued.get("token") or "").strip()
         if not token:
             raise ValueError("Remote token issuance failed")
@@ -968,19 +956,20 @@ class InstanceSyncService:
     ) -> Dict[str, Any]:
         hostname = socket.gethostname()
         display_name = self._default_source_label()
+        settings = user_settings.load_settings()
+        deployment = deployment_identity_summary(settings=settings)
         declared_namespace = self.resolve_source_namespace(
             link_to_source=True,
-            source_namespace=source_namespace
-            or user_settings.load_settings().get("sync_source_namespace"),
+            source_namespace=source_namespace or settings.get("sync_source_namespace"),
             source_label=display_name or hostname,
         )
         return {
+            "deployment_id": deployment.get("deployment_id"),
             "hostname": hostname,
             "display_name": display_name,
             "source_namespace": declared_namespace,
-            "link_to_source_default": bool(
-                user_settings.load_settings().get("sync_link_to_source_device")
-            ),
+            "link_to_source_default": bool(settings.get("sync_link_to_source_device")),
+            "software": deployment.get("software") or {},
         }
 
     def _manifest_item_namespace(self, section: str, item: Dict[str, Any]) -> str:
@@ -1475,7 +1464,16 @@ class InstanceSyncService:
                 "count": len(items),
                 "items": items,
             }
-        return self._filter_manifest_by_workspaces(payload, workspace_ids)
+        filtered = self._filter_manifest_by_workspaces(payload, workspace_ids)
+        revision = sync_checkpoint_store.manifest_revision(filtered, selected)
+        filtered["data_revision"] = revision
+        instance = (
+            filtered.get("instance")
+            if isinstance(filtered.get("instance"), dict)
+            else {}
+        )
+        filtered["instance"] = {**instance, "data_revision": revision}
+        return filtered
 
     def build_snapshot(
         self,
@@ -1491,7 +1489,17 @@ class InstanceSyncService:
         }
         for section in selected:
             payload["sections"][section] = self._snapshot_for_section(section)
-        return self._filter_snapshot_by_workspaces(payload, workspace_ids)
+        filtered = self._filter_snapshot_by_workspaces(payload, workspace_ids)
+        manifest = self.build_manifest(selected, workspace_ids=workspace_ids)
+        revision = dict(manifest.get("data_revision") or {})
+        filtered["data_revision"] = revision
+        instance = (
+            filtered.get("instance")
+            if isinstance(filtered.get("instance"), dict)
+            else {}
+        )
+        filtered["instance"] = {**instance, "data_revision": revision}
+        return filtered
 
     def namespace_manifest(
         self,
@@ -2318,6 +2326,10 @@ class InstanceSyncService:
         primary_item: Any,
         local_item: Any = None,
         remote_item: Any = None,
+        baseline_available: bool = False,
+        local_changed_since_sync: Optional[bool] = None,
+        remote_changed_since_sync: Optional[bool] = None,
+        interpretation: str = "",
     ) -> Dict[str, Any]:
         label_item = primary_item if isinstance(primary_item, dict) else {}
         local_ts = _safe_float((local_item or {}).get("updated_at"))
@@ -2347,10 +2359,16 @@ class InstanceSyncService:
             )
             if isinstance(remote_item, dict)
             else "",
+            "local_present": isinstance(local_item, dict),
+            "remote_present": isinstance(remote_item, dict),
             "local_updated_at": local_ts or None,
             "remote_updated_at": remote_ts or None,
             "local_updated_at_label": _format_sync_timestamp(local_ts),
             "remote_updated_at_label": _format_sync_timestamp(remote_ts),
+            "baseline_available": bool(baseline_available),
+            "local_changed_since_sync": local_changed_since_sync,
+            "remote_changed_since_sync": remote_changed_since_sync,
+            "interpretation": str(interpretation or "").strip(),
         }
 
     def compare_manifests(
@@ -2358,6 +2376,7 @@ class InstanceSyncService:
         local_manifest: Dict[str, Any],
         remote_manifest: Dict[str, Any],
         sections: Optional[Iterable[str]] = None,
+        baseline: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         selected = self.normalize_sections(sections)
         comparison: List[Dict[str, Any]] = []
@@ -2371,6 +2390,11 @@ class InstanceSyncService:
             local_sections = {}
         if not isinstance(remote_sections, dict):
             remote_sections = {}
+        baseline_sections = (
+            baseline.get("sections") if isinstance(baseline, dict) else {}
+        )
+        if not isinstance(baseline_sections, dict):
+            baseline_sections = {}
         for section in selected:
             local_section = (
                 local_sections.get(section)
@@ -2403,38 +2427,209 @@ class InstanceSyncService:
             local_newer = 0
             remote_newer = 0
             identical = 0
+            local_new = 0
+            remote_new = 0
+            local_deleted = 0
+            remote_deleted = 0
+            conflicts = 0
+            known_differences = 0
             preview_items: List[Dict[str, Any]] = []
+            section_baseline = baseline_sections.get(section)
+            baseline_items = (
+                section_baseline.get("items")
+                if isinstance(section_baseline, dict)
+                else {}
+            )
+            baseline_complete = bool(
+                section_baseline.get("complete")
+                if isinstance(section_baseline, dict)
+                else False
+            )
+            if not isinstance(baseline_items, dict):
+                baseline_items = {}
             for sync_id in sorted(set(local_map) | set(remote_map)):
                 local_item = local_map.get(sync_id)
                 remote_item = remote_map.get(sync_id)
+                primary_item = local_item or remote_item or {}
+                selection_id = self._manifest_selection_id(
+                    primary_item,
+                    fallback=sync_id,
+                )
+                baseline_item = baseline_items.get(selection_id)
+                if not isinstance(baseline_item, dict):
+                    baseline_item = baseline_items.get(sync_id)
+                has_baseline = isinstance(baseline_item, dict)
+                if not has_baseline and baseline_complete:
+                    baseline_item = {
+                        "local_digest": "",
+                        "remote_digest": "",
+                        "local_present": False,
+                        "remote_present": False,
+                    }
+                    has_baseline = True
+                baseline_item = baseline_item if has_baseline else {}
+                local_digest = (
+                    sync_checkpoint_store.digest_value(local_item)
+                    if local_item is not None
+                    else ""
+                )
+                remote_digest = (
+                    sync_checkpoint_store.digest_value(remote_item)
+                    if remote_item is not None
+                    else ""
+                )
+                local_changed = (
+                    local_digest != str(baseline_item.get("local_digest") or "")
+                    if has_baseline
+                    else None
+                )
+                remote_changed = (
+                    remote_digest != str(baseline_item.get("remote_digest") or "")
+                    if has_baseline
+                    else None
+                )
                 if local_item is None:
                     only_remote += 1
+                    status = "only_remote"
+                    interpretation = "untracked_presence"
+                    if has_baseline:
+                        base_local = str(baseline_item.get("local_digest") or "")
+                        if base_local and local_changed:
+                            if remote_changed:
+                                status = "delete_conflict"
+                                interpretation = "local_deleted_remote_changed"
+                                conflicts += 1
+                            else:
+                                status = "local_deleted"
+                                interpretation = "local_deleted_since_sync"
+                                local_deleted += 1
+                        elif not base_local and remote_changed:
+                            status = "remote_new"
+                            interpretation = "remote_created_since_sync"
+                            remote_new += 1
+                        else:
+                            status = "known_difference"
+                            interpretation = "unchanged_one_sided_state"
+                            known_differences += 1
                     preview_items.append(
                         self._preview_item(
                             section,
-                            status="only_remote",
+                            status=status,
                             sync_id=sync_id,
                             primary_item=remote_item,
                             remote_item=remote_item,
+                            baseline_available=has_baseline,
+                            local_changed_since_sync=local_changed,
+                            remote_changed_since_sync=remote_changed,
+                            interpretation=interpretation,
                         )
                     )
                     continue
                 if remote_item is None:
                     only_local += 1
+                    status = "only_local"
+                    interpretation = "untracked_presence"
+                    if has_baseline:
+                        base_remote = str(baseline_item.get("remote_digest") or "")
+                        if base_remote and remote_changed:
+                            if local_changed:
+                                status = "delete_conflict"
+                                interpretation = "remote_deleted_local_changed"
+                                conflicts += 1
+                            else:
+                                status = "remote_deleted"
+                                interpretation = "remote_deleted_since_sync"
+                                remote_deleted += 1
+                        elif not base_remote and local_changed:
+                            status = "local_new"
+                            interpretation = "local_created_since_sync"
+                            local_new += 1
+                        else:
+                            status = "known_difference"
+                            interpretation = "unchanged_one_sided_state"
+                            known_differences += 1
                     preview_items.append(
                         self._preview_item(
                             section,
-                            status="only_local",
+                            status=status,
                             sync_id=sync_id,
                             primary_item=local_item,
                             local_item=local_item,
+                            baseline_available=has_baseline,
+                            local_changed_since_sync=local_changed,
+                            remote_changed_since_sync=remote_changed,
+                            interpretation=interpretation,
                         )
                     )
                     continue
                 local_ts = _safe_float(local_item.get("updated_at"))
                 remote_ts = _safe_float(remote_item.get("updated_at"))
-                if abs(local_ts - remote_ts) < 0.000001:
+                if local_digest == remote_digest:
                     identical += 1
+                elif has_baseline and local_changed and remote_changed:
+                    conflicts += 1
+                    preview_items.append(
+                        self._preview_item(
+                            section,
+                            status="conflict",
+                            sync_id=sync_id,
+                            primary_item=local_item,
+                            local_item=local_item,
+                            remote_item=remote_item,
+                            baseline_available=True,
+                            local_changed_since_sync=True,
+                            remote_changed_since_sync=True,
+                            interpretation="both_changed_since_sync",
+                        )
+                    )
+                elif has_baseline and local_changed:
+                    local_newer += 1
+                    preview_items.append(
+                        self._preview_item(
+                            section,
+                            status="local_newer",
+                            sync_id=sync_id,
+                            primary_item=local_item,
+                            local_item=local_item,
+                            remote_item=remote_item,
+                            baseline_available=True,
+                            local_changed_since_sync=True,
+                            remote_changed_since_sync=False,
+                            interpretation="local_changed_since_sync",
+                        )
+                    )
+                elif has_baseline and remote_changed:
+                    remote_newer += 1
+                    preview_items.append(
+                        self._preview_item(
+                            section,
+                            status="remote_newer",
+                            sync_id=sync_id,
+                            primary_item=remote_item,
+                            local_item=local_item,
+                            remote_item=remote_item,
+                            baseline_available=True,
+                            local_changed_since_sync=False,
+                            remote_changed_since_sync=True,
+                            interpretation="remote_changed_since_sync",
+                        )
+                    )
+                elif has_baseline:
+                    known_differences += 1
+                    preview_items.append(
+                        self._preview_item(
+                            section,
+                            status="known_difference",
+                            sync_id=sync_id,
+                            primary_item=local_item,
+                            local_item=local_item,
+                            remote_item=remote_item,
+                            baseline_available=True,
+                            local_changed_since_sync=False,
+                            remote_changed_since_sync=False,
+                            interpretation="unchanged_known_difference",
+                        )
+                    )
                 elif local_ts > remote_ts:
                     local_newer += 1
                     preview_items.append(
@@ -2470,6 +2665,13 @@ class InstanceSyncService:
                     "local_newer": local_newer,
                     "remote_newer": remote_newer,
                     "identical": identical,
+                    "local_new": local_new,
+                    "remote_new": remote_new,
+                    "local_deleted": local_deleted,
+                    "remote_deleted": remote_deleted,
+                    "conflicts": conflicts,
+                    "known_differences": known_differences,
+                    "baseline_available": bool(baseline_items),
                     "change_count": len(preview_items),
                     "selected_by_default": bool(preview_items),
                     "items": preview_items[:12],

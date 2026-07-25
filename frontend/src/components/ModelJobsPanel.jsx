@@ -60,7 +60,7 @@ const ModelJobsPanel = () => {
       setJobs(Array.isArray(response?.data?.jobs) ? response.data.jobs : []);
     } catch (err) {
       setJobs([]);
-      setError("Failed to load model jobs");
+      setError(err?.response?.data?.detail || "Failed to load model jobs");
     } finally {
       setLoading(false);
     }

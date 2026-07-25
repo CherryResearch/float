@@ -20,7 +20,9 @@ DEFAULT_SIGNAL_THRESHOLD = 0.34
 MEMORY_GRAPH_SCHEMA_VERSION = 1
 
 _TOKEN_RE = re.compile(r"[a-z0-9_./:-]+")
-_PATH_HINT_RE = re.compile(r"[\\/]|[.](txt|md|json|csv|pdf|png|jpg|jpeg|py|tsx?|jsx?)$", re.I)
+_PATH_HINT_RE = re.compile(
+    r"[\\/]|[.](txt|md|json|csv|pdf|png|jpg|jpeg|py|tsx?|jsx?)$", re.I
+)
 _CONVERSATION_HINT_RE = re.compile(r"(^|/)[^/]+[.]json$", re.I)
 
 _STOPWORDS = {
@@ -279,14 +281,20 @@ def _sparse_topk_features(vector: List[float], *, topk: int) -> Dict[int, float]
     if not vector or topk <= 0:
         return {}
     ranked = sorted(
-        ((idx, float(value)) for idx, value in enumerate(vector) if float(value) != 0.0),
+        (
+            (idx, float(value))
+            for idx, value in enumerate(vector)
+            if float(value) != 0.0
+        ),
         key=lambda item: abs(item[1]),
         reverse=True,
     )
     return {idx: value for idx, value in ranked[:topk]}
 
 
-def _sparse_cosine_similarity(left: List[float], right: List[float], *, topk: int) -> float:
+def _sparse_cosine_similarity(
+    left: List[float], right: List[float], *, topk: int
+) -> float:
     left_sparse = _sparse_topk_features(left, topk=topk)
     right_sparse = _sparse_topk_features(right, topk=topk)
     if not left_sparse or not right_sparse:
@@ -692,7 +700,8 @@ def build_memory_graph(
         ),
         "embeddings_source": (
             "rag_service"
-            if rag_service is not None and callable(getattr(rag_service, "_embed_text", None))
+            if rag_service is not None
+            and callable(getattr(rag_service, "_embed_text", None))
             else "hash_fallback"
         ),
         "limitations": [

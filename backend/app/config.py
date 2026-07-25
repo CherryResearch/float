@@ -109,7 +109,7 @@ if not os.getenv("FLOAT_ENV_FILE"):
 OPENAI_CHAT_COMPLETIONS_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 DEFAULT_OPENAI_API_URL = OPENAI_RESPONSES_URL
-DEFAULT_OPENAI_MODEL = "gpt-5.4"
+DEFAULT_OPENAI_MODEL = "chat-latest"
 
 DEFAULT_DATA_DIR = (REPO_ROOT / "data").resolve()
 DEFAULT_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -339,7 +339,7 @@ def load_config():
         # Hugging Face token for gated model downloads
         "hf_token": os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN", ""),
         # Default OpenAI model for chat
-        "api_model": os.getenv("OPENAI_MODEL", "gpt-5.4"),
+        "api_model": os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
         "local_url": os.getenv(
             "LOCAL_LLM_URL", "http://localhost:11433"
         ),  # maybe 1234 unless its proxied
@@ -408,6 +408,8 @@ def load_config():
         "harmony_format": harmony_format,
         "harmony_format_mode": harmony_format_mode,
         "server_url": os.getenv("SERVER_URL", ""),
+        "server_preset_id": os.getenv("SERVER_PRESET_ID", "").strip(),
+        "server_presets": os.getenv("SERVER_PRESETS_JSON", "[]"),
         "mcp_url": os.getenv("MCP_SERVER_URL"),
         "mcp_token": os.getenv("MCP_API_TOKEN", ""),
         "livekit_url": os.getenv("LIVEKIT_URL", "ws://localhost:7880"),
@@ -419,7 +421,7 @@ def load_config():
         # Default OpenAI TTS voice. 'nova' was not a valid voice name.
         "voice_model": os.getenv("VOICE_MODEL", "alloy"),
         "stream_backend": os.getenv("FLOAT_STREAM_BACKEND", "api"),
-        "realtime_model": os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2"),
+        "realtime_model": os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2.1"),
         "openai_provider_transport": os.getenv(
             "FLOAT_OPENAI_PROVIDER_TRANSPORT", "http"
         )

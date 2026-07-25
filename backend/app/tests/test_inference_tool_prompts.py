@@ -96,6 +96,13 @@ def _setup_write_file_tool(
     args["path"] = "note_from_tool.txt"
 
 
+def _setup_open_url_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = SimpleNamespace(legacy_open_url=lambda url, user=None: f"Opened {url}")
+    monkeypatch.setattr(browser, "get_computer_service", lambda: service)
+
+
 TOOL_CASES = [
     ToolCase(
         prompt="Use open_url to load https://example.com and confirm it opens.",
@@ -103,6 +110,7 @@ TOOL_CASES = [
         build_args=lambda tmp: {"url": "https://example.com"},
         func=browser.open_url,
         verify=lambda tmp, mgr, output, args: (output == f"Opened {args['url']}"),
+        setup=lambda tmp, mgr, monkeypatch, args: _setup_open_url_tool(monkeypatch),
     ),
     ToolCase(
         prompt="Write a quick note via write_file so we can inspect it later.",

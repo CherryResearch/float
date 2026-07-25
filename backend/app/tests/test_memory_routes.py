@@ -47,9 +47,7 @@ def test_memory_list_can_include_archived_items_on_demand(client):
         params={"detailed": True, "include_archived": True},
     )
     assert archived_resp.status_code == 200
-    archived_items = {
-        item["key"]: item for item in archived_resp.json()["items"]
-    }
+    archived_items = {item["key"]: item for item in archived_resp.json()["items"]}
     assert "archived-note" in archived_items
     assert archived_items["archived-note"]["pruned_at"] is not None
     assert "last_accessed_at" in archived_items["archived-note"]

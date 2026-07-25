@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { Room, RoomEvent } from "livekit-client";
 import axios from "axios";
-import { ensureDeviceAndToken } from "../utils/sync";
 import "../styles/Chat.css";
 
 const VoiceChat = () => {
@@ -12,8 +11,6 @@ const VoiceChat = () => {
     let room;
     const join = async () => {
       try {
-        // Ensure device token before establishing voice session
-        await ensureDeviceAndToken();
         const res = await axios.post("/api/voice/connect", {
           identity: crypto.randomUUID(),
           room: "float",

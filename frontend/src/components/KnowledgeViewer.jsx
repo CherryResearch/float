@@ -6,15 +6,16 @@ import CalendarTab from "./CalendarTab";
 import MemoryTab from "./MemoryTab";
 import ThreadsTab from "./ThreadsTab";
 import DocumentsTab from "./DocumentsTab";
+import KnowledgeSkillsTab from "./KnowledgeSkillsTab";
 import KnowledgeVisualizationsTab from "./KnowledgeVisualizationsTab";
 import KnowledgeSyncTab from "./KnowledgeSyncTab";
-import PageSkeleton, { Line, Rect } from "./Skeleton";
+import { Line, Rect } from "./Skeleton";
 
 const KnowledgeViewer = () => {
-  const [memoryDocs, setMemoryDocs] = useState([]);
+  const [, setMemoryDocs] = useState([]);
   const [loading, setLoading] = useState(false);
   const [tab, setTab] = useState(() => localStorage.getItem("knowledge-tab") || "memory");
-  const [table, setTable] = useState("default");
+  const table = "default";
   const tabsRef = useRef(null);
   const [tabsHeight, setTabsHeight] = useState(0);
   const location = useLocation();
@@ -72,42 +73,16 @@ const KnowledgeViewer = () => {
     localStorage.setItem("knowledge-tab", tabParam);
   }, [tabParam, tab]);
 
-  const viewDoc = async (id) => {
-    try {
-      const res = await axios.get(`/api/knowledge/${id}`);
-      alert(res.data.documents ? res.data.documents[0] : "No content");
-    } catch (err) {
-      console.error("Failed to fetch document", err);
+  useEffect(() => {
+    const activeTab = tabsRef.current?.querySelector("button.active");
+    if (activeTab && typeof activeTab.scrollIntoView === "function") {
+      activeTab.scrollIntoView({ block: "nearest", inline: "center" });
     }
-  };
-
-  const editDoc = async (id) => {
-    try {
-      const res = await axios.get(`/api/knowledge/${id}`);
-      const current = res.data.documents ? res.data.documents[0] : "";
-      const text = window.prompt("Edit document", current);
-      if (text !== null) {
-        await axios.put(`/api/knowledge/${id}`, { text });
-        loadDocs();
-      }
-    } catch (err) {
-      console.error("Failed to update document", err);
-    }
-  };
-
-  const deleteDoc = async (id) => {
-    if (!window.confirm("Delete document?")) return;
-    try {
-      await axios.delete(`/api/knowledge/${id}`);
-      loadDocs();
-    } catch (err) {
-      console.error("Failed to delete document", err);
-    }
-  };
+  }, [tab]);
 
   return (
     <div
-      className="knowledge-viewer"
+      className={`knowledge-viewer knowledge-viewer--${tab}`}
       style={{
         "--knowledge-tabs-height": tabsHeight ? `${tabsHeight}px` : undefined,
       }}
@@ -149,6 +124,13 @@ const KnowledgeViewer = () => {
           documents
         </button>
         <button
+          className={tab === "skills" ? "active" : ""}
+          onClick={() => changeTab("skills")}
+          aria-current={tab === "skills" ? "page" : undefined}
+        >
+          skills
+        </button>
+        <button
           className={tab === "sync" ? "active" : ""}
           onClick={() => changeTab("sync")}
           aria-current={tab === "sync" ? "page" : undefined}
@@ -175,6 +157,8 @@ const KnowledgeViewer = () => {
           )
         ) : tab === "visualizations" ? (
           <KnowledgeVisualizationsTab />
+        ) : tab === "skills" ? (
+          <KnowledgeSkillsTab />
         ) : tab === "sync" ? (
           <KnowledgeSyncTab />
         ) : (

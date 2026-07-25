@@ -1,4 +1,3 @@
-import os
 import json
 
 from app.base_services import MemoryManager
@@ -43,4 +42,3 @@ def test_export_omits_secret_and_protected():
     assert "a" in ext
     assert "b" not in ext  # protected excluded by default
     assert "c" not in ext  # secret excluded entirely from export
-

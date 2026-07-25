@@ -150,6 +150,45 @@ def test_list_dir_workspace_only_normalizes_prefix(mem_mgr, tmp_path, monkeypatc
     assert any(item["path"] == "nested/hello.txt" for item in result["entries"])
 
 
+def test_workspace_listing_read_path_round_trips_to_read_file(
+    mem_mgr, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("FLOAT_DATA_DIR", str(tmp_path))
+    mem_mgr.register_tool("list_dir", local_files.list_dir)
+    mem_mgr.register_tool("read_file", local_files.read_file)
+    target = tmp_path / "workspace" / "imports" / "profile.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("Profile details", encoding="utf-8")
+    list_args = {
+        "path": "imports",
+        "workspace_only": True,
+        "recursive": False,
+        "include_hidden": False,
+        "max_entries": 100,
+    }
+    list_sig = generate_signature("bob", "list_dir", list_args)
+
+    listing = mem_mgr.invoke_tool(
+        "list_dir", user="bob", signature=list_sig, **list_args
+    )
+    entry = next(item for item in listing["entries"] if item["type"] == "file")
+
+    assert entry["path"] == "imports/profile.md"
+    assert entry["read_path"] == "workspace/imports/profile.md"
+    read_args = {
+        "path": entry["read_path"],
+        "start_line": 1,
+        "line_count": 200,
+        "max_chars": 12000,
+    }
+    read_sig = generate_signature("bob", "read_file", read_args)
+    result = mem_mgr.invoke_tool(
+        "read_file", user="bob", signature=read_sig, **read_args
+    )
+    assert result["path"] == entry["read_path"]
+    assert result["text"] == "Profile details"
+
+
 def test_list_dir_normalizes_exact_data_prefix(mem_mgr, tmp_path, monkeypatch):
     monkeypatch.setenv("FLOAT_DATA_DIR", str(tmp_path))
     mem_mgr.register_tool("list_dir", local_files.list_dir)
@@ -279,3 +318,53 @@ def test_tool_decision_recovers_from_payload(client):
     res = client.post("/api/tools/decision", json=payload)
     assert res.status_code == 200
     assert res.json()["status"] == "invoked"
+
+
+def test_tool_decision_does_not_reconstruct_a_denied_request(client, monkeypatch):
+    from app import routes
+    from app.main import app
+
+    request_id = "denied-fallback-req"
+    app.state.pending_tools = {
+        request_id: {
+            "id": request_id,
+            "name": "remember",
+            "args": {"key": "should_not_exist", "value": "blocked"},
+            "session_id": "sess-denied-fallback",
+            "message_id": "msg-denied-fallback",
+            "chain_id": "msg-denied-fallback",
+            "status": "proposed",
+        }
+    }
+    app.state.agent_console_state = {"agents": {}, "resources": {}}
+    invoke_count = 0
+
+    async def fake_invoke(*args, **kwargs):
+        nonlocal invoke_count
+        invoke_count += 1
+        return "unexpected"
+
+    monkeypatch.setattr(routes, "_invoke_registered_tool_in_thread", fake_invoke)
+    decision_context = {
+        "request_id": request_id,
+        "name": "remember",
+        "args": {"key": "should_not_exist", "value": "blocked"},
+        "session_id": "sess-denied-fallback",
+        "message_id": "msg-denied-fallback",
+        "chain_id": "msg-denied-fallback",
+    }
+
+    denied = client.post(
+        "/api/tools/decision",
+        json={**decision_context, "decision": "deny"},
+    )
+    repeated = client.post(
+        "/api/tools/decision",
+        json={**decision_context, "decision": "accept"},
+    )
+
+    assert denied.status_code == 200
+    assert repeated.status_code == 200
+    assert repeated.json() == denied.json()
+    assert repeated.json()["status"] == "denied"
+    assert invoke_count == 0

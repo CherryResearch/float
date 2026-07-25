@@ -59,6 +59,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "active_workspace_id": "root",
     "sync_selected_workspace_ids": ["root"],
     "local_model_registrations": [],
+    "huggingface_model_registrations": [],
 }
 
 

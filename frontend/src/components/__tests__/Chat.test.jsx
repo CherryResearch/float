@@ -1,7 +1,7 @@
 import React from "react";
 import { afterEach, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import "@testing-library/jest-dom/vitest";
 import axios from "axios";
 import { GlobalContext } from "../../main";
@@ -16,6 +16,11 @@ import Chat, {
   resolveRegenerateRequestTarget,
   resolveSubchatControlFromTools,
 } from "../Chat";
+
+const LocationProbe = () => {
+  const location = useLocation();
+  return <output data-testid="chat-location">{`${location.pathname}${location.search}`}</output>;
+};
 
 describe("Chat", () => {
   afterEach(() => {
@@ -39,6 +44,7 @@ describe("Chat", () => {
         <GlobalContext.Provider value={{ state, setState }}>
           <MemoryRouter>
             <Chat thoughts={[]} setActiveMessageId={() => {}} {...props} />
+            <LocationProbe />
           </MemoryRouter>
         </GlobalContext.Provider>,
       ),
@@ -419,6 +425,30 @@ describe("Chat", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("marks an unresolved tool loop partial and offers a retry continuation", () => {
+    renderChat({
+      conversation: [
+        {
+          role: "ai",
+          id: "turn-unresolved",
+          text: "I could not finish the tool follow-up.",
+          metadata: {
+            status: "partial",
+            unresolved_tool_loop: true,
+          },
+        },
+      ],
+      history: [
+        { role: "ai", text: "I could not finish the tool follow-up." },
+      ],
+    });
+
+    expect(document.querySelector(".message-status-chip")).toHaveTextContent("partial");
+    expect(
+      screen.getByRole("button", { name: /continue generating/i }),
+    ).toHaveTextContent("retry continue");
+  });
+
   it("continues a completed notification-selected tool batch once", async () => {
     let resolveContinue;
     const continuePromise = new Promise((resolve) => {
@@ -700,7 +730,23 @@ describe("Chat", () => {
             model: "gpt-5.4-mini",
             response_id: "resp_1234567890",
             workflow: { name: "mini_execution" },
-            usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 },
+            reasoning: {
+              requested_effort: 0.83,
+              effective_effort: 0.83,
+              preset: "high",
+              rounded: false,
+              continuous: true,
+            },
+            generation: {
+              max_output_tokens: 65536,
+              output_limit_source: "user",
+            },
+            usage: {
+              prompt_tokens: 10,
+              completion_tokens: 4,
+              total_tokens: 14,
+              source: "estimate",
+            },
           },
           tools: [
             {
@@ -721,6 +767,9 @@ describe("Chat", () => {
     expect(screen.getByText("Message metadata")).toBeInTheDocument();
     expect(screen.getByText("gpt-5.4-mini")).toBeInTheDocument();
     expect(screen.getByText("mini_execution")).toBeInTheDocument();
+    expect(screen.getByText("high · 0.83")).toBeInTheDocument();
+    expect(screen.getByText("65536 tokens")).toBeInTheDocument();
+    expect(screen.getByText("Usage (estimated)")).toBeInTheDocument();
     expect(screen.getByText("in 10 / out 4 / total 14")).toBeInTheDocument();
   });
 
@@ -775,7 +824,7 @@ describe("Chat", () => {
             live_stream: {
               source: "realtime",
               mode: "api",
-              model: "gpt-realtime-2",
+              model: "gpt-realtime-2.1",
               provider: "openai-realtime",
               session_id: "sess-live-provider",
             },
@@ -785,7 +834,7 @@ describe("Chat", () => {
       history: [{ role: "ai", text: "Realtime reply." }],
     });
 
-    expect(screen.getByText("live/api:gpt-realtime-2")).toBeInTheDocument();
+    expect(screen.getByText("live/api:gpt-realtime-2.1")).toBeInTheDocument();
   });
 
   it("persists chat window width changes from the resize handle keyboard controls", () => {
@@ -843,6 +892,8 @@ describe("Chat", () => {
         sessionId: "sess-send-mode",
         apiStatus: "online",
         apiModel: "gpt-5.4",
+        outputTokenMode: "65536",
+        customOutputTokens: 32768,
         textRagEnabled: false,
         visionRagEnabled: true,
       });
@@ -860,6 +911,7 @@ describe("Chat", () => {
             message: "What is the capital of France?",
             mode: "api",
             model: "gpt-5.4",
+            max_output_tokens: 65536,
             use_rag: true,
             use_text_rag: false,
             use_vision_rag: true,
@@ -1446,14 +1498,14 @@ describe("Chat", () => {
     });
 
     fireEvent.click(screen.getAllByRole("button", { name: /chat settings/i })[0]);
-    fireEvent.mouseEnter(await screen.findByRole("button", { name: /microphone/i }));
+    fireEvent.click(await screen.findByRole("tab", { name: /microphone/i }));
 
     expect(await screen.findByLabelText("STT model")).toHaveValue(
       "gpt-realtime-whisper",
     );
     expect(screen.getByLabelText("microphone level")).toBeInTheDocument();
 
-    fireEvent.mouseEnter(screen.getByRole("button", { name: /^volume/i }));
+    fireEvent.click(screen.getByRole("tab", { name: /^voice/i }));
 
     expect(await screen.findByLabelText("TTS model")).toHaveValue("tts-1");
     expect(
@@ -1463,7 +1515,19 @@ describe("Chat", () => {
   });
 
   it("surfaces text and vision RAG controls in thinking settings", async () => {
-    renderChat({
+    const { setState } = renderChat({
+      backendMode: "server",
+      transformerModel: "thinkingmachines/Inkling",
+      thinkingMode: "auto",
+      outputTokenMode: "auto",
+      customOutputTokens: 32768,
+      serverModelDetails: [
+        {
+          id: "thinkingmachines/Inkling",
+          max_context_length: 65536,
+          source: "tinker-sdk",
+        },
+      ],
       textRagEnabled: true,
       visionRagEnabled: false,
       ragEmbeddingModel: "local:all-MiniLM-L6-v2",
@@ -1471,19 +1535,58 @@ describe("Chat", () => {
     });
 
     fireEvent.click(screen.getAllByRole("button", { name: /chat settings/i })[0]);
-    fireEvent.mouseEnter(await screen.findByRole("button", { name: /thinking/i }));
+    fireEvent.click(await screen.findByRole("tab", { name: /reasoning & memory/i }));
 
-    expect(
-      await screen.findAllByTitle(
-        "Memory: automatic Retrieval Augmented Generation to find similar memories.",
-      ),
-    ).not.toHaveLength(0);
+    expect(screen.getByLabelText("About reasoning effort")).toBeInTheDocument();
+    expect(screen.getByLabelText("About response limit")).toBeInTheDocument();
+    expect(screen.getByLabelText("About memory retrieval")).toBeInTheDocument();
+    const reasoningHelp = screen.getByLabelText("About reasoning effort");
+    fireEvent.mouseOver(reasoningHelp);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      /reasoning effort and output length are independent/i,
+    );
+    fireEvent.mouseOut(reasoningHelp);
+    await waitFor(() => expect(screen.queryByRole("tooltip")).not.toBeInTheDocument());
     expect(screen.getByRole("checkbox", { name: /text models/i })).toBeChecked();
     expect(screen.getByRole("checkbox", { name: /vision models/i })).not.toBeChecked();
-    expect(screen.getByText("text retrieval model")).toBeInTheDocument();
-    expect(screen.getByDisplayValue(/all-MiniLM-L6-v2/i)).toBeInTheDocument();
-    expect(screen.getByText("vision retrieval model")).toBeInTheDocument();
-    expect(screen.getByDisplayValue(/OpenCLIP ViT-B-32/i)).toBeDisabled();
+    const textRetrievalModel = screen.getByLabelText("text retrieval model");
+    const visionRetrievalModel = screen.getByLabelText("vision retrieval model");
+    expect(textRetrievalModel).toHaveValue("local:all-MiniLM-L6-v2");
+    expect(visionRetrievalModel).toHaveValue("ViT-B-32");
+    expect(visionRetrievalModel).toBeDisabled();
+    expect(textRetrievalModel.closest(".chat-settings-rag-card")).toContainElement(
+      screen.getByRole("checkbox", { name: /text models/i }),
+    );
+    expect(visionRetrievalModel.closest(".chat-settings-rag-card")).toContainElement(
+      screen.getByRole("checkbox", { name: /vision models/i }),
+    );
+    expect(screen.getByRole("button", { name: "minimal" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "medium" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "xhigh" })).toBeInTheDocument();
+    expect(screen.getByLabelText("response limit")).toHaveValue("auto");
+    expect(
+      screen.getByText(/64K context · response max not reported/i),
+    ).toBeInTheDocument();
+    fireEvent.mouseOver(screen.getByLabelText("About response limit"));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      /context is the full working window/i,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "medium" }));
+    let updater = setState.mock.calls.at(-1)?.[0];
+    expect(updater({ thinkingMode: "auto" }).thinkingMode).toBe("medium");
+
+    fireEvent.change(screen.getByRole("slider", { name: "reasoning effort" }), {
+      target: { value: "0.83" },
+    });
+    updater = setState.mock.calls.at(-1)?.[0];
+    expect(updater({ thinkingMode: "high" }).thinkingMode).toBe("0.83");
+
+    fireEvent.change(screen.getByLabelText("response limit"), {
+      target: { value: "65536" },
+    });
+    updater = setState.mock.calls.at(-1)?.[0];
+    expect(updater({ outputTokenMode: "auto" }).outputTokenMode).toBe("65536");
   });
 
   it("recognizes a trailing percent tool command as a tool directive", () => {
@@ -1644,24 +1747,94 @@ describe("Chat", () => {
   });
 
   it("offers a workflow editor shortcut in composer settings", async () => {
+    const getSpy = vi.spyOn(axios, "get").mockResolvedValue({ data: { workflows: [] } });
+    try {
+      renderChat({
+        sessionId: "sess-chat-workflow-settings",
+        apiStatus: "online",
+      });
+
+      fireEvent.click(screen.getAllByRole("button", { name: /chat settings/i })[0]);
+      const dialog = await screen.findByRole("dialog", { name: /chat settings/i });
+      fireEvent.click(within(dialog).getByRole("tab", { name: /workflow/i }));
+
+      const manageButton = await within(dialog).findByRole("button", {
+        name: /manage workflows & modules in knowledge/i,
+      });
+      fireEvent.click(manageButton);
+      expect(screen.getByTestId("chat-location")).toHaveTextContent(
+        "/knowledge?tab=skills&view=workflows",
+      );
+    } finally {
+      getSpy.mockRestore();
+    }
+  });
+
+  it("loads dynamic workflow profiles and keeps their ids when selected", async () => {
+    const getSpy = vi.spyOn(axios, "get").mockResolvedValue({
+      data: {
+        workflows: [
+          {
+            id: "default",
+            label: "Default",
+            description: "Balanced response profile.",
+          },
+          {
+            id: "background_reflection",
+            label: "Background Reflection",
+            description: "Reflect after the active response.",
+          },
+        ],
+      },
+    });
+    try {
+      const { setState } = renderChat({
+        sessionId: "sess-chat-dynamic-workflow",
+        apiStatus: "online",
+      });
+
+      fireEvent.click(screen.getAllByRole("button", { name: /chat settings/i })[0]);
+      const dialog = await screen.findByRole("dialog", { name: /chat settings/i });
+      fireEvent.click(within(dialog).getByRole("tab", { name: /workflow/i }));
+      const select = await within(dialog).findByLabelText(/active workflow profile/i);
+
+      expect(
+        within(select).getByRole("option", { name: "Background Reflection" }),
+      ).toBeInTheDocument();
+      fireEvent.change(select, { target: { value: "background_reflection" } });
+      const stateUpdater = setState.mock.calls.at(-1)[0];
+      expect(stateUpdater({ workflowProfile: "default" })).toEqual({
+        workflowProfile: "background_reflection",
+      });
+    } finally {
+      getSpy.mockRestore();
+    }
+  });
+
+  it("exposes dialog state and restores focus after Escape", async () => {
     renderChat({
-      sessionId: "sess-chat-workflow-settings",
+      sessionId: "sess-chat-settings-keyboard",
       apiStatus: "online",
     });
 
-    fireEvent.click(screen.getAllByRole("button", { name: /chat settings/i })[0]);
-    await waitFor(() => {
-      expect(document.querySelector(".chat-settings-popover")).not.toBeNull();
-    });
-    const popover = document.querySelector(".chat-settings-popover");
-    const workflowItem = Array.from(
-      popover.querySelectorAll(".chat-settings-item"),
-    ).find((item) => item.textContent.includes("workflow"));
-    fireEvent.mouseEnter(workflowItem);
+    const trigger = screen.getAllByRole("button", { name: /chat settings/i })[0];
+    fireEvent.click(trigger);
+    const dialog = await screen.findByRole("dialog", { name: /chat settings/i });
+    expect(dialog).toBeInTheDocument();
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
 
-    expect(
-      await screen.findByRole("button", { name: /open workflow editor/i }),
-    ).toBeInTheDocument();
+    const cameraTab = within(dialog).getByRole("tab", { name: /camera/i });
+    cameraTab.focus();
+    fireEvent.keyDown(cameraTab, { key: "ArrowRight" });
+    await waitFor(() => {
+      expect(within(dialog).getByRole("tab", { name: /microphone/i })).toHaveFocus();
+    });
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: /chat settings/i })).not.toBeInTheDocument();
+      expect(trigger).toHaveFocus();
+    });
   });
 
   it("opens the agent console when inline tool links use console behavior", () => {
@@ -2845,7 +3018,7 @@ describe("Chat", () => {
             client_secret: "ephemeral-secret",
             url: "https://example.test/realtime",
             session_id: "sess-live-tool-config",
-            model: "gpt-realtime-2",
+            model: "gpt-realtime-2.1",
           },
         });
       }

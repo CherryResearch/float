@@ -1,12 +1,17 @@
 # etl_tools.py
 
-from typing import Dict, List
+from typing import Dict
 
 from api_tools import fetch_data_from_api, process_api_data
+
 # Use the backend MemoryManager stub for storing results
 from app.services import MemoryManager
-from web_tools import (extract_images_from_html, extract_links_from_html,
-                       extract_text_from_html, fetch_webpage_content)
+from web_tools import (
+    extract_images_from_html,
+    extract_links_from_html,
+    extract_text_from_html,
+    fetch_webpage_content,
+)
 
 
 class ETLTools:

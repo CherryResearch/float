@@ -834,6 +834,22 @@ _BUILTIN_TOOL_CATALOG: Dict[str, Dict[str, Any]] = {
             "Protected and secret values are not mirrored into vector search by default."
         ],
     ),
+    "graph.update": _entry(
+        category="memory",
+        summary="Create or update durable graph nodes and claims.",
+        description=(
+            "Writes explicit graph nodes and multi-role claims into Float's SQLite "
+            "graph store. Use this for manual graph editing, graph fixtures, and "
+            "tool-trace experiments that need exact node/edge payloads."
+        ),
+        runtime={"executor": "backend_python", "network": False, "filesystem": False},
+        freshness={"type": "live_local_state"},
+        persistence={"writes_state": True, "stores_output": True},
+        safety={"risk_level": "medium", "default_approval": "confirm"},
+        can_access=["shared durable graph store"],
+        cannot_access=["automatic graph extraction or renderer tuning"],
+        limit_hints=["Writes are tracked by action history when it is enabled."],
+    ),
     "recall": _entry(
         category="memory",
         summary="Recall by exact key or search shared memory and knowledge snippets.",

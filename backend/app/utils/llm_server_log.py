@@ -46,4 +46,3 @@ def log_event(event: str, data: Dict[str, Any] | None = None) -> None:
             LOGGER.debug("%s %s", event, record)
     except Exception:
         pass
-

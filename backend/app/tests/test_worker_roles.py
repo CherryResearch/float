@@ -1,5 +1,20 @@
-from workers.multimodal import (ASR, ASR_CACHE, ROLE_REGISTRY, VISION_CACHE,
-                                VisionCaptioner)
+import pytest
+from workers.multimodal import (
+    ASR,
+    ASR_CACHE,
+    ROLE_REGISTRY,
+    VISION_CACHE,
+    VisionCaptioner,
+)
+
+
+@pytest.fixture(autouse=True)
+def clear_worker_caches():
+    VISION_CACHE.clear()
+    ASR_CACHE.clear()
+    yield
+    VISION_CACHE.clear()
+    ASR_CACHE.clear()
 
 
 def test_asr_and_vad_are_edge():

@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from app.utils import memory_store
 
+GRAPH_STORE_SCHEMA_VERSION = 1
 GRAPH_NODE_KINDS = {"entity", "event"}
 GRAPH_CLAIM_EPISTEMIC_STATUSES = {
     "observed",
@@ -309,6 +310,21 @@ class GraphStore:
             ).fetchall()
         return [node for row in rows if (node := self._load_node(row)) is not None]
 
+    def list_claims(self, *, limit: int = 100) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT claim_id, claim_type, predicate, status, epistemic_status,
+                       confidence, valid_from, valid_to, occurred_at, source_kind,
+                       source_ref, metadata_json, created_at, updated_at
+                FROM graph_claims
+                ORDER BY updated_at DESC, claim_id ASC
+                LIMIT ?
+                """,
+                (max(1, int(limit or 100)),),
+            ).fetchall()
+        return [claim for row in rows if (claim := self._load_claim(row)) is not None]
+
     def upsert_claim(
         self,
         *,
@@ -500,5 +516,142 @@ class GraphStore:
             "role_count": int(role_count or 0),
         }
 
+    def projection(
+        self,
+        *,
+        node_limit: int = 120,
+        claim_limit: int = 240,
+    ) -> Dict[str, Any]:
+        """Return a visualization-ready projection of durable graph state."""
 
-__all__ = ["GraphStore", "resolve_path"]
+        raw_nodes = self.list_nodes(limit=node_limit)
+        raw_claims = self.list_claims(limit=claim_limit)
+        node_ids = {str(node.get("node_id") or "") for node in raw_nodes}
+        node_ids.discard("")
+        prefix = "knowledge"
+        links: List[Dict[str, Any]] = []
+        visible_claims: List[Dict[str, Any]] = []
+        degree_counts: Dict[str, int] = {}
+
+        for claim in raw_claims:
+            roles = [
+                role
+                for role in claim.get("roles", [])
+                if str(role.get("node_id") or "") in node_ids
+            ]
+            if len(roles) < 2:
+                continue
+            claim_links = self._claim_projection_links(claim, roles, prefix=prefix)
+            if not claim_links:
+                continue
+            visible_claims.append(claim)
+            for link in claim_links:
+                links.append(link)
+                source = str(link.get("source") or "")
+                target = str(link.get("target") or "")
+                degree_counts[source] = degree_counts.get(source, 0) + 1
+                degree_counts[target] = degree_counts.get(target, 0) + 1
+
+        nodes: List[Dict[str, Any]] = []
+        for raw_node in raw_nodes:
+            node_id = str(raw_node.get("node_id") or "")
+            projected_id = f"{prefix}:{node_id}"
+            attributes = raw_node.get("attributes")
+            attributes = attributes if isinstance(attributes, dict) else {}
+            nodes.append(
+                {
+                    "id": projected_id,
+                    "node_id": node_id,
+                    "label": raw_node.get("canonical_name") or node_id,
+                    "type": raw_node.get("node_type") or raw_node.get("node_kind"),
+                    "node_kind": raw_node.get("node_kind"),
+                    "node_type": raw_node.get("node_type"),
+                    "graph_key": "knowledge",
+                    "level": 0
+                    if str(raw_node.get("node_kind") or "") == "entity"
+                    else 1,
+                    "weight": max(1, degree_counts.get(projected_id, 0)),
+                    "summary_text": raw_node.get("summary_text") or "",
+                    "attributes": attributes,
+                    "status": raw_node.get("status") or "active",
+                    "match_key": attributes.get("match_key") or "",
+                    "updated_at": raw_node.get("updated_at"),
+                }
+            )
+
+        return {
+            "schema_version": GRAPH_STORE_SCHEMA_VERSION,
+            "nodes": nodes,
+            "links": links,
+            "claims": visible_claims,
+            "metadata": {
+                "schema_version": GRAPH_STORE_SCHEMA_VERSION,
+                "node_count": len(nodes),
+                "claim_count": len(visible_claims),
+                "link_count": len(links),
+                "source": "graph_store",
+                "maxLevel": 1 if any(node.get("level") == 1 for node in nodes) else 0,
+            },
+        }
+
+    @staticmethod
+    def _claim_projection_links(
+        claim: Dict[str, Any],
+        roles: List[Dict[str, Any]],
+        *,
+        prefix: str,
+    ) -> List[Dict[str, Any]]:
+        def projected_id(role: Dict[str, Any]) -> str:
+            return f"{prefix}:{role.get('node_id')}"
+
+        subject_roles = [
+            role
+            for role in roles
+            if str(role.get("role_name") or "").lower()
+            in {"subject", "source", "from", "actor", "owner", "person"}
+        ]
+        object_roles = [
+            role
+            for role in roles
+            if str(role.get("role_name") or "").lower()
+            in {"object", "target", "to", "friend", "member"}
+        ]
+        if subject_roles and object_roles:
+            pairs = [
+                (source, target)
+                for source in subject_roles
+                for target in object_roles
+                if projected_id(source) != projected_id(target)
+            ]
+        else:
+            anchor = roles[0]
+            pairs = [
+                (anchor, role)
+                for role in roles[1:]
+                if projected_id(anchor) != projected_id(role)
+            ]
+
+        links: List[Dict[str, Any]] = []
+        for source, target in pairs:
+            links.append(
+                {
+                    "source": projected_id(source),
+                    "target": projected_id(target),
+                    "type": "claim",
+                    "graph_key": "knowledge",
+                    "predicate": claim.get("predicate") or "",
+                    "claim_id": claim.get("claim_id") or "",
+                    "claim_type": claim.get("claim_type") or "relation",
+                    "epistemic_status": claim.get("epistemic_status") or "asserted",
+                    "status": claim.get("status") or "active",
+                    "confidence": claim.get("confidence"),
+                    "weight": max(0.1, min(float(claim.get("confidence") or 1.0), 2.0)),
+                    "source_role": source.get("role_name"),
+                    "target_role": target.get("role_name"),
+                    "metadata": claim.get("metadata") or {},
+                }
+            )
+        return links
+
+
+__all__ = ["GraphStore", "GRAPH_STORE_SCHEMA_VERSION", "resolve_path"]

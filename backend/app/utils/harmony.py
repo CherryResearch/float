@@ -16,12 +16,10 @@ from __future__ import annotations
 from typing import Any, List
 
 try:  # Prefer the real implementation when available
-    from openai_harmony import (  # type: ignore
-        Message as _HarmonyMessage,
-        Role as _HarmonyRole,
-        HarmonyEncodingName as _HarmonyEncodingName,
-        load_harmony_encoding as _load_harmony_encoding,
-    )
+    from openai_harmony import HarmonyEncodingName as _HarmonyEncodingName
+    from openai_harmony import Message as _HarmonyMessage  # type: ignore
+    from openai_harmony import Role as _HarmonyRole
+    from openai_harmony import load_harmony_encoding as _load_harmony_encoding
 
     # Some test setups may stub these as None; guard against that.
     if _HarmonyMessage is not None and _HarmonyRole is not None:
@@ -91,4 +89,3 @@ except Exception:  # Fallback minimal shims
                 return "".join(chr(i) for i in ids)
 
         return _Tok()
-

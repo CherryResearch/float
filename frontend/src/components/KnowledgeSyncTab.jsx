@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import axios from "axios";
 import StateInspector from "./StateInspector";
 import "../styles/ProgressBar.css";
+import "../styles/ImportReview.css";
 import { buildSyncOwnershipInspectorRows } from "../utils/stateExplanations";
 import {
   WORKSPACE_PRIVATE_PATTERNS_HELP,
@@ -12,6 +13,11 @@ import {
   workspacePrivatePatternsText,
   workspaceSyncBlocked,
 } from "../utils/privacyLevels";
+import {
+  describeClassifiedImport,
+  isMarkdownOrTextImport,
+  normalizeClassifiedImportPreview,
+} from "../utils/importClassification";
 
 const DEFAULT_EXPORT_DEFAULTS = {
   format: "md",
@@ -142,6 +148,10 @@ const coerceWorkspaceProfiles = (value) => {
     source_device_name: "",
     source_workspace_id: "",
     source_workspace_name: "",
+    lineage_id: "",
+    origin_deployment_id: "",
+    upstream_deployment_id: "",
+    sync_back: {},
     privacy_mode: "default",
     private_patterns: [],
   };
@@ -158,6 +168,20 @@ const coerceWorkspaceProfiles = (value) => {
             : root.name,
         privacy_mode: normalizeWorkspacePrivacyMode(rootEntry.privacy_mode),
         private_patterns: normalizeWorkspacePrivatePatterns(rootEntry.private_patterns),
+        lineage_id:
+          typeof rootEntry.lineage_id === "string" ? rootEntry.lineage_id.trim() : "",
+        origin_deployment_id:
+          typeof rootEntry.origin_deployment_id === "string"
+            ? rootEntry.origin_deployment_id.trim()
+            : "",
+        upstream_deployment_id:
+          typeof rootEntry.upstream_deployment_id === "string"
+            ? rootEntry.upstream_deployment_id.trim()
+            : "",
+        sync_back:
+          rootEntry.sync_back && typeof rootEntry.sync_back === "object"
+            ? rootEntry.sync_back
+            : {},
       };
     }
   }
@@ -207,6 +231,18 @@ const coerceWorkspaceProfiles = (value) => {
         typeof entry.source_workspace_name === "string"
           ? entry.source_workspace_name.trim()
           : "",
+      lineage_id:
+        typeof entry.lineage_id === "string" ? entry.lineage_id.trim() : "",
+      origin_deployment_id:
+        typeof entry.origin_deployment_id === "string"
+          ? entry.origin_deployment_id.trim()
+          : "",
+      upstream_deployment_id:
+        typeof entry.upstream_deployment_id === "string"
+          ? entry.upstream_deployment_id.trim()
+          : "",
+      sync_back:
+        entry.sync_back && typeof entry.sync_back === "object" ? entry.sync_back : {},
       privacy_mode: normalizeWorkspacePrivacyMode(entry.privacy_mode),
       private_patterns: normalizeWorkspacePrivatePatterns(entry.private_patterns),
     });
@@ -243,6 +279,22 @@ const coerceSavedPeers = (value) =>
           public_key: typeof entry.public_key === "string" ? entry.public_key.trim() : "",
           remote_device_name:
             typeof entry.remote_device_name === "string" ? entry.remote_device_name.trim() : "",
+          remote_deployment_id:
+            typeof entry.remote_deployment_id === "string" ? entry.remote_deployment_id.trim() : "",
+          remote_software:
+            entry.remote_software && typeof entry.remote_software === "object"
+              ? entry.remote_software
+              : {},
+          remote_data:
+            entry.remote_data && typeof entry.remote_data === "object"
+              ? entry.remote_data
+              : {},
+          data_checkpoint:
+            entry.data_checkpoint && typeof entry.data_checkpoint === "object"
+              ? entry.data_checkpoint
+              : {},
+          last_status_at:
+            typeof entry.last_status_at === "string" ? entry.last_status_at.trim() : "",
           last_used_at:
             typeof entry.last_used_at === "string" ? entry.last_used_at.trim() : "",
           remote_public_key:
@@ -311,7 +363,7 @@ const describeSyncOperation = (operation) => {
   ];
   const remote =
     String(operation.remote_label || "").trim() ||
-    String(operation.remote_url || "").trim();
+    (String(operation.remote_url || "").trim() ? "remote device" : "");
   if (remote) parts.push(remote);
   if (operation.started_at || operation.finished_at) {
     parts.push(formatDateTime(operation.finished_at || operation.started_at));
@@ -347,15 +399,78 @@ const syncPreviewStatusLabel = (status) => {
   const key = String(status || "").trim().toLowerCase();
   if (key === "only_remote") return "Only remote";
   if (key === "only_local") return "Only local";
-  if (key === "remote_newer") return "Remote newer";
-  if (key === "local_newer") return "Local newer";
+  if (key === "remote_new") return "New remotely since sync";
+  if (key === "local_new") return "New here since sync";
+  if (key === "remote_deleted") return "Deleted remotely since sync";
+  if (key === "local_deleted") return "Deleted here since sync";
+  if (key === "remote_newer") return "Remote changed";
+  if (key === "local_newer") return "Local changed";
+  if (key === "conflict") return "Both changed";
+  if (key === "delete_conflict") return "Edit/delete conflict";
+  if (key === "known_difference") return "Known difference";
   if (key === "identical") return "Identical";
   return key || "Changed";
 };
 
 const SYNC_ACTIONABLE_STATUSES = {
-  pull: new Set(["only_remote", "remote_newer", "only_local"]),
-  push: new Set(["only_local", "local_newer", "only_remote"]),
+  pull: new Set([
+    "only_remote",
+    "remote_new",
+    "remote_newer",
+    "only_local",
+    "local_new",
+    "local_deleted",
+    "remote_deleted",
+    "known_difference",
+  ]),
+  push: new Set([
+    "only_local",
+    "local_new",
+    "local_newer",
+    "only_remote",
+    "remote_new",
+    "local_deleted",
+    "remote_deleted",
+    "known_difference",
+  ]),
+};
+
+const syncItemIsDeletion = (item, direction) => {
+  const status = String(item?.status || "").trim().toLowerCase();
+  if (status === "known_difference") {
+    return direction === "pull"
+      ? item?.local_present === true && item?.remote_present !== true
+      : item?.remote_present === true && item?.local_present !== true;
+  }
+  return direction === "pull"
+    ? ["only_local", "local_new", "remote_deleted"].includes(status)
+    : ["only_remote", "remote_new", "local_deleted"].includes(status);
+};
+
+const syncProposedActionLabel = (item, direction) => {
+  const status = String(item?.status || "").trim().toLowerCase();
+  if (direction === "pull") {
+    if (["only_remote", "remote_new", "local_deleted"].includes(status)) return "Add or restore here";
+    if (status === "remote_newer") return "Update here";
+    if (["only_local", "local_new", "remote_deleted"].includes(status)) return "Delete here";
+    if (status === "known_difference") {
+      if (item?.remote_present === true && item?.local_present !== true) return "Add here";
+      if (item?.local_present === true && item?.remote_present !== true) return "Delete here";
+      return "Use remote version here";
+    }
+  } else {
+    if (["only_local", "local_new", "remote_deleted"].includes(status)) return "Add or restore there";
+    if (status === "local_newer") return "Update there";
+    if (["only_remote", "remote_new", "local_deleted"].includes(status)) return "Delete there";
+    if (status === "known_difference") {
+      if (item?.local_present === true && item?.remote_present !== true) return "Add there";
+      if (item?.remote_present === true && item?.local_present !== true) return "Delete there";
+      return "Use local version there";
+    }
+  }
+  if (status === "conflict") return "Resolve both edits";
+  if (status === "delete_conflict") return "Resolve edit/delete";
+  return "No change";
 };
 
 const normalizeSyncSelectionIds = (value) => {
@@ -384,26 +499,42 @@ const syncSectionSelectedCount = (selections, direction, sectionKey) =>
 const describeSyncDirectionSummary = (section, direction, remoteLabel) => {
   const label = remoteLabel || "remote";
   const identical = Number(section?.identical || 0);
+  const statusCounts = syncSectionDiffItems(section).reduce((counts, item) => {
+    const status = String(item?.status || "").trim().toLowerCase();
+    if (status) counts[status] = Number(counts[status] || 0) + 1;
+    return counts;
+  }, {});
+  const count = (...statuses) =>
+    statuses.reduce((total, status) => total + Number(statusCounts[status] || 0), 0);
+  const conflicts = count("conflict", "delete_conflict");
+  const unresolved = count("known_difference");
+  const untracked = count("only_local", "only_remote");
   if (direction === "pull") {
-    const onlyRemote = Number(section?.only_remote || 0);
-    const remoteNewer = Number(section?.remote_newer || 0);
-    const onlyLocal = Number(section?.only_local || 0);
-    if (!onlyRemote && !remoteNewer && !onlyLocal) {
+    const additions = count("only_remote", "remote_new", "local_deleted");
+    const updates = count("remote_newer");
+    const deletions = count("only_local", "local_new", "remote_deleted");
+    if (!additions && !updates && !deletions && !conflicts && !unresolved) {
       return identical
         ? `${identical} already match here. Nothing new to pull from ${label}.`
         : `Nothing to pull from ${label}.`;
     }
-    return `${onlyRemote} new on ${label}, ${remoteNewer} newer on ${label}, ${onlyLocal} deleted on ${label}, ${identical} already match here.`;
+    const baselineNote = untracked
+      ? ` ${untracked} one-sided item${untracked === 1 ? " is" : "s are"} unresolved without a shared checkpoint.`
+      : "";
+    return `${additions} add or restore here, ${updates} update here, ${deletions} delete here, ${conflicts} conflicts, ${unresolved} known differences, ${identical} already match.${baselineNote}`;
   }
-  const onlyLocal = Number(section?.only_local || 0);
-  const localNewer = Number(section?.local_newer || 0);
-  const onlyRemote = Number(section?.only_remote || 0);
-  if (!onlyLocal && !localNewer && !onlyRemote) {
+  const additions = count("only_local", "local_new", "remote_deleted");
+  const updates = count("local_newer");
+  const deletions = count("only_remote", "remote_new", "local_deleted");
+  if (!additions && !updates && !deletions && !conflicts && !unresolved) {
     return identical
       ? `${identical} already match there. Nothing to push from this device.`
       : "Nothing to push from this device.";
   }
-  return `${onlyLocal} only on this device, ${localNewer} newer here, ${onlyRemote} deleted here, ${identical} already match there.`;
+  const baselineNote = untracked
+    ? ` ${untracked} one-sided item${untracked === 1 ? " is" : "s are"} unresolved without a shared checkpoint.`
+    : "";
+  return `${additions} add or restore there, ${updates} update there, ${deletions} delete there, ${conflicts} conflicts, ${unresolved} known differences, ${identical} already match.${baselineNote}`;
 };
 
 const describeSyncItemTiming = (item) => {
@@ -435,7 +566,7 @@ const inferImportFormatFromFilename = (name) => {
   const value = String(name || "").trim().toLowerCase();
   if (value.endsWith(".zip")) return "zip";
   if (value.endsWith(".json")) return "json";
-  if (value.endsWith(".md")) return "markdown";
+  if (value.endsWith(".md") || value.endsWith(".markdown")) return "markdown";
   if (value.endsWith(".txt")) return "text";
   return "auto";
 };
@@ -455,12 +586,12 @@ const describePeerStatus = (peer, options = {}) => {
   if (peer?.remote_device_id) {
     return { key: "paired", label: "paired" };
   }
-  return { key: "saved", label: "saved target" };
+  return { key: "saved", label: "saved address - not paired" };
 };
 
 const describePeerIdentityStatus = (status) => {
   const state = String(status?.identity_state || "").trim();
-  if (state === "verified") return "same saved device";
+  if (state === "verified") return "saved fingerprint matched";
   if (state === "mismatch") return "different Float identity";
   if (state === "missing_remote_identity") return "no remote fingerprint";
   if (state === "unanchored") return "fingerprint not saved yet";
@@ -501,7 +632,8 @@ const describeSyncHistoryStatus = (action) => {
 
 const describeLatestSyncActivity = (action) => {
   if (!action || typeof action !== "object") return "";
-  const summary = String(action.summary || "").trim() || "Sync activity";
+  const actionName = String(action.name || "").trim();
+  const summary = actionName === "sync_ingest" ? "Incoming sync applied" : "Pull completed";
   const itemCount = Number(action.item_count || 0);
   const itemLabel =
     itemCount > 0 ? `${itemCount} changed item${itemCount === 1 ? "" : "s"}` : "";
@@ -518,10 +650,10 @@ const describeSyncOwnershipTarget = (summary) => {
   const remoteUrl = String(target.remote_url || "").trim();
   const peerLabel = String(target.peer_label || "").trim();
   if (mode === "saved_peer" && remoteUrl) {
-    return peerLabel ? `${peerLabel} at ${remoteUrl}` : remoteUrl;
+    return peerLabel || "Saved device";
   }
   if (mode === "manual_url" && remoteUrl) {
-    return `${remoteUrl} (manual URL)`;
+    return "Saved address - not paired";
   }
   return "None saved";
 };
@@ -542,12 +674,6 @@ const describeSyncOwnershipTargetNote = (summary) => {
   return "No default outbound target is configured yet.";
 };
 
-const looksLikeLegacyBrowserName = (value) => {
-  const lowered = String(value || "").trim().toLowerCase();
-  if (!lowered) return false;
-  return lowered.startsWith("mozilla/5.0") || lowered.includes("applewebkit");
-};
-
 const SyncLabelText = ({ text, tooltip }) => (
   <span className="knowledge-sync-label-inline" title={tooltip || undefined}>
     {text}
@@ -563,6 +689,7 @@ const KnowledgeSyncTab = () => {
   const [refreshToken, setRefreshToken] = useState(0);
   const [message, setMessage] = useState("");
   const [importStatus, setImportStatus] = useState("");
+  const [importStatusKind, setImportStatusKind] = useState("");
   const [overview, setOverview] = useState(null);
   const [deviceDisplayName, setDeviceDisplayName] = useState("");
   const [syncVisibleOnLan, setSyncVisibleOnLan] = useState(false);
@@ -585,7 +712,7 @@ const KnowledgeSyncTab = () => {
   const [newWorkspaceNamespace, setNewWorkspaceNamespace] = useState("");
   const [newWorkspaceRootPath, setNewWorkspaceRootPath] = useState("");
   const [syncPreview, setSyncPreview] = useState(null);
-  const [syncSelections, setSyncSelections] = useState({});
+  const [syncPreviewPlanKey, setSyncPreviewPlanKey] = useState("");
   const [syncItemSelections, setSyncItemSelections] = useState({ pull: {}, push: {} });
   const [syncItemReview, setSyncItemReview] = useState(null);
   const [syncBusy, setSyncBusy] = useState(false);
@@ -614,6 +741,13 @@ const KnowledgeSyncTab = () => {
     selectedFiles: {},
     destinationFolder: "",
     summary: null,
+    classification: "",
+    messageCount: 0,
+    roleCounts: {},
+    preview: "",
+    warnings: [],
+    suggestedAction: "",
+    allowedActions: [],
   });
 
   const selectedPeer = useMemo(
@@ -624,6 +758,35 @@ const KnowledgeSyncTab = () => {
     !!selectedPeer &&
     !!syncRemoteUrl.trim() &&
     syncRemoteUrl.trim() !== String(selectedPeer.remote_url || "").trim();
+  const currentSyncPlanKey = useMemo(
+    () =>
+      JSON.stringify({
+        remote_url: syncRemoteUrl.trim(),
+        peer_id: selectedPeerId || "",
+        scopes: normalizePeerScopes(targetScopes),
+        local_workspace_ids: normalizeWorkspaceIdList(selectedWorkspaceIds),
+        remote_workspace_ids: normalizeWorkspaceIdList(remoteWorkspaceIds),
+        workspace_mode: workspaceMode,
+        local_target_workspace_id: localTargetWorkspaceId || activeWorkspaceId || "root",
+        remote_target_workspace_id: remoteTargetWorkspaceId || "root",
+        link_to_source: !!syncLinkToSourceDevice,
+        source_namespace: syncSourceNamespace.trim() || deviceDisplayName.trim(),
+      }),
+    [
+      activeWorkspaceId,
+      deviceDisplayName,
+      localTargetWorkspaceId,
+      remoteTargetWorkspaceId,
+      remoteWorkspaceIds,
+      selectedPeerId,
+      selectedWorkspaceIds,
+      syncLinkToSourceDevice,
+      syncRemoteUrl,
+      syncSourceNamespace,
+      targetScopes,
+      workspaceMode,
+    ],
+  );
   const selectedPeerConnected =
     !!selectedPeer &&
     !remoteAddressDirty &&
@@ -647,6 +810,43 @@ const KnowledgeSyncTab = () => {
   const latestSyncActivityLabel = recentSyncActions.length
     ? describeLatestSyncActivity(recentSyncActions[0])
     : "";
+  const localDeploymentStatus = overview?.deployment_status || {};
+  const localSoftwareStatus = localDeploymentStatus?.software || {};
+  const localDataStatus = localDeploymentStatus?.data || {};
+  const localDataRevision = localDataStatus?.revision || {};
+  const localDataCheckpoint = localDataStatus?.sync_checkpoint || {};
+  const remoteDeploymentStatus = peerStatus?.deployment_status || {
+    software: selectedPeer?.remote_software || {},
+    data: selectedPeer?.remote_data || {},
+  };
+  const remoteSoftwareComparison = peerStatus?.software_comparison || {};
+  const localDeploymentId = String(localDataStatus?.deployment_id || "").trim();
+  const localSoftwareLabel =
+    String(localSoftwareStatus?.label || "").trim()
+    || `${String(localSoftwareStatus?.release_version || "unknown").trim()} // build unassigned`;
+  const localDataLabel =
+    String(localDataStatus?.display_name || deviceDisplayName || "").trim()
+    || (localDeploymentId ? `deployment ${localDeploymentId.slice(0, 8)}` : "deployment identity pending");
+  const localDataRevisionCode = String(localDataRevision?.code || "").trim();
+  const localDataBuildLabel = localDataRevisionCode
+    ? `${localDataLabel} // ${localDataRevisionCode}`
+    : localDataLabel;
+  const selectedPeerDataCheckpoint = selectedPeer?.data_checkpoint || {};
+  const remoteSoftwareLabel = String(remoteDeploymentStatus?.software?.label || "").trim();
+  const remoteDataRevisionCode = String(remoteDeploymentStatus?.data?.revision?.code || "").trim();
+  const remoteDataLabel =
+    String(remoteDeploymentStatus?.data?.display_name || "").trim()
+    || (String(remoteDeploymentStatus?.data?.deployment_id || selectedPeer?.remote_deployment_id || "").trim()
+      ? `deployment ${String(
+          remoteDeploymentStatus?.data?.deployment_id || selectedPeer?.remote_deployment_id,
+        ).slice(0, 8)}`
+      : "");
+  const remoteDataBuildLabel = remoteDataRevisionCode
+    ? `${remoteDataLabel || "remote data"} // ${remoteDataRevisionCode}`
+    : remoteDataLabel;
+  const activeDataCheckpoint = selectedPeer
+    ? selectedPeerDataCheckpoint
+    : localDataCheckpoint;
   const buildSyncOperationOwner = () =>
     deviceDisplayName ||
     overview?.current_device?.display_name ||
@@ -773,7 +973,11 @@ const KnowledgeSyncTab = () => {
             ? normalizeWorkspaceIdList(match.local_workspace_ids)
             : selectedIds,
         );
-        setRemoteWorkspaceIds(match?.remote_workspace_ids || []);
+        setRemoteWorkspaceIds(
+          normalizeWorkspaceIdList(match?.remote_workspace_ids).length
+            ? normalizeWorkspaceIdList(match.remote_workspace_ids)
+            : ["root"],
+        );
         setLocalTargetWorkspaceId(match?.local_target_workspace_id || activeId || "root");
         setRemoteTargetWorkspaceId(match?.remote_target_workspace_id || "root");
         setDeviceDisplayName(String(nextOverview?.current_device?.display_name || "").trim());
@@ -815,12 +1019,21 @@ const KnowledgeSyncTab = () => {
     syncRemoteUrlRef.current = syncRemoteUrl.trim();
     setPeerStatus(null);
     setSyncPreview(null);
-    setSyncSelections({});
+    setSyncPreviewPlanKey("");
     setSyncItemSelections({ pull: {}, push: {} });
     setSyncItemReview(null);
     setPeerStatusBusy(false);
     return undefined;
   }, [syncRemoteUrl]);
+
+  useEffect(() => {
+    if (!syncPreview || !syncPreviewPlanKey || syncPreviewPlanKey === currentSyncPlanKey) return;
+    setSyncPreview(null);
+    setSyncPreviewPlanKey("");
+    setSyncItemSelections({ pull: {}, push: {} });
+    setSyncItemReview(null);
+    setMessage("Sync settings changed. Preview changes again before pulling or sending data.");
+  }, [currentSyncPlanKey, syncPreview, syncPreviewPlanKey]);
 
   useEffect(() => () => {
     clearSyncProgressTimers();
@@ -854,23 +1067,8 @@ const KnowledgeSyncTab = () => {
     return payload;
   }, [deviceDisplayName, syncLinkToSourceDevice, syncSourceNamespace]);
 
-  const persistSyncPreferences = async (overrides = {}, successMessage = "") => {
-    const resolvedSourceNamespace = syncSourceNamespace.trim() || deviceDisplayName.trim();
-    await axios.post("/api/user-settings", {
-      device_display_name: deviceDisplayName.trim(),
-      sync_visible_on_lan: !!syncVisibleOnLan,
-      sync_auto_accept_push: !!syncAutoAcceptPush,
-      sync_remote_url: syncRemoteUrl.trim(),
-      sync_link_to_source_device: !!syncLinkToSourceDevice,
-      sync_source_namespace: resolvedSourceNamespace,
-      sync_saved_peers: savedPeers,
-      workspace_profiles: workspaceProfiles,
-      active_workspace_id: activeWorkspaceId || "root",
-      sync_selected_workspace_ids: normalizeWorkspaceIdList(selectedWorkspaceIds).length
-        ? normalizeWorkspaceIdList(selectedWorkspaceIds)
-        : [activeWorkspaceId || "root"],
-      ...overrides,
-    });
+  const persistSyncPreferences = async (updates = {}, successMessage = "") => {
+    await axios.post("/api/user-settings", updates);
     if (successMessage) setMessage(successMessage);
   };
 
@@ -921,13 +1119,13 @@ const KnowledgeSyncTab = () => {
     );
     nextPullSections.forEach((section) => {
       if (!section?.key) return;
-      nextSelections.pull[section.key] = syncSectionActionableItems(section, "pull").map(
-        (item) => item?.selection_id || item?.resource_id,
-      );
+      nextSelections.pull[section.key] = syncSectionActionableItems(section, "pull")
+        .filter((item) => !syncItemIsDeletion(item, "pull"))
+        .map((item) => item?.selection_id || item?.resource_id);
       const pushSection = nextPushSections[section.key] || section;
-      nextSelections.push[section.key] = syncSectionActionableItems(pushSection, "push").map(
-        (item) => item?.selection_id || item?.resource_id,
-      );
+      nextSelections.push[section.key] = syncSectionActionableItems(pushSection, "push")
+        .filter((item) => !syncItemIsDeletion(item, "push"))
+        .map((item) => item?.selection_id || item?.resource_id);
     });
     return nextSelections;
   };
@@ -1065,6 +1263,7 @@ const KnowledgeSyncTab = () => {
     setLocalTargetWorkspaceId(activeWorkspaceId || "root");
     setRemoteTargetWorkspaceId("root");
     setSyncPreview(null);
+    setSyncPreviewPlanKey("");
     setMessage("");
   };
 
@@ -1079,11 +1278,16 @@ const KnowledgeSyncTab = () => {
         ? normalizeWorkspaceIdList(peer.local_workspace_ids)
         : [activeWorkspaceId || "root"],
     );
-    setRemoteWorkspaceIds(normalizeWorkspaceIdList(peer.remote_workspace_ids));
+    setRemoteWorkspaceIds(
+      normalizeWorkspaceIdList(peer.remote_workspace_ids).length
+        ? normalizeWorkspaceIdList(peer.remote_workspace_ids)
+        : ["root"],
+    );
     setWorkspaceMode(peer.workspace_mode || "merge");
     setLocalTargetWorkspaceId(peer.local_target_workspace_id || activeWorkspaceId || "root");
     setRemoteTargetWorkspaceId(peer.remote_target_workspace_id || "root");
     setSyncPreview(null);
+    setSyncPreviewPlanKey("");
     setMessage(nextMessage);
   };
 
@@ -1104,6 +1308,9 @@ const KnowledgeSyncTab = () => {
     try {
       await persistSyncPreferences(
         {
+          device_display_name: deviceDisplayName.trim(),
+          sync_link_to_source_device: !!syncLinkToSourceDevice,
+          sync_source_namespace: resolvedSourceNamespace,
           workspace_profiles: normalizedWorkspaceProfiles,
           active_workspace_id: activeWorkspaceId || "root",
           sync_selected_workspace_ids: normalizedSelectedWorkspaceIds,
@@ -1220,6 +1427,12 @@ const KnowledgeSyncTab = () => {
       setMessage("Import mode currently supports one local and one remote source workspace.");
       return;
     }
+    if (selectedPeer && remoteAddressDirty) {
+      setMessage(
+        "Verify the changed address before saving it. Float updates a paired address only after the saved fingerprint matches.",
+      );
+      return;
+    }
     const nextPeer = {
       ...(selectedPeer || {}),
       id: selectedPeerId || buildPeerId(),
@@ -1327,6 +1540,10 @@ const KnowledgeSyncTab = () => {
       setMessage("Import mode currently supports one local and one remote source workspace.");
       return;
     }
+    if (!selectedPeer?.remote_device_id) {
+      setMessage("Pair this saved address using a one-time code before previewing data.");
+      return;
+    }
     if (selectedPeerId && !normalizePeerScopes(targetScopes).includes("sync")) {
       setMessage("Paired devices used here must include the sync scope.");
       return;
@@ -1358,18 +1575,8 @@ const KnowledgeSyncTab = () => {
         controller ? { signal: controller.signal } : undefined,
       );
       const previewPayload = res?.data || null;
-      const sections = Array.isArray(previewPayload?.pull_sections)
-        ? previewPayload.pull_sections
-        : Array.isArray(previewPayload?.sections)
-          ? previewPayload.sections
-          : [];
       setSyncPreview(previewPayload);
-      setSyncSelections(
-        sections.reduce((acc, section) => {
-          if (section?.key) acc[section.key] = !!section.selected_by_default;
-          return acc;
-        }, {}),
-      );
+      setSyncPreviewPlanKey(currentSyncPlanKey);
       setSyncItemSelections(buildSyncItemSelectionState(previewPayload));
       setSyncItemReview(null);
       setPeerStatus((prev) => ({
@@ -1384,7 +1591,6 @@ const KnowledgeSyncTab = () => {
         setTargetLabel(String(previewPayload?.remote?.hostname || remoteUrl).trim());
       }
       mergePairedDeviceRecord(previewPayload?.paired_device);
-      await persistSyncPreferences({ sync_remote_url: remoteUrl });
       finishSyncProgress(requestId, {
         detail: "Preview ready.",
         progress: 1,
@@ -1414,6 +1620,10 @@ const KnowledgeSyncTab = () => {
   };
 
   const applySync = async (direction) => {
+    if (!syncPreview || !syncPreviewPlanKey || syncPreviewPlanKey !== currentSyncPlanKey) {
+      setMessage("Preview changes before pulling or sending data.");
+      return;
+    }
     const sectionSource =
       direction === "push"
         ? pullSections.map((section) => pushSectionMap[section.key] || section)
@@ -1422,7 +1632,7 @@ const KnowledgeSyncTab = () => {
     const itemSelections = {};
     sectionSource.forEach((section) => {
       const sectionKey = String(section?.key || "").trim();
-      if (!sectionKey || !syncSelections[sectionKey]) return;
+      if (!sectionKey) return;
       const actionableItems = syncSectionActionableItems(section, direction);
       if (!actionableItems.length) return;
       const allowedSelectionIds = new Set(
@@ -1475,6 +1685,7 @@ const KnowledgeSyncTab = () => {
           remote_target_workspace_id: remoteTargetWorkspaceId || "root",
           item_selections: itemSelections,
           paired_device: buildPairedDevicePayload(),
+          plan_receipt: syncPreview?.plan_receipt || undefined,
           operation_id: requestId,
           operation_owner: buildSyncOperationOwner(),
           ...syncOptionsPayload,
@@ -1616,6 +1827,11 @@ const KnowledgeSyncTab = () => {
         setSelectedPeerId(paired.id);
         setTargetLabel(paired.label);
         setTargetScopes(paired.scopes);
+        setRemoteWorkspaceIds(
+          normalizeWorkspaceIdList(paired.remote_workspace_ids).length
+            ? normalizeWorkspaceIdList(paired.remote_workspace_ids)
+            : ["root"],
+        );
         setPairCodeInput("");
         setRefreshToken((value) => value + 1);
         setMessage(`Paired with ${paired.label}.`);
@@ -1647,6 +1863,13 @@ const KnowledgeSyncTab = () => {
 
   const revertSyncAction = async (action) => {
     if (!action?.id) return;
+    if (
+      !window.confirm(
+        "Undo this local sync? This restores this device only; it does not change the remote device.",
+      )
+    ) {
+      return;
+    }
     setUndoSyncBusyId(action.id);
     setMessage("");
     try {
@@ -1660,6 +1883,7 @@ const KnowledgeSyncTab = () => {
         setMessage(`Reverted ${action.summary || "sync activity"}.`);
       }
       setSyncPreview(null);
+      setSyncPreviewPlanKey("");
       setRefreshToken((value) => value + 1);
     } catch (error) {
       setMessage(extractSyncError(error, "Failed to revert sync activity."));
@@ -1781,10 +2005,18 @@ const KnowledgeSyncTab = () => {
       selectedFiles: {},
       destinationFolder: "",
       summary: null,
+      classification: "",
+      messageCount: 0,
+      roleCounts: {},
+      preview: "",
+      warnings: [],
+      suggestedAction: "",
+      allowedActions: [],
     });
 
   const triggerImportPicker = () => {
     setImportStatus("");
+    setImportStatusKind("");
     clearImportReview();
     if (importFileInputRef.current) {
       importFileInputRef.current.value = "";
@@ -1794,17 +2026,35 @@ const KnowledgeSyncTab = () => {
 
   const previewImportCandidates = async (file) => {
     if (!file) return;
+    const format = inferImportFormatFromFilename(file.name);
+    const classifiedTextImport = isMarkdownOrTextImport(format);
     const formData = new FormData();
     formData.append("file", file);
     setImportBusy(true);
     setImportStatus("Detecting import candidates...");
+    setImportStatusKind("progress");
     try {
       const response = await axios.post("/api/conversations/import/preview", formData);
+      if (classifiedTextImport) {
+        const classification = normalizeClassifiedImportPreview(response?.data || {}, file);
+        setImportReview({
+          file,
+          detectedFiles: [],
+          selectedFiles: {},
+          destinationFolder: "",
+          summary: response?.data || null,
+          ...classification,
+        });
+        setImportStatus("");
+        setImportStatusKind("");
+        return;
+      }
       const detectedFiles = Array.isArray(response?.data?.detected_files)
         ? response.data.detected_files
         : [];
       if (!detectedFiles.length) {
         setImportStatus("No importable files detected in this archive.");
+        setImportStatusKind("error");
         return;
       }
       const selectedFiles = {};
@@ -1820,14 +2070,22 @@ const KnowledgeSyncTab = () => {
         summary: response?.data || null,
       });
       setImportStatus("");
+      setImportStatusKind("");
     } catch (error) {
       setImportStatus(extractSyncError(error, "Import preview failed."));
+      setImportStatusKind("error");
     } finally {
       setImportBusy(false);
     }
   };
 
-  const uploadConversationImport = async ({ file, selectedFiles = null, destinationFolder = "" }) => {
+  const uploadConversationImport = async ({
+    file,
+    selectedFiles = null,
+    destinationFolder = "",
+    intent = "",
+    confirmAmbiguous = false,
+  }) => {
     if (!file) return;
     const formData = new FormData();
     formData.append("file", file);
@@ -1836,8 +2094,11 @@ const KnowledgeSyncTab = () => {
       formData.append("selected_files", JSON.stringify(selectedFiles));
     }
     if (destinationFolder) formData.append("destination_folder", destinationFolder);
+    if (intent) formData.append("intent", intent);
+    if (confirmAmbiguous) formData.append("confirm_ambiguous", "true");
     setImportBusy(true);
     setImportStatus("Importing...");
+    setImportStatusKind("progress");
     try {
       const res = await axios.post("/api/conversations/import", formData);
       const imported = Array.isArray(res?.data?.imports) ? res.data.imports : [];
@@ -1848,9 +2109,33 @@ const KnowledgeSyncTab = () => {
               String(imported?.[0]?.name || res?.data?.name || "").trim() || "archive"
             } (${res?.data?.message_count || 0} messages).`,
       );
+      setImportStatusKind("success");
       clearImportReview();
     } catch (error) {
       setImportStatus(extractSyncError(error, "Import failed."));
+      setImportStatusKind("error");
+    } finally {
+      setImportBusy(false);
+    }
+  };
+
+  const uploadDocumentImport = async ({ file }) => {
+    if (!file) return;
+    const formData = new FormData();
+    formData.append("file", file);
+    setImportBusy(true);
+    setImportStatus("Saving document...");
+    setImportStatusKind("progress");
+    try {
+      await axios.post("/api/knowledge/upload", formData);
+      setImportStatus(
+        `Saved ${file.name || "file"} to Documents and knowledge search.`,
+      );
+      setImportStatusKind("success");
+      clearImportReview();
+    } catch (error) {
+      setImportStatus(extractSyncError(error, "Document save failed."));
+      setImportStatusKind("error");
     } finally {
       setImportBusy(false);
     }
@@ -1860,7 +2145,7 @@ const KnowledgeSyncTab = () => {
     const file = event?.target?.files?.[0];
     if (!file) return;
     const format = inferImportFormatFromFilename(file.name);
-    if (format === "zip" || format === "json") {
+    if (format === "zip" || format === "json" || isMarkdownOrTextImport(format)) {
       previewImportCandidates(file);
       return;
     }
@@ -1879,6 +2164,23 @@ const KnowledgeSyncTab = () => {
   );
   const importReviewIgnoredJsonLabel =
     importReview.summary?.ignored_json_entry_count != null ? "entries" : "files";
+  const classifiedImport = Boolean(importReview.classification);
+  const classifiedImportDescription = classifiedImport
+    ? describeClassifiedImport(importReview)
+    : null;
+  const classifiedImportActions = new Set(importReview.allowedActions || []);
+  const canImportRecognizedConversation =
+    classifiedImport &&
+    Number(importReview.messageCount || 0) > 0 &&
+    classifiedImportActions.has("conversation");
+  const canSaveClassifiedDocument =
+    classifiedImport && classifiedImportActions.has("document");
+  const conversationImportIsPrimary =
+    importReview.classification === "conversation" && importReview.suggestedAction !== "document";
+  const classifiedRoleSummary = Object.entries(importReview.roleCounts || {})
+    .filter(([, count]) => Number(count) > 0)
+    .map(([role, count]) => `${role}: ${count}`)
+    .join(" | ");
   const deviceAccess = overview?.device_access || {};
   const advertisedUrls = deviceAccess?.advertised_urls || {};
   const lanUrl = String(advertisedUrls?.lan || "").trim();
@@ -1891,14 +2193,10 @@ const KnowledgeSyncTab = () => {
   const legacyInboundDevices = Array.isArray(overview?.legacy_inbound_devices)
     ? overview.legacy_inbound_devices
     : [];
-  const trustedInboundDevices = inboundDevices.filter(
-    (device) => !looksLikeLegacyBrowserName(device?.name) && !device?.legacy_browser_record,
-  );
+  const trustedInboundDevices = inboundDevices.filter((device) => !device?.legacy_record);
   const visibleLegacyInboundDevices = [
     ...legacyInboundDevices,
-    ...inboundDevices.filter(
-      (device) => looksLikeLegacyBrowserName(device?.name) || device?.legacy_browser_record,
-    ),
+    ...inboundDevices.filter((device) => device?.legacy_record),
   ].filter(
     (device, index, list) =>
       list.findIndex((entry) => String(entry?.id || "").trim() === String(device?.id || "").trim())
@@ -1992,6 +2290,30 @@ const KnowledgeSyncTab = () => {
     || String(syncPreview?.remote?.hostname || "").trim()
     || String(syncPreview?.remote?.base_url || "").trim()
     || "remote";
+  const selectedPullItemCount = Object.values(syncItemSelections?.pull || {}).reduce(
+    (total, value) => total + normalizeSyncSelectionIds(value).length,
+    0,
+  );
+  const selectedPushItemCount = Object.values(syncItemSelections?.push || {}).reduce(
+    (total, value) => total + normalizeSyncSelectionIds(value).length,
+    0,
+  );
+  const unselectedDeletionCount = pullSections.reduce((total, section) => {
+    const pullDeletes = syncSectionActionableItems(section, "pull").filter((item) =>
+      syncItemIsDeletion(item, "pull"),
+    ).length;
+    const pushSection = pushSectionMap[section.key] || section;
+    const pushDeletes = syncSectionActionableItems(pushSection, "push").filter((item) =>
+      syncItemIsDeletion(item, "push"),
+    ).length;
+    return total + pullDeletes + pushDeletes;
+  }, 0);
+  const selectedPeerLabel =
+    String(selectedPeer?.remote_device_name || selectedPeer?.label || "").trim() || "remote device";
+  const previewIsCurrent =
+    !!syncPreview && !!syncPreviewPlanKey && syncPreviewPlanKey === currentSyncPlanKey;
+  const canPreviewSync =
+    !!selectedPeer?.remote_device_id && !remoteAddressDirty && !syncBusy && !syncActionBusy;
   const syncItemReviewDirection = String(syncItemReview?.direction || "").trim().toLowerCase();
   const syncItemReviewSectionKey = String(syncItemReview?.sectionKey || "").trim();
   const syncItemReviewSection =
@@ -2008,6 +2330,13 @@ const KnowledgeSyncTab = () => {
   const syncItemReviewAllSelected =
     syncItemReviewItems.length > 0
     && syncItemReviewSelectedIds.length === syncItemReviewItems.length;
+  const syncItemReviewDeletionIds = syncItemReviewItems
+    .filter((item) => syncItemIsDeletion(item, syncItemReviewDirection))
+    .map((item) => String(item?.selection_id || item?.resource_id || "").trim())
+    .filter(Boolean);
+  const syncItemReviewSelectedDeletionCount = syncItemReviewDeletionIds.filter((itemId) =>
+    syncItemReviewSelectedIds.includes(itemId),
+  ).length;
   const importModeInvalid =
     workspaceMode === "import" &&
     (normalizeWorkspaceIdList(selectedWorkspaceIds).length !== 1
@@ -2058,6 +2387,117 @@ const KnowledgeSyncTab = () => {
           {latestSyncActivityLabel}
         </p>
       ) : null}
+      <section className="knowledge-sync-card knowledge-sync-card--active-flow">
+        <div className="knowledge-sync-section-head">
+          <div className="knowledge-sync-section-stack">
+            <h4>Sync with a device</h4>
+            <span className="status-note">
+              Select a paired device, preview the changes, then choose what to pull here or send there.
+            </span>
+          </div>
+          <span
+            className={`knowledge-sync-target-status is-${
+              selectedPeerConnected ? "connected" : selectedPeer?.remote_device_id ? "paired" : "saved"
+            }`}
+          >
+            {selectedPeerConnected
+              ? "connected now"
+              : selectedPeer?.remote_device_id
+                ? "paired"
+                : "pair required"}
+          </span>
+        </div>
+        <label className="field-label" htmlFor="sync-active-peer">
+          <span>Device</span>
+        </label>
+        <select
+          id="sync-active-peer"
+          value={selectedPeerId}
+          onChange={(event) => {
+            const peer = savedPeers.find((entry) => entry.id === event.target.value);
+            if (peer) selectSavedPeer(peer);
+            else resetPairEditor();
+          }}
+        >
+          <option value="">Choose a saved device</option>
+          {savedPeers.map((peer) => (
+            <option key={`active-${peer.id}`} value={peer.id}>
+              {peer.label}{peer.remote_device_id ? "" : " - not paired"}
+            </option>
+          ))}
+        </select>
+        {selectedPeer ? (
+          <div className="knowledge-sync-target-meta">
+            <span>{selectedPeerLabel}</span>
+            <span>{selectedPeer.remote_device_id ? "Trust record present" : "Saved address only"}</span>
+            {shortFingerprint(selectedPeer.remote_public_key) ? (
+              <span>fingerprint {shortFingerprint(selectedPeer.remote_public_key)}</span>
+            ) : (
+              <span>fingerprint not saved</span>
+            )}
+          </div>
+        ) : (
+          <p className="status-note">Pair or save a device in Connection setup below.</p>
+        )}
+        <div className="knowledge-sync-actions">
+          {remoteAddressDirty ? (
+            <button
+              type="button"
+              className="icon-btn"
+              onClick={checkPeerStatus}
+              disabled={peerStatusBusy}
+            >
+              {peerStatusBusy ? "Verifying..." : "Verify device and address"}
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className="icon-btn"
+            onClick={previewSync}
+            disabled={!canPreviewSync}
+          >
+            {syncBusy ? "Previewing..." : "Preview changes"}
+          </button>
+          <button
+            type="button"
+            className="icon-btn"
+            onClick={() => applySync("pull")}
+            disabled={!previewIsCurrent || !selectedPullItemCount || !!syncActionBusy}
+            title={!previewIsCurrent ? "Preview required" : undefined}
+          >
+            {syncActionBusy === "pull" ? "Pulling..." : `Pull ${selectedPullItemCount || "selected"} here`}
+          </button>
+          <button
+            type="button"
+            className="icon-btn"
+            onClick={() => applySync("push")}
+            disabled={!previewIsCurrent || !selectedPushItemCount || !!syncActionBusy}
+            title={!previewIsCurrent ? "Preview required" : undefined}
+          >
+            {syncActionBusy === "push"
+              ? "Sending..."
+              : `Send ${selectedPushItemCount || "selected"} to ${selectedPeerLabel}`}
+          </button>
+        </div>
+        {!previewIsCurrent ? (
+          <p className="status-note">Preview required before pull or send actions become available.</p>
+        ) : unselectedDeletionCount ? (
+          <p className="status-note">
+            {unselectedDeletionCount} proposed deletion{unselectedDeletionCount === 1 ? " is" : "s are"} off by default. Review items to include any deletion.
+          </p>
+        ) : null}
+        {selectedPeer ? (
+          <details className="knowledge-sync-connection-details">
+            <summary>Connection details</summary>
+            <div className="knowledge-sync-target-meta">
+              <span>Last known address: {selectedPeer.remote_url}</span>
+              {peerStatus?.advertised_lan_url ? (
+                <span>Advertised address: {peerStatus.advertised_lan_url}</span>
+              ) : null}
+            </div>
+          </details>
+        ) : null}
+      </section>
       <section className="knowledge-sync-card knowledge-sync-card--compact-status">
         <div className="knowledge-sync-section-head">
           <h4>
@@ -2315,6 +2755,75 @@ const KnowledgeSyncTab = () => {
           <div className="knowledge-sync-section-head">
             <h4>
               <SyncLabelText
+                text="Deployment status"
+                tooltip="Software and data are separate, equal status dimensions. Software uses version plus build; data uses deployment identity plus a deterministic content revision and peer checkpoints."
+              />
+            </h4>
+          </div>
+          <div className="knowledge-sync-preview-grid">
+            <span className="knowledge-sync-preview-chip" data-status-dimension="software">
+              <strong>software</strong>
+              <span>{localSoftwareLabel}</span>
+            </span>
+            <span className="knowledge-sync-preview-chip" data-status-dimension="data">
+              <strong>data</strong>
+              <span>{localDataBuildLabel}</span>
+            </span>
+          </div>
+          <div className="knowledge-sync-card-subtle">
+            <span>
+              Software uses the stable release version plus an occasional build checkpoint.
+              Exact snapshot digests remain available underneath.
+            </span>
+            <span>
+              Data owns {Number(localDataStatus?.workspace_count || localWorkspaceProfiles.length)} workspace
+              {Number(localDataStatus?.workspace_count || localWorkspaceProfiles.length) === 1 ? "" : "s"}
+              {localDeploymentId ? ` under deployment ${localDeploymentId.slice(0, 8)}` : ""}.
+            </span>
+            {localDataRevisionCode ? (
+              <span>
+                Data revision {localDataRevisionCode}; last local revision detected{" "}
+                {formatDateTime(localDataStatus?.last_updated_at || localDataRevision?.observed_at_iso)}.
+              </span>
+            ) : null}
+            {activeDataCheckpoint?.last_synced_at || activeDataCheckpoint?.last_synced_at_iso ? (
+              <span>
+                Last synced {formatDateTime(
+                  activeDataCheckpoint?.last_synced_at || activeDataCheckpoint?.last_synced_at_iso,
+                )}
+                {activeDataCheckpoint?.peer_label ? ` with ${activeDataCheckpoint.peer_label}` : ""}.{" "}
+                {activeDataCheckpoint?.summary || ""}
+              </span>
+            ) : activeDataCheckpoint?.last_verified_at || activeDataCheckpoint?.last_verified_at_iso ? (
+              <span>
+                Common data state last verified{" "}
+                {formatDateTime(
+                  activeDataCheckpoint?.last_verified_at || activeDataCheckpoint?.last_verified_at_iso,
+                )}. {activeDataCheckpoint?.summary || ""}
+              </span>
+            ) : (
+              <span>No successful data sync checkpoint has been recorded yet.</span>
+            )}
+            {peerStatus?.reachable ? (
+              <span>
+                Remote software: {remoteSoftwareComparison?.summary || "comparison unavailable"}. Remote data:{" "}
+                {remoteDataBuildLabel
+                  || peerStatus?.display_name
+                  || selectedPeer?.label
+                  || "reachable deployment"}.
+              </span>
+            ) : selectedPeer && (remoteSoftwareLabel || remoteDataLabel) ? (
+              <span>
+                Last known peer status: software {remoteSoftwareLabel || "unknown"}; data {remoteDataBuildLabel || "identity unavailable"}.
+              </span>
+            ) : null}
+          </div>
+        </section>
+
+        <section className="knowledge-sync-card">
+          <div className="knowledge-sync-section-head">
+            <h4>
+              <SyncLabelText
                 text="Current device"
                 tooltip="This Float instance keeps its own device identity, pairing state, and advertised sync addresses here."
               />
@@ -2492,6 +3001,29 @@ const KnowledgeSyncTab = () => {
                       <div className="status-note">
                         Source: {profile.source_device_name || "remote"} /{" "}
                         {profile.source_workspace_name || profile.name}
+                        {profile.upstream_deployment_id ? (
+                          <>
+                            {" "}
+                            · sync back to{" "}
+                            <span title={profile.upstream_deployment_id}>
+                              {profile.upstream_deployment_id.slice(0, 12)}
+                            </span>
+                          </>
+                        ) : null}
+                      </div>
+                    ) : null}
+                    {profile.lineage_id ? (
+                      <div className="status-note" title={profile.lineage_id}>
+                        Lineage {profile.lineage_id.slice(0, 12)}
+                        {profile.origin_deployment_id ? (
+                          <>
+                            {" "}
+                            · origin{" "}
+                            <span title={profile.origin_deployment_id}>
+                              {profile.origin_deployment_id.slice(0, 12)}
+                            </span>
+                          </>
+                        ) : null}
                       </div>
                     ) : null}
                     {workspaceSyncBlocked(privacyMode) ? (
@@ -2736,7 +3268,7 @@ const KnowledgeSyncTab = () => {
 
         <section className="knowledge-sync-card">
           <div className="knowledge-sync-section-head">
-            <h4>{selectedPeerId ? "Edit paired device" : "Pair a device"}</h4>
+            <h4>{selectedPeerId ? "Edit connection" : "Connection setup"}</h4>
             {selectedPeerId ? (
               <button type="button" className="icon-btn" onClick={resetPairEditor}>
                 New pair
@@ -2771,7 +3303,7 @@ const KnowledgeSyncTab = () => {
           />
           {remoteAddressDirty ? (
             <p className="status-note">
-              Address change. Check remote to update this saved pair if the fingerprint matches; pair again if it is a different Float instance.
+              Address change. Verify the device and address to update this pair if the saved fingerprint matches; pair again if it is a different Float instance.
             </p>
           ) : null}
           {syncRemoteUrl.trim() ? (
@@ -2808,7 +3340,7 @@ const KnowledgeSyncTab = () => {
                     disabled={peerStatusBusy}
                     title={CHECK_REMOTE_HELP}
                   >
-                    {peerStatusBusy ? "Checking..." : "Check remote"}
+                    {peerStatusBusy ? "Verifying..." : "Verify device and address"}
                   </button>
                 </div>
               </div>
@@ -3014,20 +3546,21 @@ const KnowledgeSyncTab = () => {
             placeholder="ABCD1234"
           />
           <div className="knowledge-sync-actions">
-            <button type="button" className="icon-btn" onClick={upsertSavedPeer} disabled={savingPrefs}>
+            <button
+              type="button"
+              className="icon-btn"
+              onClick={upsertSavedPeer}
+              disabled={savingPrefs || remoteAddressDirty}
+              title={remoteAddressDirty ? "Verify the changed address before saving it." : undefined}
+            >
               {savingPrefs
                 ? "Saving..."
                 : selectedPeerId
-                  ? remoteAddressDirty
-                    ? "Replace saved URL"
-                    : "Update pair"
-                  : "Save pair"}
+                  ? "Save connection settings"
+                  : "Save address"}
             </button>
             <button type="button" className="icon-btn" onClick={pairWithCode} disabled={pairBusy}>
-              {pairBusy ? "Pairing..." : "Pair now"}
-            </button>
-            <button type="button" className="icon-btn" onClick={previewSync} disabled={syncBusy || syncActionBusy}>
-              {syncBusy ? "Checking..." : "Preview sync"}
+              {pairBusy ? "Pairing..." : "Pair using code"}
             </button>
           </div>
           <p className="status-note">
@@ -3040,11 +3573,11 @@ const KnowledgeSyncTab = () => {
         <div className="knowledge-sync-section-head">
           <h4>
             <SyncLabelText
-              text="Paired devices"
-              tooltip="Saved trusted targets. Each pair remembers the remote base URL, device id, allowed scopes, and workspace mapping."
+              text="Saved devices"
+              tooltip="Saved connection addresses and verified pairs. The address is only a reachability hint; the saved fingerprint is the device check."
             />
           </h4>
-          <p className="status-note">Named targets with stable fingerprints, scopes, workspace mapping, and last-used details.</p>
+          <p className="status-note">A saved address is not a pair until a one-time code establishes trust.</p>
         </div>
         {savedPeers.length ? (
           <div className="knowledge-sync-target-list">
@@ -3071,7 +3604,6 @@ const KnowledgeSyncTab = () => {
                         {peerState.label}
                       </span>
                     </div>
-                    <span>{peer.remote_url}</span>
                     <div className="knowledge-sync-preview-chip-row">
                       {normalizePeerScopes(peer.scopes).map((scope) => (
                         <span
@@ -3119,7 +3651,7 @@ const KnowledgeSyncTab = () => {
                       onClick={() => syncPairTrust(peer)}
                       title={REFRESH_TRUST_HELP}
                     >
-                      {pairSyncBusy && selectedPeerId === peer.id ? "Updating..." : "Refresh trust"}
+                      {pairSyncBusy && selectedPeerId === peer.id ? "Repairing..." : "Repair pairing"}
                     </button>
                     <button
                       type="button"
@@ -3127,10 +3659,10 @@ const KnowledgeSyncTab = () => {
                       onClick={() => revokeRemotePair(peer)}
                       title={REVOKE_REMOTE_HELP}
                     >
-                      Revoke remote
+                      Revoke pairing on both devices
                     </button>
                     <button type="button" className="knowledge-sync-target-remove" onClick={() => removeSavedPeer(peer)}>
-                      Remove
+                      Forget on this device
                     </button>
                   </div>
                 </article>
@@ -3152,8 +3684,7 @@ const KnowledgeSyncTab = () => {
               />
             </h4>
             <p className="status-note">
-              Compare this device with {syncPreview?.remote?.base_url || syncRemoteUrl.trim()} and
-              choose which sections to merge.
+              Compare this device with {remotePreviewLabel} and choose which items to move.
             </p>
           </div>
           <div className="knowledge-sync-card-subtle">
@@ -3169,6 +3700,18 @@ const KnowledgeSyncTab = () => {
             </span>
             <span>Mode {syncPreview?.workspace_mode || workspaceMode}</span>
           </div>
+          {syncPreview?.data_checkpoint?.summary ? (
+            <div className="status-note">
+              Data checkpoint: {syncPreview.data_checkpoint.summary}
+              {syncPreview.data_checkpoint.last_synced_at
+                || syncPreview.data_checkpoint.last_synced_at_iso
+                ? ` (${formatDateTime(
+                    syncPreview.data_checkpoint.last_synced_at
+                      || syncPreview.data_checkpoint.last_synced_at_iso,
+                  )})`
+                : ""}
+            </div>
+          ) : null}
           {Array.isArray(syncPreview?.workspaces?.local?.ignored_workspace_ids) &&
           syncPreview.workspaces.local.ignored_workspace_ids.length ? (
             <div className="status-note">
@@ -3225,14 +3768,7 @@ const KnowledgeSyncTab = () => {
                 section.key,
               );
               return (
-                <label key={section.key} className="knowledge-sync-preview-card">
-                  <input
-                    type="checkbox"
-                    checked={!!syncSelections[section.key]}
-                    onChange={(event) =>
-                      setSyncSelections((prev) => ({ ...prev, [section.key]: event.target.checked }))
-                    }
-                  />
+                <article key={section.key} className="knowledge-sync-preview-card">
                   <div>
                     <strong>{section.label}</strong>
                     <div className="status-note">
@@ -3285,16 +3821,28 @@ const KnowledgeSyncTab = () => {
                       ))}
                     </div>
                   </div>
-                </label>
+                </article>
               );
             })}
           </div>
           <div className="knowledge-sync-actions">
-            <button type="button" className="icon-btn" onClick={() => applySync("pull")} disabled={!!syncActionBusy}>
-              {syncActionBusy === "pull" ? "Pulling..." : "Pull here"}
+            <button
+              type="button"
+              className="icon-btn"
+              onClick={() => applySync("pull")}
+              disabled={!previewIsCurrent || !selectedPullItemCount || !!syncActionBusy}
+            >
+              {syncActionBusy === "pull" ? "Pulling..." : `Apply pull here (${selectedPullItemCount})`}
             </button>
-            <button type="button" className="icon-btn" onClick={() => applySync("push")} disabled={!!syncActionBusy}>
-              {syncActionBusy === "push" ? "Pushing..." : "Push there"}
+            <button
+              type="button"
+              className="icon-btn"
+              onClick={() => applySync("push")}
+              disabled={!previewIsCurrent || !selectedPushItemCount || !!syncActionBusy}
+            >
+              {syncActionBusy === "push"
+                ? "Sending..."
+                : `Apply send to ${selectedPeerLabel} (${selectedPushItemCount})`}
             </button>
           </div>
         </section>
@@ -3336,6 +3884,12 @@ const KnowledgeSyncTab = () => {
               </span>
               <span>{syncItemReviewItems.length} actionable items</span>
             </div>
+            {syncItemReviewDeletionIds.length ? (
+              <p className="status-note">
+                Deletions are off by default. {syncItemReviewSelectedDeletionCount}/
+                {syncItemReviewDeletionIds.length} selected explicitly.
+              </p>
+            ) : null}
             <div className="knowledge-sync-actions">
               <button
                 type="button"
@@ -3383,8 +3937,12 @@ const KnowledgeSyncTab = () => {
                         <span className="status-note">{describeSyncItemTiming(item)}</span>
                       ) : null}
                     </div>
-                    <span className="knowledge-sync-preview-item-status">
-                      {syncPreviewStatusLabel(item?.status)}
+                    <span
+                      className="knowledge-sync-preview-item-status"
+                      title={syncItemIsDeletion(item, syncItemReviewDirection) ? "Deletion requires explicit selection." : undefined}
+                    >
+                      <strong>{syncProposedActionLabel(item, syncItemReviewDirection)}</strong>
+                      <span>{syncPreviewStatusLabel(item?.status)}</span>
                     </span>
                   </label>
                 );
@@ -3445,7 +4003,7 @@ const KnowledgeSyncTab = () => {
                         onClick={() => revertSyncAction(action)}
                         disabled={undoSyncBusyId === action.id}
                       >
-                        {undoSyncBusyId === action.id ? "Undoing..." : "Undo"}
+                        {undoSyncBusyId === action.id ? "Undoing..." : "Undo local sync"}
                       </button>
                     </div>
                   ) : null}
@@ -3603,9 +4161,9 @@ const KnowledgeSyncTab = () => {
           <div className="knowledge-sync-card-subtle">
             <div className="knowledge-sync-section-head">
               <div className="knowledge-sync-section-stack">
-                <strong>Legacy browser records</strong>
+                <strong>Unverified legacy records</strong>
                 <span className="status-note">
-                  Browser-origin or user-agent-shaped entries usually created by older local tests. Keep them out of the trusted-device list and prune them when they are no longer needed.
+                  Older records without one-time pairing proof are not trusted devices. Prune them when they are no longer needed.
                 </span>
               </div>
               <button
@@ -3640,26 +4198,33 @@ const KnowledgeSyncTab = () => {
           <h4>
             <SyncLabelText
               text="Import and export"
-              tooltip="Local file movement for conversations and knowledge archives. This is separate from trusted-device sync."
+              tooltip="Review local files as conversation transcripts or save them as searchable documents. This is separate from trusted-device sync."
             />
           </h4>
-          <p className="status-note">Import archives into a folder path, or export the full conversation set here.</p>
+          <p className="status-note">Review conversations and documents before saving, or export the full conversation set here.</p>
         </div>
         <input
           ref={importFileInputRef}
           type="file"
           className="knowledge-sync-hidden-input"
-          accept=".zip,.json,.md,.txt"
+          accept=".zip,.json,.md,.markdown,.txt"
           onChange={handleImportFileChange}
         />
         <div className="knowledge-sync-grid">
           <div className="knowledge-sync-card-subtle">
             <strong>Import</strong>
-            <span>Preview archive contents, choose files, then import into root or a folder path.</span>
+            <span>Preview files first, then choose conversation history or Documents and knowledge search.</span>
             <button type="button" className="icon-btn" onClick={triggerImportPicker} disabled={importBusy}>
-              {importBusy ? "Working..." : "Import file or archive"}
+              {importBusy ? "Reviewing..." : "Review file or archive"}
             </button>
-            {importStatus ? <span className="status-note">{importStatus}</span> : null}
+            {importStatus ? (
+              <span
+                className="status-note"
+                role={importStatusKind === "error" ? "alert" : "status"}
+              >
+                {importStatus}
+              </span>
+            ) : null}
           </div>
           <div className="knowledge-sync-card-subtle">
             <strong>Export all</strong>
@@ -3701,94 +4266,208 @@ const KnowledgeSyncTab = () => {
           </div>
         </div>
         {importReview.file ? (
-          <div className="knowledge-sync-import-review">
+          <div className="knowledge-sync-import-review import-review-shell">
             <div className="knowledge-sync-section-head">
               <div className="knowledge-sync-section-stack">
                 <strong>Import review</strong>
-                <span className="status-note">{importReview.file.name}</span>
+                {!classifiedImport ? (
+                  <span className="status-note">{importReview.file.name}</span>
+                ) : null}
               </div>
-              <button type="button" className="icon-btn" onClick={clearImportReview}>
+              <button
+                type="button"
+                className="import-review-button import-review-button--quiet"
+                onClick={clearImportReview}
+              >
                 Clear
               </button>
             </div>
-            <label className="field-label" htmlFor="sync-import-folder">
-              <span>Destination folder</span>
-            </label>
-            <input
-              id="sync-import-folder"
-              type="text"
-              value={importReview.destinationFolder}
-              onChange={(event) => setImportReview((prev) => ({ ...prev, destinationFolder: event.target.value }))}
-              placeholder="Leave blank for root"
-            />
-            <div className="knowledge-sync-section-head">
-              <span className="status-note">
-                Detected files ({importReviewSelectedCount}/{importReview.detectedFiles.length})
-              </span>
-              <button
-                type="button"
-                className="icon-btn"
-                onClick={() => {
-                  const nextSelected = {};
-                  importReview.detectedFiles.forEach((item) => {
-                    const path = String(item?.path || item?.name || "").trim();
-                    if (path) nextSelected[path] = !importReviewAllSelected;
-                  });
-                  setImportReview((prev) => ({ ...prev, selectedFiles: nextSelected }));
-                }}
-              >
-                {importReviewAllSelected ? "Deselect all" : "Select all"}
-              </button>
-            </div>
-            {importReviewIgnoredJsonCount > 0 ? (
-              <span className="status-note">
-                Ignored {importReviewIgnoredJsonCount} metadata-only JSON
-                {importReviewIgnoredJsonCount === 1
-                  ? ` ${importReviewIgnoredJsonLabel.slice(0, -1)}`
-                  : ` ${importReviewIgnoredJsonLabel}`}
-                .
-              </span>
-            ) : null}
-            <div className="knowledge-sync-import-list">
-              {importReview.detectedFiles.map((item) => {
-                const path = String(item?.path || item?.name || "").trim();
-                if (!path) return null;
-                return (
-                  <label key={`import-file-${path}`} className="knowledge-sync-import-item">
-                    <input
-                      type="checkbox"
-                      checked={Boolean(importReview.selectedFiles[path])}
-                      onChange={() =>
-                        setImportReview((prev) => ({
-                          ...prev,
-                          selectedFiles: { ...prev.selectedFiles, [path]: !prev.selectedFiles[path] },
-                        }))
-                      }
-                    />
-                    <div className="knowledge-sync-section-stack">
-                      <strong>{path}</strong>
-                      <span className="status-note">{item.message_count ?? 0} messages</span>
+            {classifiedImport ? (
+              <>
+                <div
+                  className={`import-review-card import-review-card--${importReview.classification}`}
+                >
+                  <div className="import-review-summary">
+                    <strong className="import-review-title">
+                      {classifiedImportDescription?.title}
+                    </strong>
+                    <span className="import-review-detail" role="status">
+                      {classifiedImportDescription?.detail}
+                    </span>
+                    <div className="import-review-meta">
+                      <span className="import-review-filename">{importReview.file.name}</span>
+                      {classifiedRoleSummary ? (
+                        <span className="import-review-count">{classifiedRoleSummary}</span>
+                      ) : null}
                     </div>
-                  </label>
-                );
-              })}
-            </div>
-            <button
-              type="button"
-              className="icon-btn"
-              onClick={() =>
-                uploadConversationImport({
-                  file: importReview.file,
-                  selectedFiles: Object.entries(importReview.selectedFiles)
-                    .filter(([, value]) => Boolean(value))
-                    .map(([path]) => path),
-                  destinationFolder: importReview.destinationFolder.trim(),
-                })
-              }
-              disabled={importReviewSelectedCount === 0 || importBusy}
-            >
-              {importBusy ? "Importing..." : "Import selected"}
-            </button>
+                  </div>
+                  {(importReview.warnings || []).map((warning, index) => (
+                    <span
+                      key={`sync-import-warning-${index}`}
+                      className="import-review-warning"
+                      role="alert"
+                    >
+                      <strong>Warning:</strong> {warning}
+                    </span>
+                  ))}
+                  {importReview.preview ? (
+                    <pre className="import-review-preview" aria-label="File import preview">
+                      {importReview.preview}
+                    </pre>
+                  ) : null}
+                </div>
+                {canImportRecognizedConversation ? (
+                  <>
+                    <label className="field-label" htmlFor="sync-import-folder">
+                      <span>Conversation destination folder</span>
+                    </label>
+                    <input
+                      id="sync-import-folder"
+                      type="text"
+                      value={importReview.destinationFolder}
+                      onChange={(event) =>
+                        setImportReview((prev) => ({ ...prev, destinationFolder: event.target.value }))
+                      }
+                      placeholder="Leave blank for root"
+                    />
+                  </>
+                ) : null}
+                <div className="import-review-actions">
+                  {canImportRecognizedConversation && !conversationImportIsPrimary ? (
+                    <button
+                      type="button"
+                      className="import-review-button import-review-button--secondary"
+                      onClick={() =>
+                        uploadConversationImport({
+                          file: importReview.file,
+                          destinationFolder: importReview.destinationFolder.trim(),
+                          intent: "conversation",
+                          confirmAmbiguous: importReview.classification === "ambiguous",
+                        })
+                      }
+                      disabled={importBusy}
+                    >
+                      {importReview.classification === "ambiguous"
+                        ? "Import recognized messages"
+                        : "Import conversation"}
+                    </button>
+                  ) : null}
+                  {canSaveClassifiedDocument ? (
+                    <button
+                      type="button"
+                      className={`import-review-button ${
+                        conversationImportIsPrimary
+                          ? "import-review-button--secondary"
+                          : "import-review-button--primary"
+                      }`}
+                      onClick={() => uploadDocumentImport({ file: importReview.file })}
+                      disabled={importBusy}
+                    >
+                      Save as document
+                    </button>
+                  ) : null}
+                  {canImportRecognizedConversation && conversationImportIsPrimary ? (
+                    <button
+                      type="button"
+                      className="import-review-button import-review-button--primary"
+                      onClick={() =>
+                        uploadConversationImport({
+                          file: importReview.file,
+                          destinationFolder: importReview.destinationFolder.trim(),
+                          intent: "conversation",
+                        })
+                      }
+                      disabled={importBusy}
+                    >
+                      Import conversation
+                    </button>
+                  ) : null}
+                </div>
+              </>
+            ) : (
+              <>
+                <label className="field-label" htmlFor="sync-import-folder">
+                  <span>Destination folder</span>
+                </label>
+                <input
+                  id="sync-import-folder"
+                  type="text"
+                  value={importReview.destinationFolder}
+                  onChange={(event) =>
+                    setImportReview((prev) => ({ ...prev, destinationFolder: event.target.value }))
+                  }
+                  placeholder="Leave blank for root"
+                />
+                <div className="knowledge-sync-section-head">
+                  <span className="status-note">
+                    Detected files ({importReviewSelectedCount}/{importReview.detectedFiles.length})
+                  </span>
+                  <button
+                    type="button"
+                    className="import-review-button import-review-button--secondary"
+                    onClick={() => {
+                      const nextSelected = {};
+                      importReview.detectedFiles.forEach((item) => {
+                        const path = String(item?.path || item?.name || "").trim();
+                        if (path) nextSelected[path] = !importReviewAllSelected;
+                      });
+                      setImportReview((prev) => ({ ...prev, selectedFiles: nextSelected }));
+                    }}
+                  >
+                    {importReviewAllSelected ? "Deselect all" : "Select all"}
+                  </button>
+                </div>
+                {importReviewIgnoredJsonCount > 0 ? (
+                  <span className="status-note">
+                    Ignored {importReviewIgnoredJsonCount} metadata-only JSON
+                    {importReviewIgnoredJsonCount === 1
+                      ? ` ${importReviewIgnoredJsonLabel.slice(0, -1)}`
+                      : ` ${importReviewIgnoredJsonLabel}`}
+                    .
+                  </span>
+                ) : null}
+                <div className="knowledge-sync-import-list">
+                  {importReview.detectedFiles.map((item) => {
+                    const path = String(item?.path || item?.name || "").trim();
+                    if (!path) return null;
+                    return (
+                      <label key={`import-file-${path}`} className="knowledge-sync-import-item">
+                        <input
+                          type="checkbox"
+                          checked={Boolean(importReview.selectedFiles[path])}
+                          onChange={() =>
+                            setImportReview((prev) => ({
+                              ...prev,
+                              selectedFiles: { ...prev.selectedFiles, [path]: !prev.selectedFiles[path] },
+                            }))
+                          }
+                        />
+                        <div className="knowledge-sync-section-stack">
+                          <strong>{path}</strong>
+                          <span className="status-note">{item.message_count ?? 0} messages</span>
+                        </div>
+                      </label>
+                    );
+                  })}
+                </div>
+                <button
+                  type="button"
+                  className="import-review-button import-review-button--primary"
+                  onClick={() =>
+                    uploadConversationImport({
+                      file: importReview.file,
+                      selectedFiles: Object.entries(importReview.selectedFiles)
+                        .filter(([, value]) => Boolean(value))
+                        .map(([path]) => path),
+                      destinationFolder: importReview.destinationFolder.trim(),
+                    })
+                  }
+                  disabled={importReviewSelectedCount === 0 || importBusy}
+                >
+                  {importBusy ? "Importing..." : "Import selected"}
+                </button>
+              </>
+            )}
           </div>
         ) : null}
       </section>

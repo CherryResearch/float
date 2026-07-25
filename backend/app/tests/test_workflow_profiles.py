@@ -21,13 +21,11 @@ def test_list_addons_reads_repo_and_local_roots(tmp_path, monkeypatch):
     repo_root.mkdir(parents=True, exist_ok=True)
     local_root.mkdir(parents=True, exist_ok=True)
 
-    (repo_root / "repo-addon").mkdir()
-    (repo_root / "repo-addon" / "config.json").write_text(
+    (repo_root / "repo-addon.json").write_text(
         '{"id": "repo-addon", "label": "Repo addon", "status": "live"}',
         encoding="utf-8",
     )
-    (local_root / "local-addon").mkdir()
-    (local_root / "local-addon" / "config.json").write_text(
+    (local_root / "local-addon.json").write_text(
         '{"id": "local-addon", "label": "Local addon", "status": "experimental"}',
         encoding="utf-8",
     )
@@ -53,13 +51,11 @@ def test_list_addons_prefers_local_override_for_duplicate_ids(tmp_path, monkeypa
     repo_root.mkdir(parents=True, exist_ok=True)
     local_root.mkdir(parents=True, exist_ok=True)
 
-    (repo_root / "shared").mkdir()
-    (repo_root / "shared" / "config.json").write_text(
+    (repo_root / "shared.json").write_text(
         '{"id": "shared", "label": "Repo label", "status": "live"}',
         encoding="utf-8",
     )
-    (local_root / "shared").mkdir()
-    (local_root / "shared" / "config.json").write_text(
+    (local_root / "shared.json").write_text(
         '{"id": "shared", "label": "Local label", "status": "experimental"}',
         encoding="utf-8",
     )
@@ -72,9 +68,7 @@ def test_list_addons_prefers_local_override_for_duplicate_ids(tmp_path, monkeypa
             "label": "Local label",
             "description": "",
             "status": "experimental",
-            "path": str(local_root / "shared" / "config.json"),
-            "config_path": str(local_root / "shared" / "config.json"),
-            "package_path": str(local_root / "shared"),
+            "path": str(local_root / "shared.json"),
             "source": "local",
         }
     ]
@@ -201,8 +195,7 @@ def test_workflow_catalog_payload_includes_custom_addon_modules(tmp_path, monkey
     monkeypatch.setattr(workflow_profiles.app_config, "REPO_ROOT", tmp_path)
     local_root = tmp_path / "data" / "modules" / "addons"
     local_root.mkdir(parents=True, exist_ok=True)
-    (local_root / "local-pack").mkdir()
-    (local_root / "local-pack" / "config.json").write_text(
+    (local_root / "local-pack.json").write_text(
         """
         {
           "id": "local-pack",
@@ -231,8 +224,6 @@ def test_workflow_catalog_payload_includes_custom_addon_modules(tmp_path, monkey
     assert module["source"] == "custom"
     assert module["enabled"] is True
     assert module["addon_id"] == "local-pack"
-    assert module["config_path"] == str(local_root / "local-pack" / "config.json")
-    assert module["package_path"] == str(local_root / "local-pack")
     assert module["tool_names"] == ["containers.list", "containers.start"]
     assert workflow_profiles.normalize_module_id("container_orchestration") == (
         "container_orchestration"
@@ -278,151 +269,3 @@ def test_skill_doc_rejects_path_traversal_ids(tmp_path, monkeypatch):
     assert workflow_profiles.normalize_skill_id("../bad") == ""
     with pytest.raises(ValueError):
         workflow_profiles.write_local_skill_doc("../bad", "Nope")
-
-
-def test_import_addon_pack_previews_and_copies_skills(tmp_path, monkeypatch):
-    from app import workflow_profiles
-
-    monkeypatch.setattr(workflow_profiles.app_config, "REPO_ROOT", tmp_path)
-    source = tmp_path / "workspace" / "Hermes Pack"
-    source.mkdir(parents=True)
-    (source / "skills").mkdir()
-    (source / "config.json").write_text(
-        """
-        {
-          "id": "Hermes Pack",
-          "label": "Hermes Pack",
-          "modules": [
-            {
-              "id": "Hermes Agent",
-              "skill_id": "Hermes Agent",
-              "tool_names": ["hermes.plan"]
-            }
-          ]
-        }
-        """,
-        encoding="utf-8",
-    )
-    (source / "skills" / "Hermes Agent.md").write_text(
-        "Hermes skill summary\n\n# Hermes Agent\n",
-        encoding="utf-8",
-    )
-
-    preview = workflow_profiles.import_addon_pack(str(source), dry_run=True)
-
-    assert preview["status"] == "preview"
-    assert preview["addon"]["id"] == "hermes_pack"
-    assert preview["addon"]["module_ids"] == ["hermes_agent"]
-    assert preview["addon"]["skill_ids"] == ["hermes_agent"]
-    assert preview["skill_doc_count"] == 1
-    assert preview["can_write"] is True
-
-    imported = workflow_profiles.import_addon_pack(str(source), dry_run=False)
-
-    local_config = (
-        tmp_path / "data" / "modules" / "addons" / "hermes_pack" / "config.json"
-    )
-    local_skill = tmp_path / "data" / "modules" / "skills" / "hermes_agent.md"
-    assert imported["status"] == "imported"
-    assert local_config.exists()
-    assert local_skill.read_text(encoding="utf-8").startswith("Hermes skill summary")
-    payload = workflow_profiles.workflow_catalog_payload(
-        enabled_modules=["hermes_agent"]
-    )
-    module = next(item for item in payload["modules"] if item["id"] == "hermes_agent")
-    assert module["source"] == "custom"
-    assert module["skill_available"] is True
-    assert module["skill_source"] == "local"
-
-
-def test_import_addon_pack_rejects_traversal_and_missing_config(tmp_path, monkeypatch):
-    from app import workflow_profiles
-
-    monkeypatch.setattr(workflow_profiles.app_config, "REPO_ROOT", tmp_path)
-    source = tmp_path / "workspace" / "bad-pack"
-    source.mkdir(parents=True)
-
-    with pytest.raises(ValueError, match="config.json"):
-        workflow_profiles.import_addon_pack(str(source), dry_run=True)
-
-    with pytest.raises(ValueError, match="not allowed"):
-        workflow_profiles.import_addon_pack("../outside", dry_run=True)
-
-
-def test_export_addon_pack_writes_local_pack_and_skill_docs(tmp_path, monkeypatch):
-    from app import workflow_profiles
-
-    monkeypatch.setattr(workflow_profiles.app_config, "REPO_ROOT", tmp_path)
-    local_addon = tmp_path / "data" / "modules" / "addons" / "custom_pack"
-    local_skill = tmp_path / "data" / "modules" / "skills"
-    local_addon.mkdir(parents=True)
-    local_skill.mkdir(parents=True)
-    (local_addon / "config.json").write_text(
-        """
-        {
-          "id": "custom_pack",
-          "modules": [{"id": "custom_mod", "skill_id": "custom_skill"}]
-        }
-        """,
-        encoding="utf-8",
-    )
-    (local_skill / "custom_skill.md").write_text(
-        "Custom skill summary\n\n# Custom Skill\n",
-        encoding="utf-8",
-    )
-    destination = tmp_path / "workspace" / "exports"
-
-    preview = workflow_profiles.export_addon_pack(
-        "custom_pack",
-        str(destination),
-        dry_run=True,
-    )
-
-    assert preview["status"] == "preview"
-    assert preview["skill_doc_count"] == 1
-    assert preview["destination_path"] == str(destination / "custom_pack")
-
-    exported = workflow_profiles.export_addon_pack(
-        "custom_pack",
-        str(destination),
-        dry_run=False,
-    )
-
-    assert exported["status"] == "exported"
-    assert (destination / "custom_pack" / "config.json").exists()
-    assert (destination / "custom_pack" / "skills" / "custom_skill.md").exists()
-
-
-def test_import_and_export_skill_markdown(tmp_path, monkeypatch):
-    from app import workflow_profiles
-
-    monkeypatch.setattr(workflow_profiles.app_config, "REPO_ROOT", tmp_path)
-    source = tmp_path / "workspace" / "Skill File.md"
-    source.parent.mkdir(parents=True)
-    source.write_text(
-        "---\n"
-        "name: skill-file\n"
-        "description: Skill summary\n"
-        "---\n\n"
-        "# Skill\n",
-        encoding="utf-8",
-    )
-
-    preview = workflow_profiles.import_skill_markdown(str(source), dry_run=True)
-
-    assert preview["skill_id"] == "skill_file"
-    assert preview["can_write"] is True
-
-    imported = workflow_profiles.import_skill_markdown(str(source), dry_run=False)
-    assert imported["status"] == "imported"
-    assert imported["summary"] == "Skill summary"
-    assert (tmp_path / "data" / "modules" / "skills" / "skill_file.md").exists()
-
-    destination = tmp_path / "workspace" / "skill-export"
-    exported = workflow_profiles.export_skill_markdown(
-        "skill_file",
-        str(destination),
-        dry_run=False,
-    )
-    assert exported["status"] == "exported"
-    assert (destination / "skill_file.md").read_text(encoding="utf-8").startswith("---")

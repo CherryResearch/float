@@ -15,10 +15,14 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Inspect sparse SAE features from layer activations."
     )
-    parser.add_argument("--model", default="gpt-oss-20b", help="Model ID (or metadata label).")
+    parser.add_argument(
+        "--model", default="gpt-oss-20b", help="Model ID (or metadata label)."
+    )
     parser.add_argument("--layer", required=True, help="Layer index or name.")
     parser.add_argument("--prompt", default="", help="Prompt text for live capture.")
-    parser.add_argument("--topk", type=int, default=20, help="Top active features to print.")
+    parser.add_argument(
+        "--topk", type=int, default=20, help="Top active features to print."
+    )
     parser.add_argument(
         "--l0-threshold",
         type=float,
@@ -29,7 +33,9 @@ def _parse_args() -> argparse.Namespace:
         "--activations",
         help="Path to offline activation record (.json/.npz/.parquet).",
     )
-    parser.add_argument("--record-out", help="Write captured live activations to this path.")
+    parser.add_argument(
+        "--record-out", help="Write captured live activations to this path."
+    )
     parser.add_argument("--sae-weights", help="Path to SAE weights JSON.")
     parser.add_argument(
         "--feature-labels",
@@ -111,7 +117,9 @@ def _token_text(record: ActivationRecord, idx: int) -> str:
     return f"<id:{record.token_ids[idx]}>"
 
 
-def _print_trace(record: ActivationRecord, weights: SAEWeights, topk: int, threshold: float) -> None:
+def _print_trace(
+    record: ActivationRecord, weights: SAEWeights, topk: int, threshold: float
+) -> None:
     print("=== SAE inspection trace ===")
     print(f"model: {record.model_name}")
     print(f"layer: {record.layer_name}")

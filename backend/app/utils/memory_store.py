@@ -134,11 +134,13 @@ def _save_json(store: Dict[str, Any], target: Path) -> None:
 
 
 def _save_sqlite(store: Dict[str, Any], target: Path) -> None:
+    change_counts: Dict[str, int] = {}
     try:
         with sqlite3.connect(str(target)) as conn:
             _ensure_sqlite_schema(conn)
-            cur = conn.execute("SELECT key FROM memories")
-            existing = {row[0] for row in cur.fetchall()}
+            cur = conn.execute("SELECT key, payload FROM memories")
+            existing_payloads = {str(row[0]): str(row[1]) for row in cur.fetchall()}
+            existing = set(existing_payloads)
             incoming = {str(key) for key in store.keys()}
             stale = existing - incoming
             if stale:
@@ -148,9 +150,11 @@ def _save_sqlite(store: Dict[str, Any], target: Path) -> None:
                 )
             now = time.time()
             rows = []
+            serialized_payloads: Dict[str, str] = {}
             for key, item in store.items():
                 key_str = str(key)
                 payload = json.dumps(item, indent=2, default=_default_serializer)
+                serialized_payloads[key_str] = payload
                 if isinstance(item, dict):
                     created_at = _safe_float(item.get("created_at")) or now
                     updated_at = _safe_float(item.get("updated_at")) or created_at
@@ -170,8 +174,67 @@ def _save_sqlite(store: Dict[str, Any], target: Path) -> None:
                 rows,
             )
             conn.commit()
+            created = incoming - existing
+            updated = {
+                key
+                for key in incoming & existing
+                if existing_payloads.get(key) != serialized_payloads.get(key)
+            }
+            change_counts = {
+                "before_count": len(existing),
+                "after_count": len(incoming),
+                "created_count": len(created),
+                "updated_count": len(updated),
+                "deleted_count": len(stale),
+                "changed_count": len(created) + len(updated) + len(stale),
+            }
     except Exception as exc:
         logger.warning("memory_store.save: failed to persist %s (%s)", target, exc)
+        return
+    if change_counts.get("changed_count"):
+        _record_content_free_write_event(target, change_counts)
+
+
+def _record_content_free_write_event(target: Path, counts: Dict[str, int]) -> None:
+    """Record mutation counts only when the store belongs to a Float deployment."""
+    candidates = [target.parent]
+    if target.parent.name.lower() == "databases":
+        candidates.insert(0, target.parent.parent)
+    data_root = next(
+        (
+            candidate
+            for candidate in candidates
+            if (candidate / "deployment.json").is_file()
+        ),
+        None,
+    )
+    if data_root is None:
+        return
+    deleted_count = int(counts.get("deleted_count") or 0)
+    before_count = int(counts.get("before_count") or 0)
+    if deleted_count >= 2 and deleted_count * 2 >= max(before_count, 1):
+        event_type = "data.bulk_replace"
+    elif deleted_count:
+        event_type = "data.delete"
+    else:
+        event_type = "data.update"
+    try:
+        from app.utils.deployment_event_store import record_event
+
+        record_event(
+            event_type=event_type,
+            data_root=data_root,
+            sections=["memories"],
+            counts=counts,
+        )
+    except Exception:
+        # The primary write already committed. Provenance failure must be visible,
+        # but cannot safely roll back the separate memory database at this point.
+        logger.warning(
+            "memory_store.save: failed to record deployment event for %s",
+            target,
+            exc_info=True,
+        )
 
 
 def load(path: Optional[PathLike] = None) -> Dict[str, Any]:

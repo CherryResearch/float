@@ -48,9 +48,7 @@ _SHELL_KEYWORDS = (
     "yum",
 )
 _KEYWORD_PATTERN = "|".join(re.escape(keyword) for keyword in _SHELL_KEYWORDS)
-_SHELL_CHAIN_PATTERN = re.compile(
-    rf"(?i)(?:;|&&|\|\|)\s*(?:{_KEYWORD_PATTERN})\b"
-)
+_SHELL_CHAIN_PATTERN = re.compile(rf"(?i)(?:;|&&|\|\|)\s*(?:{_KEYWORD_PATTERN})\b")
 _PIPE_PATTERN = re.compile(rf"(?i)\|\s*(?:{_KEYWORD_PATTERN})\b")
 
 
@@ -60,13 +58,16 @@ def sanitize_args(args: Dict[str, Any]) -> Dict[str, Any]:
     Raises:
         ValueError: if an argument looks like a shell-injection payload.
     """
+
     def _sanitize(value: Any, path: str) -> Any:
         if isinstance(value, str):
             if _looks_like_shell_payload(value):
                 raise ValueError(f"Unsafe characters in argument '{path}'")
             return value
         if isinstance(value, dict):
-            return {k: _sanitize(v, f"{path}.{k}" if path else k) for k, v in value.items()}
+            return {
+                k: _sanitize(v, f"{path}.{k}" if path else k) for k, v in value.items()
+            }
         if isinstance(value, list):
             return [_sanitize(item, path) for item in value]
         return value

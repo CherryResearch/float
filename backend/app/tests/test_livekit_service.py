@@ -28,7 +28,7 @@ def test_openai_realtime_connect_uses_client_secret_flow(monkeypatch):
                 "expires_at": 1_234_567_890,
                 "session": {
                     "id": "sess_123",
-                    "model": "gpt-realtime-2",
+                    "model": "gpt-realtime-2.1",
                 },
             }
 
@@ -45,7 +45,7 @@ def test_openai_realtime_connect_uses_client_secret_flow(monkeypatch):
         {
             "stream_backend": "api",
             "api_key": "test-key",
-            "realtime_model": "gpt-realtime-2",
+            "realtime_model": "gpt-realtime-2.1",
             "voice_model": "kitten",
             "realtime_voice": "marin",
             "realtime_base_url": "https://api.openai.com/v1/realtime/client_secrets",
@@ -57,7 +57,7 @@ def test_openai_realtime_connect_uses_client_secret_flow(monkeypatch):
     assert captured["url"] == "https://api.openai.com/v1/realtime/client_secrets"
     assert captured["headers"]["Authorization"] == "Bearer test-key"
     assert captured["json"]["session"]["type"] == "realtime"
-    assert captured["json"]["session"]["model"] == "gpt-realtime-2"
+    assert captured["json"]["session"]["model"] == "gpt-realtime-2.1"
     assert captured["json"]["session"]["audio"]["output"]["voice"] == "marin"
     assert (
         captured["json"]["session"]["audio"]["input"]["turn_detection"]["type"]
@@ -82,13 +82,13 @@ def test_openai_realtime_connect_uses_client_secret_flow(monkeypatch):
         "url": "https://api.openai.com/v1/realtime/calls",
         "client_secret": "ephemeral-secret",
         "expires_at": 1_234_567_890,
-        "model": "gpt-realtime-2",
-        "response_model": "gpt-realtime-2",
+        "model": "gpt-realtime-2.1",
+        "response_model": "gpt-realtime-2.1",
         "multimodal_model": "",
         "caption_model": "",
         "session": {
             "id": "sess_123",
-            "model": "gpt-realtime-2",
+            "model": "gpt-realtime-2.1",
         },
         "session_id": "sess_123",
         "source": "live",
@@ -99,7 +99,7 @@ def test_openai_realtime_connect_uses_client_secret_flow(monkeypatch):
             "transport_backend": "api",
             "provider": "openai-realtime",
             "mode": "api",
-            "response_model": "gpt-realtime-2",
+            "response_model": "gpt-realtime-2.1",
             "multimodal_model": "",
             "caption_model": "",
             "stt_model": "",
@@ -124,7 +124,7 @@ def test_openai_realtime_connect_accepts_nested_client_secret(monkeypatch):
             return {
                 "session": {
                     "id": "sess_nested",
-                    "model": "gpt-realtime-2",
+                    "model": "gpt-realtime-2.1",
                     "client_secret": {
                         "value": "nested-ephemeral-secret",
                         "expires_at": 1_234_567_999,
@@ -142,13 +142,13 @@ def test_openai_realtime_connect_accepts_nested_client_secret(monkeypatch):
         {
             "stream_backend": "api",
             "api_key": "test-key",
-            "realtime_model": "gpt-realtime-2",
+            "realtime_model": "gpt-realtime-2.1",
         }
     ).connect("user-1", "float")
 
     assert result["client_secret"] == "nested-ephemeral-secret"
     assert result["expires_at"] == 1_234_567_999
-    assert result["response_model"] == "gpt-realtime-2"
+    assert result["response_model"] == "gpt-realtime-2.1"
 
 
 def test_openai_realtime_inherits_stt_and_reasoning_controls(monkeypatch):
@@ -166,7 +166,7 @@ def test_openai_realtime_inherits_stt_and_reasoning_controls(monkeypatch):
                 "value": "ephemeral-secret",
                 "session": {
                     "id": "sess_reasoning",
-                    "model": "gpt-realtime-2",
+                    "model": "gpt-realtime-2.1",
                 },
             }
 
@@ -180,7 +180,7 @@ def test_openai_realtime_inherits_stt_and_reasoning_controls(monkeypatch):
         {
             "stream_backend": "api",
             "api_key": "test-key",
-            "realtime_model": "gpt-realtime-2",
+            "realtime_model": "gpt-realtime-2.1",
             "stt_model": "gpt-realtime-whisper",
             "realtime_tracing": "auto",
             "realtime_transcription_logprobs": True,

@@ -82,7 +82,9 @@ class SAEWeights:
         self.feature_labels = {int(k): str(v) for k, v in self.feature_labels.items()}
 
         if len(self.encoder) != len(self.decoder):
-            raise ValueError("encoder and decoder must have the same number of features.")
+            raise ValueError(
+                "encoder and decoder must have the same number of features."
+            )
         if self.encoder:
             d_model = len(self.encoder[0])
             if any(len(row) != d_model for row in self.encoder):
@@ -110,7 +112,9 @@ class SAEWeights:
             "encoder": self.encoder,
             "decoder": self.decoder,
             "encoder_bias": self.encoder_bias,
-            "feature_labels": {str(key): value for key, value in self.feature_labels.items()},
+            "feature_labels": {
+                str(key): value for key, value in self.feature_labels.items()
+            },
             "metadata": self.metadata,
         }
 
@@ -140,5 +144,7 @@ class SteeringConfig:
     dry_run: bool = False
 
     def __post_init__(self) -> None:
-        self.features = {int(feature_id): float(alpha) for feature_id, alpha in self.features.items()}
+        self.features = {
+            int(feature_id): float(alpha) for feature_id, alpha in self.features.items()
+        }
         self.token_positions = str(self.token_positions).strip() or "all"

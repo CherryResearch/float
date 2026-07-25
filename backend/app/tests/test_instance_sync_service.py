@@ -3,6 +3,8 @@ import hashlib
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def _load_modules():
     backend_dir = Path(__file__).resolve().parents[2]
@@ -74,6 +76,7 @@ def _configure_paths(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "FLOAT_MEMORY_FILE", str(tmp_path / "databases" / "memory.sqlite3")
     )
+    monkeypatch.setenv("FLOAT_DATA_DIR", str(tmp_path / "data"))
     return modules
 
 
@@ -283,7 +286,7 @@ def test_settings_sync_selects_imported_custom_theme_when_settings_are_newer(
     assert theme_store.list_themes()[0]["id"] == "forest-glass"
 
 
-def test_remote_client_repairs_saved_pair_when_device_proof_is_required():
+def test_remote_client_requires_repair_instead_of_re_registering_stale_pair():
     modules = _load_modules()
     sync_module = modules["sync_module"]
     RemoteFloatClient = modules["RemoteFloatClient"]
@@ -308,7 +311,15 @@ def test_remote_client_repairs_saved_pair_when_device_proof_is_required():
         def __init__(self):
             self.calls = []
 
-        def request(self, method, url, json=None, headers=None, timeout=None):
+        def request(
+            self,
+            method,
+            url,
+            json=None,
+            headers=None,
+            timeout=None,
+            allow_redirects=None,
+        ):
             self.calls.append(
                 {
                     "method": method,
@@ -348,23 +359,40 @@ def test_remote_client_repairs_saved_pair_when_device_proof_is_required():
         device_name="Cherry",
     )
 
-    assert client.get_manifest(["settings"]) == {"sections": {}}
+    with pytest.raises(ValueError, match="Pair this device again"):
+        client.get_manifest(["settings"])
 
-    paths = [call["path"] for call in session.calls]
-    assert paths == [
-        "devices/token",
-        "devices/register",
-        "devices/token",
-        "sync/manifest",
-    ]
-    assert session.calls[0]["json"]["public_key"] == ""
-    assert session.calls[1]["json"]["public_key"]
-    assert session.calls[2]["json"]["device_id"] == "fresh-device"
-    assert (
-        session.calls[2]["json"]["public_key"] == session.calls[1]["json"]["public_key"]
+    assert session.calls == []
+
+
+@pytest.mark.parametrize(
+    "remote_url",
+    [
+        "http://127.0.0.1:5000",
+        "http://169.254.169.254/latest/meta-data",
+        "http://8.8.8.8:5000",
+        "ftp://192.168.1.25/resource",
+        "http://user:secret@192.168.1.25:5000",
+        "http://192.168.1.25:5000?redirect=http://169.254.169.254",
+    ],
+)
+def test_remote_sync_url_rejects_non_private_or_credentialed_targets(remote_url):
+    sync_module = _load_modules()["sync_module"]
+
+    with pytest.raises(ValueError):
+        sync_module._resolve_remote_urls(remote_url)
+
+
+def test_remote_sync_url_allows_private_and_tailnet_targets():
+    sync_module = _load_modules()["sync_module"]
+
+    assert sync_module._resolve_remote_urls("192.168.1.25:5000")["api_base"] == (
+        "http://192.168.1.25:5000/api"
     )
-    assert session.calls[3]["headers"]["Authorization"] == "Bearer fresh-token"
-    assert client.get_pairing_state()["remote_device_id"] == "fresh-device"
+    assert (
+        sync_module._resolve_remote_urls("http://100.100.10.20:5000")["instance_base"]
+        == "http://100.100.10.20:5000"
+    )
 
 
 def test_remote_client_enriches_legacy_settings_snapshot_with_themes():
@@ -402,7 +430,15 @@ def test_remote_client_enriches_legacy_settings_snapshot_with_themes():
         def __init__(self):
             self.calls = []
 
-        def request(self, method, url, json=None, headers=None, timeout=None):
+        def request(
+            self,
+            method,
+            url,
+            json=None,
+            headers=None,
+            timeout=None,
+            allow_redirects=None,
+        ):
             path = url.rsplit("/api/", 1)[-1]
             self.calls.append({"method": method, "path": path, "json": json or {}})
             if path == "devices/token":
@@ -1002,6 +1038,137 @@ def test_compare_manifests_counts_local_and_remote_changes(tmp_path, monkeypatch
     assert section["items"][1]["detail"] == "notes/beta | 2 messages"
     assert section["items"][2]["status"] == "only_remote"
     assert section["items"][2]["label"] == "Gamma remote"
+
+
+def test_compare_manifests_uses_checkpoint_for_deletes_and_conflicts(
+    tmp_path, monkeypatch
+):
+    from app.utils import sync_checkpoint_store
+
+    modules = _configure_paths(tmp_path, monkeypatch)
+    service = modules["InstanceSyncService"]()
+    base_items = [
+        {"sync_id": "remote-delete", "updated_at": 10.0, "label": "Delete"},
+        {"sync_id": "delete-conflict", "updated_at": 10.0, "label": "Conflict"},
+        {"sync_id": "both-edit", "updated_at": 10.0, "label": "Both"},
+        {"sync_id": "remote-edit", "updated_at": 10.0, "label": "Remote edit"},
+    ]
+    base_manifest = {"sections": {"conversations": {"items": base_items}}}
+    baseline = sync_checkpoint_store.build_view_baseline(
+        local_manifest=base_manifest,
+        remote_manifest=base_manifest,
+        item_selections={
+            "conversations": [
+                "remote-delete",
+                "delete-conflict",
+                "both-edit",
+                "remote-edit",
+                "local-create",
+            ]
+        },
+    )
+    local_manifest = {
+        "sections": {
+            "conversations": {
+                "items": [
+                    base_items[0],
+                    {
+                        **base_items[1],
+                        "updated_at": 20.0,
+                        "label": "Edited before remote delete",
+                    },
+                    {
+                        **base_items[2],
+                        "updated_at": 20.0,
+                        "label": "Local edit",
+                    },
+                    base_items[3],
+                    {
+                        "sync_id": "local-create",
+                        "updated_at": 20.0,
+                        "label": "Created here",
+                    },
+                ]
+            }
+        }
+    }
+    remote_manifest = {
+        "sections": {
+            "conversations": {
+                "items": [
+                    {
+                        **base_items[2],
+                        "updated_at": 30.0,
+                        "label": "Remote edit",
+                    },
+                    {
+                        **base_items[3],
+                        "updated_at": 30.0,
+                        "label": "Changed remotely",
+                    },
+                ]
+            }
+        }
+    }
+
+    section = service.compare_manifests(
+        local_manifest,
+        remote_manifest,
+        ["conversations"],
+        baseline=baseline,
+    )[0]
+    statuses = {item["selection_id"]: item["status"] for item in section["all_items"]}
+
+    assert statuses == {
+        "both-edit": "conflict",
+        "delete-conflict": "delete_conflict",
+        "local-create": "local_new",
+        "remote-delete": "remote_deleted",
+        "remote-edit": "remote_newer",
+    }
+    assert section["conflicts"] == 2
+    assert section["local_new"] == 1
+    assert section["remote_deleted"] == 1
+    assert section["remote_newer"] == 1
+
+
+def test_compare_manifests_treats_new_item_after_complete_observation_as_created(
+    tmp_path, monkeypatch
+):
+    from app.utils import sync_checkpoint_store
+
+    modules = _configure_paths(tmp_path, monkeypatch)
+    service = modules["InstanceSyncService"]()
+    empty = {"sections": {"conversations": {"items": []}}}
+    baseline = sync_checkpoint_store.build_observed_view_baseline(
+        local_manifest=empty,
+        remote_manifest=empty,
+        sections=["conversations"],
+    )
+    local_manifest = {
+        "sections": {
+            "conversations": {
+                "items": [
+                    {
+                        "sync_id": "created-downstream",
+                        "updated_at": 20.0,
+                        "label": "Created downstream",
+                    }
+                ]
+            }
+        }
+    }
+
+    section = service.compare_manifests(
+        local_manifest,
+        empty,
+        ["conversations"],
+        baseline=baseline,
+    )[0]
+
+    assert section["local_new"] == 1
+    assert section["all_items"][0]["status"] == "local_new"
+    assert section["all_items"][0]["interpretation"] == "local_created_since_sync"
 
 
 def test_namespace_manifest_preserves_original_sync_id(tmp_path, monkeypatch):

@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useState } from "react";
 import "../styles/WeekView.css";
 import FilterBar from "./FilterBar";
 

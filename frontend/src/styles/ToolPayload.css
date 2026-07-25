@@ -250,17 +250,6 @@
   text-decoration: underline;
 }
 
-.tool-workspace-link {
-  color: var(--color-accent);
-  text-decoration: none;
-  font-weight: 600;
-}
-
-.tool-workspace-link:hover,
-.tool-workspace-link:focus-visible {
-  text-decoration: underline;
-}
-
 .tool-search-domain {
   font-size: 0.7rem;
   text-transform: uppercase;

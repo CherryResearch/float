@@ -49,10 +49,14 @@ def _resolve_block_list(model: Any) -> tuple[list[Any], str]:
     )
 
 
-def resolve_hook_target(model: Any, layer: int, module_target: str = "resid_post") -> HookTarget:
+def resolve_hook_target(
+    model: Any, layer: int, module_target: str = "resid_post"
+) -> HookTarget:
     blocks, block_path = _resolve_block_list(model)
     if layer < 0 or layer >= len(blocks):
-        raise ValueError(f"Layer {layer} is out of range for {block_path} (n={len(blocks)}).")
+        raise ValueError(
+            f"Layer {layer} is out of range for {block_path} (n={len(blocks)})."
+        )
 
     block = blocks[layer]
     module_target = module_target.strip().lower()
@@ -82,8 +86,12 @@ def capture_transformers_activations(
     """
 
     torch, AutoModelForCausalLM, AutoTokenizer = _import_transformers_runtime()
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
-    model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name, trust_remote_code=trust_remote_code
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, trust_remote_code=trust_remote_code
+    )
     model.to(device)
     model.eval()
 
@@ -178,7 +186,9 @@ class TorchSteeringHook:
             return output
 
         seq_len = int(hidden.shape[1])
-        positions = _parse_token_positions(self._config.token_positions, seq_len=seq_len)
+        positions = _parse_token_positions(
+            self._config.token_positions, seq_len=seq_len
+        )
         self.applied_positions = positions
         if not positions:
             return output
@@ -211,8 +221,12 @@ def run_transformers_with_steering(
     """Run one generation with steering hook attached."""
 
     torch, AutoModelForCausalLM, AutoTokenizer = _import_transformers_runtime()
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
-    model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name, trust_remote_code=trust_remote_code
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, trust_remote_code=trust_remote_code
+    )
     model.to(device)
     model.eval()
 

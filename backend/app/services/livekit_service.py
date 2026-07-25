@@ -3,14 +3,13 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Protocol
 
+import jwt
 import requests
 from app.model_registry import model_supports_images
 
-import jwt
-
 DEFAULT_REALTIME_SESSION_URL = "https://api.openai.com/v1/realtime/client_secrets"
 DEFAULT_REALTIME_CONNECT_URL = "https://api.openai.com/v1/realtime/calls"
-DEFAULT_REALTIME_MODEL = "gpt-realtime-2"
+DEFAULT_REALTIME_MODEL = "gpt-realtime-2.1"
 DEFAULT_REALTIME_VOICE = "alloy"
 DEFAULT_REALTIME_TRANSCRIPTION_MODEL = "gpt-realtime-whisper"
 DEFAULT_LIVE_AGENT_MODE = "local"

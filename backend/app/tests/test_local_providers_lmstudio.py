@@ -115,7 +115,7 @@ def test_lmstudio_quick_poll_status_does_not_probe_model_inventory(monkeypatch):
     assert all("/models" not in url for url in called_urls)
 
 
-def test_lmstudio_quick_poll_status_accepts_openai_models_endpoint(monkeypatch):
+def test_lmstudio_quick_poll_status_falls_back_to_openai_inventory(monkeypatch):
     adapter = LMStudioAdapter()
     called_urls = []
 
@@ -128,8 +128,9 @@ def test_lmstudio_quick_poll_status_accepts_openai_models_endpoint(monkeypatch):
                 {
                     "data": [
                         {
-                            "id": "google/gemma-4-12B-it-qat-q4_0-gguf",
+                            "id": "google/gemma-4-12b",
                             "state": "loaded",
+                            "loaded_context_length": 32768,
                         }
                     ]
                 }
@@ -145,28 +146,43 @@ def test_lmstudio_quick_poll_status_accepts_openai_models_endpoint(monkeypatch):
     assert status["inventory_reachable"] is True
     assert status["inventory_model_count"] == 1
     assert status["model_loaded"] is True
-    assert status["loaded_model"] == "google/gemma-4-12B-it-qat-q4_0-gguf"
-    assert called_urls == [
-        "http://127.0.0.1:1234/api/v1/status",
-        "http://127.0.0.1:1234/v1/models",
-    ]
+    assert status["loaded_model"] == "google/gemma-4-12b"
+    assert status["context_length"] == 32768
+    assert any(url.endswith("/v1/models") for url in called_urls)
 
 
-def test_lmstudio_quick_poll_status_uses_first_openai_model_without_state(
-    monkeypatch,
-):
+def test_lmstudio_quick_poll_prefers_native_inventory_with_load_state(monkeypatch):
     adapter = LMStudioAdapter()
+    called_urls = []
 
     def fake_get(url, timeout, headers=None):
+        called_urls.append(url)
         if url.endswith("/api/v1/status"):
+            raise RuntimeError("http 404")
+        if url.endswith("/api/v0/status"):
             return _FakeResponse({"error": "Unexpected endpoint or method."})
+        if url.endswith("/api/v0/models"):
+            return _FakeResponse(
+                {
+                    "data": [
+                        {
+                            "id": "openai/gpt-oss-20b",
+                            "state": "loaded",
+                            "loaded_context_length": 8192,
+                        },
+                        {"id": "google/gemma-4-12b", "state": "not-loaded"},
+                    ],
+                    "object": "list",
+                }
+            )
         if url.endswith("/v1/models"):
             return _FakeResponse(
                 {
                     "data": [
-                        {"id": "google/gemma-4-12b-live-test"},
-                        {"id": "gemma-3-12b-it"},
-                    ]
+                        {"id": "openai/gpt-oss-20b", "object": "model"},
+                        {"id": "google/gemma-4-12b", "object": "model"},
+                    ],
+                    "object": "list",
                 }
             )
         raise RuntimeError("offline")
@@ -174,12 +190,16 @@ def test_lmstudio_quick_poll_status_uses_first_openai_model_without_state(
     monkeypatch.setattr("app.local_providers.lmstudio.requests.get", fake_get)
 
     status = adapter.poll_status(_base_cfg(), quick=True)
+    model_urls = [url for url in called_urls if url.endswith("/models")]
 
+    assert model_urls == ["http://127.0.0.1:1234/api/v0/models"]
     assert status["server_running"] is True
-    assert status["inventory_reachable"] is True
-    assert status["inventory_model_count"] == 2
     assert status["model_loaded"] is True
-    assert status["loaded_model"] == "google/gemma-4-12b-live-test"
+    assert status["loaded_model"] == "openai/gpt-oss-20b"
+    assert status["model_state_known"] is True
+    assert status["model_state_source"] == "inventory"
+    assert status["model_state_stale"] is False
+    assert status["context_length"] == 8192
 
 
 def test_lmstudio_remote_unmanaged_load_uses_http(monkeypatch):
@@ -253,6 +273,38 @@ def test_lmstudio_start_server_reports_unreachable_api_after_cli_wakeup(monkeypa
     assert result["ok"] is False
     assert "did not become reachable" in result["error"]
     assert "External HTTP only" in result["error"]
+
+
+def test_lmstudio_start_server_uses_bind_for_lan(monkeypatch):
+    adapter = LMStudioAdapter()
+    captured = {}
+    monkeypatch.setattr(
+        LMStudioAdapter,
+        "poll_status",
+        lambda self, cfg, quick=False: {"server_running": False},
+    )
+    monkeypatch.setattr(
+        LMStudioAdapter,
+        "detect_installation",
+        lambda self, cfg: {"ok": True, "installed": True, "binary": "lms"},
+    )
+
+    def fake_run(self, args, timeout=45):
+        captured["args"] = args
+        return {"ok": True, "stdout": "started"}
+
+    monkeypatch.setattr(LMStudioAdapter, "_run_cmd", fake_run)
+    monkeypatch.setattr(
+        LMStudioAdapter,
+        "_wait_until_running",
+        lambda self, cfg, timeout_seconds=30: True,
+    )
+
+    result = adapter.start_server(_base_cfg(local_provider_allow_lan=True))
+
+    assert result["ok"] is True
+    assert "--host" not in captured["args"]
+    assert captured["args"][-2:] == ["--bind", "0.0.0.0"]
 
 
 def test_lmstudio_remote_unmanaged_unload_uses_http(monkeypatch):

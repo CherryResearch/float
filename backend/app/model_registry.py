@@ -2,6 +2,12 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List
 
+from app.utils.user_model_catalog import (
+    get_user_hf_model_metadata,
+    list_user_hf_models,
+    resolve_user_hf_model_alias,
+)
+
 # Central registry for model aliases used across the application.
 # The richer metadata lets the UI and runtime distinguish direct local
 # checkpoints from provider/server-first models without hardcoded family checks.
@@ -157,17 +163,6 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "supports_images": True,
         "min_vram_gb": 12,
     },
-    "gemma-4-E2B-it-qat-q4_0": {
-        "repo_id": "google/gemma-4-E2B-it-qat-q4_0-unquantized",
-        "family": "gemma",
-        "lane": "local",
-        "local_download_supported": True,
-        "provider_supported": True,
-        "mobile_catalog_allowed": True,
-        "local_loader": "image_text_to_text",
-        "supports_images": True,
-        "min_vram_gb": 8,
-    },
     "gemma-4-12B-it-qat-q4_0": {
         "repo_id": "google/gemma-4-12B-it-qat-q4_0-unquantized",
         "family": "gemma",
@@ -184,43 +179,19 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "family": "gemma",
         "lane": "server_lan",
         "local_download_supported": False,
-        "download_job_supported": False,
+        "download_job_supported": True,
         "provider_supported": True,
         "mobile_catalog_allowed": True,
         "local_loader": "none",
         "supports_images": True,
         "min_vram_gb": 18,
     },
-    "gemma-4-E2B-it-qat-q4_0-gguf": {
-        "repo_id": "google/gemma-4-E2B-it-qat-q4_0-gguf",
-        "family": "gemma",
-        "lane": "server_lan",
-        "local_download_supported": False,
-        "download_job_supported": True,
-        "provider_supported": True,
-        "mobile_catalog_allowed": True,
-        "local_loader": "none",
-        "supports_images": True,
-        "min_vram_gb": 8,
-    },
-    "gemma-4-E4B-it-qat-q4_0-gguf": {
-        "repo_id": "google/gemma-4-E4B-it-qat-q4_0-gguf",
-        "family": "gemma",
-        "lane": "server_lan",
-        "local_download_supported": False,
-        "download_job_supported": True,
-        "provider_supported": True,
-        "mobile_catalog_allowed": True,
-        "local_loader": "none",
-        "supports_images": True,
-        "min_vram_gb": 12,
-    },
     "gemma-4-12B-it": {
         "repo_id": "google/gemma-4-12B-it",
         "family": "gemma",
         "lane": "server_lan",
         "local_download_supported": False,
-        "download_job_supported": False,
+        "download_job_supported": True,
         "provider_supported": True,
         "mobile_catalog_allowed": True,
         "local_loader": "none",
@@ -251,19 +222,6 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "requires": "cuda",
         "min_vram_gb": 28,
     },
-    "gemma-4-26B-A4B-it-qat-q4_0-gguf": {
-        "repo_id": "google/gemma-4-26B-A4B-it-qat-q4_0-gguf",
-        "family": "gemma",
-        "lane": "server_lan",
-        "local_download_supported": False,
-        "download_job_supported": True,
-        "provider_supported": True,
-        "mobile_catalog_allowed": False,
-        "local_loader": "none",
-        "supports_images": True,
-        "requires": "cuda",
-        "min_vram_gb": 24,
-    },
     "gemma-4-31B-it": {
         "repo_id": "google/gemma-4-31B-it",
         "family": "gemma",
@@ -275,19 +233,6 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "supports_images": True,
         "requires": "cuda",
         "min_vram_gb": 32,
-    },
-    "gemma-4-31B-it-qat-q4_0-gguf": {
-        "repo_id": "google/gemma-4-31B-it-qat-q4_0-gguf",
-        "family": "gemma",
-        "lane": "server_lan",
-        "local_download_supported": False,
-        "download_job_supported": True,
-        "provider_supported": True,
-        "mobile_catalog_allowed": False,
-        "local_loader": "none",
-        "supports_images": True,
-        "requires": "cuda",
-        "min_vram_gb": 28,
     },
     "whisper-small": {
         "repo_id": "openai/whisper-small",
@@ -480,19 +425,9 @@ MODEL_CAPABILITIES: Dict[str, Dict[str, Any]] = {
 
 
 MODEL_DOWNLOAD_ALLOW_PATTERNS: Dict[str, List[str]] = {
-    "gemma-4-E2B-it-qat-q4_0": [
-        ".gitattributes",
-        "README.md",
-        "chat_template.jinja",
-        "config.json",
-        "generation_config.json",
-        "model.safetensors",
-        "processor_config.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-    ],
     "gemma-4-12B-it-qat-q4_0": [
         ".gitattributes",
+        "LICENSE",
         "README.md",
         "chat_template.jinja",
         "config.json",
@@ -503,35 +438,12 @@ MODEL_DOWNLOAD_ALLOW_PATTERNS: Dict[str, List[str]] = {
         "tokenizer.json",
         "tokenizer_config.json",
     ],
-    "gemma-4-E2B-it-qat-q4_0-gguf": [
-        ".gitattributes",
-        "README.md",
-        "gemma-4-E2B_q4_0-it.gguf",
-        "gemma-4-E2B-it-mmproj.gguf",
-    ],
-    "gemma-4-E4B-it-qat-q4_0-gguf": [
-        ".gitattributes",
-        "README.md",
-        "gemma-4-E4B_q4_0-it.gguf",
-        "gemma-4-E4B-it-mmproj.gguf",
-    ],
     "gemma-4-12B-it-qat-q4_0-gguf": [
         ".gitattributes",
+        "LICENSE",
         "README.md",
         "gemma-4-12b-it-qat-q4_0.gguf",
         "mmproj-gemma-4-12b-it-qat-q4_0.gguf",
-    ],
-    "gemma-4-26B-A4B-it-qat-q4_0-gguf": [
-        ".gitattributes",
-        "README.md",
-        "gemma-4-26B_q4_0-it.gguf",
-        "gemma-4-26B-it-mmproj.gguf",
-    ],
-    "gemma-4-31B-it-qat-q4_0-gguf": [
-        ".gitattributes",
-        "README.md",
-        "gemma-4-31B_q4_0-it.gguf",
-        "gemma-4-31B-it-mmproj.gguf",
     ],
     # GPT-OSS repos include large optional variants (metal/original). By default we
     # download the MXFP4 safetensors shards + tokenizer/config needed for local
@@ -570,7 +482,11 @@ MODEL_DOWNLOAD_ALLOW_PATTERNS: Dict[str, List[str]] = {
 def get_model_metadata(name: str | None) -> Dict[str, Any]:
     if not name:
         return {}
-    return dict(MODEL_REGISTRY.get(canonical_model_alias(name), {}))
+    alias = canonical_model_alias(name)
+    static = MODEL_REGISTRY.get(alias)
+    if static is not None:
+        return dict(static)
+    return get_user_hf_model_metadata(alias)
 
 
 def canonical_model_alias(name: str | None) -> str | None:
@@ -588,6 +504,9 @@ def canonical_model_alias(name: str | None) -> str | None:
     alias = MODEL_ALIASES_BY_REPO.get(lowered)
     if alias:
         return alias
+    user_alias = resolve_user_hf_model_alias(raw)
+    if user_alias:
+        return user_alias
     if "/" in raw:
         tail = raw.rsplit("/", 1)[-1].strip()
         if tail:
@@ -660,7 +579,11 @@ def resolve_model_alias(name: str | None) -> str | None:
     if not name:
         return name
     alias = canonical_model_alias(name)
-    return MODEL_REPOS.get(alias, name)
+    static_repo = MODEL_REPOS.get(alias)
+    if static_repo:
+        return static_repo
+    user_meta = get_user_hf_model_metadata(alias)
+    return str(user_meta.get("repo_id") or name)
 
 
 def _summarise_devices(devices: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
@@ -712,6 +635,10 @@ def filter_models_for_devices(devices: Iterable[Dict[str, Any]]) -> List[str]:
 def list_downloadable_models() -> List[str]:
     """Return model aliases that support background download jobs."""
 
-    return sorted(
-        alias for alias in MODEL_REGISTRY if model_supports_download_job(alias)
+    aliases = {alias for alias in MODEL_REGISTRY if model_supports_download_job(alias)}
+    aliases.update(
+        str(entry.get("alias") or "").strip()
+        for entry in list_user_hf_models()
+        if str(entry.get("alias") or "").strip()
     )
+    return sorted(aliases)

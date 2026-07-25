@@ -157,38 +157,6 @@ def test_model_info_reports_gemma4_qat_metadata(tmp_path, monkeypatch):
     assert payload["supports_images"] is True
 
 
-def test_model_info_reports_current_gemma4_qat_gguf_targets(tmp_path, monkeypatch):
-    backend_dir = Path(__file__).resolve().parents[2]
-    if str(backend_dir) not in sys.path:
-        sys.path.insert(0, str(backend_dir))
-
-    from app import routes
-
-    monkeypatch.setattr(huggingface_hub, "HfApi", lambda token=None: _DummyInfoApi())
-
-    app = FastAPI()
-    app.include_router(routes.router, prefix="/api")
-    app.state.config = {"models_folder": str(tmp_path / "models")}
-    client = TestClient(app)
-
-    expected = {
-        "gemma-4-E2B-it-qat-q4_0-gguf": "google/gemma-4-E2B-it-qat-q4_0-gguf",
-        "gemma-4-E4B-it-qat-q4_0-gguf": "google/gemma-4-E4B-it-qat-q4_0-gguf",
-        "gemma-4-12B-it-qat-q4_0-gguf": "google/gemma-4-12B-it-qat-q4_0-gguf",
-        "gemma-4-26B-A4B-it-qat-q4_0-gguf": "google/gemma-4-26B-A4B-it-qat-q4_0-gguf",
-        "gemma-4-31B-it-qat-q4_0-gguf": "google/gemma-4-31B-it-qat-q4_0-gguf",
-    }
-    for alias, repo_id in expected.items():
-        resp = client.get(f"/api/models/info/{alias}")
-        assert resp.status_code == 200
-        payload = resp.json()
-        assert payload["repo_id"] == repo_id
-        assert payload["downloadable"] is True
-        assert payload["lane"] == "server_lan"
-        assert payload["local_loader"] == "none"
-        assert payload["supports_images"] is True
-
-
 def test_downloadable_models_include_provider_first_gemma4(tmp_path):
     backend_dir = Path(__file__).resolve().parents[2]
     if str(backend_dir) not in sys.path:
@@ -203,13 +171,9 @@ def test_downloadable_models_include_provider_first_gemma4(tmp_path):
 
     resp = client.get("/api/models/downloadable")
     assert resp.status_code == 200
-    assert "gemma-4-E2B-it-qat-q4_0" in resp.json()["models"]
+    assert "gemma-4-E4B-it" in resp.json()["models"]
     assert "gemma-4-12B-it-qat-q4_0" in resp.json()["models"]
-    assert "gemma-4-E4B-it-qat-q4_0-gguf" in resp.json()["models"]
     assert "gemma-4-12B-it-qat-q4_0-gguf" in resp.json()["models"]
-    assert "gemma-4-26B-A4B-it-qat-q4_0-gguf" in resp.json()["models"]
-    assert "gemma-4-31B-it-qat-q4_0-gguf" in resp.json()["models"]
-    assert "gemma-4-E4B-it" not in resp.json()["models"]
 
 
 def test_create_model_job_accepts_downloadable_provider_first_gemma4(
@@ -220,29 +184,25 @@ def test_create_model_job_accepts_downloadable_provider_first_gemma4(
         sys.path.insert(0, str(backend_dir))
 
     from app import routes
+    from app.routers import model_jobs
 
     monkeypatch.setattr(huggingface_hub, "HfApi", lambda token=None: _DummyInfoApi())
-    monkeypatch.setattr(routes, "_start_download_process", lambda *args: _DummyProc())
+    monkeypatch.setattr(
+        model_jobs,
+        "_start_download_process",
+        lambda *args: _DummyProc(),
+    )
 
     app = FastAPI()
     app.include_router(routes.router, prefix="/api")
     app.state.config = {"models_folder": str(tmp_path / "models")}
     client = TestClient(app)
 
-    resp = client.post(
-        "/api/models/jobs",
-        json={"model": "gemma-4-E4B-it-qat-q4_0-gguf"},
-    )
+    resp = client.post("/api/models/jobs", json={"model": "gemma-4-E4B-it"})
     assert resp.status_code == 200
     payload = resp.json()["job"]
-    assert payload["model"] == "gemma-4-E4B-it-qat-q4_0-gguf"
-    assert payload["repo_id"] == "google/gemma-4-E4B-it-qat-q4_0-gguf"
-    assert payload["allow_patterns"] == [
-        ".gitattributes",
-        "README.md",
-        "gemma-4-E4B_q4_0-it.gguf",
-        "gemma-4-E4B-it-mmproj.gguf",
-    ]
+    assert payload["model"] == "gemma-4-E4B-it"
+    assert payload["repo_id"] == "google/gemma-4-E4B-it"
 
 
 def test_create_model_job_accepts_gemma4_qat_gguf(tmp_path, monkeypatch):
@@ -251,9 +211,14 @@ def test_create_model_job_accepts_gemma4_qat_gguf(tmp_path, monkeypatch):
         sys.path.insert(0, str(backend_dir))
 
     from app import routes
+    from app.routers import model_jobs
 
     monkeypatch.setattr(huggingface_hub, "HfApi", lambda token=None: _DummyInfoApi())
-    monkeypatch.setattr(routes, "_start_download_process", lambda *args: _DummyProc())
+    monkeypatch.setattr(
+        model_jobs,
+        "_start_download_process",
+        lambda *args: _DummyProc(),
+    )
 
     app = FastAPI()
     app.include_router(routes.router, prefix="/api")
@@ -270,6 +235,7 @@ def test_create_model_job_accepts_gemma4_qat_gguf(tmp_path, monkeypatch):
     assert payload["repo_id"] == "google/gemma-4-12B-it-qat-q4_0-gguf"
     assert payload["allow_patterns"] == [
         ".gitattributes",
+        "LICENSE",
         "README.md",
         "gemma-4-12b-it-qat-q4_0.gguf",
         "mmproj-gemma-4-12b-it-qat-q4_0.gguf",

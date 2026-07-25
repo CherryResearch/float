@@ -140,7 +140,9 @@ def configure_logging(config: Dict[str, Any] | None = None) -> None:
     for h in list(root.handlers):
         root.removeHandler(h)
 
-    log_format = str((config or {}).get("log_format", os.getenv("FLOAT_LOG_FORMAT", "console"))).lower()
+    log_format = str(
+        (config or {}).get("log_format", os.getenv("FLOAT_LOG_FORMAT", "console"))
+    ).lower()
 
     handler = logging.StreamHandler(sys.stdout)
     if log_format == "json":
@@ -157,9 +159,7 @@ def configure_logging(config: Dict[str, Any] | None = None) -> None:
         "WARNING",
     )
     if str(file_level_name).upper() not in {"OFF", "NONE", "DISABLED"}:
-        file_level = getattr(
-            logging, str(file_level_name).upper(), logging.WARNING
-        )
+        file_level = getattr(logging, str(file_level_name).upper(), logging.WARNING)
         log_dir = _resolve_log_dir()
         file_handler = RotatingFileHandler(
             log_dir / "server.log",

@@ -3,9 +3,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Dict, Mapping, Optional, Tuple
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
 
 import yaml
 from pydantic import BaseModel, ConfigDict
@@ -153,7 +153,9 @@ class ModelCatalog(BaseModel):
             return [k for k in mode_defaults.keys() if k != "fallback"]
         return []
 
-    def readiness(self, workflow: str, *, check_health: bool = False, timeout: float = 0.7) -> Dict[str, object]:
+    def readiness(
+        self, workflow: str, *, check_health: bool = False, timeout: float = 0.7
+    ) -> Dict[str, object]:
         """Aggregate readiness for a workflow based on required capabilities.
 
         Returns a dict with:
@@ -186,6 +188,7 @@ def load_model_catalog(path: str | Path | None = None) -> ModelCatalog:
 
 
 # --- Endpoint Health Checking Helpers ---------------------------------------
+
 
 def _endpoint_looks_http(endpoint: str) -> bool:
     try:

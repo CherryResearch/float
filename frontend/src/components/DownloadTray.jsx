@@ -31,7 +31,6 @@ const humanBytes = (bytes, total) => {
   return format(bytes);
 };
 
-const OPEN_DELAY_MS = 300;
 const CLOSE_DELAY_MS = 1200;
 const OPEN_GRACE_MS = 400;
 
@@ -411,7 +410,9 @@ const DownloadTray = () => {
                                   try {
                                     await restartJob(job);
                                     return;
-                                  } catch {}
+                                  } catch (restartErr) {
+                                    void restartErr;
+                                  }
                                 }
                                 setJobs((prev) =>
                                   prev.map((j) =>

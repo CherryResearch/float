@@ -251,6 +251,7 @@ const ToolArgsForm = ({ schema, ui = {}, value, onChange, disabled = false }) =>
                       setJsonErrors((prev) => ({ ...prev, [key]: "" }));
                       updateField(key, parsed);
                     } catch (err) {
+                      void err;
                       setJsonErrors((prev) => ({ ...prev, [key]: "Invalid JSON." }));
                     }
                   }}

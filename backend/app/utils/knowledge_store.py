@@ -37,7 +37,9 @@ def _stable_id(seed: str) -> str:
 
 
 def _serialize_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, default=memory_store._default_serializer)
+    return json.dumps(
+        value, ensure_ascii=False, default=memory_store._default_serializer
+    )
 
 
 def _safe_json_loads(value: Any) -> Dict[str, Any]:
@@ -270,11 +272,12 @@ class KnowledgeStore:
             or now
         )
         version = int((existing or {}).get("version") or 0) + 1
-        kind = str(
-            clean_metadata.get("kind")
-            or clean_metadata.get("type")
+        kind = (
+            str(
+                clean_metadata.get("kind") or clean_metadata.get("type") or "document"
+            ).strip()
             or "document"
-        ).strip() or "document"
+        )
         title = (
             clean_metadata.get("title")
             or clean_metadata.get("filename")
@@ -290,14 +293,24 @@ class KnowledgeStore:
             summary_value = _stringify(clean_metadata.get("summary_text"))
         if summary_value is None and clean_text:
             summary_value = clean_text[:400]
-        cleaned_chunks = [str(chunk or "").strip() for chunk in chunk_texts if str(chunk or "").strip()]
+        cleaned_chunks = [
+            str(chunk or "").strip()
+            for chunk in chunk_texts
+            if str(chunk or "").strip()
+        ]
         if not cleaned_chunks:
             cleaned_chunks = [clean_text]
         chunk_rows: List[Dict[str, Any]] = []
         chunk_count = len(cleaned_chunks)
         for idx, chunk_text in enumerate(cleaned_chunks):
-            chunk_source = source_text if chunk_count == 1 else f"{source_text}#chunk:{idx + 1}"
-            chunk_id = resolved_id if chunk_count == 1 else _stable_id(f"{resolved_id}:chunk:{idx}")
+            chunk_source = (
+                source_text if chunk_count == 1 else f"{source_text}#chunk:{idx + 1}"
+            )
+            chunk_id = (
+                resolved_id
+                if chunk_count == 1
+                else _stable_id(f"{resolved_id}:chunk:{idx}")
+            )
             chunk_metadata = dict(clean_metadata)
             chunk_metadata.update(
                 {
@@ -349,7 +362,9 @@ class KnowledgeStore:
                     now,
                 ),
             )
-            conn.execute("DELETE FROM knowledge_chunks WHERE knowledge_id = ?", (resolved_id,))
+            conn.execute(
+                "DELETE FROM knowledge_chunks WHERE knowledge_id = ?", (resolved_id,)
+            )
             for idx, chunk in enumerate(chunk_rows):
                 conn.execute(
                     """
@@ -522,7 +537,9 @@ class KnowledgeStore:
             return False
         knowledge_id = str(resolved["knowledge_id"])
         with self._connect() as conn:
-            conn.execute("DELETE FROM knowledge_items WHERE knowledge_id = ?", (knowledge_id,))
+            conn.execute(
+                "DELETE FROM knowledge_items WHERE knowledge_id = ?", (knowledge_id,)
+            )
             conn.commit()
         return True
 

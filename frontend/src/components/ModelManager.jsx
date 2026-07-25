@@ -1,11 +1,9 @@
-import React, { useState, useEffect, useContext, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
-import { GlobalContext } from '../main';
-import { List, ListItem, ListItemText, Button, Typography, Paper, Grid, CircularProgress, Chip } from '@mui/material';
+import { List, ListItem, ListItemText, Button, Typography, Paper, Grid, CircularProgress } from '@mui/material';
 import { resolveLocalCatalogModelId } from "../utils/modelUtils";
 
 const ModelManager = () => {
-  const { state } = useContext(GlobalContext);
   const [availableModels, setAvailableModels] = useState([]);
   const [supportedModels, setSupportedModels] = useState([]);
   const [modelInfo, setModelInfo] = useState({});

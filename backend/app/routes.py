@@ -2,29 +2,24 @@
 import asyncio
 import copy
 import base64
-import errno
 import importlib.util
 import io
 from difflib import get_close_matches
 from collections import deque
-from fnmatch import fnmatch
 import hashlib
 import mimetypes
 import json
 import logging
 import os
 import re
-import secrets
 import time
-import shutil
 import threading
 import textwrap
 import zipfile
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, Iterable, List, Optional, Literal, Union
 
-import requests
 import socket
 from urllib.parse import quote, urlparse
 
@@ -77,22 +72,33 @@ from app.services.rag_provider import (
     update_cached_config as _update_rag_config,
 )
 from app.services import privacy_filter_service
-from app.services.instance_sync_service import (
-    InstanceSyncService,
-    RemoteFloatClient,
-    SYNC_SECTION_LABELS,
-    _resolve_remote_urls,
+from app.services.model_inventory_service import (
+    responses_api_base as _responses_api_base,
 )
+from app.routes_graph import router as graph_router
+from app.routers import device_sync as device_sync_routes
+from app.routers.model_catalog import router as model_catalog_router
+from app.routers import model_filesystem as model_filesystem_routes
+from app.routers.model_jobs import router as model_jobs_router
+from app.routers.provider import ProviderControlRequest, create_provider_router
+from app.services import model_download_service
 from app.tasks import (
     process_livekit_audio,
     rehydrate_memories as rehydrate_memories_task,
 )
 from app.hooks_auto_title import consume_pending_title
 from app.model_registry import resolve_model_alias
+from app.server_presets import (
+    normalize_custom_server_presets,
+    public_server_presets,
+    server_supports_native_tools,
+    serialize_custom_server_presets,
+)
 from app.utils import (
     blob_store,
     calendar_store,
     conversation_store,
+    deployment_event_store,
     generate_signature,
     history_store,
     sanitize_args,
@@ -102,57 +108,23 @@ from app.utils import (
 from app.utils.knowledge_store import KnowledgeStore
 from app.utils.push import can_send_push, send_web_push, vapid_config
 from app.utils.device_visibility import (
-    advertised_device_access,
-    candidate_device_urls,
+    classify_host,
+    client_host,
+    is_trusted_frontend_proxy,
 )
 from app.utils.attachment_media import build_attachment_media_descriptor
 from app.utils.device_registry import (
     decode_device_token,
-    delete_device,
     get_device,
-    register_or_update_device,
-    update_device,
-    list_devices,
-    issue_device_token,
-    touch_device,
-)
-from app.utils.rendezvous_store import (
-    accept_offer as accept_rendezvous_offer,
-    create_offer as create_rendezvous_offer,
-    create_session as create_rendezvous_session,
-)
-from app.utils.sync_review_store import (
-    create_review as create_sync_review,
-    get_review as get_sync_review,
-    list_reviews as list_sync_reviews,
-    update_review as update_sync_review,
-)
-from app.utils.sync_store import (
-    cancel_operation as sync_cancel_operation,
-    finish_operation as sync_finish_operation,
-    get_cursor as sync_get_cursor,
-    get_changes_since as sync_get_changes_since,
-    operations_snapshot as sync_operations_snapshot,
-    record_changes as sync_record_changes,
-    retire_pending_pushes_after_pull as sync_retire_pending_pushes_after_pull,
-    start_operation as sync_start_operation,
 )
 from app.utils.workspace_registry import (
     DEFAULT_WORKSPACE_ID,
-    build_synced_workspace_profile,
-    filter_workspace_ids_for_sync,
     load_workspace_state,
-    normalize_workspace_ids,
-    resolve_synced_workspace_location,
-    summarize_workspace_profile,
     workspace_item_exclusion_reason,
-    workspace_profile_map,
 )
 from app.utils.blob_store import (
     put_blob,
     put_asset,
-    get_blob,
-    exists as blob_exists,
     delete as blob_delete,
     find_asset_path,
     iter_attachment_hashes as iter_stored_attachment_hashes,
@@ -169,10 +141,6 @@ from app.workflow_profiles import (
     capture_policy_prompt,
     continue_transition_allowed,
     delete_local_skill_doc,
-    export_addon_pack,
-    export_skill_markdown,
-    import_addon_pack,
-    import_skill_markdown,
     normalize_module_id,
     normalize_skill_id,
     resolve_modules,
@@ -278,14 +246,14 @@ from app.utils.telemetry import get_request_id
 from app.utils.event_broker import BrokerEvent, EventBroker
 from app.utils.stream_sanitize import InlineToolStreamFilter
 from app.utils.tool_args import normalize_and_sanitize_tool_args, normalize_tool_args
-from app.utils.local_model_registry import (
-    list_local_model_entries,
-    remove_local_model_entry,
-    resolve_registered_model_path,
-    upsert_local_model_entry,
-)
-from app.local_providers.base import infer_openai_compatible_auth_token
 from app.local_providers import LocalProviderManager
+from app.local_providers.selection import (
+    default_local_provider_port as _default_local_provider_port,
+    effective_provider_for_runtime as _effective_provider_for_runtime,
+    normalize_local_provider as _normalize_local_provider,
+    provider_model_for_action as _provider_model_for_action,
+    provider_runtime_response as _provider_runtime_response,
+)
 from app.utils.chat_log import (
     log_chat_request,
     log_chat_response,
@@ -312,19 +280,6 @@ from workers.multimodal import (
     resolve_vision_caption_model,
 )
 from services.weaviate_client import autostart_weaviate
-from app.model_registry import (
-    canonical_model_alias,
-    filter_models_for_devices,
-    get_download_allow_patterns,
-    get_local_loader,
-    get_model_lane,
-    get_model_metadata,
-    list_downloadable_models,
-    model_allowed_in_mobile_catalog,
-    model_supports_download_job,
-    model_supports_images,
-    model_supports_provider_lane,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -378,318 +333,10 @@ def _context_schema_to_service_context(context: Any) -> ServiceContext:
     )
 
 
-OPENAI_MODELS_CACHE_TTL_SECONDS = 15 * 60
-_openai_models_cache: Dict[str, Dict[str, Any]] = {}
-_openai_models_cache_lock = threading.Lock()
-
-_OPENAI_NON_CHAT_MODEL_MARKERS = (
-    "embedding",
-    "embed",
-    "tts",
-    "whisper",
-    "transcribe",
-    "speech",
-    "audio",
-    "realtime",
-    "image",
-    "dall-e",
-    "moderation",
-    "computer-use",
-    "sora",
-)
-_OPENAI_LEGACY_COMPLETION_PREFIXES = (
-    "ada-",
-    "babbage-",
-    "curie-",
-    "davinci-",
-    "text-davinci-",
-)
-_OPENAI_LEGACY_COMPLETION_SUFFIXES = ("-instruct",)
-_OPENAI_MODEL_SIZE_RANK = {
-    "base": 5,
-    "chat": 4,
-    "codex": 3,
-    "pro": 2,
-    "max": 1,
-    "mini": -1,
-    "nano": -2,
-}
-SERVER_MODEL_PROBE_TIMEOUT_SECONDS = 0.8
-SERVER_MODEL_PROBE_REFRESH_TIMEOUT_SECONDS = 1.5
-SERVER_MODEL_PROBE_DEADLINE_SECONDS = 2.0
-SERVER_MODEL_PROBE_REFRESH_DEADLINE_SECONDS = 5.0
-
-
-def _openai_models_cache_key(base_url: str, api_key: str) -> str:
-    digest = hashlib.sha256()
-    digest.update(base_url.strip().encode("utf-8"))
-    digest.update(b"\n")
-    digest.update(api_key.strip().encode("utf-8"))
-    return digest.hexdigest()
-
-
-def _get_cached_openai_models(base_url: str, api_key: str) -> Optional[List[str]]:
-    cache_key = _openai_models_cache_key(base_url, api_key)
-    now = time.monotonic()
-    with _openai_models_cache_lock:
-        stale_keys = [
-            key
-            for key, entry in _openai_models_cache.items()
-            if now - float(entry.get("fetched_at", 0.0))
-            >= OPENAI_MODELS_CACHE_TTL_SECONDS
-        ]
-        for key in stale_keys:
-            _openai_models_cache.pop(key, None)
-        entry = _openai_models_cache.get(cache_key)
-        if not entry:
-            return None
-        models = entry.get("models", [])
-        return list(models) if isinstance(models, list) else None
-
-
-def _store_cached_openai_models(base_url: str, api_key: str, models: List[str]) -> None:
-    cache_key = _openai_models_cache_key(base_url, api_key)
-    with _openai_models_cache_lock:
-        _openai_models_cache[cache_key] = {
-            "models": list(models),
-            "fetched_at": time.monotonic(),
-        }
-
-
-def _openai_chat_model_allowed(model_id: str) -> bool:
-    lowered = str(model_id or "").strip().lower()
-    if not lowered:
-        return False
-    if lowered.startswith(_OPENAI_LEGACY_COMPLETION_PREFIXES):
-        return False
-    if lowered.endswith(_OPENAI_LEGACY_COMPLETION_SUFFIXES) or any(
-        f"{suffix}-" in lowered for suffix in _OPENAI_LEGACY_COMPLETION_SUFFIXES
-    ):
-        return False
-    return not any(marker in lowered for marker in _OPENAI_NON_CHAT_MODEL_MARKERS)
-
-
-def _parse_openai_model_date(model_id: str) -> int:
-    match = re.search(r"(?:^|-)(20\d{2})-(\d{2})-(\d{2})(?:$|-)", model_id)
-    if not match:
-        return 0
-    return int(f"{match.group(1)}{match.group(2)}{match.group(3)}")
-
-
-def _openai_model_sort_key(model_id: str) -> tuple[Any, ...]:
-    lowered = str(model_id or "").strip().lower()
-    match = re.match(r"^gpt-(\d+)(?:\.(\d+))?", lowered)
-    if not match:
-        return (1, lowered)
-    suffix = lowered[len(match.group(0)) :].lstrip("-")
-    size = next(
-        (part for part in suffix.split("-") if part in _OPENAI_MODEL_SIZE_RANK),
-        "base",
-    )
-    return (
-        0,
-        -(int(match.group(1)) if match.group(1) else 0),
-        -(int(match.group(2)) if match.group(2) else 0),
-        -_OPENAI_MODEL_SIZE_RANK.get(size, _OPENAI_MODEL_SIZE_RANK["base"]),
-        -_parse_openai_model_date(lowered),
-        lowered,
-    )
-
-
-def _sort_openai_model_ids(model_ids: Iterable[str]) -> List[str]:
-    return sorted(model_ids, key=_openai_model_sort_key)
-
-
-def _filter_openai_model_ids(
-    model_ids: List[str],
-    *,
-    include_non_chat: bool = False,
-) -> List[str]:
-    if include_non_chat:
-        return _sort_openai_model_ids(model_ids)
-    return _sort_openai_model_ids(
-        model_id for model_id in model_ids if _openai_chat_model_allowed(model_id)
-    )
-
-
-def _server_model_probe_targets(server_url: str) -> List[str]:
-    value = str(server_url or "").strip()
-    if not value:
-        return []
-    if "://" not in value and not value.startswith("/"):
-        value = f"http://{value}"
-    try:
-        parsed = urlparse(value)
-    except Exception:
-        return []
-    if not parsed.scheme or not parsed.netloc:
-        return []
-    origin = f"{parsed.scheme}://{parsed.netloc}"
-    path = (parsed.path or "").rstrip("/")
-    lowered = path.lower()
-    targets: List[str] = []
-    seen: set[str] = set()
-
-    def add(pathname: str) -> None:
-        normalized_path = pathname if pathname.startswith("/") else f"/{pathname}"
-        target = f"{origin}{normalized_path}"
-        if target not in seen:
-            seen.add(target)
-            targets.append(target)
-
-    endpoint_suffixes = (
-        "/chat/completions",
-        "/completions",
-        "/responses",
-    )
-    for suffix in endpoint_suffixes:
-        if lowered.endswith(suffix):
-            add(path[: -len(suffix)] + "/models")
-            break
-    if lowered.endswith("/models"):
-        add(path or "/models")
-    elif re.search(r"/v\d+$", lowered):
-        add(f"{path}/models")
-    elif path:
-        add(f"{path}/v1/models")
-        add(f"{path}/models")
-
-    add("/api/v0/models")
-    add("/api/v1/models")
-    add("/v1/models")
-    add("/models")
-    return targets
-
-
-def _server_model_probe_request(
-    endpoint: str,
-    *,
-    headers: Optional[Dict[str, str]] = None,
-    timeout: float = SERVER_MODEL_PROBE_TIMEOUT_SECONDS,
-) -> requests.Response:
-    # Provider inventory probes are usually local/LAN health checks. Avoid the
-    # shared retrying session so a down provider cannot stall the FastAPI loop.
-    return requests.get(endpoint, headers=headers or None, timeout=timeout)
-
-
-def _extract_model_inventory(payload: Any) -> Dict[str, Any]:
-    models: List[str] = []
-    loaded_model = ""
-
-    def append_entry(raw_entry: Any) -> None:
-        nonlocal loaded_model
-        if isinstance(raw_entry, str) and raw_entry.strip():
-            models.append(raw_entry.strip())
-            return
-        if not isinstance(raw_entry, dict):
-            return
-        value = raw_entry.get("id") or raw_entry.get("model") or raw_entry.get("name")
-        if not isinstance(value, str) or not value.strip():
-            return
-        model_id = value.strip()
-        models.append(model_id)
-        state = (
-            str(raw_entry.get("state") or raw_entry.get("status") or "").strip().lower()
-        )
-        if not loaded_model and state in {"loaded", "active", "running"}:
-            loaded_model = model_id
-
-    if isinstance(payload, dict):
-        for key in ("data", "models"):
-            raw_models = payload.get(key)
-            if isinstance(raw_models, list):
-                for item in raw_models:
-                    append_entry(item)
-        for key in ("loaded_model", "active_model", "current_model", "model"):
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                loaded_model = loaded_model or value.strip()
-                models.append(value.strip())
-                break
-    elif isinstance(payload, list):
-        for item in payload:
-            append_entry(item)
-
-    deduped = sorted({model for model in models if model})
-    return {"models": deduped, "loaded_model": loaded_model}
-
-
-def _probe_server_model_inventory(
-    target_url: str,
-    *,
-    headers: Optional[Dict[str, str]] = None,
-    refresh: bool = False,
-) -> Dict[str, Any]:
-    reachable = False
-    last_error = ""
-    checked_endpoints: List[str] = []
-    timeout_seconds = (
-        SERVER_MODEL_PROBE_REFRESH_TIMEOUT_SECONDS
-        if refresh
-        else SERVER_MODEL_PROBE_TIMEOUT_SECONDS
-    )
-    deadline_seconds = (
-        SERVER_MODEL_PROBE_REFRESH_DEADLINE_SECONDS
-        if refresh
-        else SERVER_MODEL_PROBE_DEADLINE_SECONDS
-    )
-    deadline = time.monotonic() + deadline_seconds
-    for endpoint in _server_model_probe_targets(target_url):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            last_error = "probe timed out"
-            break
-        checked_endpoints.append(endpoint)
-        try:
-            response = _server_model_probe_request(
-                endpoint,
-                headers=headers,
-                timeout=max(0.1, min(timeout_seconds, remaining)),
-            )
-        except requests.RequestException as exc:
-            last_error = str(exc)
-            continue
-        status_code = int(getattr(response, "status_code", 0) or 0)
-        if status_code in {401, 403}:
-            return {
-                "status": "success",
-                "models": [],
-                "reachable": True,
-                "endpoint": endpoint,
-                "checked_endpoints": checked_endpoints,
-                "auth_required": True,
-            }
-        if status_code >= 400:
-            last_error = str(getattr(response, "text", "") or f"HTTP {status_code}")
-            continue
-        reachable = True
-        try:
-            payload = response.json()
-        except Exception as exc:
-            last_error = str(exc)
-            continue
-        inventory = _extract_model_inventory(payload)
-        models = inventory.get("models", [])
-        if models:
-            return {
-                "status": "success",
-                "models": models,
-                "loaded_model": inventory.get("loaded_model") or "",
-                "reachable": True,
-                "endpoint": endpoint,
-                "checked_endpoints": checked_endpoints,
-            }
-    return {
-        "status": "success",
-        "models": [],
-        "loaded_model": "",
-        "reachable": reachable,
-        "checked_endpoints": checked_endpoints,
-        "error": last_error,
-    }
-
-
 router = APIRouter()
+router.include_router(graph_router)
+router.include_router(model_catalog_router)
+router.include_router(model_jobs_router)
 llm_service = LLMService()
 livekit_service = LiveKitService(app_config.load_config())
 engine = get_engine()
@@ -699,6 +346,57 @@ stt_service = STTService()
 provider_manager = LocalProviderManager(
     lambda: llm_service.config if isinstance(llm_service.config, dict) else {}
 )
+model_filesystem_routes.configure_model_filesystem_runtime(
+    llm_service=llm_service,
+    provider_manager=provider_manager,
+)
+router.include_router(model_filesystem_routes.router)
+router.include_router(create_provider_router(provider_manager))
+
+# Compatibility aliases for legacy imports while model storage and callers migrate.
+MODEL_PAYLOAD_SUFFIXES = model_filesystem_routes.MODEL_PAYLOAD_SUFFIXES
+_build_model_delete_lock_detail = (
+    model_filesystem_routes._build_model_delete_lock_detail
+)
+_build_model_delete_lock_message = (
+    model_filesystem_routes._build_model_delete_lock_message
+)
+_build_model_delete_lock_parts = model_filesystem_routes._build_model_delete_lock_parts
+_count_local_files = model_filesystem_routes._count_local_files
+_fallback_verification_from_job = (
+    model_filesystem_routes._fallback_verification_from_job
+)
+_hf_cache_model_allowed = model_filesystem_routes._hf_cache_model_allowed
+_is_hf_cache_dir = model_filesystem_routes._is_hf_cache_dir
+_local_model_delete_lock_detail = (
+    model_filesystem_routes._local_model_delete_lock_detail
+)
+_naive_local_verification = model_filesystem_routes._naive_local_verification
+_provider_display_name = model_filesystem_routes._provider_display_name
+_provider_model_delete_lock_details = (
+    model_filesystem_routes._provider_model_delete_lock_details
+)
+_remote_manifest = model_filesystem_routes._remote_manifest
+_resolve_hf_snapshot = model_filesystem_routes._resolve_hf_snapshot
+_resolve_local_model_dir = model_filesystem_routes._resolve_local_model_dir
+_sha256_file = model_filesystem_routes._sha256_file
+delete_model = model_filesystem_routes.delete_model
+list_transformer_models = model_filesystem_routes.list_transformer_models
+model_exists = model_filesystem_routes.model_exists
+model_info = model_filesystem_routes.model_info
+model_integrity = model_filesystem_routes.model_integrity
+model_local_size = model_filesystem_routes.model_local_size
+model_summary = model_filesystem_routes.model_summary
+reveal_model_directory = model_filesystem_routes.reveal_model_directory
+verify_model = model_filesystem_routes.verify_model
+_folder_size_bytes = model_download_service.folder_size_bytes
+_get_jobs_state = model_download_service.get_jobs_state
+_job_progress = model_download_service.job_progress
+_path_matches_any = model_download_service.path_matches_any
+_refresh_job_status = model_download_service.refresh_job_status
+_resolve_models_dir = model_download_service.resolve_models_dir
+_start_download_process = model_download_service.start_download_process
+_terminate_proc = model_download_service.terminate_proc
 
 _COMMON_TOOL_NAME_HINTS = {
     "memory": ["remember", "recall"],
@@ -721,26 +419,6 @@ _COMMON_TOOL_NAME_HINTS = {
 # In-memory notification buffer (recent only)
 if not hasattr(asyncio, "__float_notifications__"):
     asyncio.__float_notifications__ = []  # type: ignore[attr-defined]
-
-
-def _responses_api_base(api_url: Optional[str]) -> str:
-    """Return the base URL used for Responses API calls.
-
-    Falls back to the canonical OpenAI base when ``api_url`` is unset and
-    strips either ``/responses`` or legacy ``/chat/completions`` suffixes to
-    avoid duplicate path segments when constructing proxy URLs.
-    """
-
-    default_base = app_config.OPENAI_RESPONSES_URL.rsplit("/responses", 1)[0]
-    trimmed = (api_url or "").strip()
-    if not trimmed:
-        return default_base
-    normalized = trimmed.rstrip("/")
-    for suffix in ("/responses", "/chat/completions"):
-        if normalized.endswith(suffix):
-            base = normalized[: -len(suffix)] or default_base
-            return base.rstrip("/") or default_base
-    return normalized
 
 
 def _notifications_buffer():
@@ -897,6 +575,12 @@ def _apply_empty_response_fallback(
 def _response_status_value(metadata: Dict[str, Any]) -> str:
     if metadata.get("error") or metadata.get("empty_response"):
         return "error"
+    if (
+        metadata.get("output_truncated")
+        or metadata.get("unresolved_tool_loop")
+        or metadata.get("tool_free_turn_failed")
+    ):
+        return "partial"
     return "complete"
 
 
@@ -1098,11 +782,6 @@ def _privacy_route_check_for_message(
     config_payload: Dict[str, Any] | None = None,
 ) -> Optional[Dict[str, Any]]:
     settings_data = settings_payload if isinstance(settings_payload, dict) else {}
-    if (
-        privacy_filter_service.normalize_mode(settings_data.get("privacy_filter_mode"))
-        == "off"
-    ):
-        return None
     if (
         _normalize_privacy_route_mode(
             settings_data.get("privacy_filter_route_private_mode")
@@ -1588,33 +1267,190 @@ def _merge_usage(
     return merged
 
 
+_REASONING_PRESET_EFFORTS: Dict[str, float] = {
+    "none": 0.0,
+    "minimal": 0.01,
+    "low": 0.3,
+    "medium": 0.6,
+    "high": 0.9,
+    "xhigh": 0.99,
+}
+
+
+def _nearest_reasoning_preset(effort: float) -> str:
+    bounded = min(0.99, max(0.0, float(effort)))
+    return min(
+        _REASONING_PRESET_EFFORTS,
+        key=lambda name: (
+            abs(_REASONING_PRESET_EFFORTS[name] - bounded),
+            -_REASONING_PRESET_EFFORTS[name],
+        ),
+    )
+
+
 def _reasoning_payload(
-    thinking: Optional[Union[bool, str]]
+    thinking: Optional[Union[bool, str, float]]
 ) -> Optional[Dict[str, Any]]:
     if thinking is None:
         return None
+    if isinstance(thinking, bool):
+        preset = "high" if thinking else "low"
+        return {
+            "requested_effort": preset,
+            "effort_value": _REASONING_PRESET_EFFORTS[preset],
+            "preset": preset,
+        }
+    if isinstance(thinking, (int, float)):
+        effort_value = min(0.99, max(0.0, float(thinking)))
+        return {
+            "requested_effort": effort_value,
+            "effort_value": effort_value,
+            "preset": _nearest_reasoning_preset(effort_value),
+        }
     if isinstance(thinking, str):
         mode = thinking.strip().lower()
         if not mode or mode == "auto":
             return None
-        if mode == "high":
-            return {"effort": "high"}
-        if mode == "low":
-            return {"effort": "low"}
+        aliases = {
+            "off": "none",
+            "disabled": "none",
+            "max": "xhigh",
+        }
+        mode = aliases.get(mode, mode)
+        if mode in _REASONING_PRESET_EFFORTS:
+            return {
+                "requested_effort": mode,
+                "effort_value": _REASONING_PRESET_EFFORTS[mode],
+                "preset": mode,
+            }
+        try:
+            effort_value = min(0.99, max(0.0, float(mode)))
+        except (TypeError, ValueError):
+            return None
+        return {
+            "requested_effort": effort_value,
+            "effort_value": effort_value,
+            "preset": _nearest_reasoning_preset(effort_value),
+        }
+    return None
+
+
+def _supports_continuous_reasoning_effort(model: Optional[str]) -> bool:
+    raw = str(model or "").strip().lower()
+    return raw.startswith("tinker://") or "inkling" in raw
+
+
+def _normalize_output_token_limit(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
         return None
-    # Responses API supports reasoning controls for GPT-5 / o-series models.
-    return {"effort": "high" if thinking else "low"}
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0:
+        return None
+    return min(2_000_000, parsed)
+
+
+def _reasoning_generation_kwargs(
+    thinking: Optional[Union[bool, str, float]],
+    *,
+    model: Optional[str],
+    max_output_tokens: Any = None,
+) -> Dict[str, Any]:
+    reasoning = _reasoning_payload_for_model(thinking, model=model)
+    output_token_limit = _normalize_output_token_limit(max_output_tokens)
+    result: Dict[str, Any] = {}
+    if reasoning is not None:
+        result["reasoning"] = reasoning
+    if output_token_limit is not None:
+        result["output_token_limit"] = output_token_limit
+    return result
+
+
+def _apply_reasoning_response_metadata(
+    response: Any,
+    reasoning: Optional[Dict[str, Any]],
+    output_token_limit: Optional[int] = None,
+) -> None:
+    if not isinstance(response, dict):
+        return
+    metadata = response.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+        response["metadata"] = metadata
+    normalized_output_limit = _normalize_output_token_limit(output_token_limit)
+    metadata["generation"] = {
+        "max_output_tokens": normalized_output_limit,
+        "output_limit_source": (
+            "user" if normalized_output_limit is not None else "provider_default"
+        ),
+    }
+    if isinstance(reasoning, dict):
+        metadata["reasoning"] = {
+            "requested_effort": reasoning.get("requested_effort"),
+            "effective_effort": reasoning.get("effort"),
+            "preset": reasoning.get("preset"),
+            "rounded": bool(reasoning.get("rounded")),
+            "continuous": bool(reasoning.get("continuous")),
+            # Compatibility field for older inspectors. Output length is now
+            # independently selected rather than inferred from reasoning effort.
+            "output_token_budget": normalized_output_limit,
+            "output_token_mode": (
+                "explicit"
+                if normalized_output_limit is not None
+                else "provider_default"
+            ),
+        }
+    finish_reason = str(metadata.get("finish_reason") or "").strip().lower()
+    if finish_reason in {
+        "length",
+        "max_tokens",
+        "max_output_tokens",
+        "max_completion_tokens",
+    }:
+        metadata["output_truncated"] = True
+        metadata["termination_category"] = "output_token_limit"
+        metadata.setdefault("category", "output_token_limit")
+        metadata.setdefault("warning", "Response reached its output token budget.")
+        metadata.setdefault(
+            "hint",
+            "The provider stopped at an output limit. Continue the response or raise the explicit max-output setting if the model supports it.",
+        )
+
+
+def _runtime_model_identity_note(
+    *,
+    model: Any,
+    mode: Any,
+    provider: Any = None,
+) -> Optional[str]:
+    model_name = str(model or "").strip()
+    if not model_name:
+        return None
+    mode_name = str(mode or "").strip() or "configured runtime"
+    provider_name = str(provider or "").strip()
+    route = f"{mode_name}/{provider_name}" if provider_name else mode_name
+    return (
+        "runtime identity:\n"
+        "- You are Float, the agent and product identity presented to the user.\n"
+        f"- The underlying inference model generating this turn is `{model_name}` via `{route}`.\n"
+        "- If asked who or what you are, distinguish Float from the underlying model instead of denying either identity."
+    )
 
 
 def _supports_reasoning_controls(model: Optional[str]) -> bool:
     raw = str(model or "").strip().lower()
     if not raw:
         return False
-    return raw.startswith(("gpt-5", "o1", "o3", "o4", "gpt-realtime-2"))
+    return (
+        raw.startswith(("gpt-5", "o1", "o3", "o4", "gpt-realtime-2", "tinker://"))
+        or "inkling" in raw
+    )
 
 
 def _reasoning_payload_for_model(
-    thinking: Optional[Union[bool, str]],
+    thinking: Optional[Union[bool, str, float]],
     *,
     model: Optional[str],
 ) -> Optional[Dict[str, Any]]:
@@ -1623,6 +1459,23 @@ def _reasoning_payload_for_model(
         return None
     if not _supports_reasoning_controls(model):
         return None
+    continuous = _supports_continuous_reasoning_effort(model)
+    requested = payload.get("requested_effort")
+    preset = str(payload.get("preset") or "medium")
+    if isinstance(requested, (int, float)) and not isinstance(requested, bool):
+        effective: Union[str, float] = (
+            float(payload["effort_value"]) if continuous else preset
+        )
+        rounded = not continuous
+    elif continuous and preset in {"none", "xhigh"}:
+        effective = float(payload["effort_value"])
+        rounded = False
+    else:
+        effective = preset
+        rounded = False
+    payload["effort"] = effective
+    payload["rounded"] = rounded
+    payload["continuous"] = continuous
     return payload
 
 
@@ -1785,6 +1638,80 @@ def _rehydrate_pending_tool(app, request_id: str) -> dict[str, Any] | None:
                     "chain_id": chain_id,
                     "status": status,
                 }
+    return None
+
+
+def _rehydrate_terminal_tool(
+    app,
+    request_id: str,
+    *,
+    session_id: str | None = None,
+    message_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Recover a completed tool decision without making it runnable again."""
+
+    request_id_str = str(request_id)
+    terminal_statuses = {
+        "invoked",
+        "denied",
+        "error",
+        "cancelled",
+        "timeout",
+        "scheduled",
+    }
+
+    def _terminal_record(event: Any) -> dict[str, Any] | None:
+        if not isinstance(event, dict):
+            return None
+        event_id = event.get("id") or event.get("request_id")
+        if event_id is None or str(event_id) != request_id_str:
+            return None
+        status = _tool_resolution_status(event.get("status"))
+        if status not in terminal_statuses:
+            return None
+        record = dict(event)
+        record["id"] = request_id_str
+        record["status"] = status
+        return record
+
+    try:
+        state = getattr(app.state, "agent_console_state", None)
+    except AttributeError:
+        state = None
+    if isinstance(state, dict):
+        agents = state.get("agents")
+        if isinstance(agents, dict):
+            for agent in agents.values():
+                events = agent.get("events") if isinstance(agent, dict) else None
+                if not isinstance(events, list):
+                    continue
+                for event in reversed(events):
+                    record = _terminal_record(event)
+                    if record is not None:
+                        return record
+
+    session_key = str(session_id or "").strip()
+    message_key = str(message_id or "").strip()
+    if not session_key:
+        return None
+    try:
+        conversation = conversation_store.load_conversation(session_key)
+    except Exception:
+        return None
+    if not isinstance(conversation, list):
+        return None
+    for message in reversed(conversation):
+        if not isinstance(message, dict):
+            continue
+        if message_key and str(message.get("id") or "") != message_key:
+            continue
+        tool_events = message.get("tools")
+        if not isinstance(tool_events, list):
+            continue
+        for event in reversed(tool_events):
+            record = _terminal_record(event)
+            if record is not None:
+                return record
     return None
 
 
@@ -2178,6 +2105,54 @@ def _scrub_tool_placeholder_text(value: Any) -> str:
     return scrubbed.strip()
 
 
+def _response_indicates_tool_stop(response: Any) -> bool:
+    if not isinstance(response, dict):
+        return False
+    metadata = response.get("metadata")
+    response_meta = metadata if isinstance(metadata, dict) else {}
+    reason = (
+        str(
+            response_meta.get("finish_reason") or response_meta.get("stop_reason") or ""
+        )
+        .strip()
+        .lower()
+    )
+    return reason in {
+        "tool_call",
+        "tool_calls",
+        "function_call",
+        "function_calls",
+        "requires_action",
+    }
+
+
+_EXPLICIT_TOOL_OPTOUT_RE = re.compile(
+    r"(?:^|[.!?]\s+)(?:please[,:]?\s+)?(?:"
+    r"no\s+(?:more\s+)?tools?"
+    r"|(?:do\s+not|don't|dont|never)\s+"
+    r"(?:use|call|run|invoke|request|propose|execute)\s+"
+    r"(?:(?:any|more|any\s+more)\s+)?tools?"
+    r"|(?:stop|avoid)\s+"
+    r"(?:using|calling|running|invoking|requesting|proposing|executing)\s+"
+    r"(?:(?:any|more|any\s+more)\s+)?tools?"
+    r"|without\s+"
+    r"(?:using|calling|running|invoking|requesting|proposing|executing)\s+"
+    r"(?:any\s+)?tools?"
+    r")\s*(?:[.!?]|$)",
+    re.IGNORECASE,
+)
+
+
+def _turn_explicitly_disallows_tools(value: Any) -> bool:
+    """Honor a clear text instruction that disables tools for this turn."""
+    if not isinstance(value, str):
+        return False
+    normalized = " ".join(value.split()).strip()
+    if not normalized:
+        return False
+    return bool(_EXPLICIT_TOOL_OPTOUT_RE.search(normalized))
+
+
 def _normalize_tool_args_for_proposal(name: str, args: Any) -> Dict[str, Any]:
     candidate = args if isinstance(args, dict) else {}
     if not name:
@@ -2275,6 +2250,20 @@ def _conversation_history_through_message(
             has_later_messages = idx < len(history) - 1
             return prefix, True, has_later_messages
     return list(history), False, False
+
+
+def _conversation_message_has_later_entries(
+    session_name: str | None, message_id: Any
+) -> bool:
+    normalized_session = str(session_name or "").strip()
+    normalized_message = str(message_id or "").strip()
+    if not normalized_session or not normalized_message:
+        return False
+    _, target_found, has_later_messages = _conversation_history_through_message(
+        normalized_session,
+        normalized_message,
+    )
+    return bool(target_found and has_later_messages)
 
 
 def _tool_resolution_status(status_value: Any) -> str:
@@ -3105,7 +3094,17 @@ def _tool_prompt_json_value(
         if isinstance(current, str):
             text = current
             if len(text) > max_string:
-                return text[: max(0, max_string - 3)].rstrip() + "..."
+                omission_marker = "\n... [content omitted] ...\n"
+                available = max_string - len(omission_marker)
+                if available <= 1:
+                    return text[:max_string]
+                head_count = (available + 1) // 2
+                tail_count = available - head_count
+                return (
+                    text[:head_count].rstrip()
+                    + omission_marker
+                    + text[-tail_count:].lstrip()
+                )
             return text
         if depth >= max_depth:
             if isinstance(current, dict):
@@ -3132,7 +3131,14 @@ def _tool_prompt_json_value(
         if isinstance(current, dict):
             trimmed: dict[str, Any] = {}
             items = list(current.items())
-            for key, item in items[:max_items]:
+            selected_items = items
+            if len(items) > max_items:
+                head_count = max(1, max_items // 3)
+                tail_count = max(0, max_items - head_count)
+                selected_items = items[:head_count]
+                if tail_count:
+                    selected_items.extend(items[-tail_count:])
+            for key, item in selected_items:
                 trimmed[str(key)] = _inner(item, depth + 1)
             if len(items) > max_items:
                 trimmed["_truncated_keys"] = len(items) - max_items
@@ -3142,7 +3148,12 @@ def _tool_prompt_json_value(
     return _inner(value, 0)
 
 
-def _tool_events_prompt_payload(tool_events: Any) -> list[dict[str, Any]]:
+def _tool_events_prompt_payload(
+    tool_events: Any,
+    *,
+    max_items: int = 12,
+    max_string: int = 1600,
+) -> list[dict[str, Any]]:
     if not isinstance(tool_events, list):
         return []
     payload: list[dict[str, Any]] = []
@@ -3158,14 +3169,30 @@ def _tool_events_prompt_payload(tool_events: Any) -> list[dict[str, Any]]:
             entry["status"] = status
         args = tool.get("args") if isinstance(tool.get("args"), dict) else {}
         if args:
-            entry["args"] = _tool_prompt_json_value(args)
+            entry["args"] = _tool_prompt_json_value(
+                args,
+                max_items=max_items,
+                max_string=min(max_string, 800),
+            )
         menu_payload = _tool_menu_prompt_payload(name, tool.get("result"))
         if menu_payload is not None:
-            entry["result"] = menu_payload
+            entry["result"] = _tool_prompt_json_value(
+                menu_payload,
+                max_items=max_items,
+                max_string=max_string,
+            )
         elif "result" in tool:
-            entry["result"] = _tool_prompt_json_value(tool.get("result"))
+            entry["result"] = _tool_prompt_json_value(
+                tool.get("result"),
+                max_items=max_items,
+                max_string=max_string,
+            )
         elif tool.get("error"):
-            entry["error"] = _tool_prompt_json_value(tool.get("error"))
+            entry["error"] = _tool_prompt_json_value(
+                tool.get("error"),
+                max_items=max_items,
+                max_string=max_string,
+            )
         if entry:
             payload.append(entry)
     return payload
@@ -3202,7 +3229,6 @@ def _tool_events_prompt_text(
     result_char_budget: Optional[int] = None,
 ) -> str:
     lines = _tool_events_prompt_lines(tool_events)
-    payload = _tool_events_prompt_payload(tool_events)
     payload_budget = _tool_result_prompt_char_budget(
         model=model,
         mode=mode,
@@ -3217,10 +3243,46 @@ def _tool_events_prompt_text(
         )
     if lines:
         sections.append("Summary:\n" + "\n".join(f"- {line}" for line in lines))
+    raw_payload = ""
+    payload: list[dict[str, Any]] = []
+    for max_items, max_string in (
+        (12, 1600),
+        (12, 1000),
+        (10, 800),
+        (8, 600),
+        (6, 400),
+        (4, 240),
+        (3, 120),
+    ):
+        candidate = _tool_events_prompt_payload(
+            tool_events,
+            max_items=max_items,
+            max_string=max_string,
+        )
+        candidate_text = json.dumps(candidate, ensure_ascii=False, indent=2)
+        payload = candidate
+        raw_payload = candidate_text
+        if len(candidate_text) <= payload_budget:
+            break
+    if payload and len(raw_payload) > payload_budget:
+        minimal_payload = []
+        for tool in _tool_entries(tool_events):
+            minimal_entry: dict[str, Any] = {}
+            name = _tool_entry_name(tool)
+            status = _tool_resolution_status(tool.get("status"))
+            if name:
+                minimal_entry["name"] = name
+            if status:
+                minimal_entry["status"] = status
+            if minimal_entry:
+                minimal_payload.append(minimal_entry)
+        while minimal_payload:
+            raw_payload = json.dumps(minimal_payload, ensure_ascii=False, indent=2)
+            if len(raw_payload) <= payload_budget:
+                break
+            minimal_payload.pop()
+        payload = minimal_payload
     if payload:
-        raw_payload = json.dumps(payload, ensure_ascii=False, indent=2)
-        if len(raw_payload) > payload_budget:
-            raw_payload = raw_payload[: max(0, payload_budget - 3)].rstrip() + "..."
         sections.append("Tool result data:\n```json\n" + raw_payload + "\n```")
     return "\n\n".join(section for section in sections if section)
 
@@ -3980,6 +4042,13 @@ async def _register_tool_proposals(
 ) -> list[dict[str, Any]]:
     if not isinstance(tools, list) or not tools:
         return []
+    if _conversation_message_has_later_entries(session_id, message_id):
+        logger.info(
+            "Suppressed tool proposals for superseded session=%s message=%s",
+            session_id,
+            message_id,
+        )
+        return []
 
     registry: dict | None = getattr(request.app.state, "pending_tools", None)
     if registry is None:
@@ -3996,6 +4065,13 @@ async def _register_tool_proposals(
     )
 
     for tool in tools:
+        if _conversation_message_has_later_entries(session_id, message_id):
+            logger.info(
+                "Stopped registering tool proposals for superseded session=%s message=%s",
+                session_id,
+                message_id,
+            )
+            break
         if not isinstance(tool, dict):
             continue
         tool_name = _normalize_tool_name(tool.get("name"))
@@ -4019,6 +4095,14 @@ async def _register_tool_proposals(
             continue
 
         proposal_id = str(uuid4())
+        server_auto_decide = bool(
+            approval_allows_auto_for_tool(
+                approval_level,
+                tool_name,
+                settings_payload,
+            )
+            and tool_name not in CLIENT_RESOLUTION_TOOLS
+        )
         record = {
             "id": proposal_id,
             "name": tool_name,
@@ -4029,6 +4113,10 @@ async def _register_tool_proposals(
             "model": model,
             "mode": mode,
             "status": "proposed",
+            "server_auto_decide": server_auto_decide,
+            "review_notification_emitted": bool(
+                not server_auto_decide and _tool_resolution_notifications_enabled()
+            ),
         }
         registry[proposal_id] = record
         if signature:
@@ -4073,6 +4161,7 @@ async def _register_tool_proposals(
                     "session_id": session_id,
                     "model": model,
                     "mode": mode,
+                    "server_auto_decide": server_auto_decide,
                 },
                 default_agent=default_agent,
             )
@@ -4094,10 +4183,7 @@ async def _register_tool_proposals(
             message_id=message_id,
             request_id=proposal_id,
         )
-        if (
-            approval_allows_auto_for_tool(approval_level, tool_name, settings_payload)
-            and tool_name not in CLIENT_RESOLUTION_TOOLS
-        ):
+        if server_auto_decide:
             try:
                 auto_result = await decide_tool(
                     request,
@@ -4202,6 +4288,46 @@ def _emit_tool_resolution_notification(
     )
 
 
+def _emit_terminal_tool_resolution_notification(
+    app,
+    *,
+    record: dict[str, Any],
+    status: Any,
+) -> None:
+    """Publish a non-visual terminal event so proposal notices can reconcile."""
+
+    request_id = str(record.get("id") or record.get("request_id") or "").strip()
+    normalized_status = _tool_resolution_status(status)
+    if not request_id or normalized_status in {"pending", "proposed"}:
+        return
+    if (
+        not bool(record.get("review_notification_emitted"))
+        and not _tool_resolution_notifications_enabled()
+    ):
+        return
+    tool_name = str(record.get("name") or "tool").strip() or "tool"
+    emit_notification(
+        app,
+        title="Tool review resolved",
+        body=f"{tool_name} is {normalized_status}.",
+        category="tool_resolution",
+        data={
+            "action_url": "/",
+            "tool_ids": [request_id],
+            "tool_names": [tool_name],
+            "tool_args": [
+                record.get("args") if isinstance(record.get("args"), dict) else {}
+            ],
+            "tool_statuses": [normalized_status],
+            "status": normalized_status,
+            "terminal": True,
+            "session_id": record.get("session_id"),
+            "message_id": record.get("message_id"),
+            "chain_id": record.get("chain_id") or record.get("message_id"),
+        },
+    )
+
+
 def _tool_outcome_payload(
     status: str,
     message: str | None = None,
@@ -4220,176 +4346,6 @@ def _tool_outcome_payload(
 
 
 TEST_PROMPTS_DIR = Path(__file__).resolve().parent / "tests" / "prompts"
-
-# ---------------------------
-# Helpers for model integrity
-# ---------------------------
-
-
-def _sha256_file(path: Path) -> str:
-    """Compute SHA-256 for a file in streaming fashion."""
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def _remote_manifest(
-    repo_id: str,
-    allow_patterns: Optional[list[str]] = None,
-    token: Optional[str] = None,
-) -> tuple[list[dict], int, str | None]:
-    """Return (manifest, total_bytes, commit_sha) for a HF repo.
-
-    Manifest entries are dicts: {"path": str, "size": int, "sha256": Optional[str]}.
-    """
-    # Lazy import to avoid heavy hub import on startup
-    from huggingface_hub import HfApi
-
-    api = HfApi(token=token) if token else HfApi()
-    # Request file metadata so sibling sizes are populated (HF defaults to size=None).
-    info = api.model_info(repo_id, files_metadata=True)
-    manifest: list[dict] = []
-    total = 0
-    for s in getattr(info, "siblings", []) or []:
-        # attribute names vary across hub versions; be defensive
-        path = getattr(s, "rfilename", None) or getattr(s, "path", None)
-        if path is not None:
-            path = str(path)
-            if not _path_matches_any(path, allow_patterns):
-                continue
-        size = getattr(s, "size", None)
-        sha256 = None
-        # Try LFS metadata first
-        try:
-            lfs = getattr(s, "lfs", None)
-            if isinstance(lfs, dict):
-                sha256 = lfs.get("sha256") or lfs.get("oid")
-        except Exception:
-            sha256 = None
-        # Fallback to generic sha field if present
-        if not sha256:
-            sha = getattr(s, "sha", None)
-            if isinstance(sha, str) and len(sha) in (40, 64):
-                sha256 = sha if len(sha) == 64 else None
-        if path is None:
-            continue
-        entry = {
-            "path": str(path),
-            "size": int(size or 0),
-            "sha256": sha256,
-        }
-        manifest.append(entry)
-        total += int(size or 0)
-    commit = getattr(info, "sha", None)
-    return manifest, int(total), commit
-
-
-def _path_matches_any(rel_posix: str, patterns: Optional[list[str]]) -> bool:
-    if not patterns:
-        return True
-    return any(fnmatch(rel_posix, pat) for pat in patterns)
-
-
-def _folder_size_bytes(
-    root: Path, *, include_patterns: Optional[list[str]] = None
-) -> int:
-    try:
-        if root.is_file():
-            return int(root.stat().st_size)
-    except Exception:
-        return 0
-    total = 0
-    for p in root.rglob("*"):
-        try:
-            if p.is_file():
-                if ".cache" in p.parts:
-                    continue
-                name = p.name.lower()
-                if (
-                    name.endswith(".incomplete")
-                    or name.endswith(".lock")
-                    or name.endswith(".metadata")
-                ):
-                    continue
-                rel = p.relative_to(root).as_posix()
-                if not _path_matches_any(rel, include_patterns):
-                    continue
-                total += p.stat().st_size
-        except Exception:
-            continue
-    return total
-
-
-def _count_local_files(root: Path) -> int:
-    try:
-        if root.is_file():
-            return 1
-    except Exception:
-        return 0
-    count = 0
-    for p in root.rglob("*"):
-        try:
-            if p.is_file():
-                count += 1
-        except Exception:
-            continue
-    return count
-
-
-def _fallback_verification_from_job(
-    request: Request,
-    model_name: str,
-    local_dir: Optional[Path],
-    installed: int,
-) -> Optional[dict]:
-    if local_dir is None:
-        return None
-    try:
-        jobs = _get_jobs_state(request.app)
-    except Exception:
-        return None
-    for job in jobs.values():
-        if job.get("model") != model_name:
-            continue
-        try:
-            _refresh_job_status(job)
-        except Exception:
-            continue
-        if job.get("status") != "completed":
-            continue
-        guessed_total = int(job.get("total") or 0)
-        if guessed_total <= 0:
-            guessed_total = int(installed)
-        checked = _count_local_files(local_dir)
-        verified = checked > 0 and installed > 0
-        return {
-            "exists": True,
-            "verified": verified,
-            "expected_bytes": guessed_total,
-            "installed_bytes": int(installed),
-            "checked_files": int(checked),
-        }
-    return None
-
-
-def _naive_local_verification(
-    local_dir: Optional[Path],
-    installed: int,
-) -> Optional[dict]:
-    if local_dir is None or installed <= 0:
-        return None
-    checked = _count_local_files(local_dir)
-    if checked <= 0:
-        return None
-    return {
-        "exists": True,
-        "verified": True,
-        "expected_bytes": int(installed),
-        "installed_bytes": int(installed),
-        "checked_files": int(checked),
-    }
 
 
 def _last_user_message(conversation):
@@ -4416,6 +4372,9 @@ def _require_scope(request: Request, scope: str) -> Dict[str, Any]:
     scopes = payload.get("scopes", [])
     if scope not in scopes:
         raise HTTPException(status_code=403, detail="Insufficient scope")
+    device_id = str(payload.get("sub") or "").strip()
+    if not device_id or get_device(device_id) is None:
+        raise HTTPException(status_code=401, detail="Device is no longer registered")
     return payload
 
 
@@ -4432,6 +4391,30 @@ def _optional_device_claims(
         except Exception:
             raise HTTPException(status_code=401, detail="Invalid token")
     return _require_scope(request, scope)
+
+
+def _is_local_control_request(request: Request) -> bool:
+    return is_trusted_frontend_proxy(request) or classify_host(
+        client_host(request)
+    ) == ("loopback")
+
+
+def _require_local_control(request: Request) -> None:
+    if not _is_local_control_request(request):
+        raise HTTPException(
+            status_code=403,
+            detail="This device control is available only through Float's local frontend.",
+        )
+
+
+def _local_control_or_device_claims(
+    request: Request, scope: str = "sync"
+) -> Optional[Dict[str, Any]]:
+    claims = _optional_device_claims(request, scope)
+    if claims is not None:
+        return claims
+    _require_local_control(request)
+    return None
 
 
 def _get_or_create_device_public_key() -> str:
@@ -5853,24 +5836,10 @@ class GenerateRequest(BaseModel):
     response_format: Optional[str] = None
     context: Optional[ContextSchema] = None
     session_id: Optional[str] = None
-    thinking: Optional[Union[bool, str]] = None
+    thinking: Optional[Union[bool, str, float]] = None
+    max_output_tokens: Optional[int] = Field(default=None, ge=1, le=2_000_000)
     attachments: List[Attachment] = Field(default_factory=list)
     vision_workflow: Optional[str] = "auto"
-
-
-class ProviderControlRequest(BaseModel):
-    provider: Optional[str] = None
-    model: Optional[str] = None
-    context_length: Optional[int] = None
-
-
-def _normalize_local_provider(value: Any) -> str:
-    raw = str(value or "").strip().lower()
-    if raw in {"lm-studio", "lm_studio"}:
-        raw = "lmstudio"
-    if raw in {"lmstudio", "ollama", "custom-openai-compatible"}:
-        return raw
-    return "lmstudio"
 
 
 def _normalize_local_provider_mode(value: Any) -> str:
@@ -5892,51 +5861,6 @@ def _normalize_live_agent_mode(value: Any) -> str:
     if raw in {"api", "local", "server"}:
         return raw
     return "local"
-
-
-def _default_local_provider_port(provider: str) -> int:
-    return 11434 if provider == "ollama" else 1234
-
-
-def _provider_marker_from_model(value: Any) -> Optional[str]:
-    marker = str(value or "").strip().lower()
-    if provider_manager.is_provider_marker(marker):
-        return marker
-    return None
-
-
-def _provider_model_for_action(value: Any) -> Optional[str]:
-    candidate = str(value or "").strip()
-    if not candidate:
-        return None
-    if provider_manager.is_provider_marker(candidate):
-        return None
-    return candidate
-
-
-def _effective_provider_for_runtime(
-    cfg: Dict[str, Any] | None,
-    *,
-    requested_model: Optional[str] = None,
-    explicit_provider: Optional[str] = None,
-) -> Optional[str]:
-    cfg_dict = cfg if isinstance(cfg, dict) else {}
-    if explicit_provider:
-        normalized = _normalize_local_provider(explicit_provider)
-        if provider_manager.is_provider_marker(normalized):
-            return normalized
-    marker = _provider_marker_from_model(requested_model)
-    if marker:
-        return marker
-    if isinstance(requested_model, str) and requested_model.strip():
-        return None
-    configured_provider = _normalize_local_provider(cfg_dict.get("local_provider"))
-    if provider_manager.is_provider_marker(configured_provider):
-        return configured_provider
-    configured_marker = _provider_marker_from_model(cfg_dict.get("transformer_model"))
-    if configured_marker:
-        return configured_marker
-    return None
 
 
 def _resolve_provider_inference_target_or_none(
@@ -6006,11 +5930,9 @@ async def generate(request: Request, payload: GenerateRequest = Body(...)):
                     "mode": mode_used,
                     "model_requested": payload.model,
                     "model_resolved": effective_model,
-                    "provider": (
-                        provider_target.get("provider")
-                        if isinstance(provider_target, dict)
-                        else None
-                    ),
+                    "provider": provider_target.get("provider")
+                    if isinstance(provider_target, dict)
+                    else None,
                 },
             )
         except Exception:
@@ -6096,13 +6018,13 @@ async def generate(request: Request, payload: GenerateRequest = Body(...)):
             mode_used, payload.context and "set" or "none"
         ).inc()
         _t0 = time.perf_counter()
-        generate_kwargs: Dict[str, Any] = {}
-        reasoning = _reasoning_payload_for_model(
+        generate_kwargs = _reasoning_generation_kwargs(
             payload.thinking,
             model=effective_model,
+            max_output_tokens=payload.max_output_tokens,
         )
-        if reasoning is not None:
-            generate_kwargs["reasoning"] = reasoning
+        reasoning = generate_kwargs.get("reasoning")
+        output_token_limit = generate_kwargs.get("output_token_limit")
         if isinstance(provider_target, dict):
             server_url = str(provider_target.get("base_url") or "").strip()
             if server_url:
@@ -6121,6 +6043,11 @@ async def generate(request: Request, payload: GenerateRequest = Body(...)):
             stream_message_id=message_id if stream_consumer is not None else None,
             **generate_kwargs,
         )
+        _apply_reasoning_response_metadata(
+            response,
+            reasoning,
+            output_token_limit,
+        )
         if isinstance(response, dict):
             response_meta = response.get("metadata")
             if not isinstance(response_meta, dict):
@@ -6133,38 +6060,30 @@ async def generate(request: Request, payload: GenerateRequest = Body(...)):
                 response_meta.setdefault("server_url", provider_target.get("base_url"))
                 response_meta.setdefault(
                     "provider_runtime",
-                    (
-                        provider_target.get("runtime")
-                        if isinstance(provider_target.get("runtime"), dict)
-                        else {}
-                    ),
+                    provider_target.get("runtime")
+                    if isinstance(provider_target.get("runtime"), dict)
+                    else {},
                 )
             mismatch_error = _apply_model_mismatch_error(
                 response_meta,
                 mode=mode_used,
-                provider=(
-                    provider_target.get("provider")
-                    if isinstance(provider_target, dict)
-                    else None
-                ),
+                provider=provider_target.get("provider")
+                if isinstance(provider_target, dict)
+                else None,
             )
             if mismatch_error:
                 response["text"] = mismatch_error
             usage_stats = _normalize_usage_counts(
-                (
-                    response_meta.get("usage")
-                    if isinstance(response_meta.get("usage"), dict)
-                    else None
-                ),
+                response_meta.get("usage")
+                if isinstance(response_meta.get("usage"), dict)
+                else None,
                 payload.prompt or "",
                 response.get("text") or "",
             )
             merged_usage = _merge_usage(
-                (
-                    response_meta.get("usage")
-                    if isinstance(response_meta.get("usage"), dict)
-                    else None
-                ),
+                response_meta.get("usage")
+                if isinstance(response_meta.get("usage"), dict)
+                else None,
                 usage_stats,
             )
             if merged_usage is not None:
@@ -6205,25 +6124,6 @@ async def generate(request: Request, payload: GenerateRequest = Body(...)):
         llm_service.mode = previous_mode
 
 
-def _provider_runtime_response(runtime: Dict[str, Any]) -> Dict[str, Any]:
-    mapped = dict(runtime or {})
-    mapped["mode"] = "local"
-    mapped["active_backend"] = "provider"
-    mapped["loaded"] = bool(mapped.get("model_loaded"))
-    mapped["load_state"] = "ready" if mapped.get("model_loaded") else "idle"
-    mapped["load_error"] = mapped.get("last_error")
-    provider_name = str(mapped.get("provider") or "").strip()
-    loaded_model = str(mapped.get("loaded_model") or "").strip()
-    if provider_name:
-        mapped["model"] = provider_name
-    elif loaded_model:
-        mapped["model"] = loaded_model
-    effective_model = str(mapped.get("effective_model") or "").strip()
-    if effective_model:
-        mapped["effective_model_id"] = effective_model
-    return mapped
-
-
 def _resolve_provider_for_request(
     request: Request,
     *,
@@ -6236,211 +6136,6 @@ def _resolve_provider_for_request(
         requested_model=requested_model,
         explicit_provider=explicit_provider,
     )
-
-
-@router.get("/llm/provider/status")
-async def provider_status(
-    request: Request,
-    provider: Optional[str] = Query(default=None),
-    model: Optional[str] = Query(default=None),
-    quick: bool = Query(default=False),
-):
-    chosen_provider = _resolve_provider_for_request(
-        request,
-        requested_model=model,
-        explicit_provider=provider,
-    )
-    if not chosen_provider:
-        raise HTTPException(
-            status_code=400,
-            detail="Provider must be 'lmstudio' or 'ollama'.",
-        )
-    runtime = await run_in_threadpool(
-        provider_manager.provider_status, chosen_provider, quick
-    )
-    return {"status": "success", "runtime": runtime}
-
-
-@router.get("/llm/provider/models")
-async def provider_models(
-    request: Request,
-    provider: Optional[str] = Query(default=None),
-    model: Optional[str] = Query(default=None),
-    refresh: bool = Query(default=False),
-):
-    chosen_provider = _resolve_provider_for_request(
-        request,
-        requested_model=model,
-        explicit_provider=provider,
-    )
-    if not chosen_provider:
-        raise HTTPException(
-            status_code=400,
-            detail="Provider must be 'lmstudio', 'ollama', or 'custom-openai-compatible'.",
-        )
-    snapshot = provider_manager.provider_models(chosen_provider, refresh=refresh)
-    return {
-        "status": "success",
-        "models": snapshot.get("models", []),
-        "runtime": _provider_runtime_response(
-            snapshot.get("runtime") if isinstance(snapshot.get("runtime"), dict) else {}
-        ),
-    }
-
-
-@router.get("/llm/server/models")
-async def server_models(
-    request: Request,
-    server_url: Optional[str] = Query(default=None),
-    refresh: bool = Query(default=False),
-):
-    """Probe an OpenAI-compatible server URL for its model inventory."""
-
-    cfg = request.app.state.config
-    target_url = str(server_url or cfg.get("server_url") or "").strip()
-    if not target_url:
-        raise HTTPException(status_code=400, detail="server_url is required")
-    headers: Dict[str, str] = {}
-    token = infer_openai_compatible_auth_token(cfg, target_url)
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return await asyncio.to_thread(
-        _probe_server_model_inventory,
-        target_url,
-        headers=headers,
-        refresh=refresh,
-    )
-
-
-@router.post("/llm/provider/start")
-async def provider_start(
-    request: Request,
-    payload: Optional[ProviderControlRequest] = Body(default=None),
-):
-    payload = payload or ProviderControlRequest()
-    chosen_provider = _resolve_provider_for_request(
-        request,
-        requested_model=payload.model,
-        explicit_provider=payload.provider,
-    )
-    if not chosen_provider:
-        raise HTTPException(
-            status_code=400,
-            detail="Provider must be 'lmstudio', 'ollama', or 'custom-openai-compatible'.",
-        )
-    result = provider_manager.provider_start(chosen_provider)
-    if not result.get("ok"):
-        detail = (result.get("result") or {}).get(
-            "error"
-        ) or "Failed to start provider."
-        raise HTTPException(status_code=409, detail=str(detail))
-    return {"status": "success", **result}
-
-
-@router.post("/llm/provider/stop")
-async def provider_stop(
-    request: Request,
-    payload: Optional[ProviderControlRequest] = Body(default=None),
-):
-    payload = payload or ProviderControlRequest()
-    chosen_provider = _resolve_provider_for_request(
-        request,
-        requested_model=payload.model,
-        explicit_provider=payload.provider,
-    )
-    if not chosen_provider:
-        raise HTTPException(
-            status_code=400,
-            detail="Provider must be 'lmstudio', 'ollama', or 'custom-openai-compatible'.",
-        )
-    result = provider_manager.provider_stop(chosen_provider)
-    if not result.get("ok"):
-        detail = (result.get("result") or {}).get("error") or "Failed to stop provider."
-        raise HTTPException(status_code=409, detail=str(detail))
-    return {"status": "success", **result}
-
-
-@router.post("/llm/provider/load")
-async def provider_load(
-    request: Request,
-    payload: Optional[ProviderControlRequest] = Body(default=None),
-):
-    payload = payload or ProviderControlRequest()
-    chosen_provider = _resolve_provider_for_request(
-        request,
-        requested_model=payload.model,
-        explicit_provider=payload.provider,
-    )
-    if not chosen_provider:
-        raise HTTPException(
-            status_code=400,
-            detail="Provider must be 'lmstudio', 'ollama', or 'custom-openai-compatible'.",
-        )
-    result = provider_manager.provider_load(
-        provider=chosen_provider,
-        model=_provider_model_for_action(payload.model),
-        context_length=payload.context_length,
-    )
-    if not result.get("ok"):
-        detail = (result.get("result") or {}).get(
-            "error"
-        ) or "Failed to load provider model."
-        raise HTTPException(status_code=409, detail=str(detail))
-    return {"status": "success", **result}
-
-
-@router.post("/llm/provider/unload")
-async def provider_unload(
-    request: Request,
-    payload: Optional[ProviderControlRequest] = Body(default=None),
-):
-    payload = payload or ProviderControlRequest()
-    chosen_provider = _resolve_provider_for_request(
-        request,
-        requested_model=payload.model,
-        explicit_provider=payload.provider,
-    )
-    if not chosen_provider:
-        raise HTTPException(
-            status_code=400,
-            detail="Provider must be 'lmstudio', 'ollama', or 'custom-openai-compatible'.",
-        )
-    result = provider_manager.provider_unload(
-        provider=chosen_provider,
-        model=_provider_model_for_action(payload.model),
-    )
-    if not result.get("ok"):
-        detail = (result.get("result") or {}).get(
-            "error"
-        ) or "Failed to unload provider model."
-        raise HTTPException(status_code=409, detail=str(detail))
-    return {"status": "success", **result}
-
-
-@router.get("/llm/provider/logs")
-async def provider_logs(
-    request: Request,
-    provider: Optional[str] = Query(default=None),
-    model: Optional[str] = Query(default=None),
-    cursor: int = Query(default=0, ge=0),
-    limit: int = Query(default=200, ge=1, le=2000),
-):
-    chosen_provider = _resolve_provider_for_request(
-        request,
-        requested_model=model,
-        explicit_provider=provider,
-    )
-    if not chosen_provider:
-        raise HTTPException(
-            status_code=400,
-            detail="Provider must be 'lmstudio', 'ollama', or 'custom-openai-compatible'.",
-        )
-    logs = provider_manager.provider_logs(
-        provider=chosen_provider,
-        cursor=cursor,
-        limit=limit,
-    )
-    return {"status": "success", "logs": logs}
 
 
 @router.get("/llm/local-status")
@@ -6659,30 +6354,9 @@ class WorkflowSkillDocPayload(BaseModel):
     body: str
 
 
-class WorkflowModulePackImportPayload(BaseModel):
-    source_path: str
-    addon_id: Optional[str] = None
-    dry_run: bool = True
-    overwrite: bool = False
-
-
-class WorkflowModulePackExportPayload(BaseModel):
-    destination_path: str
-    dry_run: bool = True
-    overwrite: bool = False
-
-
-class WorkflowSkillImportPayload(BaseModel):
-    source_path: str
-    skill_id: Optional[str] = None
-    dry_run: bool = True
-    overwrite: bool = False
-
-
-class WorkflowSkillExportPayload(BaseModel):
-    destination_path: str
-    dry_run: bool = True
-    overwrite: bool = False
+class WorkflowSkillDraftPayload(BaseModel):
+    focus: str = ""
+    model: str = ""
 
 
 @router.get("/workflows/skills")
@@ -6696,7 +6370,7 @@ async def workflows_skill_doc(skill_id: str):
     if not normalized:
         raise HTTPException(status_code=400, detail="Invalid skill id")
     payload = skill_doc_payload(normalized, include_body=True)
-    if payload is None or payload.get("active") is None:
+    if payload is None:
         raise HTTPException(status_code=404, detail="Skill doc not found")
     return payload
 
@@ -6726,59 +6400,96 @@ async def workflows_skill_doc_delete(skill_id: str):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.post("/workflows/module-packs/import")
-async def workflows_module_pack_import(payload: WorkflowModulePackImportPayload):
-    try:
-        return import_addon_pack(
-            payload.source_path,
-            addon_id=payload.addon_id,
-            dry_run=payload.dry_run,
-            overwrite=payload.overwrite,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@router.post("/workflows/module-packs/{addon_id}/export")
-async def workflows_module_pack_export(
-    addon_id: str,
-    payload: WorkflowModulePackExportPayload,
+@router.post("/workflows/skills/{skill_id}/draft")
+async def workflows_skill_doc_draft(
+    skill_id: str,
+    request: Request,
+    payload: Optional[WorkflowSkillDraftPayload] = Body(default=None),
 ):
-    try:
-        return export_addon_pack(
-            addon_id,
-            payload.destination_path,
-            dry_run=payload.dry_run,
-            overwrite=payload.overwrite,
+    """Generate an audited reflection proposal without writing a skill file."""
+
+    normalized = normalize_skill_id(skill_id)
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Invalid skill id")
+    current = skill_doc_payload(normalized, include_body=True)
+    if current is None:
+        raise HTTPException(status_code=400, detail="Invalid skill id")
+    active = current.get("active") if isinstance(current.get("active"), dict) else {}
+    active_body = str(active.get("body") or "").strip()
+    focus = str((payload or WorkflowSkillDraftPayload()).focus or "").strip()
+    requested_model = str((payload or WorkflowSkillDraftPayload()).model or "").strip()
+    if len(requested_model) > 500:
+        raise HTTPException(status_code=400, detail="Model id is too long")
+    question_parts = [
+        f"Draft a proposed Hermes-style markdown skill document for `{normalized}`.",
+        "The result will be loaded as an unsaved editor draft and must require a separate user save.",
+    ]
+    if focus:
+        question_parts.append(f"Requested focus: {focus[:1000]}")
+    if active_body:
+        question_parts.append(
+            "Current active guidance for context:\n" + active_body[:6000]
         )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@router.post("/workflows/skills/import")
-async def workflows_skill_import(payload: WorkflowSkillImportPayload):
-    try:
-        return import_skill_markdown(
-            payload.source_path,
-            skill_id=payload.skill_id,
-            dry_run=payload.dry_run,
-            overwrite=payload.overwrite,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@router.post("/workflows/skills/{skill_id}/export")
-async def workflows_skill_export(skill_id: str, payload: WorkflowSkillExportPayload):
-    try:
-        return export_skill_markdown(
-            skill_id,
-            payload.destination_path,
-            dry_run=payload.dry_run,
-            overwrite=payload.overwrite,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    current_sha256 = hashlib.sha256(active_body.encode("utf-8")).hexdigest()
+    result = await create_reflection_task(
+        request,
+        ReflectionTaskCreate(
+            title=f"Skill proposal: {normalized}",
+            question="\n\n".join(question_parts),
+            source="user",
+            patience=1,
+            metadata={
+                "source_mode": "knowledge_skills",
+                "proposal_kind": "skill_markdown",
+                "skill_id": normalized,
+                "target_path": current.get("local_path"),
+                "current_sha256": current_sha256,
+                "requires_user_save": True,
+                "requested_model": requested_model or None,
+            },
+            run_now=True,
+        ),
+    )
+    task = result.get("task") if isinstance(result.get("task"), dict) else {}
+    run = result.get("run") if isinstance(result.get("run"), dict) else {}
+    proposed_body = str(run.get("output") or "").strip()
+    thought_trace = (
+        run.get("thought_trace") if isinstance(run.get("thought_trace"), list) else []
+    )
+    trace_characters = sum(
+        len(str(item.get("text") or ""))
+        for item in thought_trace
+        if isinstance(item, dict)
+    )
+    return {
+        "status": "drafted" if proposed_body else "unavailable",
+        "skill_id": normalized,
+        "proposal": (
+            {
+                "body": proposed_body,
+                "source": "background_reflection",
+                "requires_user_save": True,
+            }
+            if proposed_body
+            else None
+        ),
+        "audit": {
+            "task_id": task.get("id"),
+            "run_id": run.get("id"),
+            "created_at": run.get("created_at"),
+            "current_sha256": current_sha256,
+            "target_path": current.get("local_path"),
+            "wrote_skill_file": False,
+            "reasoning_trace": {
+                "preserved": bool(thought_trace),
+                "entries": len(thought_trace),
+                "characters": trace_characters,
+            },
+            "generation": (
+                run.get("generation") if isinstance(run.get("generation"), dict) else {}
+            ),
+        },
+    }
 
 
 class CapturePromotePayload(BaseModel):
@@ -7733,16 +7444,15 @@ async def chat(request: Request, chat_request: ChatRequest):
                     ),
                     reverse=True,
                 )
-
-                def _score_ok(item: Dict[str, Any]) -> bool:
-                    raw = item.get("score")
-                    if not isinstance(raw, (int, float)):
-                        return True
-                    sim = max(0.0, min(1.0, float(raw)))
-                    return sim >= rag_min_similarity
-
                 if rag_min_similarity > 0:
                     filtered: list[Dict[str, Any]] = []
+
+                    def _score_ok(item: Dict[str, Any]) -> bool:
+                        raw = item.get("score")
+                        if not isinstance(raw, (int, float)):
+                            return True
+                        sim = max(0.0, min(1.0, float(raw)))
+                        return sim >= rag_min_similarity
 
                     for item in combined:
                         if not isinstance(item, dict):
@@ -7750,45 +7460,6 @@ async def chat(request: Request, chat_request: ChatRequest):
                         if _score_ok(item):
                             filtered.append(item)
                     combined = filtered
-                if text_rag_enabled and rag_top_k > 0 and not combined:
-                    plaintext_matches = _search_plaintext_conversations_for_rag(
-                        chat_request.message,
-                        limit=max(rag_query_top_k, rag_top_k, 1),
-                        external_llm=external_llm,
-                        workspace_profiles=workspace_recall_profiles,
-                    )
-                    for match in plaintext_matches:
-                        if not isinstance(match, dict):
-                            continue
-                        meta = (
-                            match.get("metadata")
-                            if isinstance(match.get("metadata"), dict)
-                            else {}
-                        )
-                        if _blocked(meta):
-                            continue
-                        match_id = str(match.get("id") or "")
-                        if match_id and match_id in seen_ids:
-                            continue
-                        dedupe_key = _rag_match_key(match)
-                        if dedupe_key and dedupe_key in seen_match_keys:
-                            continue
-                        if match_id:
-                            seen_ids.add(match_id)
-                        if dedupe_key:
-                            seen_match_keys.add(dedupe_key)
-                        reranked = _rerank_chat_match(match)
-                        if rag_min_similarity > 0 and not _score_ok(reranked):
-                            continue
-                        combined.append(reranked)
-                    combined.sort(
-                        key=lambda item: (
-                            float(item.get("score"))
-                            if isinstance(item.get("score"), (int, float))
-                            else 0.0
-                        ),
-                        reverse=True,
-                    )
                 rag_matches = combined[:rag_top_k]
             except HTTPException:
                 rag_matches = []
@@ -7979,6 +7650,9 @@ async def chat(request: Request, chat_request: ChatRequest):
         _append_conversation_entry(session_name, assistant_placeholder)
 
         settings_payload = user_settings.load_settings()
+        tools_disabled_for_turn = _turn_explicitly_disallows_tools(chat_request.message)
+        if tools_disabled_for_turn:
+            metadata["tools_disabled_for_turn"] = True
         privacy_route = _privacy_route_check_for_message(
             chat_request.message,
             settings_payload=settings_payload,
@@ -8002,6 +7676,9 @@ async def chat(request: Request, chat_request: ChatRequest):
                 route_metadata = privacy_route.get("metadata")
                 if isinstance(route_metadata, dict):
                     metadata_update.update(route_metadata)
+                if tools_disabled_for_turn:
+                    metadata_update["tools_disabled_for_turn"] = True
+                    metadata_update["privacy_route_safety_override"] = True
                 metadata_update.update(
                     {
                         "status": "pending",
@@ -8052,9 +7729,13 @@ async def chat(request: Request, chat_request: ChatRequest):
                     effective_model = resolved_model.strip()
 
         computer_request = _computer_request_config(chat_request.computer)
-        computer_capture_turn = _turn_uses_computer_capture_tools(
-            user_message=chat_request.message,
-            computer_request=computer_request,
+        computer_capture_turn = (
+            False
+            if tools_disabled_for_turn
+            else _turn_uses_computer_capture_tools(
+                user_message=chat_request.message,
+                computer_request=computer_request,
+            )
         )
         computer_tools_allowed = (
             computer_capture_turn and "computer_use" in workflow_config["modules"]
@@ -8076,48 +7757,84 @@ async def chat(request: Request, chat_request: ChatRequest):
                 request=request,
                 allow_computer_capture=computer_tools_allowed,
                 response_format=response_format,
+                include_tool_guidance=not tools_disabled_for_turn,
             ),
             messages=list(context.messages),
-            tools=_filter_turn_tool_definitions(
-                context.tools,
-                allow_computer_capture=computer_tools_allowed,
+            tools=(
+                []
+                if tools_disabled_for_turn
+                else _filter_turn_tool_definitions(
+                    context.tools,
+                    allow_computer_capture=computer_tools_allowed,
+                )
             ),
             metadata=dict(context.metadata),
         )
-        prompt_tool_definitions = _merge_prompt_tool_definitions(
-            _registered_prompt_tool_definitions(
-                request.app,
-                allow_computer_capture=computer_tools_allowed,
-            ),
-            generation_ctx.tools,
+        prompt_tool_definitions = (
+            []
+            if tools_disabled_for_turn
+            else _merge_prompt_tool_definitions(
+                _registered_prompt_tool_definitions(
+                    request.app,
+                    allow_computer_capture=computer_tools_allowed,
+                ),
+                generation_ctx.tools,
+            )
         )
         generation_ctx.metadata["workflow"] = {
             "name": workflow_config["name"],
             "modules": list(active_workflow_modules),
         }
         generation_ctx.metadata.pop("capture_policy", None)
-        _add_turn_system_message(
-            generation_ctx,
-            "turn_scope",
-            _turn_tool_scope_note(allow_computer_capture=computer_tools_allowed),
-            metadata={"turn_scope": True},
+        if not tools_disabled_for_turn:
+            _add_turn_system_message(
+                generation_ctx,
+                "turn_scope",
+                _turn_tool_scope_note(allow_computer_capture=computer_tools_allowed),
+                metadata={"turn_scope": True},
+            )
+            _add_turn_system_message(
+                generation_ctx,
+                "tool_approval",
+                _turn_tool_approval_note(_approval_level_setting()),
+                metadata={"tool_approval": True},
+            )
+        if tools_disabled_for_turn:
+            _add_turn_system_message(
+                generation_ctx,
+                "tools_disabled_for_turn",
+                "The user explicitly disabled tools for this turn. Do not request, propose, or invoke any tool. Answer only with text.",
+                metadata={"tools_disabled_for_turn": True},
+            )
+        if not tools_disabled_for_turn:
+            _add_turn_system_message(
+                generation_ctx,
+                "workflow",
+                workflow_prompt(
+                    workflow_config["name"],
+                    modules=active_workflow_modules,
+                    include_default_modules=False,
+                ),
+                metadata={"workflow": workflow_config["name"]},
+            )
+        runtime_identity_note = _runtime_model_identity_note(
+            model=effective_model,
+            mode=effective_mode,
+            provider=provider_target.get("provider")
+            if isinstance(provider_target, dict)
+            else None,
         )
-        _add_turn_system_message(
-            generation_ctx,
-            "tool_approval",
-            _turn_tool_approval_note(_approval_level_setting()),
-            metadata={"tool_approval": True},
-        )
-        _add_turn_system_message(
-            generation_ctx,
-            "workflow",
-            workflow_prompt(
-                workflow_config["name"],
-                modules=active_workflow_modules,
-                include_default_modules=False,
-            ),
-            metadata={"workflow": workflow_config["name"]},
-        )
+        if runtime_identity_note:
+            _add_turn_system_message(
+                generation_ctx,
+                "runtime_identity",
+                runtime_identity_note,
+                metadata={
+                    "runtime_identity": True,
+                    "model": effective_model,
+                    "mode": effective_mode,
+                },
+            )
         if computer_capture_turn and not computer_tools_allowed:
             generation_ctx.metadata["disabled_modules"] = sorted(
                 set(generation_ctx.metadata.get("disabled_modules") or [])
@@ -8359,21 +8076,29 @@ async def chat(request: Request, chat_request: ChatRequest):
         previous_service_mode = getattr(llm_service, "mode", mode_used)
         llm_service.mode = effective_mode
         try:
-            generate_kwargs: Dict[str, Any] = {}
-            reasoning = _reasoning_payload_for_model(
+            generate_kwargs = _reasoning_generation_kwargs(
                 chat_request.thinking,
                 model=effective_model,
+                max_output_tokens=chat_request.max_output_tokens,
             )
+            reasoning = generate_kwargs.get("reasoning")
             if reasoning is None:
                 workflow_thinking = str(
                     workflow_config["profile"].get("thinking_default") or "auto"
                 ).strip()
-                reasoning = _reasoning_payload_for_model(
+                generate_kwargs = _reasoning_generation_kwargs(
                     None if workflow_thinking == "auto" else workflow_thinking,
                     model=effective_model,
+                    max_output_tokens=chat_request.max_output_tokens,
                 )
-            if reasoning is not None:
-                generate_kwargs["reasoning"] = reasoning
+                reasoning = generate_kwargs.get("reasoning")
+            output_token_limit = generate_kwargs.get("output_token_limit")
+            if prompt_tool_definitions and _server_uses_native_tool_calls(
+                request.app.state.config,
+                mode=effective_mode,
+                provider_target=provider_target,
+            ):
+                generate_kwargs["native_tool_definitions"] = prompt_tool_definitions
             if isinstance(provider_target, dict):
                 server_url = str(provider_target.get("base_url") or "").strip()
                 if server_url:
@@ -8389,14 +8114,15 @@ async def chat(request: Request, chat_request: ChatRequest):
                     workflow_name=workflow_config["name"],
                 )
                 generate_kwargs["capture_raw_api"] = True
-                generate_kwargs["tool_executor"] = _build_provider_tool_executor(
-                    request.app,
-                    session_id=session_name,
-                    message_id=message_id,
-                    workflow_name=workflow_config["name"],
-                    model=effective_model,
-                    mode=effective_mode,
-                )
+                if not tools_disabled_for_turn:
+                    generate_kwargs["tool_executor"] = _build_provider_tool_executor(
+                        request.app,
+                        session_id=session_name,
+                        message_id=message_id,
+                        workflow_name=workflow_config["name"],
+                        model=effective_model,
+                        mode=effective_mode,
+                    )
             response = await asyncio.to_thread(
                 llm_service.generate,
                 chat_request.message,
@@ -8410,6 +8136,103 @@ async def chat(request: Request, chat_request: ChatRequest):
                 stream_message_id=message_id,
                 **generate_kwargs,
             )
+            _apply_reasoning_response_metadata(
+                response,
+                reasoning,
+                output_token_limit,
+            )
+            if tools_disabled_for_turn:
+                suppressed_names = {
+                    _normalize_tool_name(tool.get("name"))
+                    for tool in (response.get("tools_used") or [])
+                    if isinstance(tool, dict) and _normalize_tool_name(tool.get("name"))
+                }
+                tool_request_suppressed = bool(
+                    suppressed_names or _response_indicates_tool_stop(response)
+                )
+                visible_text = _scrub_tool_placeholder_text(response.get("text") or "")
+                if tool_request_suppressed or not visible_text:
+                    retry_ctx = ServiceContext(
+                        system_prompt=generation_ctx.system_prompt,
+                        messages=list(generation_ctx.messages),
+                        tools=[],
+                        metadata=dict(generation_ctx.metadata),
+                    )
+                    _add_turn_system_message(
+                        retry_ctx,
+                        "tool_free_retry",
+                        "Return a text-only answer to the current user. Tools are disabled for this turn, so do not emit a tool call.",
+                        metadata={"tools_disabled_for_turn": True},
+                    )
+                    retry_generate_kwargs = dict(generate_kwargs)
+                    retry_generate_kwargs.pop("native_tool_definitions", None)
+                    retry_generate_kwargs.pop("tool_executor", None)
+                    try:
+                        retry_response = await asyncio.to_thread(
+                            llm_service.generate,
+                            chat_request.message,
+                            session_id=session_name,
+                            model=effective_model,
+                            attachments=effective_attachments,
+                            vision_workflow=vision_workflow,
+                            response_format=response_format,
+                            context=retry_ctx,
+                            **retry_generate_kwargs,
+                        )
+                    except Exception:
+                        logger.debug("tool-free turn retry failed", exc_info=True)
+                        retry_response = None
+                    if isinstance(retry_response, dict):
+                        retry_tools = retry_response.get("tools_used") or []
+                        suppressed_names.update(
+                            _normalize_tool_name(tool.get("name"))
+                            for tool in retry_tools
+                            if isinstance(tool, dict)
+                            and _normalize_tool_name(tool.get("name"))
+                        )
+                        _apply_reasoning_response_metadata(
+                            retry_response,
+                            reasoning,
+                            output_token_limit,
+                        )
+                        retry_meta = dict(retry_response.get("metadata") or {})
+                        retry_meta["tool_free_retry"] = True
+                        retry_response["metadata"] = retry_meta
+                        response = retry_response
+
+                remaining_tool_names = {
+                    _normalize_tool_name(tool.get("name"))
+                    for tool in (response.get("tools_used") or [])
+                    if isinstance(tool, dict) and _normalize_tool_name(tool.get("name"))
+                }
+                suppressed_names.update(remaining_tool_names)
+                remaining_tool_stop = _response_indicates_tool_stop(response)
+                tool_request_suppressed = bool(
+                    tool_request_suppressed
+                    or remaining_tool_names
+                    or remaining_tool_stop
+                )
+                tool_free_meta = dict(response.get("metadata") or {})
+                tool_free_meta["tools_disabled_for_turn"] = True
+                if tool_request_suppressed:
+                    tool_free_meta["tool_requests_suppressed"] = True
+                if suppressed_names:
+                    tool_free_meta["suppressed_tool_names"] = sorted(suppressed_names)
+                response["tools_used"] = []
+                visible_text = _scrub_tool_placeholder_text(response.get("text") or "")
+                if remaining_tool_names or remaining_tool_stop:
+                    response[
+                        "text"
+                    ] = "I couldn't generate a tool-free reply. Try regenerate."
+                    tool_free_meta["tool_free_turn_failed"] = True
+                elif visible_text:
+                    response["text"] = visible_text
+                else:
+                    response[
+                        "text"
+                    ] = "I couldn't generate a tool-free reply. Try regenerate."
+                    tool_free_meta["tool_free_turn_failed"] = True
+                response["metadata"] = tool_free_meta
             llm_service.set_context(context, session_name)
         except Exception as exc:
             _append_user_turn_to_context()
@@ -8484,11 +8307,9 @@ async def chat(request: Request, chat_request: ChatRequest):
             metadata_update.setdefault("server_url", provider_target.get("base_url"))
             metadata_update.setdefault(
                 "provider_runtime",
-                (
-                    provider_target.get("runtime")
-                    if isinstance(provider_target.get("runtime"), dict)
-                    else {}
-                ),
+                provider_target.get("runtime")
+                if isinstance(provider_target.get("runtime"), dict)
+                else {},
             )
         status_value = _response_status_value(metadata_update)
         metadata_update["status"] = status_value
@@ -8526,31 +8347,25 @@ async def chat(request: Request, chat_request: ChatRequest):
         mismatch_error = _apply_model_mismatch_error(
             metadata_update,
             mode=mode_used,
-            provider=(
-                provider_target.get("provider")
-                if isinstance(provider_target, dict)
-                else None
-            ),
+            provider=provider_target.get("provider")
+            if isinstance(provider_target, dict)
+            else None,
         )
         if mismatch_error:
             text = mismatch_error
             response["text"] = text
         metadata_update.setdefault("updated_at", trace_time)
         usage_stats = _normalize_usage_counts(
-            (
-                metadata_update.get("usage")
-                if isinstance(metadata_update.get("usage"), dict)
-                else None
-            ),
+            metadata_update.get("usage")
+            if isinstance(metadata_update.get("usage"), dict)
+            else None,
             chat_request.message or "",
             text,
         )
         merged_usage = _merge_usage(
-            (
-                metadata_update.get("usage")
-                if isinstance(metadata_update.get("usage"), dict)
-                else None
-            ),
+            metadata_update.get("usage")
+            if isinstance(metadata_update.get("usage"), dict)
+            else None,
             usage_stats,
         )
         if merged_usage is not None:
@@ -8635,11 +8450,9 @@ async def chat(request: Request, chat_request: ChatRequest):
             tool_payloads = response.get("tools_used") or []
             if computer_session:
                 tool_payloads = [
-                    (
-                        _inject_session_into_tool_args(tool, computer_session.get("id"))
-                        if isinstance(tool, dict)
-                        else tool
-                    )
+                    _inject_session_into_tool_args(tool, computer_session.get("id"))
+                    if isinstance(tool, dict)
+                    else tool
                     for tool in tool_payloads
                 ]
             response["tools_used"] = await _register_tool_proposals(
@@ -8663,6 +8476,7 @@ async def chat(request: Request, chat_request: ChatRequest):
             response["text"] = text
             metadata = response.get("metadata")
             metadata_update = dict(metadata) if isinstance(metadata, dict) else {}
+            metadata_update["status"] = "pending"
             metadata_update["tool_response_pending"] = True
             response["metadata"] = metadata_update
         elif tools_used_response:
@@ -8671,6 +8485,7 @@ async def chat(request: Request, chat_request: ChatRequest):
             if _inline_tools_need_result_continuation(
                 tools_used_response, metadata_update
             ):
+                metadata_update["status"] = "pending"
                 metadata_update["tool_response_pending"] = True
                 metadata_update["inline_tool_continuation_pending"] = True
             else:
@@ -8692,11 +8507,9 @@ async def chat(request: Request, chat_request: ChatRequest):
             message_id,
             {
                 "text": response.get("text") or text,
-                "metadata": (
-                    response.get("metadata")
-                    if isinstance(response.get("metadata"), dict)
-                    else {}
-                ),
+                "metadata": response.get("metadata")
+                if isinstance(response.get("metadata"), dict)
+                else {},
                 "updated_at": time.time(),
                 "iso_timestamp": iso_response_ts,
             },
@@ -8808,7 +8621,8 @@ class ChatContinueRequest(BaseModel):
     message_id: str
     model: Optional[str] = None
     tools: Optional[list[dict[str, Any]]] = None
-    thinking: Optional[Union[bool, str]] = None
+    thinking: Optional[Union[bool, str, float]] = None
+    max_output_tokens: Optional[int] = Field(default=None, ge=1, le=2_000_000)
     mode: Optional[str] = None
     workflow: Optional[str] = None
 
@@ -9074,6 +8888,7 @@ def _stable_tool_continue_value(value: Any) -> Any:
 
 _CHAT_CONTINUE_LOCKS: dict[str, asyncio.Lock] = {}
 _CHAT_CONTINUE_LOCKS_GUARD = threading.Lock()
+_DEFAULT_TOOL_CONTINUATION_ROUND_LIMIT = 12
 
 
 def _chat_continue_lock_for(session_id: Any, message_id: Any) -> asyncio.Lock:
@@ -9084,6 +8899,22 @@ def _chat_continue_lock_for(session_id: Any, message_id: Any) -> asyncio.Lock:
             lock = asyncio.Lock()
             _CHAT_CONTINUE_LOCKS[key] = lock
         return lock
+
+
+def _tool_continuation_round_limit(request: Request) -> int:
+    config = getattr(request.app.state, "config", {})
+    raw_limit = (
+        config.get(
+            "tool_continuation_round_limit", _DEFAULT_TOOL_CONTINUATION_ROUND_LIMIT
+        )
+        if isinstance(config, dict)
+        else _DEFAULT_TOOL_CONTINUATION_ROUND_LIMIT
+    )
+    try:
+        parsed = int(raw_limit)
+    except (TypeError, ValueError):
+        parsed = _DEFAULT_TOOL_CONTINUATION_ROUND_LIMIT
+    return max(1, min(parsed, 64))
 
 
 def _tool_continue_signature(tool_events: Any, *, include_ids: bool = True) -> str:
@@ -9227,6 +9058,74 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
         return None
 
     existing_target_entry = _history_target_entry()
+
+    def _latest_target_entry() -> Optional[Dict[str, Any]]:
+        latest_prefix, latest_found, _ = _conversation_history_through_message(
+            session_name,
+            payload.message_id,
+        )
+        if not latest_found:
+            return existing_target_entry
+        for entry in reversed(latest_prefix):
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("id") or "").strip() == target_message_id:
+                return entry
+        return existing_target_entry
+
+    def _stopped_continuation_response(
+        *,
+        reason: str,
+        fallback_text: str,
+        round_count: int | None = None,
+    ) -> ChatResponse:
+        target_entry = _latest_target_entry() or {}
+        existing_text = _scrub_tool_placeholder_text(
+            target_entry.get("text") or target_entry.get("content") or ""
+        )
+        stopped_text = existing_text.strip() or fallback_text
+        existing_meta = target_entry.get("metadata")
+        metadata = dict(existing_meta) if isinstance(existing_meta, dict) else {}
+        metadata.update(
+            {
+                "status": "partial",
+                "tool_continued": True,
+                "tool_response_pending": None,
+                "inline_tool_continuation_pending": None,
+                "continuation_stop_reason": reason,
+            }
+        )
+        if reason == "newer_conversation_turn":
+            metadata["continuation_superseded"] = True
+        if reason == "tool_continuation_round_limit":
+            metadata["tool_continuation_limit_reached"] = True
+        if round_count is not None:
+            metadata["tool_continuation_rounds"] = round_count
+        trace_time = time.time()
+        metadata["updated_at"] = trace_time
+        _update_conversation_entry(
+            session_name,
+            payload.message_id,
+            {
+                "text": stopped_text,
+                "metadata": metadata,
+                "updated_at": trace_time,
+            },
+        )
+        return ChatResponse(
+            message=stopped_text,
+            thought="",
+            tools_used=[],
+            metadata=metadata,
+            context=ContextSchema(**context.to_dict()),
+        )
+
+    if history_target_found and history_has_later_messages:
+        return _stopped_continuation_response(
+            reason="newer_conversation_turn",
+            fallback_text="Continuation stopped because a newer conversation turn was sent.",
+        )
+
     if tool_continue_signature and existing_target_entry:
         existing_meta = existing_target_entry.get("metadata")
         if isinstance(existing_meta, dict):
@@ -9266,6 +9165,36 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
                         metadata=dict(existing_meta),
                         context=ContextSchema(**context.to_dict()),
                     )
+
+    continuation_rounds = 1
+    if existing_target_entry:
+        existing_meta = existing_target_entry.get("metadata")
+        if isinstance(existing_meta, dict):
+            try:
+                continuation_rounds = (
+                    max(
+                        0,
+                        int(existing_meta.get("tool_continuation_rounds") or 0),
+                    )
+                    + 1
+                )
+            except (TypeError, ValueError):
+                continuation_rounds = 1
+    continuation_round_limit = _tool_continuation_round_limit(request)
+    if continuation_rounds > continuation_round_limit:
+        return _stopped_continuation_response(
+            reason="tool_continuation_round_limit",
+            fallback_text=(
+                "I stopped the tool continuation to prevent a runaway loop. "
+                "Review the completed results or start a new turn."
+            ),
+            round_count=continuation_round_limit,
+        )
+    _update_conversation_entry(
+        session_name,
+        payload.message_id,
+        {"metadata": {"tool_continuation_rounds": continuation_rounds}},
+    )
 
     computer_capture_turn = _turn_uses_computer_capture_tools(
         tool_events=tool_events,
@@ -9356,6 +9285,24 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
         ),
         metadata={"workflow": workflow_config["name"]},
     )
+    runtime_identity_note = _runtime_model_identity_note(
+        model=effective_model,
+        mode=effective_mode,
+        provider=provider_target.get("provider")
+        if isinstance(provider_target, dict)
+        else None,
+    )
+    if runtime_identity_note:
+        _add_turn_system_message(
+            generation_ctx,
+            "runtime_identity",
+            runtime_identity_note,
+            metadata={
+                "runtime_identity": True,
+                "model": effective_model,
+                "mode": effective_mode,
+            },
+        )
     if computer_capture_turn and not computer_tools_allowed:
         generation_ctx.metadata["disabled_modules"] = sorted(
             set(generation_ctx.metadata.get("disabled_modules") or [])
@@ -9429,21 +9376,29 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
     previous_service_mode = getattr(llm_service, "mode", mode_used)
     llm_service.mode = effective_mode
     try:
-        generate_kwargs: Dict[str, Any] = {}
-        reasoning = _reasoning_payload_for_model(
+        generate_kwargs = _reasoning_generation_kwargs(
             payload.thinking,
             model=effective_model,
+            max_output_tokens=payload.max_output_tokens,
         )
+        reasoning = generate_kwargs.get("reasoning")
         if reasoning is None:
             workflow_thinking = str(
                 workflow_config["profile"].get("thinking_default") or "auto"
             ).strip()
-            reasoning = _reasoning_payload_for_model(
+            generate_kwargs = _reasoning_generation_kwargs(
                 None if workflow_thinking == "auto" else workflow_thinking,
                 model=effective_model,
+                max_output_tokens=payload.max_output_tokens,
             )
-        if reasoning is not None:
-            generate_kwargs["reasoning"] = reasoning
+            reasoning = generate_kwargs.get("reasoning")
+        output_token_limit = generate_kwargs.get("output_token_limit")
+        if _server_uses_native_tool_calls(
+            request.app.state.config,
+            mode=effective_mode,
+            provider_target=provider_target,
+        ):
+            generate_kwargs["native_tool_definitions"] = prompt_tool_definitions
         if isinstance(provider_target, dict):
             server_url = str(provider_target.get("base_url") or "").strip()
             if server_url:
@@ -9477,6 +9432,11 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
             context=generation_ctx,
             **generate_kwargs,
         )
+        _apply_reasoning_response_metadata(
+            response,
+            reasoning,
+            output_token_limit,
+        )
     except Exception as exc:
         _mark_conversation_message_error_if_pending(
             session_name,
@@ -9488,6 +9448,13 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
         raise HTTPException(status_code=500, detail=str(exc))
     finally:
         llm_service.mode = previous_service_mode
+
+    if _conversation_message_has_later_entries(session_name, payload.message_id):
+        return _stopped_continuation_response(
+            reason="newer_conversation_turn",
+            fallback_text="Continuation stopped because a newer conversation turn was sent.",
+            round_count=continuation_rounds,
+        )
 
     def _tool_signature(entry: Dict[str, Any]) -> Optional[tuple[str, str]]:
         if not isinstance(entry, dict):
@@ -9644,6 +9611,56 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
             return True
         return False
 
+    def _tool_entry_completed_successfully(entry: Any) -> bool:
+        if not isinstance(entry, dict):
+            return False
+        if _normalize_tool_status(entry.get("status")) != "invoked":
+            return False
+        if _compact_summary_text(entry.get("error")):
+            return False
+        result_value = entry.get("result")
+        if result_value is None:
+            return False
+        if not isinstance(result_value, dict):
+            return True
+        if result_value.get("ok") is False or _tool_result_has_error(result_value):
+            return False
+        failed_statuses = {
+            "cancelled",
+            "denied",
+            "error",
+            "pending",
+            "proposed",
+            "timeout",
+        }
+        if _normalize_tool_status(result_value.get("status")) in failed_statuses:
+            return False
+        wrapped = result_value.get("data")
+        if isinstance(wrapped, dict):
+            if wrapped.get("ok") is False:
+                return False
+            if _normalize_tool_status(wrapped.get("status")) in failed_statuses:
+                return False
+        return True
+
+    def _all_provided_tools_completed_successfully() -> bool:
+        supplied_tools = payload.tools or []
+        return bool(supplied_tools) and all(
+            _tool_entry_completed_successfully(entry) for entry in supplied_tools
+        )
+
+    def _response_needs_tool_result_text_retry(resp: Dict[str, Any]) -> bool:
+        if not _all_provided_tools_completed_successfully():
+            return False
+        if resp.get("tools_used"):
+            return False
+        response_meta = (
+            resp.get("metadata") if isinstance(resp.get("metadata"), dict) else {}
+        )
+        if response_meta.get("error") or response_meta.get("empty_response"):
+            return False
+        return not _scrub_tool_placeholder_text(resp.get("text") or "")
+
     def _tool_result_excerpt(result_value: Any) -> Optional[str]:
         if isinstance(result_value, str):
             return _compact_summary_text(result_value)
@@ -9734,28 +9751,58 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
             lines = lines[:max_lines] + [f"... {extra} more step(s)"]
         return lines
 
-    if _is_repeat_tool_loop(response):
+    repeat_tool_loop = _is_repeat_tool_loop(response)
+    successful_result_needs_text = _response_needs_tool_result_text_retry(response)
+    if repeat_tool_loop or successful_result_needs_text:
         try:
+            retry_messages: list[Dict[str, Any]] = []
+            excluded_turn_keys = {
+                "capture_policy",
+                "computer_use_disabled",
+                "continuation",
+                "tool_approval",
+                "turn_scope",
+                "workflow",
+            }
+            for message in generation_ctx.messages:
+                if not isinstance(message, dict):
+                    continue
+                message_meta = (
+                    message.get("metadata")
+                    if isinstance(message.get("metadata"), dict)
+                    else {}
+                )
+                if str(message_meta.get("turn_message_key") or "").strip() in (
+                    excluded_turn_keys
+                ):
+                    continue
+                retry_messages.append(message)
             retry_ctx = ServiceContext(
-                system_prompt=context.system_prompt,
-                messages=list(generation_ctx.messages),
+                system_prompt=_strip_tool_guidance_prompt_hints(
+                    generation_ctx.system_prompt
+                ),
+                messages=retry_messages,
                 tools=[],
                 metadata=dict(generation_ctx.metadata),
             )
             _add_turn_system_message(
                 retry_ctx,
                 "retry_without_tools",
-                "Finish from the provided tool output without requesting more tools.",
+                "The requested tool has already finished. Answer from its supplied output in text only; do not request, propose, or invoke another tool.",
                 metadata={"continuation": True},
             )
             retry_prev_mode = getattr(llm_service, "mode", mode_used)
             llm_service.mode = effective_mode
             try:
+                retry_generate_kwargs = dict(generate_kwargs)
+                retry_generate_kwargs.pop("native_tool_definitions", None)
+                retry_generate_kwargs.pop("tool_executor", None)
                 retry_response = await asyncio.to_thread(
                     llm_service.generate,
-                    [],
+                    "Using only the completed tool output above, answer the original user's request now in text. Do not request or invoke tools.",
                     session_id=session_name,
                     model=effective_model,
+                    attachments=recalled_image_attachments,
                     response_format=_resolve_route_response_format(
                         None,
                         harmony_enabled=_config_allows_harmony_for_model(
@@ -9764,13 +9811,30 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
                         model_name=effective_model,
                     ),
                     context=retry_ctx,
-                    **generate_kwargs,
+                    **retry_generate_kwargs,
                 )
             finally:
                 llm_service.mode = retry_prev_mode
             if isinstance(retry_response, dict):
                 retry_meta = dict(retry_response.get("metadata") or {})
                 retry_meta["retry_without_tools"] = True
+                retry_meta["tool_result_text_retry"] = True
+                retry_tools = retry_response.get("tools_used") or []
+                if retry_tools or _response_indicates_tool_stop(retry_response):
+                    suppressed_names = sorted(
+                        {
+                            _normalize_tool_name(tool.get("name"))
+                            for tool in retry_tools
+                            if isinstance(tool, dict)
+                            and _normalize_tool_name(tool.get("name"))
+                        }
+                    )
+                    retry_meta["tool_requests_suppressed"] = True
+                    retry_meta["tool_result_text_retry_failed"] = True
+                    if suppressed_names:
+                        retry_meta["suppressed_tool_names"] = suppressed_names
+                    retry_response["text"] = ""
+                    retry_response["tools_used"] = []
                 retry_response["metadata"] = retry_meta
                 response = retry_response
         except Exception:
@@ -9830,6 +9894,18 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
         except Exception:
             logger.debug("post-discovery persistence retry failed", exc_info=True)
 
+    if _conversation_message_has_later_entries(session_name, payload.message_id):
+        return _stopped_continuation_response(
+            reason="newer_conversation_turn",
+            fallback_text="Continuation stopped because a newer conversation turn was sent.",
+            round_count=continuation_rounds,
+        )
+
+    _apply_reasoning_response_metadata(
+        response,
+        reasoning,
+        output_token_limit,
+    )
     response_tools_used = (
         response.get("tools_used")
         if isinstance(response.get("tools_used"), list)
@@ -9926,8 +10002,12 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
             response_meta.pop("tool_response_pending", None)
             response_meta.pop("inline_tool_continuation_pending", None)
             response["metadata"] = response_meta
-        text = response.get("text") or ""
+        text = _scrub_tool_placeholder_text(response.get("text") or "")
         if not text:
+            response_metadata = response.get("metadata")
+            response_meta = (
+                response_metadata if isinstance(response_metadata, dict) else {}
+            )
             if repeated_tool_requests:
                 text = unresolved_loop_prefix
                 outcome_lines = _tool_outcome_lines(payload.tools or [])
@@ -9940,12 +10020,36 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
                 response["metadata"] = response_meta
             elif response_tools_used:
                 text = _resolved_tool_summary_text(response_tools_used)
+            elif (
+                response_meta.get("error")
+                or response_meta.get("empty_response")
+                or _response_has_visible_thoughts(response)
+            ):
+                text = _apply_empty_response_fallback(
+                    response,
+                    default_text="I couldn't continue the response. Try regenerate.",
+                    error_template="I couldn't continue the response ({error}). Try regenerate.",
+                )
+            elif payload.tools:
+                text = unresolved_loop_prefix
+                outcome_lines = _tool_outcome_lines(payload.tools or [])
+                if outcome_lines:
+                    text = f"{text}\n\n" + "\n".join(
+                        f"- {line}" for line in outcome_lines
+                    )
+                response_meta = dict(response.get("metadata") or {})
+                response_meta["empty_tool_continuation"] = True
+                response_meta["continuation_stop_reason"] = "empty_after_tool_results"
+                response_meta["unresolved_tool_loop"] = True
+                response["metadata"] = response_meta
             else:
                 text = _apply_empty_response_fallback(
                     response,
                     default_text="I couldn't continue the response. Try regenerate.",
                     error_template="I couldn't continue the response ({error}). Try regenerate.",
                 )
+            response["text"] = text
+        else:
             response["text"] = text
 
     metadata_update = dict(response.get("metadata") or {})
@@ -9961,14 +10065,13 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
         metadata_update.setdefault("server_url", provider_target.get("base_url"))
         metadata_update.setdefault(
             "provider_runtime",
-            (
-                provider_target.get("runtime")
-                if isinstance(provider_target.get("runtime"), dict)
-                else {}
-            ),
+            provider_target.get("runtime")
+            if isinstance(provider_target.get("runtime"), dict)
+            else {},
         )
     status_value = _response_status_value(metadata_update)
     metadata_update["status"] = status_value
+    metadata_update["tool_continuation_rounds"] = continuation_rounds
     metadata_update.setdefault("session_name", session_name)
     try:
         metadata_update.setdefault(
@@ -10002,11 +10105,9 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
     mismatch_error = _apply_model_mismatch_error(
         metadata_update,
         mode=mode_used,
-        provider=(
-            provider_target.get("provider")
-            if isinstance(provider_target, dict)
-            else None
-        ),
+        provider=provider_target.get("provider")
+        if isinstance(provider_target, dict)
+        else None,
     )
     if mismatch_error:
         text = mismatch_error
@@ -10017,6 +10118,7 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
     if waiting_for_next_tool_turn:
         metadata_update.pop("tool_continued", None)
         metadata_update["tool_response_pending"] = True
+        metadata_update["status"] = "pending"
     else:
         metadata_update.setdefault("tool_continued", True)
         metadata_update["tool_response_pending"] = None
@@ -10027,20 +10129,16 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
             "tool_continue_semantic_signature"
         ] = tool_continue_semantic_signature
     usage_stats = _normalize_usage_counts(
-        (
-            metadata_update.get("usage")
-            if isinstance(metadata_update.get("usage"), dict)
-            else None
-        ),
+        metadata_update.get("usage")
+        if isinstance(metadata_update.get("usage"), dict)
+        else None,
         tool_prompt_text if tool_prompt_text else "continue",
         text,
     )
     merged_usage = _merge_usage(
-        (
-            metadata_update.get("usage")
-            if isinstance(metadata_update.get("usage"), dict)
-            else None
-        ),
+        metadata_update.get("usage")
+        if isinstance(metadata_update.get("usage"), dict)
+        else None,
         usage_stats,
     )
     if merged_usage is not None:
@@ -10492,12 +10590,12 @@ async def memory_upsert(request: Request, key: str, payload: MemoryItemUpsert):
     privacy_decision = privacy_filter_service.decide_sensitivity(
         _memory_value_to_text(payload.value),
         explicit_sensitivity=explicit_sensitivity,
-        existing_sensitivity=(
-            existing.get("sensitivity") if isinstance(existing, dict) else None
-        ),
-        existing_sensitivity_source=(
-            existing.get("sensitivity_source") if isinstance(existing, dict) else None
-        ),
+        existing_sensitivity=existing.get("sensitivity")
+        if isinstance(existing, dict)
+        else None,
+        existing_sensitivity_source=existing.get("sensitivity_source")
+        if isinstance(existing, dict)
+        else None,
         purpose="memory",
     )
     effective_sensitivity = (
@@ -10966,6 +11064,32 @@ class ToolSchedule(BaseModel):
     chain_id: Optional[str] = None
 
 
+_TOOL_DECISION_LOCKS: dict[str, dict[str, Any]] = {}
+_TOOL_DECISION_LOCKS_GUARD = threading.Lock()
+
+
+def _tool_decision_lock_for(request_id: Any) -> tuple[str, asyncio.Lock]:
+    key = str(request_id or "").strip()
+    with _TOOL_DECISION_LOCKS_GUARD:
+        entry = _TOOL_DECISION_LOCKS.get(key)
+        if not isinstance(entry, dict):
+            entry = {"lock": asyncio.Lock(), "users": 0}
+            _TOOL_DECISION_LOCKS[key] = entry
+        entry["users"] = int(entry.get("users") or 0) + 1
+        return key, entry["lock"]
+
+
+def _release_tool_decision_lock(key: str, lock: asyncio.Lock) -> None:
+    with _TOOL_DECISION_LOCKS_GUARD:
+        entry = _TOOL_DECISION_LOCKS.get(key)
+        if not isinstance(entry, dict) or entry.get("lock") is not lock:
+            return
+        remaining = max(0, int(entry.get("users") or 0) - 1)
+        entry["users"] = remaining
+        if remaining == 0:
+            _TOOL_DECISION_LOCKS.pop(key, None)
+
+
 def _suggest_tool_names(tool_name: str, limit: int = 4) -> list[str]:
     raw_requested = str(tool_name or "").strip()
     requested = _normalize_tool_name(tool_name)
@@ -11250,6 +11374,7 @@ async def propose_tool(request: Request, payload: ToolProposal):
         "message_id": target_message,
         "chain_id": payload.chain_id or payload.message_id or target_session,
         "status": "proposed",
+        "review_notification_emitted": _tool_resolution_notifications_enabled(),
     }
     request.app.state.pending_tools[rid] = record
     try:
@@ -11292,12 +11417,113 @@ async def propose_tool(request: Request, payload: ToolProposal):
 
 @router.post("/tools/decision")
 async def decide_tool(request: Request, payload: ToolDecision):
+    """Serialize decisions for one request so a tool can only invoke once."""
+
+    lock_key, lock = _tool_decision_lock_for(payload.request_id)
+    try:
+        async with lock:
+            registry = getattr(request.app.state, "pending_tools", None)
+            pre_record = (
+                registry.get(payload.request_id) if isinstance(registry, dict) else None
+            )
+            if not isinstance(pre_record, dict):
+                pre_record = _rehydrate_terminal_tool(
+                    request.app,
+                    payload.request_id,
+                    session_id=payload.session_id,
+                    message_id=payload.message_id,
+                )
+            pre_record = dict(pre_record) if isinstance(pre_record, dict) else {}
+            was_terminal = (
+                _tool_resolution_status(pre_record.get("status"))
+                not in {
+                    "pending",
+                    "proposed",
+                }
+                if pre_record
+                else False
+            )
+
+            result = await _decide_tool_locked(request, payload)
+            resolved_status = _tool_resolution_status(
+                result.get("status") if isinstance(result, dict) else None
+            )
+            if not was_terminal and resolved_status not in {"pending", "proposed"}:
+                current_registry = getattr(request.app.state, "pending_tools", None)
+                resolved_record = (
+                    current_registry.get(payload.request_id)
+                    if isinstance(current_registry, dict)
+                    else None
+                )
+                if not isinstance(resolved_record, dict):
+                    resolved_record = _rehydrate_terminal_tool(
+                        request.app,
+                        payload.request_id,
+                        session_id=payload.session_id,
+                        message_id=payload.message_id,
+                    )
+                record = (
+                    dict(resolved_record)
+                    if isinstance(resolved_record, dict)
+                    else pre_record
+                )
+                record = dict(record or {})
+                record.setdefault("id", payload.request_id)
+                record.setdefault("name", payload.name)
+                record.setdefault("args", payload.args or {})
+                record.setdefault("session_id", payload.session_id)
+                record.setdefault("message_id", payload.message_id)
+                record.setdefault(
+                    "chain_id",
+                    payload.chain_id or payload.message_id or payload.session_id,
+                )
+                _emit_terminal_tool_resolution_notification(
+                    request.app,
+                    record=record,
+                    status=resolved_status,
+                )
+            return result
+    finally:
+        _release_tool_decision_lock(lock_key, lock)
+
+
+async def _decide_tool_locked(request: Request, payload: ToolDecision):
     """Accept or deny a previously proposed tool."""
     registry: dict | None = getattr(request.app.state, "pending_tools", None)
     if registry is None:
         registry = {}
         setattr(request.app.state, "pending_tools", registry)
     rec = registry.get(payload.request_id)
+    terminal_rec = None
+    if rec and _tool_resolution_status(rec.get("status")) not in {
+        "pending",
+        "proposed",
+    }:
+        terminal_rec = rec
+    elif not rec:
+        terminal_rec = _rehydrate_terminal_tool(
+            request.app,
+            payload.request_id,
+            session_id=payload.session_id,
+            message_id=payload.message_id,
+        )
+    if terminal_rec:
+        terminal_status = _tool_resolution_status(terminal_rec.get("status"))
+        terminal_result = terminal_rec.get("result")
+        if terminal_result is None:
+            terminal_messages = {
+                "denied": "Denied by user.",
+                "error": "Tool error.",
+                "cancelled": "Stopped by user.",
+                "timeout": "Timed out.",
+                "scheduled": "Already scheduled.",
+            }
+            terminal_result = _tool_outcome_payload(
+                terminal_status,
+                terminal_messages.get(terminal_status),
+                ok=terminal_status in {"invoked", "scheduled"},
+            )
+        return {"status": terminal_status, "result": terminal_result}
     if not rec:
         recovered = _rehydrate_pending_tool(request.app, payload.request_id)
         if recovered:
@@ -11779,11 +12005,9 @@ async def resolve_client_tool(request: Request, payload: ToolClientResolve):
                 "type": "tool",
                 "id": payload.request_id,
                 "name": rec["name"],
-                "args": (
-                    payload.args
-                    if isinstance(payload.args, dict)
-                    else rec.get("args", {})
-                ),
+                "args": payload.args
+                if isinstance(payload.args, dict)
+                else rec.get("args", {}),
                 "result": result_payload,
                 "chain_id": rec.get("chain_id"),
                 "message_id": rec.get("message_id"),
@@ -11829,6 +12053,11 @@ async def resolve_client_tool(request: Request, payload: ToolClientResolve):
         session_id=rec.get("session_id"),
         message_id=rec.get("message_id"),
         request_id=payload.request_id,
+    )
+    _emit_terminal_tool_resolution_notification(
+        request.app,
+        record={**rec, "id": payload.request_id},
+        status=status,
     )
     return {"status": status, "result": result_payload}
 
@@ -12029,6 +12258,19 @@ async def schedule_tool(request: Request, payload: ToolSchedule) -> dict:
         session_id=session_id,
         message_id=message_id,
         request_id=payload.request_id,
+    )
+    _emit_terminal_tool_resolution_notification(
+        request.app,
+        record={
+            **rec,
+            "id": payload.request_id,
+            "name": name,
+            "args": args,
+            "session_id": session_id,
+            "message_id": message_id,
+            "chain_id": chain_id,
+        },
+        status="scheduled",
     )
     return {"status": "scheduled", "event_id": payload.event_id}
 
@@ -12393,241 +12635,6 @@ def _conversation_message_text(message: Dict[str, Any]) -> str:
     return ""
 
 
-def _plaintext_query_terms(query: Any) -> list[str]:
-    text = str(query or "").strip().lower()
-    if not text:
-        return []
-    terms: list[str] = []
-    seen: set[str] = set()
-    for token in re.split(r"[^a-z0-9]+", text):
-        if len(token) < 3 or token in _TITLE_STOPWORDS or token in seen:
-            continue
-        seen.add(token)
-        terms.append(token)
-    return terms
-
-
-def _plaintext_conversation_sensitivity(meta: Dict[str, Any]) -> str:
-    sensitivity = str(meta.get("sensitivity") or "").strip().lower()
-    if sensitivity:
-        return sensitivity
-    return conversation_store.conversation_privacy_to_sensitivity(
-        meta.get("privacy_mode")
-    )
-
-
-def _plaintext_conversation_blocked(
-    name: str,
-    meta: Dict[str, Any],
-    *,
-    external_llm: bool,
-    workspace_profiles: Optional[List[Dict[str, Any]]] = None,
-) -> bool:
-    if not isinstance(meta, dict):
-        meta = {}
-    if meta.get("rag_excluded") or meta.get("excluded"):
-        return True
-    sensitivity = _plaintext_conversation_sensitivity(meta)
-    if sensitivity == "secret":
-        return True
-    if external_llm and sensitivity == "protected":
-        return True
-    if (
-        workspace_item_exclusion_reason(
-            namespace=meta.get("source_sync_namespace"),
-            values=[
-                name,
-                meta.get("name"),
-                meta.get("path"),
-                meta.get("display_name"),
-                meta.get("title"),
-            ],
-            profiles=workspace_profiles,
-            purpose="default_recall",
-        )
-        is not None
-    ):
-        return True
-    return False
-
-
-def _plaintext_message_blocked(
-    message: Dict[str, Any],
-    *,
-    external_llm: bool,
-) -> bool:
-    meta = message.get("metadata") if isinstance(message, dict) else None
-    if not isinstance(meta, dict):
-        return False
-    if meta.get("rag_excluded") or meta.get("excluded"):
-        return True
-    sensitivity = str(meta.get("sensitivity") or "").strip().lower()
-    if sensitivity == "secret":
-        return True
-    if external_llm and sensitivity == "protected":
-        return True
-    return False
-
-
-def _plaintext_match_score(
-    query: Any,
-    terms: list[str],
-    text: str,
-    title: str = "",
-) -> float:
-    text_lower = text.lower()
-    title_lower = title.lower()
-    query_lower = str(query or "").strip().lower()
-    term_hits = sum(1 for term in terms if term in text_lower)
-    title_hits = sum(1 for term in terms if term in title_lower)
-    exact_bonus = 0.12 if query_lower and query_lower in text_lower else 0.0
-    if term_hits <= 0 and exact_bonus <= 0:
-        return 0.0
-    score = 0.58 + min(0.28, term_hits * 0.08) + min(0.08, title_hits * 0.04)
-    return max(0.0, min(0.96, score + exact_bonus))
-
-
-def _plaintext_match_snippet(
-    text: str,
-    terms: list[str],
-    *,
-    limit: int = 900,
-) -> str:
-    cleaned = " ".join(str(text or "").split())
-    if len(cleaned) <= limit:
-        return cleaned
-    lowered = cleaned.lower()
-    positions = [lowered.find(term) for term in terms if term and term in lowered]
-    first_hit = min((pos for pos in positions if pos >= 0), default=0)
-    start = max(0, first_hit - 220)
-    end = min(len(cleaned), start + limit)
-    start = max(0, end - limit)
-    snippet = cleaned[start:end].strip()
-    if start > 0:
-        snippet = "..." + snippet
-    if end < len(cleaned):
-        snippet = snippet.rstrip() + "..."
-    return snippet
-
-
-def _search_plaintext_conversations_for_rag(
-    query: Any,
-    *,
-    limit: int = 3,
-    external_llm: bool = True,
-    workspace_profiles: Optional[List[Dict[str, Any]]] = None,
-    max_conversations: int = 250,
-) -> list[Dict[str, Any]]:
-    """Search saved conversation JSON as a narrow fallback for missed RAG hits."""
-
-    terms = _plaintext_query_terms(query)
-    query_text = str(query or "").strip()
-    if not terms or not query_text:
-        return []
-    try:
-        raw_entries = conversation_store.list_conversations(include_metadata=True)
-    except Exception:
-        return []
-    entries: list[Dict[str, Any]] = []
-    for raw in raw_entries:
-        if isinstance(raw, dict):
-            name = str(raw.get("name") or raw.get("path") or "").strip()
-            if name:
-                entries.append(dict(raw))
-        elif isinstance(raw, str) and raw.strip():
-            entries.append({"name": raw.strip(), "path": raw.strip()})
-    entries.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
-
-    ranked: list[tuple[float, str, int, Dict[str, Any]]] = []
-    scanned = 0
-    for entry in entries:
-        if scanned >= max_conversations:
-            break
-        name = str(entry.get("name") or entry.get("path") or "").strip()
-        if not name:
-            continue
-        scanned += 1
-        try:
-            full_meta = conversation_store.get_metadata(name)
-        except Exception:
-            full_meta = {}
-        meta = dict(full_meta if isinstance(full_meta, dict) else {})
-        meta.setdefault("name", name)
-        meta.setdefault("path", entry.get("path") or name)
-        meta.setdefault("display_name", entry.get("display_name") or name)
-        meta["privacy_mode"] = conversation_store.normalize_conversation_privacy_mode(
-            meta.get("privacy_mode")
-        )
-        if _plaintext_conversation_blocked(
-            name,
-            meta,
-            external_llm=external_llm,
-            workspace_profiles=workspace_profiles,
-        ):
-            continue
-        try:
-            messages = conversation_store.load_conversation(name)
-        except Exception:
-            continue
-        if not isinstance(messages, list):
-            continue
-        title = str(meta.get("display_name") or name)
-        for idx, message in enumerate(messages):
-            if not isinstance(message, dict):
-                continue
-            role = str(message.get("role") or "").strip().lower()
-            if role and role not in {"user", "assistant", "system"}:
-                continue
-            if _plaintext_message_blocked(message, external_llm=external_llm):
-                continue
-            text = _conversation_message_text(message)
-            if not text.strip():
-                continue
-            score = _plaintext_match_score(query_text, terms, text, title)
-            if score <= 0:
-                continue
-            match_meta = {
-                "kind": "conversation",
-                "source": f"conversation:{name}",
-                "root_source": f"conversation:{name}",
-                "conversation_id": name,
-                "title": title,
-                "role": role or "message",
-                "retrieved_via": "plaintext_conversation",
-                "privacy_mode": meta.get("privacy_mode"),
-                "sensitivity": _plaintext_conversation_sensitivity(meta),
-            }
-            message_id = message.get("id")
-            if isinstance(message_id, str) and message_id.strip():
-                match_meta["message_id"] = message_id.strip()
-            ranked.append(
-                (
-                    score,
-                    str(meta.get("updated_at") or entry.get("updated_at") or ""),
-                    idx,
-                    {
-                        "id": "plaintext-conversation:"
-                        + hashlib.sha1(f"{name}:{idx}".encode("utf-8")).hexdigest(),
-                        "text": _plaintext_match_snippet(text, terms),
-                        "metadata": match_meta,
-                        "score": score,
-                    },
-                )
-            )
-    ranked.sort(key=lambda row: (row[0], row[1], -row[2]), reverse=True)
-    results: list[Dict[str, Any]] = []
-    seen_sources: set[str] = set()
-    for _score, _updated_at, _idx, match in ranked:
-        source = str((match.get("metadata") or {}).get("source") or "")
-        if source in seen_sources:
-            continue
-        seen_sources.add(source)
-        results.append(match)
-        if len(results) >= max(1, limit):
-            break
-    return results
-
-
 def _conversation_base_name(name: str) -> str:
     normalized = str(name or "").strip().replace("\\", "/")
     if not normalized:
@@ -12695,11 +12702,46 @@ def _strip_tool_call_prompt_hints(prompt: str) -> str:
     return cleaned.strip()
 
 
+def _strip_tool_guidance_prompt_hints(prompt: str) -> str:
+    cleaned = _strip_tool_call_prompt_hints(prompt)
+    cleaned = cleaned.replace(_TOOL_DISCOVERY_PROMPT_HINT, "")
+    cleaned = _strip_available_tools_prompt_section(cleaned)
+    cleaned = re.sub(
+        r"^\s*\*\*(?:action\s+loop|tool-use\s+policy):.*?(?=^\s*\*\*|\Z)",
+        "",
+        cleaned,
+        flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 def _model_supports_harmony_tool_calls(model_name: Any) -> bool:
     normalized = (
         str(resolve_model_alias(model_name) or model_name or "").strip().lower()
     )
     return "gpt-oss" in normalized
+
+
+def _server_uses_native_tool_calls(
+    cfg: Any,
+    *,
+    mode: Any,
+    provider_target: Optional[Dict[str, Any]] = None,
+) -> bool:
+    if str(mode or "").strip().lower() != "server":
+        return False
+    if isinstance(provider_target, dict):
+        provider = str(provider_target.get("provider") or "").strip().lower()
+        if provider:
+            return provider == "tinker"
+    if not isinstance(cfg, dict):
+        return False
+    return server_supports_native_tools(
+        cfg,
+        preset_id=cfg.get("server_preset_id"),
+        base_url=cfg.get("server_url"),
+    )
 
 
 def _harmony_format_mode_from_config(cfg: Any) -> str:
@@ -12747,6 +12789,7 @@ def _effective_system_prompt(
     allow_computer_capture: Optional[bool] = None,
     response_format: Optional[str] = None,
     tools: Optional[list[Any]] = None,
+    include_tool_guidance: bool = True,
 ) -> str:
     """Combine immutable base system prompt with user-editable custom additions."""
     base = _strip_tool_call_prompt_hints((base_prompt or "").strip())
@@ -12775,6 +12818,8 @@ def _effective_system_prompt(
             if resolved_base
             else _ensure_tool_discovery_hint(custom)
         )
+    if not include_tool_guidance:
+        return _strip_tool_guidance_prompt_hints(resolved_base)
     resolved_base = _strip_tool_call_prompt_hints(resolved_base)
     format_hint = _tool_call_prompt_hint(response_format)
     if not resolved_base:
@@ -12863,6 +12908,8 @@ class ConversationImportPayload(BaseModel):
     format: str = "md"
     content: Optional[str] = None
     messages: Optional[List[Dict[str, Any]]] = None
+    intent: Optional[str] = None
+    confirm_ambiguous: bool = False
 
 
 def _sanitize_import_folder_path(value: str) -> str:
@@ -12948,11 +12995,52 @@ def _next_import_name(
         counter += 1
 
 
+def _decode_markdown_import_upload(raw: bytes) -> str:
+    if len(raw) > MAX_UPLOAD_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail="Markdown/text import file is too large",
+        )
+    if b"\x00" in raw:
+        raise HTTPException(
+            status_code=400,
+            detail="Markdown/text import must not contain null bytes",
+        )
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Markdown/text import must be UTF-8",
+        ) from exc
+
+
 @router.post("/conversations/import/preview")
 async def import_conversation_preview(file: UploadFile = UploadFileType(...)):
     from app.utils import conversation_io
 
     lower_name = (file.filename or "").lower()
+    if lower_name.endswith((".md", ".markdown", ".txt")):
+        raw = await file.read(MAX_UPLOAD_SIZE + 1)
+        text = _decode_markdown_import_upload(raw)
+        analysis = (
+            conversation_io.classify_conversation_text(text)
+            if lower_name.endswith(".txt")
+            else conversation_io.classify_conversation_markdown(text)
+        )
+        filename = Path(file.filename or "import.md").name
+        detected = {
+            "path": filename,
+            "name": Path(filename).stem or filename,
+            **analysis,
+        }
+        return {
+            **analysis,
+            "detected_files": [detected],
+            "importable_conversation_count": (
+                1 if analysis["classification"] == "conversation" else 0
+            ),
+        }
     raw = await file.read()
     if lower_name.endswith(".zip"):
         try:
@@ -13036,6 +13124,8 @@ async def import_conversation(
     name: Optional[str] = Form(default=None),
     format: Optional[str] = Form(default=None),
     content: Optional[str] = Form(default=None),
+    intent: Optional[str] = Form(default=None),
+    confirm_ambiguous: Optional[bool] = Form(default=None),
     destination_folder: Optional[str] = Form(default=None),
     selected_files: Optional[Any] = Form(default=None),
 ):
@@ -13072,6 +13162,15 @@ async def import_conversation(
     resolved_name = (name or import_payload.name or "").strip()
     fmt = (format or import_payload.format or "").strip().lower()
     request_content = content if content is not None else import_payload.content
+    resolved_intent = (intent or import_payload.intent or "").strip().lower()
+    resolved_confirm_ambiguous = (
+        bool(confirm_ambiguous)
+        if confirm_ambiguous is not None
+        else bool(import_payload.confirm_ambiguous)
+    )
+    ambiguous_conversation_confirmed = (
+        resolved_intent == "conversation" and resolved_confirm_ambiguous
+    )
     requested_destination = _sanitize_import_folder_path(destination_folder)
     parsed_selected_files = _parse_import_selected_files(selected_files)
     messages: List[Dict[str, Any]] = []
@@ -13080,8 +13179,47 @@ async def import_conversation(
     if not fmt and not file:
         fmt = "md"
 
+    def parse_textual_import(
+        raw_text: str, *, plain_text_format: bool = False
+    ) -> List[Dict[str, Any]]:
+        if "\x00" in raw_text:
+            raise HTTPException(
+                status_code=400,
+                detail="Markdown/text import must not contain null bytes",
+            )
+        if len(raw_text.encode("utf-8")) > MAX_UPLOAD_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail="Markdown/text import file is too large",
+            )
+        analysis = (
+            conversation_io.classify_conversation_text(raw_text)
+            if plain_text_format
+            else conversation_io.classify_conversation_markdown(raw_text)
+        )
+        classification = analysis["classification"]
+        if classification == "document":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "This file looks like a document, not a Float conversation. "
+                    "Add it as a knowledge document instead."
+                ),
+            )
+        if classification == "ambiguous" and not ambiguous_conversation_confirmed:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "This file is transcript-like but ambiguous. Review it and "
+                    "resubmit with intent=conversation and confirm_ambiguous=true, "
+                    "or add it as a knowledge document."
+                ),
+            )
+        if plain_text_format:
+            return conversation_io.import_conversation_text(raw_text)
+        return conversation_io.import_conversation_markdown(raw_text)
+
     if file is not None:
-        raw = await file.read()
         lower_name = (file.filename or "").lower()
         if not fmt:
             if lower_name.endswith(".zip"):
@@ -13094,10 +13232,18 @@ async def import_conversation(
                 fmt = "text"
         if not fmt:
             fmt = "md"
-        text_body = raw.decode("utf-8", errors="ignore")
+        if fmt in {"md", "markdown", "text"}:
+            raw = await file.read(MAX_UPLOAD_SIZE + 1)
+            text_body = _decode_markdown_import_upload(raw)
+        else:
+            raw = await file.read()
+            text_body = raw.decode("utf-8", errors="ignore")
 
         if fmt in {"md", "markdown", "text"}:
-            messages = conversation_io.import_conversation_markdown(text_body)
+            messages = parse_textual_import(
+                text_body,
+                plain_text_format=fmt == "text",
+            )
         elif fmt == "zip":
             if parsed_selected_files:
                 candidate_list = [
@@ -13269,7 +13415,10 @@ async def import_conversation(
             raise HTTPException(
                 status_code=400, detail="Markdown import requires content"
             )
-        messages = conversation_io.import_conversation_markdown(request_content)
+        messages = parse_textual_import(
+            request_content,
+            plain_text_format=fmt == "text",
+        )
     else:
         messages = parse_json_text(request_content or "")
 
@@ -13677,3138 +13826,145 @@ async def push_test(payload: PushTestPayload):
 # Device and identity endpoints (Phase 1)
 
 
-class DeviceRegisterPayload(BaseModel):
-    public_key: str
-    name: Optional[str] = None
-    capabilities: Optional[Dict[str, Any]] = None
-
-
-SYNC_DEVICE_SCOPE_ORDER = ("sync", "stream", "files")
-
-
-def _normalize_sync_scopes(value: Any) -> List[str]:
-    if not isinstance(value, list):
-        return []
-    seen: set[str] = set()
-    normalized: List[str] = []
-    for item in value:
-        scope = str(item or "").strip().lower()
-        if scope not in SYNC_DEVICE_SCOPE_ORDER or scope in seen:
-            continue
-        seen.add(scope)
-        normalized.append(scope)
-    return normalized
-
-
-def _registered_device_scopes(record: Dict[str, Any]) -> List[str]:
-    capabilities = record.get("capabilities") if isinstance(record, dict) else {}
-    if not isinstance(capabilities, dict):
-        return []
-    requested = _normalize_sync_scopes(capabilities.get("requested_scopes"))
-    if requested:
-        return requested
-    allowed = [
-        scope for scope in SYNC_DEVICE_SCOPE_ORDER if bool(capabilities.get(scope))
-    ]
-    if allowed:
-        return allowed
-    if capabilities.get("instance_sync") or capabilities.get("paired_via_offer"):
-        return ["sync"]
-    return []
-
-
-def _coerce_saved_peer(entry: Any, index: int = 0) -> Optional[Dict[str, Any]]:
-    if not isinstance(entry, dict):
-        return None
-    remote_url = str(entry.get("remote_url") or "").strip()
-    if not remote_url:
-        return None
-    peer_id = str(entry.get("id") or "").strip() or f"peer-{index + 1}"
-    scopes = _normalize_sync_scopes(entry.get("scopes"))
-    profiles, active_workspace_id, selected_workspace_ids = load_workspace_state()
-    local_workspace_ids = normalize_workspace_ids(
-        entry.get("local_workspace_ids"), profiles
-    ) or list(selected_workspace_ids)
-    return {
-        "id": peer_id,
-        "label": str(entry.get("label") or "").strip() or remote_url,
-        "remote_url": remote_url,
-        "scopes": scopes or ["sync"],
-        "remote_device_id": str(entry.get("remote_device_id") or "").strip(),
-        "public_key": str(entry.get("public_key") or "").strip(),
-        "remote_public_key": str(entry.get("remote_public_key") or "").strip(),
-        "remote_device_name": str(entry.get("remote_device_name") or "").strip(),
-        "last_used_at": str(entry.get("last_used_at") or "").strip(),
-        "local_workspace_ids": local_workspace_ids,
-        "remote_workspace_ids": [
-            str(item).strip()
-            for item in (entry.get("remote_workspace_ids") or [])
-            if str(item or "").strip()
-        ],
-        "workspace_mode": (
-            "import"
-            if str(entry.get("workspace_mode") or "").strip().lower() == "import"
-            else "merge"
-        ),
-        "local_target_workspace_id": (
-            str(entry.get("local_target_workspace_id") or "").strip()
-            or active_workspace_id
-        ),
-        "remote_target_workspace_id": (
-            str(entry.get("remote_target_workspace_id") or "").strip()
-            or DEFAULT_WORKSPACE_ID
-        ),
-    }
-
-
-def _load_saved_peers() -> List[Dict[str, Any]]:
-    settings = user_settings.load_settings()
-    raw = settings.get("sync_saved_peers")
-    if not isinstance(raw, list):
-        return []
-    peers: List[Dict[str, Any]] = []
-    for index, entry in enumerate(raw):
-        normalized = _coerce_saved_peer(entry, index)
-        if normalized is not None:
-            peers.append(normalized)
-    return peers
-
-
-def _sync_ownership_summary(
-    settings: Dict[str, Any],
-    access: Dict[str, Any],
-    saved_peers: List[Dict[str, Any]],
-    operations: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    remote_url = str(settings.get("sync_remote_url") or "").strip()
-    default_peer = next(
-        (
-            peer
-            for peer in saved_peers
-            if str(peer.get("remote_url") or "").strip() == remote_url
-        ),
-        None,
-    )
-    visibility = access.get("visibility") if isinstance(access, dict) else {}
-    visibility = visibility if isinstance(visibility, dict) else {}
-    lan_enabled = bool(
-        visibility.get("lan_enabled") or settings.get("sync_visible_on_lan")
-    )
-    online_supported = bool(visibility.get("online_supported"))
-    online_requested = bool(settings.get("sync_visible_online"))
-    auto_accept_push = bool(settings.get("sync_auto_accept_push"))
-    if remote_url:
-        outbound_mode = "saved_peer" if default_peer else "manual_url"
-    else:
-        outbound_mode = "none"
-    operations = operations if isinstance(operations, dict) else {}
-    active_operation = operations.get("active_operation")
-    if not isinstance(active_operation, dict):
-        active_operation = None
-    last_operation = operations.get("last_attempt")
-    if not isinstance(last_operation, dict):
-        last_operation = None
-    background_owner = {
-        "mode": "active" if active_operation else "idle",
-        "active_operation_id": str((active_operation or {}).get("id") or "").strip(),
-        "active_kind": str((active_operation or {}).get("kind") or "").strip(),
-        "active_status": str((active_operation or {}).get("status") or "").strip(),
-        "active_owner": str((active_operation or {}).get("owner") or "").strip(),
-        "active_remote_url": str(
-            (active_operation or {}).get("remote_url") or ""
-        ).strip(),
-        "cancel_requested": bool((active_operation or {}).get("cancel_requested")),
-        "can_request_stop": bool(active_operation)
-        and not bool((active_operation or {}).get("cancel_requested")),
-        "last_operation_id": str((last_operation or {}).get("id") or "").strip(),
-        "last_kind": str((last_operation or {}).get("kind") or "").strip(),
-        "last_status": str((last_operation or {}).get("status") or "").strip(),
-        "last_owner": str((last_operation or {}).get("owner") or "").strip(),
-    }
-    return {
-        "private_network_only": True,
-        "inbound_visibility": {
-            "lan_enabled": lan_enabled,
-            "online_requested": online_requested,
-            "online_supported": online_supported,
-        },
-        "outbound_target": {
-            "mode": outbound_mode,
-            "remote_url": remote_url,
-            "peer_id": (
-                str(default_peer.get("id") or "").strip()
-                if isinstance(default_peer, dict)
-                else ""
-            ),
-            "peer_label": (
-                str(default_peer.get("label") or "").strip()
-                if isinstance(default_peer, dict)
-                else ""
-            ),
-        },
-        "push_review_mode": "auto_accept" if auto_accept_push else "review_required",
-        "saved_peer_count": len(saved_peers),
-        "background_owner": background_owner,
-        "auto_sync": {
-            "enabled": False,
-            "available": False,
-            "mode": "manual_review_only",
-            "reason": (
-                "Automatic sync is not enabled. This device can suggest "
-                "manual Check remote and Preview sync steps, but it will not "
-                "schedule or apply sync automatically."
-            ),
-        },
-        "unfinished_notice": (
-            "Automatic stop-kill safeguards are future work. Stop records cancel "
-            "intent and aborts the current local request where possible, but it "
-            "does not kill remote work that another device already accepted."
-        ),
-    }
-
-
-def _sync_operation_remote_label(paired_device: Optional[Dict[str, Any]]) -> str:
-    pair = _coerce_saved_peer(paired_device or {}) or {}
-    return str(
-        pair.get("label")
-        or pair.get("remote_device_name")
-        or pair.get("remote_device_id")
-        or ""
-    ).strip()
-
-
-def _begin_sync_operation(
-    *,
-    kind: str,
-    remote_url: str,
-    operation_id: Optional[str] = None,
-    operation_owner: Optional[str] = None,
-    paired_device: Optional[Dict[str, Any]] = None,
-    sections: Optional[List[str]] = None,
-    workspace_mode: Optional[str] = None,
-    metadata: Optional[Dict[str, Any]] = None,
-) -> Optional[Dict[str, Any]]:
-    try:
-        return sync_start_operation(
-            kind=kind,
-            operation_id=operation_id,
-            owner=operation_owner,
-            remote_url=remote_url,
-            remote_label=_sync_operation_remote_label(paired_device),
-            sections=sections or [],
-            workspace_mode=workspace_mode or "",
-            request_id=_current_request_id(),
-            metadata=metadata,
-        )
-    except Exception:
-        logger.debug("Failed to record sync operation start", exc_info=True)
-        return None
-
-
-def _finish_sync_operation(
-    operation: Optional[Dict[str, Any]],
-    *,
-    status: str,
-    error: Optional[str] = None,
-    result: Optional[Dict[str, Any]] = None,
-) -> None:
-    op_id = str((operation or {}).get("id") or "").strip()
-    if not op_id:
-        return
-    try:
-        sync_finish_operation(op_id, status=status, error=error, result=result)
-    except Exception:
-        logger.debug("Failed to record sync operation finish", exc_info=True)
-
-
-def _retire_pending_pushes_after_pull(
-    operation: Optional[Dict[str, Any]],
-    *,
-    remote_url: str,
-) -> Dict[str, Any]:
-    op_id = str((operation or {}).get("id") or "").strip()
-    try:
-        return sync_retire_pending_pushes_after_pull(
-            remote_url=remote_url,
-            pull_operation_id=op_id or None,
-        )
-    except Exception:
-        logger.debug(
-            "Failed to retire pending push operations after pull", exc_info=True
-        )
-        return {"count": 0, "operation_ids": []}
-
-
-def _sync_operations_overview() -> Dict[str, Any]:
-    try:
-        return sync_operations_snapshot()
-    except Exception:
-        logger.debug("Failed to read sync operation telemetry", exc_info=True)
-        return {"active_operation": None, "last_attempt": None, "recent": []}
-
-
-def _sync_suggestion_explanation(
-    *,
-    title: str,
-    summary: str,
-    rows: List[Dict[str, str]],
-) -> Dict[str, Any]:
-    return {
-        "title": title,
-        "summary": summary,
-        "rows": [
-            {
-                "label": str(row.get("label") or "").strip(),
-                "value": str(row.get("value") or "").strip(),
-            }
-            for row in rows
-            if str(row.get("label") or "").strip()
-            and str(row.get("value") or "").strip()
-        ],
-    }
-
-
-def _sync_suggestion(
-    *,
-    suggestion_id: str,
-    title: str,
-    summary: str,
-    action: str,
-    action_label: str,
-    priority: int,
-    severity: str = "info",
-    peer: Optional[Dict[str, Any]] = None,
-    next_step: str = "",
-    requirements: Optional[List[Dict[str, str]]] = None,
-) -> Dict[str, Any]:
-    peer = peer if isinstance(peer, dict) else {}
-    remote_url = str(peer.get("remote_url") or "").strip()
-    peer_label = str(peer.get("label") or peer.get("remote_device_name") or "").strip()
-    rows = [
-        {"label": "Source", "value": "/api/sync/overview.sync_suggestions"},
-        {"label": "Action", "value": action_label},
-        {"label": "Automatic sync", "value": "Off"},
-        {"label": "Review", "value": "Manual approval required"},
-        {"label": "Peer", "value": peer_label},
-        {"label": "Remote", "value": remote_url},
-        {"label": "Next", "value": next_step or summary},
-    ]
-    return {
-        "id": suggestion_id,
-        "title": title,
-        "summary": summary,
-        "severity": severity,
-        "priority": priority,
-        "action": action,
-        "action_label": action_label,
-        "next_step": next_step or summary,
-        "peer_id": str(peer.get("id") or "").strip(),
-        "peer_label": peer_label,
-        "remote_url": remote_url,
-        "manual_review_required": True,
-        "auto_sync_enabled": False,
-        "auto_sync_available": False,
-        "requirements": requirements or [],
-        "state_explanation": _sync_suggestion_explanation(
-            title=f"Why {title} is suggested",
-            summary=summary,
-            rows=rows,
-        ),
-    }
-
-
-def _sync_saved_peer_ready(peer: Dict[str, Any]) -> bool:
-    scopes = _normalize_sync_scopes(peer.get("scopes"))
-    has_sync_scope = "sync" in scopes or not scopes
-    has_identity = bool(str(peer.get("remote_public_key") or "").strip())
-    local_workspaces = normalize_workspace_ids(peer.get("local_workspace_ids")) or []
-    remote_workspaces = [
-        str(item).strip()
-        for item in (peer.get("remote_workspace_ids") or [])
-        if str(item or "").strip()
-    ]
-    workspace_mode = str(peer.get("workspace_mode") or "").strip().lower()
-    if workspace_mode == "import":
-        has_workspace_mapping = bool(local_workspaces and remote_workspaces)
-    else:
-        has_workspace_mapping = bool(local_workspaces)
-    return has_sync_scope and has_identity and has_workspace_mapping
-
-
-def _sync_saved_peer_requirements(peer: Dict[str, Any]) -> List[Dict[str, str]]:
-    scopes = _normalize_sync_scopes(peer.get("scopes"))
-    has_sync_scope = "sync" in scopes or not scopes
-    has_identity = bool(str(peer.get("remote_public_key") or "").strip())
-    local_workspaces = normalize_workspace_ids(peer.get("local_workspace_ids")) or []
-    remote_workspaces = [
-        str(item).strip()
-        for item in (peer.get("remote_workspace_ids") or [])
-        if str(item or "").strip()
-    ]
-    workspace_mode = str(peer.get("workspace_mode") or "").strip().lower()
-    if workspace_mode == "import":
-        workspace_ready = bool(local_workspaces and remote_workspaces)
-        workspace_detail = (
-            "Local and remote targets selected"
-            if workspace_ready
-            else "Choose one local and one remote import target"
-        )
-    else:
-        workspace_ready = bool(local_workspaces)
-        workspace_detail = (
-            "Local sync workspaces selected"
-            if workspace_ready
-            else "Choose local workspaces for preview/apply"
-        )
-    return [
-        {
-            "label": "Sync scope",
-            "status": "ready" if has_sync_scope else "missing",
-            "detail": "Sync allowed" if has_sync_scope else "Add the sync scope",
-        },
-        {
-            "label": "Stable identity",
-            "status": "ready" if has_identity else "needs_check",
-            "detail": (
-                "Remote fingerprint saved"
-                if has_identity
-                else "Run Check remote or Refresh trust to save the fingerprint"
-            ),
-        },
-        {
-            "label": "Workspace mapping",
-            "status": "ready" if workspace_ready else "missing",
-            "detail": workspace_detail,
-        },
-        {
-            "label": "Automatic sync",
-            "status": "off",
-            "detail": "Only suggestions are shown; nothing runs automatically",
-        },
-    ]
-
-
-def _sync_overview_suggestions(
-    *,
-    access: Dict[str, Any],
-    saved_peers: List[Dict[str, Any]],
-    operations: Dict[str, Any],
-    sync_reviews: Dict[str, Any],
-) -> List[Dict[str, Any]]:
-    suggestions: List[Dict[str, Any]] = []
-    active_operation = operations.get("active_operation")
-    if isinstance(active_operation, dict):
-        suggestions.append(
-            _sync_suggestion(
-                suggestion_id=(
-                    f"active-sync-{str(active_operation.get('id') or 'operation')}"
-                ),
-                title="Sync request is still active",
-                summary=(
-                    "A local sync request is still owned by this device. Stop "
-                    "records cancel intent; it does not claim remote rollback."
-                ),
-                action="wait_or_stop",
-                action_label="Wait or stop",
-                priority=5,
-                severity="warning",
-                peer={
-                    "label": active_operation.get("remote_label") or "",
-                    "remote_url": active_operation.get("remote_url") or "",
-                },
-                next_step=(
-                    "Wait for it to finish, or use Stop if you want to abort "
-                    "the current local request wait."
-                ),
-            )
-        )
-
-    pending_reviews = (
-        sync_reviews.get("pending") if isinstance(sync_reviews, dict) else []
-    )
-    pending_count = len(pending_reviews) if isinstance(pending_reviews, list) else 0
-    if pending_count:
-        suggestions.append(
-            _sync_suggestion(
-                suggestion_id="review-inbound-sync",
-                title="Review inbound sync",
-                summary=(
-                    f"{pending_count} inbound push review"
-                    f"{'' if pending_count == 1 else 's'} need a decision."
-                ),
-                action="review_inbound",
-                action_label="Review pending push",
-                priority=10,
-                severity="warning",
-                next_step=(
-                    "Open the pending sync review and approve only the sections "
-                    "you want this device to accept."
-                ),
-            )
-        )
-
-    for peer in saved_peers:
-        if not isinstance(peer, dict):
-            continue
-        requirements = _sync_saved_peer_requirements(peer)
-        peer_id = str(peer.get("id") or "peer").strip()
-        peer_label = str(peer.get("label") or peer.get("remote_url") or "peer").strip()
-        if _sync_saved_peer_ready(peer):
-            suggestions.append(
-                _sync_suggestion(
-                    suggestion_id=f"ready-reviewed-sync-{peer_id}",
-                    title=f"{peer_label} is ready for reviewed sync",
-                    summary=(
-                        "Auto-sync is still off. This pair has sync scope, a "
-                        "saved fingerprint, and workspace mapping, so the next "
-                        "safe step is Check remote, then Preview."
-                    ),
-                    action="check_then_preview",
-                    action_label="Check remote, then preview",
-                    priority=30,
-                    severity="info",
-                    peer=peer,
-                    requirements=requirements,
-                    next_step=(
-                        "Check remote to confirm reachability, then Preview "
-                        "sync before pulling or pushing selected sections."
-                    ),
-                )
-            )
-        else:
-            suggestions.append(
-                _sync_suggestion(
-                    suggestion_id=f"prepare-reviewed-sync-{peer_id}",
-                    title=f"Prepare {peer_label} for reviewed sync",
-                    summary=(
-                        "This saved pair is not ready for low-friction manual "
-                        "sync yet. Complete the missing trust, scope, or "
-                        "workspace requirement first."
-                    ),
-                    action="complete_pair_setup",
-                    action_label="Complete pair setup",
-                    priority=35,
-                    severity="warning",
-                    peer=peer,
-                    requirements=requirements,
-                    next_step=(
-                        "Refresh trust or edit the pair until sync scope, "
-                        "fingerprint, and workspace mapping are ready."
-                    ),
-                )
-            )
-
-    if not saved_peers:
-        suggestions.append(
-            _sync_suggestion(
-                suggestion_id="pair-a-device",
-                title="Pair a device before syncing",
-                summary=(
-                    "No saved sync peers exist. Pairing stores a stable remote "
-                    "identity so later URL changes can be verified safely."
-                ),
-                action="pair_device",
-                action_label="Pair a device",
-                priority=40,
-                severity="info",
-                next_step=(
-                    "Enable private-network visibility if needed, then pair the "
-                    "other Float instance before previewing data movement."
-                ),
-            )
-        )
-
-    visibility = access.get("visibility") if isinstance(access, dict) else {}
-    visibility = visibility if isinstance(visibility, dict) else {}
-    if not bool(visibility.get("lan_enabled")):
-        suggestions.append(
-            _sync_suggestion(
-                suggestion_id="enable-lan-visibility",
-                title="LAN visibility is off",
-                summary=(
-                    "This device is local-only right now. Pairing and inbound "
-                    "private-network sync are easier after LAN visibility is on."
-                ),
-                action="enable_lan_visibility",
-                action_label="Enable LAN visibility",
-                priority=50,
-                severity="info",
-                next_step=(
-                    "Turn on LAN visibility when you want another local device "
-                    "to discover or reach this Float instance."
-                ),
-            )
-        )
-
-    return sorted(
-        suggestions,
-        key=lambda item: (
-            int(item.get("priority") or 100),
-            str(item.get("id") or ""),
-        ),
-    )
-
-
-def _workspace_state_summary(
-    settings: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    profiles, active_workspace_id, selected_workspace_ids = load_workspace_state(
-        settings
-    )
-    return {
-        "profiles": [summarize_workspace_profile(profile) for profile in profiles],
-        "active_workspace_id": active_workspace_id,
-        "selected_workspace_ids": selected_workspace_ids,
-    }
-
-
-def _workspace_profile_from_state(
-    workspace_state: Dict[str, Any], workspace_id: Optional[str]
-) -> Optional[Dict[str, Any]]:
-    target_id = str(workspace_id or "").strip()
-    profiles = workspace_state.get("profiles")
-    if not isinstance(profiles, list):
-        return None
-    for profile in profiles:
-        if not isinstance(profile, dict):
-            continue
-        if str(profile.get("id") or "").strip() == target_id:
-            return profile
-    return None
-
-
-def _workspace_namespace_prefix(profile: Optional[Dict[str, Any]]) -> str:
-    if not isinstance(profile, dict):
-        return ""
-    return str(profile.get("namespace") or "").strip().replace("\\", "/").strip("/")
-
-
-def _workspace_join_namespace(*parts: str) -> str:
-    cleaned = [str(part or "").strip().replace("\\", "/").strip("/") for part in parts]
-    return "/".join(part for part in cleaned if part)
-
-
-def _workspace_target_namespace(
-    *,
-    mode: str,
-    target_profile: Optional[Dict[str, Any]],
-    source_device_name: Optional[str],
-    source_workspace_profile: Optional[Dict[str, Any]],
-) -> str:
-    base_namespace = _workspace_namespace_prefix(target_profile)
-    if str(mode or "").strip().lower() != "import":
-        return base_namespace
-    source_workspace = source_workspace_profile or {}
-    location = resolve_synced_workspace_location(
-        parent_profile=target_profile,
-        source_device_name=str(source_device_name or "").strip(),
-        source_workspace_id=str(source_workspace.get("id") or "").strip(),
-        source_workspace_name=str(source_workspace.get("name") or "").strip(),
-        source_workspace_slug=str(source_workspace.get("slug") or "").strip(),
-    )
-    return str(location.get("namespace") or "").strip()
-
-
-def _filter_recursive_workspace_ids(
-    local_profiles: List[Dict[str, Any]],
-    workspace_ids: List[str],
-    paired_device: Optional[Dict[str, Any]],
-) -> tuple[List[str], List[str]]:
-    if not workspace_ids:
-        return [], []
-    profile_by_id = workspace_profile_map(local_profiles)
-    peer_id = str((paired_device or {}).get("id") or "").strip()
-    remote_name = str(
-        (paired_device or {}).get("remote_device_name")
-        or (paired_device or {}).get("label")
-        or ""
-    ).strip()
-    filtered: List[str] = []
-    ignored: List[str] = []
-    for workspace_id in workspace_ids:
-        profile = profile_by_id.get(workspace_id) or {}
-        source_peer_id = str(profile.get("source_peer_id") or "").strip()
-        source_device_name = str(profile.get("source_device_name") or "").strip()
-        if (peer_id and source_peer_id and source_peer_id == peer_id) or (
-            remote_name and source_device_name and source_device_name == remote_name
-        ):
-            ignored.append(workspace_id)
-            continue
-        filtered.append(workspace_id)
-    return filtered, ignored
-
-
-def _ignored_local_workspace_detail(
-    recursive_ignored_ids: List[str], privacy_ignored_ids: List[str]
-) -> str:
-    if recursive_ignored_ids and privacy_ignored_ids:
-        return (
-            "All selected local workspaces were ignored to avoid syncing a "
-            "workspace back to its source device or because of workspace privacy "
-            "settings."
-        )
-    if recursive_ignored_ids:
-        return (
-            "All selected local workspaces were ignored to avoid syncing a "
-            "workspace back to its source device."
-        )
-    return "All selected local workspaces were ignored by workspace privacy settings."
-
-
-def _normalize_workspace_mode(value: Any) -> str:
-    return "import" if str(value or "").strip().lower() == "import" else "merge"
-
-
-def _upsert_workspace_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
-    settings = user_settings.load_settings()
-    profiles, active_workspace_id, selected_workspace_ids = load_workspace_state(
-        settings
-    )
-    next_profiles: List[Dict[str, Any]] = []
-    replaced = False
-    for existing in profiles:
-        existing_id = str(existing.get("id") or "").strip()
-        if existing_id == str(profile.get("id") or "").strip():
-            next_profiles.append(profile)
-            replaced = True
-        else:
-            next_profiles.append(existing)
-    if not replaced and str(profile.get("id") or "").strip():
-        next_profiles.append(profile)
-    user_settings.save_settings(
-        {
-            "workspace_profiles": next_profiles,
-            "active_workspace_id": active_workspace_id,
-            "sync_selected_workspace_ids": selected_workspace_ids,
-        }
-    )
-    return profile
-
-
-def _persist_saved_peer_state(
-    pairing: Optional[Dict[str, Any]],
-    *,
-    remote_label: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
-    normalized = _coerce_saved_peer(pairing or {})
-    if normalized is None:
-        return None
-    peers = _load_saved_peers()
-    peer_id = normalized["id"]
-    remote_name = str(
-        remote_label or normalized.get("remote_device_name") or ""
-    ).strip()
-    now = datetime.now(tz=timezone.utc).isoformat()
-    next_peer = {
-        **normalized,
-        "remote_device_name": remote_name,
-        "last_used_at": now,
-    }
-    updated = False
-    update_default_remote = False
-    settings = user_settings.load_settings()
-    current_default_remote = str(settings.get("sync_remote_url") or "").strip()
-    next_peers: List[Dict[str, Any]] = []
-    for peer in peers:
-        if str(peer.get("id") or "").strip() == peer_id:
-            next_peers.append({**peer, **next_peer})
-            if current_default_remote == str(peer.get("remote_url") or "").strip():
-                update_default_remote = True
-            updated = True
-        else:
-            next_peers.append(peer)
-    if not updated:
-        return None
-    updates: Dict[str, Any] = {"sync_saved_peers": next_peers}
-    if update_default_remote:
-        updates["sync_remote_url"] = next_peer["remote_url"]
-    user_settings.save_settings(updates)
-    return next_peer
-
-
-def _remove_saved_peer_state(peer_id: str) -> None:
-    needle = str(peer_id or "").strip()
-    if not needle:
-        return
-    peers = [
-        peer
-        for peer in _load_saved_peers()
-        if str(peer.get("id") or "").strip() != needle
-    ]
-    user_settings.save_settings({"sync_saved_peers": peers})
-
-
-def _candidate_urls_for_request(request: Optional[Request]) -> List[str]:
-    return candidate_device_urls(request)
-
-
-def _device_has_sync_capabilities(record: Dict[str, Any]) -> bool:
-    capabilities = record.get("capabilities") if isinstance(record, dict) else {}
-    if not isinstance(capabilities, dict):
-        return False
-    requested_scopes = capabilities.get("requested_scopes")
-    if isinstance(requested_scopes, list) and requested_scopes:
-        return True
-    return any(
-        bool(capabilities.get(key))
-        for key in ("instance_sync", "paired_via_offer", "sync", "stream", "files")
-    )
-
-
-def _looks_like_legacy_browser_name(name: str) -> bool:
-    lowered = str(name or "").strip().lower()
-    if not lowered:
-        return False
-    return lowered.startswith("mozilla/5.0") or "applewebkit" in lowered
-
-
-def _summarize_inbound_device(device_id: str, record: Dict[str, Any]) -> Dict[str, Any]:
-    capabilities = (
-        record.get("capabilities")
-        if isinstance(record.get("capabilities"), dict)
-        else {}
-    )
-    name = str(record.get("name") or f"device-{str(device_id)[:8]}").strip()
-    requested_scopes = (
-        capabilities.get("requested_scopes")
-        if isinstance(capabilities.get("requested_scopes"), list)
-        else []
-    )
-    legacy_browser = _looks_like_legacy_browser_name(name)
-    status = "legacy_browser_record" if legacy_browser else "trusted_device"
-    status_label = "Legacy browser record" if legacy_browser else "Trusted device"
-    last_seen = float(record.get("last_seen") or 0)
-    if (
-        not legacy_browser
-        and last_seen > 0
-        and (time.time() - last_seen) <= 600
-        and _device_has_sync_capabilities(record)
-    ):
-        status = "connected_device"
-        status_label = "Connected device"
-    if capabilities.get("paired_via_offer") and not legacy_browser:
-        status = "paired_device"
-        status_label = "Paired device"
-    return {
-        "id": str(device_id),
-        "name": name,
-        "public_key": record.get("public_key"),
-        "capabilities": capabilities,
-        "created_at": float(record.get("created_at") or 0),
-        "last_seen": last_seen,
-        "status": status,
-        "status_label": status_label,
-        "legacy_browser_record": legacy_browser,
-        "scopes": [
-            str(item).strip().lower()
-            for item in requested_scopes
-            if str(item or "").strip()
-        ],
-    }
-
-
-def _sync_review_summary(review: Dict[str, Any]) -> Dict[str, Any]:
-    requested_sections = (
-        review.get("requested_sections")
-        if isinstance(review.get("requested_sections"), list)
-        else []
-    )
-    return {
-        "id": str(review.get("id") or "").strip(),
-        "status": str(review.get("status") or "").strip() or "pending",
-        "created_at": float(review.get("created_at") or 0),
-        "updated_at": float(review.get("updated_at") or 0),
-        "source_label": str(review.get("source_label") or "").strip()
-        or "remote device",
-        "device_name": str(review.get("device_name") or "").strip(),
-        "device_id": str(review.get("device_id") or "").strip(),
-        "requested_sections": requested_sections,
-        "requested_section_labels": [
-            SYNC_SECTION_LABELS.get(section, section.title())
-            for section in requested_sections
-        ],
-        "decision": str(review.get("decision") or "").strip(),
-        "note": str(review.get("note") or "").strip(),
-        "effective_namespace": str(review.get("effective_namespace") or "").strip(),
-    }
-
-
-def _sync_reviews_snapshot(
-    *, pending_limit: int = 12, recent_limit: int = 8
-) -> Dict[str, Any]:
-    pending = [
-        _sync_review_summary(review)
-        for review in list_sync_reviews(status="pending", limit=pending_limit)
-    ]
-    recent_source_limit = max(pending_limit + recent_limit, recent_limit * 4, 16)
-    recent = [
-        _sync_review_summary(review)
-        for review in list_sync_reviews(limit=recent_source_limit)
-        if str(review.get("status") or "").strip().lower() != "pending"
-    ][:recent_limit]
-    return {
-        "pending": pending,
-        "recent": recent,
-        "counts": {
-            "pending": len(pending),
-            "recent": len(recent),
-        },
-    }
-
-
-def _peer_connectivity_status(remote_url: str) -> Dict[str, Any]:
-    urls = _resolve_remote_urls(remote_url)
-    response = http_session.get(f"{urls['api_base']}/sync/overview", timeout=8)
-    response.raise_for_status()
-    payload = response.json()
-    overview = payload if isinstance(payload, dict) else {}
-    current = (
-        overview.get("current_device")
-        if isinstance(overview.get("current_device"), dict)
-        else {}
-    )
-    device_access = (
-        overview.get("device_access")
-        if isinstance(overview.get("device_access"), dict)
-        else {}
-    )
-    sync_defaults = (
-        overview.get("sync_defaults")
-        if isinstance(overview.get("sync_defaults"), dict)
-        else {}
-    )
-    public_key = str(current.get("public_key") or "").strip()
-    return {
-        "reachable": True,
-        "instance_base": urls["instance_base"],
-        "display_name": str(current.get("display_name") or "").strip(),
-        "hostname": str(current.get("hostname") or "").strip(),
-        "public_key": public_key,
-        "source_namespace": str(current.get("source_namespace") or "").strip(),
-        "identity": {
-            "public_key": public_key,
-            "display_name": str(current.get("display_name") or "").strip(),
-            "hostname": str(current.get("hostname") or "").strip(),
-            "source_namespace": str(current.get("source_namespace") or "").strip(),
-        },
-        "visible_on_lan": bool(
-            (device_access.get("visibility") or {}).get("lan_enabled")
-            or sync_defaults.get("visible_on_lan")
-        ),
-        "advertised_lan_url": str(
-            (device_access.get("advertised_urls") or {}).get("lan") or ""
-        ).strip(),
-        "advertised_local_url": str(
-            (device_access.get("advertised_urls") or {}).get("local") or ""
-        ).strip(),
-        "workspaces": (
-            overview.get("workspaces")
-            if isinstance(overview.get("workspaces"), dict)
-            else _workspace_state_summary({})
-        ),
-        "inbound_devices": (
-            overview.get("inbound_devices")
-            if isinstance(overview.get("inbound_devices"), list)
-            else []
-        ),
-    }
-
-
-def _remote_identity_from_overview(overview: Dict[str, Any]) -> Dict[str, str]:
-    current = (
-        overview.get("current_device")
-        if isinstance(overview.get("current_device"), dict)
-        else {}
-    )
-    return {
-        "public_key": str(current.get("public_key") or "").strip(),
-        "display_name": str(current.get("display_name") or "").strip(),
-        "hostname": str(current.get("hostname") or "").strip(),
-        "source_namespace": str(current.get("source_namespace") or "").strip(),
-    }
-
-
-def _annotate_peer_identity(
-    status: Dict[str, Any],
-    pairing: Optional[Dict[str, Any]],
-    *,
-    strict: bool = False,
-) -> Dict[str, Any]:
-    pair = _coerce_saved_peer(pairing or {}) if isinstance(pairing, dict) else None
-    identity = (
-        status.get("identity") if isinstance(status.get("identity"), dict) else {}
-    )
-    observed_key = str(
-        identity.get("public_key") or status.get("public_key") or ""
-    ).strip()
-    expected_key = str((pair or {}).get("remote_public_key") or "").strip()
-    annotated = {
-        **status,
-        "identity": {
-            **identity,
-            "public_key": observed_key,
-        },
-        "identity_verified": False,
-        "identity_state": "unpaired",
-        "identity_warning": "",
-    }
-    if pair is None:
-        return annotated
-    if not expected_key:
-        remote_device_id = str(pair.get("remote_device_id") or "").strip()
-        local_public_key = str(pair.get("public_key") or "").strip()
-        expected_label = str(pair.get("label") or "").strip().lower()
-        observed_labels = {
-            str(identity.get("display_name") or status.get("display_name") or "")
-            .strip()
-            .lower(),
-            str(identity.get("hostname") or status.get("hostname") or "")
-            .strip()
-            .lower(),
-            str(
-                identity.get("source_namespace") or status.get("source_namespace") or ""
-            )
-            .strip()
-            .lower(),
-        }
-        label_matches = not expected_label or expected_label in observed_labels
-        inbound_devices = (
-            status.get("inbound_devices")
-            if isinstance(status.get("inbound_devices"), list)
-            else []
-        )
-        for device in inbound_devices:
-            if not isinstance(device, dict):
-                continue
-            if str(device.get("id") or "").strip() != remote_device_id:
-                continue
-            if not label_matches:
-                annotated["identity_state"] = "label_mismatch"
-                annotated[
-                    "identity_warning"
-                ] = "The remote recognized this saved pair's local device, but its advertised identity label does not match the saved peer. Pair it as a separate Float instance."
-                return annotated
-            if local_public_key and secrets.compare_digest(
-                str(device.get("public_key") or "").strip(), local_public_key
-            ):
-                annotated["identity_verified"] = bool(observed_key)
-                annotated["identity_state"] = (
-                    "verified" if observed_key else "missing_remote_identity"
-                )
-                annotated["identity_anchor_source"] = "remote_registered_device"
-                if not observed_key:
-                    annotated[
-                        "identity_warning"
-                    ] = "The remote recognized this saved pair, but did not report its own stable device identity."
-                    if strict:
-                        raise HTTPException(
-                            status_code=409,
-                            detail=annotated["identity_warning"],
-                        )
-                return annotated
-        annotated["identity_state"] = "unanchored"
-        annotated[
-            "identity_warning"
-        ] = "This saved peer does not have a stable remote identity yet. Refresh trust or pair again before treating a moved URL as the same device."
-        return annotated
-    if not observed_key:
-        annotated["identity_state"] = "missing_remote_identity"
-        annotated[
-            "identity_warning"
-        ] = "The remote responded, but it did not report a stable device identity."
-        if strict:
-            raise HTTPException(
-                status_code=409,
-                detail=annotated["identity_warning"],
-            )
-        return annotated
-    if secrets.compare_digest(expected_key, observed_key):
-        annotated["identity_verified"] = True
-        annotated["identity_state"] = "verified"
-        return annotated
-    annotated["identity_state"] = "mismatch"
-    annotated[
-        "identity_warning"
-    ] = "The remote URL responded, but its stable device identity does not match this saved pair. Pair it as a separate Float instance."
-    if strict:
-        raise HTTPException(
-            status_code=409,
-            detail=annotated["identity_warning"],
-        )
-    return annotated
-
-
-def _annotate_peer_identity_from_overview(
-    overview: Dict[str, Any],
-    pairing: Optional[Dict[str, Any]],
-    *,
-    strict: bool = False,
-) -> Dict[str, Any]:
-    return _annotate_peer_identity(
-        {
-            "identity": _remote_identity_from_overview(overview),
-            "inbound_devices": (
-                overview.get("inbound_devices")
-                if isinstance(overview.get("inbound_devices"), list)
-                else []
-            ),
-        },
-        pairing,
-        strict=strict,
-    )
-
-
-def _log_remote_sync_failure(
-    action: str,
-    *,
-    remote_url: str,
-    paired_device: Optional[Dict[str, Any]] = None,
-    context: Optional[Dict[str, Any]] = None,
-    exc: requests.RequestException,
-) -> None:
-    pair = _coerce_saved_peer(paired_device or {}) or {}
-    try:
-        remote_base = _resolve_remote_urls(remote_url).get("instance_base", remote_url)
-    except Exception:
-        remote_base = str(remote_url or "").strip()
-    response = getattr(exc, "response", None)
-    response_excerpt = ""
-    if response is not None:
-        try:
-            response_excerpt = textwrap.shorten(
-                " ".join(str(response.text or "").split()),
-                width=280,
-                placeholder="...",
-            )
-        except Exception:
-            response_excerpt = ""
-    logger.warning(
-        "Remote sync operation failed: action=%s remote=%s peer_id=%s peer_label=%s remote_device_id=%s remote_device_name=%s status=%s context=%s error=%s response=%s",
-        action,
-        remote_base,
-        str(pair.get("id") or "").strip() or "-",
-        str(pair.get("label") or "").strip() or "-",
-        str(pair.get("remote_device_id") or "").strip() or "-",
-        str(pair.get("remote_device_name") or "").strip() or "-",
-        response.status_code if response is not None else "-",
-        json.dumps(context or {}, ensure_ascii=False, sort_keys=True),
-        exc,
-        response_excerpt or "-",
-    )
-
-
-@router.post("/devices/register")
-async def devices_register(payload: DeviceRegisterPayload):
-    rec = register_or_update_device(
-        payload.public_key,
-        name=payload.name,
-        capabilities=payload.capabilities,
-    )
-    return {"device": rec.__dict__}
-
-
-class DeviceTokenRequest(BaseModel):
-    device_id: str
-    scopes: Optional[list[str]] = None
-    ttl_seconds: Optional[int] = 3600
-    public_key: Optional[str] = None
-
-
-@router.post("/devices/token")
-async def devices_token(payload: DeviceTokenRequest, request: Request):
-    record = get_device(payload.device_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="Device not found")
-    claims = _optional_device_claims(request, scope=None)
-    if claims is not None:
-        if str(claims.get("sub") or "").strip() != str(payload.device_id).strip():
-            raise HTTPException(
-                status_code=403, detail="Device token can only refresh itself"
-            )
-    else:
-        expected_key = str(record.get("public_key") or "").strip()
-        supplied_key = str(payload.public_key or "").strip()
-        if not expected_key or not secrets.compare_digest(expected_key, supplied_key):
-            raise HTTPException(
-                status_code=403, detail="Device proof required for token issuance"
-            )
-    requested_scopes = _normalize_sync_scopes(payload.scopes) or ["sync"]
-    allowed_scopes = _registered_device_scopes(record)
-    scopes = [scope for scope in requested_scopes if scope in allowed_scopes]
-    if not scopes:
-        raise HTTPException(status_code=403, detail="Requested scopes are not allowed")
-    touch_device(payload.device_id)
-    token = issue_device_token(payload.device_id, scopes, payload.ttl_seconds or 3600)
-    return {"token": token}
-
-
-@router.get("/devices")
-async def devices_list():
-    return {"devices": list_devices()}
-
-
-class DeviceUpdatePayload(BaseModel):
-    name: Optional[str] = None
-    capabilities: Optional[Dict[str, Any]] = None
-
-
-@router.patch("/devices/{device_id}")
-async def devices_update(
-    device_id: str, payload: DeviceUpdatePayload, request: Request
-):
-    claims = _optional_device_claims(request, "sync")
-    if (
-        claims is not None
-        and str(claims.get("sub") or "").strip() != str(device_id).strip()
-    ):
-        raise HTTPException(
-            status_code=403, detail="Device token can only update its own record"
-        )
-    record = update_device(
-        device_id,
-        name=payload.name,
-        capabilities=payload.capabilities,
-    )
-    if record is None:
-        raise HTTPException(status_code=404, detail="Device not found")
-    return {"device": record.__dict__}
-
-
-@router.delete("/devices/{device_id}")
-async def devices_delete(device_id: str, request: Request):
-    claims = _optional_device_claims(request, "sync")
-    if (
-        claims is not None
-        and str(claims.get("sub") or "").strip() != str(device_id).strip()
-    ):
-        raise HTTPException(
-            status_code=403, detail="Device token can only delete its own record"
-        )
-    if not delete_device(device_id):
-        raise HTTPException(status_code=404, detail="Device not found")
-    return {"status": "deleted"}
-
-
-@router.post("/devices/prune-legacy")
-async def devices_prune_legacy():
-    removed = 0
-    for device_id, record in (list_devices() or {}).items():
-        if not isinstance(record, dict):
-            continue
-        summary = _summarize_inbound_device(str(device_id), record)
-        if not summary["legacy_browser_record"]:
-            continue
-        if delete_device(str(device_id)):
-            removed += 1
-    return {"removed": removed}
-
-
-# ---------------------------------------------------------------------------
-# Pairing and optional gateway endpoints
-
-
-class PairingOfferPayload(BaseModel):
-    requested_scopes: Optional[List[str]] = None
-    ttl_seconds: Optional[int] = 600
-
-
-class PairingAcceptPayload(BaseModel):
-    code: str
-    device_name: str
-    public_key: str
-    requested_scopes: Optional[List[str]] = None
-    candidate_urls: Optional[List[str]] = None
-
-
-class PairDevicePayload(BaseModel):
-    peer_id: Optional[str] = None
-    remote_url: str
-    code: str
-    label: Optional[str] = None
-    scopes: Optional[List[str]] = None
-    local_workspace_ids: Optional[List[str]] = None
-    remote_workspace_ids: Optional[List[str]] = None
-    workspace_mode: Optional[str] = "merge"
-    local_target_workspace_id: Optional[str] = None
-    remote_target_workspace_id: Optional[str] = None
-
-
-class PairDeviceSyncPayload(BaseModel):
-    paired_device: Dict[str, Any]
-
-
-class SyncPeerStatusPayload(BaseModel):
-    remote_url: str
-    paired_device: Optional[Dict[str, Any]] = None
-    update_saved_peer: bool = False
-    operation_id: Optional[str] = None
-    operation_owner: Optional[str] = None
-
-
-MOBILE_FLOAT_DEFAULT_SERVE_PORT = 64345
-
-
-class MobileFloatServePayload(BaseModel):
-    serve_port: int = MOBILE_FLOAT_DEFAULT_SERVE_PORT
-
-
-class PairDeviceRevokePayload(BaseModel):
-    paired_device: Dict[str, Any]
-    remove_local_pair: bool = True
-
-
-class GatewayOfferPayload(BaseModel):
-    device_name: str
-    public_key: str
-    requested_scopes: Optional[List[str]] = None
-    candidate_urls: Optional[List[str]] = None
-    relay_url: Optional[str] = None
-    ttl_seconds: Optional[int] = 600
-
-
-class GatewayAcceptPayload(BaseModel):
-    code: str
-    device_name: str
-    public_key: str
-    candidate_urls: Optional[List[str]] = None
-    relay_url: Optional[str] = None
-
-
-class GatewaySessionPayload(BaseModel):
-    peer_device_id: str
-    scopes: Optional[List[str]] = None
-    candidate_urls: Optional[List[str]] = None
-    relay_url: Optional[str] = None
-    ttl_seconds: Optional[int] = 900
-
-
-@router.post("/pairing/offers")
-async def pairing_create_offer(request: Request, payload: PairingOfferPayload):
-    scopes = _normalize_sync_scopes(payload.requested_scopes) or ["sync"]
-    offer = create_rendezvous_offer(
-        device_name=str(
-            user_settings.load_settings().get("device_display_name") or ""
-        ).strip()
-        or socket.gethostname(),
-        public_key=_get_or_create_device_public_key(),
-        requested_scopes=scopes,
-        candidate_urls=_candidate_urls_for_request(request),
-        ttl_seconds=int(payload.ttl_seconds or 600),
-        metadata={"type": "pairing"},
-    )
-    return {
-        "offer": {
-            "code": offer["code"],
-            "expires_at": float(offer["expires_at"]),
-            "requested_scopes": offer["requested_scopes"],
-            "candidate_urls": offer["candidate_urls"],
-        }
-    }
-
-
-@router.post("/pairing/offers/accept")
-async def pairing_accept_offer(request: Request, payload: PairingAcceptPayload):
-    scopes = _normalize_sync_scopes(payload.requested_scopes) or ["sync"]
-    offer = accept_rendezvous_offer(
-        payload.code,
-        device_name=payload.device_name,
-        public_key=payload.public_key,
-        candidate_urls=payload.candidate_urls or _candidate_urls_for_request(request),
-    )
-    incoming = register_or_update_device(
-        payload.public_key,
-        name=payload.device_name,
-        capabilities={
-            "instance_sync": True,
-            "requested_scopes": scopes,
-            "sync": "sync" in scopes,
-            "stream": "stream" in scopes,
-            "files": "files" in scopes,
-            "paired_via_offer": True,
-        },
-    )
-    service = _sync_service()
-    return {
-        "paired_device": {
-            "remote_device_id": incoming.id,
-            "public_key": payload.public_key,
-            "remote_device_name": str(
-                user_settings.load_settings().get("device_display_name") or ""
-            ).strip()
-            or socket.gethostname(),
-            "remote_url": (_candidate_urls_for_request(request) or [""])[0],
-            "scopes": scopes,
-        },
-        "current_device": {
-            **service.current_instance_identity(),
-            "display_name": str(
-                user_settings.load_settings().get("device_display_name") or ""
-            ).strip()
-            or socket.gethostname(),
-            "public_key": _get_or_create_device_public_key(),
-        },
-        "offer": {
-            "code": offer.get("code"),
-            "created_by": offer.get("device_name"),
-            "requested_scopes": offer.get("requested_scopes") or [],
-        },
-    }
-
-
-@router.post("/sync/pair")
-async def sync_pair(payload: PairDevicePayload, request: Request):
-    settings = user_settings.load_settings()
-    device_name = (
-        str(settings.get("device_display_name") or "").strip() or socket.gethostname()
-    )
-    public_key = _get_or_create_device_public_key()
-    scopes = _normalize_sync_scopes(payload.scopes) or ["sync"]
-    profiles, active_workspace_id, selected_workspace_ids = load_workspace_state(
-        settings
-    )
-    local_workspace_ids = normalize_workspace_ids(
-        payload.local_workspace_ids, profiles
-    ) or list(selected_workspace_ids)
-    try:
-        urls = _resolve_remote_urls(payload.remote_url)
-        response = http_session.post(
-            f"{urls['api_base']}/pairing/offers/accept",
-            json={
-                "code": payload.code,
-                "device_name": device_name,
-                "public_key": public_key,
-                "requested_scopes": scopes,
-                "candidate_urls": _candidate_urls_for_request(request),
-            },
-            timeout=20,
-        )
-        response.raise_for_status()
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except requests.RequestException as exc:
-        _log_remote_sync_failure(
-            "sync_pair",
-            remote_url=payload.remote_url,
-            context={
-                "requested_scopes": scopes,
-                "local_workspace_ids": local_workspace_ids,
-                "remote_workspace_ids": payload.remote_workspace_ids or [],
-                "workspace_mode": payload.workspace_mode or "merge",
-            },
-            exc=exc,
-        )
-        raise HTTPException(status_code=502, detail=f"Pairing failed: {exc}")
-    parsed = response.json()
-    result = parsed if isinstance(parsed, dict) else {}
-    pair_id = str(payload.peer_id or "").strip() or str(uuid4())
-    paired_device = _coerce_saved_peer(
-        {
-            "id": pair_id,
-            "label": str(
-                payload.label
-                or result.get("current_device", {}).get("display_name")
-                or payload.remote_url
-            ).strip(),
-            "remote_url": urls["instance_base"],
-            "scopes": scopes,
-            "remote_device_id": str(
-                (result.get("paired_device") or {}).get("remote_device_id") or ""
-            ).strip(),
-            "public_key": public_key,
-            "remote_public_key": str(
-                (result.get("current_device") or {}).get("public_key") or ""
-            ).strip(),
-            "remote_device_name": str(
-                (result.get("current_device") or {}).get("display_name") or ""
-            ).strip(),
-            "last_used_at": datetime.now(tz=timezone.utc).isoformat(),
-            "local_workspace_ids": local_workspace_ids,
-            "remote_workspace_ids": [
-                str(item).strip()
-                for item in (payload.remote_workspace_ids or [])
-                if str(item or "").strip()
-            ],
-            "workspace_mode": (
-                "import"
-                if str(payload.workspace_mode or "").strip().lower() == "import"
-                else "merge"
-            ),
-            "local_target_workspace_id": str(
-                payload.local_target_workspace_id or active_workspace_id
-            ).strip()
-            or active_workspace_id,
-            "remote_target_workspace_id": str(
-                payload.remote_target_workspace_id or DEFAULT_WORKSPACE_ID
-            ).strip()
-            or DEFAULT_WORKSPACE_ID,
-        }
-    )
-    if paired_device is None:
-        raise HTTPException(status_code=400, detail="Pairing response was incomplete")
-    peers = _load_saved_peers()
-    peers = [
-        peer
-        for peer in peers
-        if str(peer.get("remote_url") or "").strip() != urls["instance_base"]
-        and str(peer.get("id") or "").strip() != pair_id
-    ]
-    peers.insert(0, paired_device)
-    user_settings.save_settings(
-        {
-            "sync_remote_url": urls["instance_base"],
-            "sync_saved_peers": peers,
-        }
-    )
-    return {"paired_device": paired_device}
-
-
-@router.post("/sync/peer/status")
-async def sync_peer_status(payload: SyncPeerStatusPayload):
-    operation = _begin_sync_operation(
-        kind="check",
-        remote_url=payload.remote_url,
-        operation_id=payload.operation_id,
-        operation_owner=payload.operation_owner,
-        paired_device=payload.paired_device,
-        sections=[],
-        workspace_mode="",
-        metadata={"update_saved_peer": bool(payload.update_saved_peer)},
-    )
-    try:
-        status = _peer_connectivity_status(payload.remote_url)
-        pairing = _coerce_saved_peer(payload.paired_device or {})
-        status = _annotate_peer_identity(status, pairing)
-        if payload.update_saved_peer:
-            if pairing is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Saved peer payload is required to update a moved URL.",
-                )
-            if not status.get("identity_verified"):
-                raise HTTPException(
-                    status_code=409,
-                    detail=status.get("identity_warning")
-                    or "Remote identity was not verified.",
-                )
-            next_pair = {
-                **pairing,
-                "remote_url": status["instance_base"],
-                "remote_public_key": (
-                    (status.get("identity") or {}).get("public_key")
-                    or pairing.get("remote_public_key")
-                    or ""
-                ),
-                "remote_device_name": status.get("display_name")
-                or status.get("hostname")
-                or pairing.get("remote_device_name")
-                or "",
-            }
-            persisted = _persist_saved_peer_state(
-                next_pair,
-                remote_label=next_pair.get("remote_device_name"),
-            )
-            if persisted:
-                status["paired_device"] = persisted
-                settings = user_settings.load_settings()
-                if (
-                    str(settings.get("sync_remote_url") or "").strip()
-                    == str(pairing.get("remote_url") or "").strip()
-                ):
-                    user_settings.save_settings(
-                        {"sync_remote_url": persisted["remote_url"]}
-                    )
-        _finish_sync_operation(
-            operation,
-            status="completed",
-            result={
-                "reachable": bool(status.get("reachable")),
-                "identity_verified": bool(status.get("identity_verified")),
-            },
-        )
-        return status
-    except HTTPException as exc:
-        _finish_sync_operation(operation, status="failed", error=str(exc.detail))
-        raise
-    except requests.RequestException as exc:
-        _finish_sync_operation(operation, status="failed", error=str(exc))
-        _log_remote_sync_failure(
-            "sync_peer_status",
-            remote_url=payload.remote_url,
-            exc=exc,
-        )
-        raise HTTPException(
-            status_code=502, detail=f"Remote status check failed: {exc}"
-        )
-    except ValueError as exc:
-        _finish_sync_operation(operation, status="failed", error=str(exc))
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-@router.post("/sync/pair/update")
-async def sync_pair_update(payload: PairDeviceSyncPayload):
-    pairing = _coerce_saved_peer(payload.paired_device)
-    if pairing is None:
-        raise HTTPException(status_code=400, detail="Paired device payload is invalid")
-    settings = user_settings.load_settings()
-    remote = RemoteFloatClient(
-        pairing["remote_url"],
-        paired_device=pairing,
-        device_name=str(settings.get("device_display_name") or "").strip()
-        or socket.gethostname(),
-    )
-    try:
-        remote_overview = remote.get_sync_overview()
-        identity_status = _annotate_peer_identity_from_overview(
-            remote_overview,
-            pairing,
-            strict=True,
-        )
-        updated_pair = remote.sync_device_registration()
-        remote_identity = identity_status.get("identity") or {}
-        if remote_identity.get("public_key"):
-            updated_pair["remote_public_key"] = str(
-                remote_identity.get("public_key") or ""
-            ).strip()
-        if remote_identity.get("display_name") or remote_identity.get("hostname"):
-            updated_pair["remote_device_name"] = str(
-                remote_identity.get("display_name")
-                or remote_identity.get("hostname")
-                or ""
-            ).strip()
-    except requests.RequestException as exc:
-        _log_remote_sync_failure(
-            "sync_pair_update",
-            remote_url=pairing["remote_url"],
-            paired_device=pairing,
-            exc=exc,
-        )
-        raise HTTPException(status_code=502, detail=f"Remote pair update failed: {exc}")
-    persisted = _persist_saved_peer_state(
-        updated_pair, remote_label=pairing.get("remote_device_name")
-    )
-    return {"paired_device": persisted or updated_pair}
-
-
-@router.post("/sync/pair/revoke")
-async def sync_pair_revoke(payload: PairDeviceRevokePayload):
-    pairing = _coerce_saved_peer(payload.paired_device)
-    if pairing is None:
-        raise HTTPException(status_code=400, detail="Paired device payload is invalid")
-    settings = user_settings.load_settings()
-    remote = RemoteFloatClient(
-        pairing["remote_url"],
-        paired_device=pairing,
-        device_name=str(settings.get("device_display_name") or "").strip()
-        or socket.gethostname(),
-    )
-    try:
-        remote.delete_remote_device()
-    except requests.RequestException as exc:
-        _log_remote_sync_failure(
-            "sync_pair_revoke",
-            remote_url=pairing["remote_url"],
-            paired_device=pairing,
-            context={"remove_local_pair": payload.remove_local_pair},
-            exc=exc,
-        )
-        raise HTTPException(status_code=502, detail=f"Remote revoke failed: {exc}")
-    if payload.remove_local_pair:
-        _remove_saved_peer_state(pairing["id"])
-    return {"status": "revoked", "paired_device_id": pairing["id"]}
-
-
-@router.post("/gateway/rendezvous/offers")
-async def gateway_create_offer(payload: GatewayOfferPayload):
-    offer = create_rendezvous_offer(
-        device_name=payload.device_name,
-        public_key=payload.public_key,
-        requested_scopes=_normalize_sync_scopes(payload.requested_scopes) or ["sync"],
-        candidate_urls=payload.candidate_urls or [],
-        relay_url=payload.relay_url,
-        ttl_seconds=int(payload.ttl_seconds or 600),
-        metadata={"type": "gateway"},
-    )
-    return {
-        "offer_id": offer["offer_id"],
-        "code": offer["code"],
-        "expires_at": float(offer["expires_at"]),
-        "relay_url": offer.get("relay_url"),
-    }
-
-
-@router.post("/gateway/rendezvous/accept")
-async def gateway_accept_offer(payload: GatewayAcceptPayload):
-    offer = accept_rendezvous_offer(
-        payload.code,
-        device_name=payload.device_name,
-        public_key=payload.public_key,
-        candidate_urls=payload.candidate_urls or [],
-        relay_url=payload.relay_url,
-    )
-    created_by = {
-        "device_name": offer.get("device_name"),
-        "public_key": offer.get("public_key"),
-    }
-    return {
-        "peer_device_name": created_by["device_name"],
-        "peer_public_key": created_by["public_key"],
-        "candidate_urls": offer.get("candidate_urls") or [],
-        "relay_session_id": offer.get("offer_id"),
-        "relay_url": offer.get("relay_url"),
-    }
-
-
-@router.post("/gateway/sessions")
-async def gateway_create_session(payload: GatewaySessionPayload):
-    session = create_rendezvous_session(
-        peer_device_id=payload.peer_device_id,
-        scopes=_normalize_sync_scopes(payload.scopes) or ["sync"],
-        candidate_urls=payload.candidate_urls or [],
-        relay_url=payload.relay_url,
-        ttl_seconds=int(payload.ttl_seconds or 900),
-    )
-    return {
-        "session_token": session["session_token"],
-        "expires_at": float(session["expires_at"]),
-        "candidate_urls": session["candidate_urls"],
-        "relay_url": session.get("relay_url"),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Sync endpoints
-
-
-class SyncSectionRequest(BaseModel):
-    sections: Optional[List[str]] = None
-    workspace_ids: Optional[List[str]] = None
-
-
-class SyncIngestRequest(BaseModel):
-    snapshot: Dict[str, Any]
-    link_to_source: bool = False
-    source_namespace: Optional[str] = None
-    source_label: Optional[str] = None
-    target_namespace: Optional[str] = None
-
-
-class SyncPlanRequest(BaseModel):
-    remote_url: str
-    sections: Optional[List[str]] = None
-    link_to_source: bool = False
-    source_namespace: Optional[str] = None
-    paired_device: Optional[Dict[str, Any]] = None
-    local_workspace_ids: Optional[List[str]] = None
-    remote_workspace_ids: Optional[List[str]] = None
-    workspace_mode: str = "merge"
-    local_target_workspace_id: Optional[str] = None
-    remote_target_workspace_id: Optional[str] = None
-    operation_id: Optional[str] = None
-    operation_owner: Optional[str] = None
-
-
-class SyncApplyRequest(BaseModel):
-    remote_url: str
-    direction: Literal["pull", "push"] = "pull"
-    sections: Optional[List[str]] = None
-    item_selections: Optional[Dict[str, List[str]]] = None
-    link_to_source: bool = False
-    source_namespace: Optional[str] = None
-    paired_device: Optional[Dict[str, Any]] = None
-    local_workspace_ids: Optional[List[str]] = None
-    remote_workspace_ids: Optional[List[str]] = None
-    workspace_mode: str = "merge"
-    local_target_workspace_id: Optional[str] = None
-    remote_target_workspace_id: Optional[str] = None
-    operation_id: Optional[str] = None
-    operation_owner: Optional[str] = None
-
-
-def _sync_service() -> InstanceSyncService:
-    return InstanceSyncService()
-
-
-_SYNC_MANUAL_REFRESH_NOTE_SNIPPETS = (
-    "run a reindex/rehydrate pass",
-    "caption reindex pass later",
-    "calendar rag rehydrate pass",
-)
-
-
-def _sync_section_applied(section_result: Any) -> int:
-    if not isinstance(section_result, dict):
-        return 0
-    try:
-        return max(0, int(section_result.get("applied") or 0))
-    except Exception:
-        return 0
-
-
-def _reload_memory_manager_from_store(request: Request) -> None:
-    state = getattr(getattr(request, "app", None), "state", None)
-    mgr = getattr(state, "memory_manager", None)
-    reload_store = getattr(mgr, "_load_persisted_store", None)
-    if not callable(reload_store):
-        return
-    try:
-        reload_store()
-    except Exception:
-        logger.debug("Failed to reload memory manager after sync", exc_info=True)
-
-
-async def _refresh_sync_result_indexes(result: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(result, dict):
-        return {}
-    section_results = result.get("sections")
-    if not isinstance(section_results, dict):
-        return {}
-    refresh: Dict[str, Any] = {}
-    if _sync_section_applied(section_results.get("knowledge")):
-        try:
-            refresh["knowledge"] = await knowledge_rag_rehydrate(
-                KnowledgeRagRehydrate()
-            )
-        except Exception as exc:
-            refresh["knowledge"] = {"error": str(exc)}
-    if _sync_section_applied(section_results.get("attachments")):
-        try:
-            attachment_result = section_results.get("attachments")
-            applied_ids = []
-            if isinstance(attachment_result, dict):
-                applied_ids = [
-                    str(item or "").strip()
-                    for item in attachment_result.get("applied_ids") or []
-                    if str(item or "").strip()
-                ]
-            refresh["attachments"] = await attachments_rag_rehydrate(
-                AttachmentsRagRehydrate(content_hashes=applied_ids or None)
-            )
-        except Exception as exc:
-            refresh["attachments"] = {"error": str(exc)}
-    if _sync_section_applied(section_results.get("calendar")):
-        try:
-            refresh["calendar"] = await calendar_rag_rehydrate(CalendarRagRehydrate())
-        except Exception as exc:
-            refresh["calendar"] = {"error": str(exc)}
-    if not refresh:
-        return {}
-    existing_notes = result.get("notes")
-    cleaned_notes: List[str] = []
-    if isinstance(existing_notes, list):
-        for note in existing_notes:
-            text = str(note or "").strip()
-            if not text:
-                continue
-            lower = text.lower()
-            if any(snippet in lower for snippet in _SYNC_MANUAL_REFRESH_NOTE_SNIPPETS):
-                continue
-            cleaned_notes.append(text)
-    for section, refresh_result in refresh.items():
-        if isinstance(refresh_result, dict) and refresh_result.get("error"):
-            cleaned_notes.append(
-                f"Post-sync {section} refresh failed: {refresh_result['error']}"
-            )
-            continue
-        scanned = int((refresh_result or {}).get("scanned") or 0)
-        reindexed = int((refresh_result or {}).get("reindexed") or 0)
-        if section == "knowledge":
-            cleaned_notes.append(
-                f"Semantic search refreshed for {reindexed} synced knowledge items ({scanned} scanned)."
-            )
-        elif section == "attachments":
-            cleaned_notes.append(
-                f"Attachment search mirrors refreshed for {reindexed} synced image attachments ({scanned} scanned)."
-            )
-        elif section == "calendar":
-            cleaned_notes.append(
-                f"Calendar retrieval refreshed for {reindexed} synced events ({scanned} scanned)."
-            )
-    result["notes"] = cleaned_notes
-    result["post_refresh"] = refresh
-    return refresh
-
-
-async def _apply_sync_ingest(
-    service: InstanceSyncService,
-    request: Request,
-    payload: SyncIngestRequest,
-) -> Dict[str, Any]:
-    sections = service.normalize_sections(
-        list((payload.snapshot.get("sections") or {}).keys())
-    )
-    before_snapshot = service.build_snapshot(sections) if sections else None
-    merged = service.merge_snapshot(
-        payload.snapshot,
-        link_to_source=payload.link_to_source,
-        source_namespace=payload.source_namespace,
-        source_label=payload.source_label,
-        target_namespace=payload.target_namespace,
-    )
-    if _sync_section_applied((merged.get("sections") or {}).get("memories")):
-        _reload_memory_manager_from_store(request)
-    await _refresh_sync_result_indexes(merged)
-    after_snapshot = service.build_snapshot(sections) if sections else None
-    if sections:
-        sync_record_changes(
-            [
-                {
-                    "type": "sync_ingest",
-                    "sections": sections,
-                    "applied_at": merged.get("applied_at"),
-                }
-            ]
-        )
-        remote_instance = (
-            payload.snapshot.get("instance")
-            if isinstance(payload.snapshot.get("instance"), dict)
-            else {}
-        )
-        source_label = (
-            remote_instance.get("hostname")
-            or remote_instance.get("source_namespace")
-            or payload.source_namespace
-            or "snapshot"
-        )
-        _record_sync_action(
-            request,
-            name="sync_ingest",
-            summary=f"Sync ingest from {source_label}",
-            before_snapshot=before_snapshot,
-            after_snapshot=after_snapshot,
-            sections=sections,
-            args={
-                "link_to_source": payload.link_to_source,
-                "source_namespace": payload.source_namespace,
-                "source_label": payload.source_label,
-                "target_namespace": payload.target_namespace,
-                "sections": sections,
-            },
-            result=merged,
-            batch_scope={
-                "scope": "sync_ingest",
-                "sections": sections,
-                "source_label": source_label,
-            },
-        )
-    return merged
-
-
-def _mobile_float_state_path() -> Path:
-    override = str(os.getenv("FLOAT_DEV_STATE_PATH") or "").strip()
-    if override:
-        return Path(override)
-    return Path(__file__).resolve().parents[2] / ".dev_state.json"
-
-
-def _load_mobile_float_state() -> Dict[str, Any]:
-    state_path = _mobile_float_state_path()
-    if not state_path.exists():
-        return {}
-    try:
-        payload = json.loads(state_path.read_text(encoding="utf-8"))
-    except Exception:
-        logger.debug("Failed to read Mobile Float launcher state", exc_info=True)
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def _coerce_port(value: Any) -> Optional[int]:
-    try:
-        port = int(value)
-    except (TypeError, ValueError):
-        return None
-    if 1 <= port <= 65535:
-        return port
-    return None
-
-
-def _mobile_float_serve_port(value: Any = None) -> int:
-    port = _coerce_port(value)
-    if port is not None:
-        return port
-    if value is None:
-        return MOBILE_FLOAT_DEFAULT_SERVE_PORT
-    raise HTTPException(
-        status_code=400, detail="Serve port must be between 1 and 65535."
-    )
-
-
-def _run_tailscale(
-    args: List[str], *, timeout: int = 15
-) -> subprocess.CompletedProcess:
-    tailscale_bin = shutil.which("tailscale")
-    if not tailscale_bin:
-        raise FileNotFoundError("tailscale executable was not found on PATH.")
-    return subprocess.run(
-        [tailscale_bin, *args],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout,
-        check=False,
-    )
-
-
-def _tailscale_command_error(action: str, result: subprocess.CompletedProcess) -> str:
-    detail = (result.stderr or result.stdout or "").strip()
-    return detail or f"tailscale {action} failed with exit code {result.returncode}."
-
-
-def _tailscale_self_status() -> Dict[str, Any]:
-    try:
-        result = _run_tailscale(["status", "--self", "--json"], timeout=12)
-    except FileNotFoundError:
-        return {
-            "installed": False,
-            "ok": False,
-            "error": "Tailscale is not installed or not on PATH.",
-        }
-    except subprocess.TimeoutExpired:
-        return {"installed": True, "ok": False, "error": "Tailscale status timed out."}
-    except Exception as exc:
-        logger.debug("Failed to inspect Tailscale status", exc_info=True)
-        return {"installed": True, "ok": False, "error": str(exc)}
-    if result.returncode != 0:
-        return {
-            "installed": True,
-            "ok": False,
-            "error": _tailscale_command_error("status", result),
-        }
-    try:
-        payload = json.loads(result.stdout or "{}")
-    except json.JSONDecodeError:
-        return {
-            "installed": True,
-            "ok": False,
-            "error": "Tailscale returned invalid JSON.",
-        }
-    self_info = payload.get("Self") if isinstance(payload, dict) else None
-    self_info = self_info if isinstance(self_info, dict) else {}
-    dns_name = str(self_info.get("DNSName") or "").strip().rstrip(".")
-    tailscale_ips = self_info.get("TailscaleIPs")
-    tailscale_ip = ""
-    if isinstance(tailscale_ips, list):
-        tailscale_ip = str(next((ip for ip in tailscale_ips if ip), "") or "").strip()
-    host = dns_name or tailscale_ip or str(self_info.get("HostName") or "").strip()
-    return {
-        "installed": True,
-        "ok": bool(host),
-        "host": host,
-        "dns_name": dns_name,
-        "tailscale_ip": tailscale_ip,
-        "hostname": str(self_info.get("HostName") or "").strip(),
-        "error": (
-            "" if host else "Tailscale is running, but no tailnet host was reported."
-        ),
-    }
-
-
-def _format_mobile_float_url_host(host: str) -> str:
-    value = str(host or "").strip()
-    if ":" in value and not value.startswith("["):
-        return f"[{value}]"
-    return value
-
-
-def _tailscale_serve_status_text() -> Dict[str, Any]:
-    try:
-        result = _run_tailscale(["serve", "status"], timeout=12)
-    except FileNotFoundError:
-        return {
-            "ok": False,
-            "text": "",
-            "error": "Tailscale is not installed or not on PATH.",
-        }
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "text": "", "error": "Tailscale Serve status timed out."}
-    except Exception as exc:
-        logger.debug("Failed to inspect Tailscale Serve status", exc_info=True)
-        return {"ok": False, "text": "", "error": str(exc)}
-    text = (result.stdout or result.stderr or "").strip()
-    if result.returncode != 0:
-        return {
-            "ok": False,
-            "text": text,
-            "error": _tailscale_command_error("serve status", result),
-        }
-    return {"ok": True, "text": text, "error": ""}
-
-
-def _mobile_float_serve_status(
-    serve_port: int = MOBILE_FLOAT_DEFAULT_SERVE_PORT,
-) -> Dict[str, Any]:
-    state = _load_mobile_float_state()
-    frontend_port = _coerce_port(state.get("frontend_port"))
-    backend_port = _coerce_port(state.get("backend_port"))
-    tailscale_status = _tailscale_self_status()
-    serve_status = (
-        _tailscale_serve_status_text()
-        if tailscale_status.get("installed")
-        else {"text": ""}
-    )
-    serve_text = str(serve_status.get("text") or "").strip()
-    target = f"localhost:{frontend_port}" if frontend_port else ""
-    host = str(tailscale_status.get("host") or "").strip()
-    configured_markers = [
-        f":{serve_port}",
-        f":{frontend_port}" if frontend_port else "",
-    ]
-    running = bool(serve_text) and all(
-        marker in serve_text for marker in configured_markers if marker
-    )
-    url = ""
-    if host:
-        url = f"http://{_format_mobile_float_url_host(host)}:{serve_port}/"
-    warning = ""
-    if not tailscale_status.get("installed"):
-        warning = "Tailscale is not installed or not on PATH."
-    elif not tailscale_status.get("ok"):
-        warning = str(tailscale_status.get("error") or "Tailscale is not ready.")
-    elif not frontend_port:
-        warning = "Float frontend port was not found in .dev_state.json."
-    elif not running:
-        warning = "Tailscale Serve is not currently pointing at this Float frontend."
-    return {
-        "ok": bool(tailscale_status.get("ok")) and bool(frontend_port),
-        "installed": bool(tailscale_status.get("installed")),
-        "running": running,
-        "serve_port": serve_port,
-        "frontend_port": frontend_port,
-        "backend_port": backend_port,
-        "tailnet_host": host,
-        "url": url,
-        "target": target,
-        "serve_status": serve_text,
-        "status_text": (
-            "running"
-            if running
-            else ("ready" if host and frontend_port else "not ready")
-        ),
-        "warning": warning,
-        "state_path": str(_mobile_float_state_path()),
-    }
-
-
-@router.get("/sync/mobile-serve/status")
-async def mobile_float_serve_status(serve_port: Optional[int] = None):
-    return _mobile_float_serve_status(_mobile_float_serve_port(serve_port))
-
-
-@router.post("/sync/mobile-serve/start")
-async def mobile_float_serve_start(payload: MobileFloatServePayload):
-    serve_port = _mobile_float_serve_port(payload.serve_port)
-    before = _mobile_float_serve_status(serve_port)
-    frontend_port = _coerce_port(before.get("frontend_port"))
-    if not before.get("installed"):
-        raise HTTPException(
-            status_code=409,
-            detail=before.get("warning") or "Tailscale is not available.",
-        )
-    if not before.get("tailnet_host"):
-        raise HTTPException(
-            status_code=409, detail=before.get("warning") or "Tailscale is not ready."
-        )
-    if frontend_port is None:
-        raise HTTPException(
-            status_code=409,
-            detail="Float frontend port was not found in .dev_state.json. Start Float first.",
-        )
-    try:
-        result = _run_tailscale(
-            [
-                "serve",
-                f"--http={serve_port}",
-                "--bg",
-                "--yes",
-                f"localhost:{frontend_port}",
-            ],
-            timeout=20,
-        )
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=504, detail="Tailscale Serve start timed out.")
-    except Exception as exc:
-        logger.debug("Failed to start Tailscale Serve for Mobile Float", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(exc))
-    if result.returncode != 0:
-        raise HTTPException(
-            status_code=500,
-            detail=_tailscale_command_error("serve start", result),
-        )
-    status = _mobile_float_serve_status(serve_port)
-    status["message"] = (
-        f"Mobile Float available at {status.get('url')}"
-        if status.get("url")
-        else "Mobile Float Serve started."
-    )
-    return status
-
-
-@router.post("/sync/mobile-serve/stop")
-async def mobile_float_serve_stop(payload: MobileFloatServePayload):
-    serve_port = _mobile_float_serve_port(payload.serve_port)
-    try:
-        result = _run_tailscale(["serve", f"--http={serve_port}", "off"], timeout=20)
-    except FileNotFoundError:
-        raise HTTPException(
-            status_code=409, detail="Tailscale is not installed or not on PATH."
-        )
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=504, detail="Tailscale Serve stop timed out.")
-    except Exception as exc:
-        logger.debug("Failed to stop Tailscale Serve for Mobile Float", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(exc))
-    if result.returncode != 0:
-        detail = _tailscale_command_error("serve stop", result)
-        if "no serve config" not in detail.lower():
-            raise HTTPException(status_code=500, detail=detail)
-    status = _mobile_float_serve_status(serve_port)
-    status["message"] = "Mobile Float Serve stopped."
-    return status
-
-
-@router.get("/sync/overview")
-async def sync_overview(request: Request):
-    service = _sync_service()
-    settings = user_settings.load_settings()
-    identity = service.current_instance_identity(
-        source_namespace=settings.get("sync_source_namespace"),
-    )
-    workspace_state = _workspace_state_summary(settings)
-    access = advertised_device_access(request)
-    saved_peers = _load_saved_peers()
-    display_name = str(settings.get("device_display_name") or "").strip()
-    inbound_devices = [
-        _summarize_inbound_device(str(device_id), record)
-        for device_id, record in (list_devices() or {}).items()
-        if isinstance(record, dict)
-    ]
-    inbound_devices.sort(
-        key=lambda item: (
-            float(item.get("last_seen") or 0),
-            float(item.get("created_at") or 0),
-        ),
-        reverse=True,
-    )
-    trusted_devices = [
-        item for item in inbound_devices if not item.get("legacy_browser_record")
-    ]
-    legacy_inbound_devices = [
-        item for item in inbound_devices if item.get("legacy_browser_record")
-    ]
-    sync_reviews = _sync_reviews_snapshot(pending_limit=12, recent_limit=8)
-    sync_operations = _sync_operations_overview()
-    return {
-        "current_device": {
-            "display_name": display_name or identity.get("hostname") or "This device",
-            "hostname": identity.get("hostname"),
-            "public_key": _get_or_create_device_public_key(),
-            "source_namespace": identity.get("source_namespace"),
-            "link_to_source_default": bool(identity.get("link_to_source_default")),
-        },
-        "device_access": access,
-        "sync_defaults": {
-            "remote_url": str(settings.get("sync_remote_url") or "").strip(),
-            "visible_on_lan": bool(settings.get("sync_visible_on_lan")),
-            "visible_online": bool(settings.get("sync_visible_online")),
-            "online_url": str(settings.get("sync_online_url") or "").strip(),
-            "auto_accept_push": bool(settings.get("sync_auto_accept_push")),
-            "link_to_source": bool(settings.get("sync_link_to_source_device")),
-            "source_namespace": str(
-                settings.get("sync_source_namespace") or ""
-            ).strip(),
-            "saved_peers": saved_peers,
-        },
-        "egress_summary": _sync_ownership_summary(
-            settings, access, saved_peers, sync_operations
-        ),
-        "sync_operations": sync_operations,
-        "sync_suggestions": _sync_overview_suggestions(
-            access=access,
-            saved_peers=saved_peers,
-            operations=sync_operations,
-            sync_reviews=sync_reviews,
-        ),
-        "workspaces": workspace_state,
-        "inbound_devices": trusted_devices,
-        "legacy_inbound_devices": legacy_inbound_devices,
-        "sync_reviews": {
-            "pending": sync_reviews["pending"],
-            "recent": sync_reviews["recent"],
-        },
-        "device_counts": {
-            "paired": len(saved_peers),
-            "trusted": len(trusted_devices),
-            "legacy": len(legacy_inbound_devices),
-            "pending_push_reviews": sync_reviews["counts"]["pending"],
-        },
-    }
-
-
-@router.post("/sync/operations/{operation_id}/cancel")
-async def sync_operation_cancel(operation_id: str):
-    try:
-        operation = sync_cancel_operation(operation_id)
-    except Exception as exc:
-        logger.debug("Failed to mark sync operation cancellation", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Unable to record sync cancellation: {exc}",
-        )
-    return {"status": "cancel_requested", "operation": operation}
-
-
-@router.post("/sync/manifest")
-async def sync_manifest(request: Request, payload: SyncSectionRequest):
-    _require_scope(request, "sync")
-    service = _sync_service()
-    manifest = service.build_manifest(
-        payload.sections, workspace_ids=payload.workspace_ids
-    )
-    manifest["instance"]["labels"] = SYNC_SECTION_LABELS
-    return manifest
-
-
-@router.post("/sync/export")
-async def sync_export(request: Request, payload: SyncSectionRequest):
-    _require_scope(request, "sync")
-    service = _sync_service()
-    snapshot = service.build_snapshot(
-        payload.sections, workspace_ids=payload.workspace_ids
-    )
-    snapshot["labels"] = SYNC_SECTION_LABELS
-    return snapshot
-
-
-@router.post("/sync/ingest")
-async def sync_ingest(request: Request, payload: SyncIngestRequest):
-    claims = _require_scope(request, "sync")
-    service = _sync_service()
-    sections = service.normalize_sections(
-        list((payload.snapshot.get("sections") or {}).keys())
-    )
-    settings = user_settings.load_settings()
-    auto_accept = bool(settings.get("sync_auto_accept_push"))
-    remote_instance = (
-        payload.snapshot.get("instance")
-        if isinstance(payload.snapshot.get("instance"), dict)
-        else {}
-    )
-    source_label = (
-        remote_instance.get("display_name")
-        or remote_instance.get("hostname")
-        or remote_instance.get("source_namespace")
-        or payload.source_label
-        or payload.source_namespace
-        or "remote device"
-    )
-    if not auto_accept:
-        review = create_sync_review(
-            {
-                "device_id": str(claims.get("sub") or "").strip(),
-                "device_name": str(
-                    remote_instance.get("display_name")
-                    or payload.source_label
-                    or source_label
-                ).strip(),
-                "source_label": source_label,
-                "link_to_source": bool(payload.link_to_source),
-                "source_namespace": str(payload.source_namespace or "").strip(),
-                "target_namespace": str(payload.target_namespace or "").strip(),
-                "requested_sections": sections,
-                "snapshot": payload.snapshot,
-            }
-        )
-        return {
-            "status": "pending_review",
-            "review_request_id": review["id"],
-            "source_label": source_label,
-            "requested_sections": sections,
-        }
-    return await _apply_sync_ingest(service, request, payload)
-
-
-class SyncReviewDecisionPayload(BaseModel):
-    note: Optional[str] = None
-
-
-@router.post("/sync/reviews/{review_id}/approve")
-async def sync_review_approve(
-    review_id: str, request: Request, payload: SyncReviewDecisionPayload
-):
-    review = get_sync_review(review_id)
-    if review is None:
-        raise HTTPException(status_code=404, detail="Sync review request not found")
-    if str(review.get("status") or "").strip().lower() != "pending":
-        raise HTTPException(
-            status_code=409, detail="Sync review request is no longer pending"
-        )
-    sync_payload = SyncIngestRequest(
-        snapshot=dict(review.get("snapshot") or {}),
-        link_to_source=bool(review.get("link_to_source")),
-        source_namespace=str(review.get("source_namespace") or "").strip() or None,
-        source_label=str(review.get("source_label") or "").strip() or None,
-        target_namespace=str(review.get("target_namespace") or "").strip() or None,
-    )
-    result = await _apply_sync_ingest(_sync_service(), request, sync_payload)
-    updated = update_sync_review(
-        review_id,
-        {
-            "status": "approved",
-            "decision": "approved",
-            "note": str(payload.note or "").strip(),
-            "reviewed_at": time.time(),
-            "effective_namespace": str(result.get("effective_namespace") or "").strip(),
-        },
-    )
-    return {
-        "status": "approved",
-        "review": _sync_review_summary(updated or review),
-        "result": result,
-    }
-
-
-@router.post("/sync/reviews/{review_id}/reject")
-async def sync_review_reject(review_id: str, payload: SyncReviewDecisionPayload):
-    review = get_sync_review(review_id)
-    if review is None:
-        raise HTTPException(status_code=404, detail="Sync review request not found")
-    if str(review.get("status") or "").strip().lower() != "pending":
-        raise HTTPException(
-            status_code=409, detail="Sync review request is no longer pending"
-        )
-    updated = update_sync_review(
-        review_id,
-        {
-            "status": "rejected",
-            "decision": "rejected",
-            "note": str(payload.note or "").strip(),
-            "reviewed_at": time.time(),
-        },
-    )
-    return {"status": "rejected", "review": _sync_review_summary(updated or review)}
-
-
-@router.post("/sync/plan")
-async def sync_plan(payload: SyncPlanRequest):
-    service = _sync_service()
-    operation = _begin_sync_operation(
-        kind="preview",
-        remote_url=payload.remote_url,
-        operation_id=payload.operation_id,
-        operation_owner=payload.operation_owner,
-        paired_device=payload.paired_device,
-        sections=service.normalize_sections(payload.sections),
-        workspace_mode=payload.workspace_mode,
-        metadata={
-            "local_workspace_ids": payload.local_workspace_ids or [],
-            "remote_workspace_ids": payload.remote_workspace_ids or [],
-        },
-    )
-    try:
-        settings = user_settings.load_settings()
-        local_workspace_state = _workspace_state_summary(settings)
-        local_profiles = local_workspace_state["profiles"]
-        pairing = _coerce_saved_peer(payload.paired_device or {})
-        local_workspace_ids = normalize_workspace_ids(
-            payload.local_workspace_ids, local_profiles
-        ) or list(
-            (pairing or {}).get("local_workspace_ids")
-            or local_workspace_state["selected_workspace_ids"]
-        )
-        (
-            local_workspace_ids,
-            ignored_local_workspace_ids,
-        ) = _filter_recursive_workspace_ids(
-            local_profiles, local_workspace_ids, pairing
-        )
-        local_sync_filter = filter_workspace_ids_for_sync(
-            local_workspace_ids, local_profiles
-        )
-        local_workspace_ids = list(local_sync_filter["workspace_ids"])
-        privacy_ignored_local_workspace_ids = list(
-            local_sync_filter["privacy_ignored_workspace_ids"]
-        )
-        if not local_workspace_ids:
-            raise HTTPException(
-                status_code=400,
-                detail=_ignored_local_workspace_detail(
-                    ignored_local_workspace_ids, privacy_ignored_local_workspace_ids
-                ),
-            )
-        remote = RemoteFloatClient(
-            payload.remote_url,
-            paired_device=pairing,
-            device_name=str(settings.get("device_display_name") or "").strip()
-            or socket.gethostname(),
-        )
-        remote_overview = remote.get_sync_overview()
-        identity_status = _annotate_peer_identity_from_overview(
-            remote_overview,
-            pairing,
-            strict=True,
-        )
-        remote_workspace_state = (
-            remote_overview.get("workspaces")
-            if isinstance(remote_overview.get("workspaces"), dict)
-            else _workspace_state_summary({})
-        )
-        remote_profiles = (
-            remote_workspace_state.get("profiles")
-            if isinstance(remote_workspace_state.get("profiles"), list)
-            else []
-        )
-        remote_workspace_ids = normalize_workspace_ids(
-            payload.remote_workspace_ids
-            or (pairing or {}).get("remote_workspace_ids")
-            or remote_workspace_state.get("selected_workspace_ids")
-            or [
-                remote_workspace_state.get("active_workspace_id")
-                or DEFAULT_WORKSPACE_ID
-            ],
-            remote_profiles,
-        ) or [remote_workspace_state.get("active_workspace_id") or DEFAULT_WORKSPACE_ID]
-        remote_sync_filter = filter_workspace_ids_for_sync(
-            remote_workspace_ids, remote_profiles
-        )
-        remote_workspace_ids = list(remote_sync_filter["workspace_ids"])
-        privacy_ignored_remote_workspace_ids = list(
-            remote_sync_filter["privacy_ignored_workspace_ids"]
-        )
-        if not remote_workspace_ids:
-            raise HTTPException(
-                status_code=400,
-                detail="All selected remote workspaces were ignored by workspace privacy settings.",
-            )
-        workspace_mode = _normalize_workspace_mode(
-            payload.workspace_mode or (pairing or {}).get("workspace_mode")
-        )
-        local_target_workspace_id = (
-            str(
-                payload.local_target_workspace_id
-                or (pairing or {}).get("local_target_workspace_id")
-                or local_workspace_state["active_workspace_id"]
-            ).strip()
-            or local_workspace_state["active_workspace_id"]
-        )
-        remote_target_workspace_id = (
-            str(
-                payload.remote_target_workspace_id
-                or (pairing or {}).get("remote_target_workspace_id")
-                or remote_workspace_state.get("active_workspace_id")
-                or DEFAULT_WORKSPACE_ID
-            ).strip()
-            or DEFAULT_WORKSPACE_ID
-        )
-        if workspace_mode == "import" and (
-            len(remote_workspace_ids) != 1 or len(local_workspace_ids) != 1
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="Import mode currently supports one source workspace per side.",
-            )
-        local_manifest = service.build_manifest(
-            payload.sections, workspace_ids=local_workspace_ids
-        )
-        local_manifest["instance"] = service.current_instance_identity(
-            source_namespace=payload.source_namespace,
-        )
-        remote_manifest = remote.get_manifest(
-            service.normalize_sections(payload.sections),
-            workspace_ids=remote_workspace_ids,
-        )
-        local_instance = (
-            local_manifest.get("instance")
-            if isinstance(local_manifest.get("instance"), dict)
-            else {}
-        )
-        remote_instance = (
-            remote_manifest.get("instance")
-            if isinstance(remote_manifest.get("instance"), dict)
-            else {}
-        )
-        local_target_workspace = _workspace_profile_from_state(
-            local_workspace_state, local_target_workspace_id
-        )
-        remote_target_workspace = _workspace_profile_from_state(
-            remote_workspace_state, remote_target_workspace_id
-        )
-        local_source_workspace = _workspace_profile_from_state(
-            local_workspace_state,
-            local_workspace_ids[0] if local_workspace_ids else DEFAULT_WORKSPACE_ID,
-        )
-        remote_source_workspace = _workspace_profile_from_state(
-            remote_workspace_state,
-            remote_workspace_ids[0] if remote_workspace_ids else DEFAULT_WORKSPACE_ID,
-        )
-        pull_namespace = _workspace_target_namespace(
-            mode=workspace_mode,
-            target_profile=local_target_workspace,
-            source_device_name=remote_instance.get("display_name")
-            or remote_instance.get("hostname"),
-            source_workspace_profile=remote_source_workspace,
-        ) or service.resolve_source_namespace(
-            link_to_source=payload.link_to_source,
-            source_namespace=remote_instance.get("source_namespace"),
-            source_label=remote_instance.get("display_name")
-            or remote_instance.get("hostname"),
-        )
-        push_namespace = _workspace_target_namespace(
-            mode=workspace_mode,
-            target_profile=remote_target_workspace,
-            source_device_name=local_instance.get("display_name")
-            or local_instance.get("hostname"),
-            source_workspace_profile=local_source_workspace,
-        ) or service.resolve_source_namespace(
-            link_to_source=payload.link_to_source,
-            source_namespace=local_instance.get("source_namespace"),
-            source_label=local_instance.get("display_name")
-            or local_instance.get("hostname"),
-        )
-        pull_manifest = (
-            service.namespace_manifest(remote_manifest, namespace=pull_namespace)
-            if pull_namespace
-            else remote_manifest
-        )
-        push_manifest = (
-            service.namespace_manifest(local_manifest, namespace=push_namespace)
-            if push_namespace
-            else local_manifest
-        )
-        pull_comparison = service.compare_manifests(
-            local_manifest,
-            pull_manifest,
-            payload.sections,
-        )
-        push_comparison = service.compare_manifests(
-            push_manifest,
-            remote_manifest,
-            payload.sections,
-        )
-        pair_state = remote.get_pairing_state()
-        if pairing is not None:
-            pair_state.update(
-                {
-                    "remote_url": remote.instance_base,
-                    "remote_public_key": (
-                        (identity_status.get("identity") or {}).get("public_key")
-                        or pairing.get("remote_public_key")
-                        or ""
-                    ),
-                    "local_workspace_ids": local_workspace_ids,
-                    "remote_workspace_ids": remote_workspace_ids,
-                    "workspace_mode": workspace_mode,
-                    "local_target_workspace_id": local_target_workspace_id,
-                    "remote_target_workspace_id": remote_target_workspace_id,
-                }
-            )
-        persisted_pair = _persist_saved_peer_state(
-            pair_state,
-            remote_label=remote_instance.get("display_name")
-            or remote_instance.get("hostname"),
-        )
-        response_payload = {
-            "link_to_source": payload.link_to_source,
-            "workspace_mode": workspace_mode,
-            "local": local_instance,
-            "remote": {
-                **remote_instance,
-                "base_url": remote.instance_base,
-            },
-            "paired_device": persisted_pair or pair_state,
-            "effective_namespaces": {
-                "pull": pull_namespace or None,
-                "push": push_namespace or None,
-            },
-            "workspaces": {
-                "local": {
-                    **local_workspace_state,
-                    "selected_workspace_ids": local_workspace_ids,
-                    "target_workspace_id": local_target_workspace_id,
-                    "ignored_workspace_ids": ignored_local_workspace_ids,
-                    "privacy_ignored_workspace_ids": privacy_ignored_local_workspace_ids,
-                },
-                "remote": {
-                    **remote_workspace_state,
-                    "selected_workspace_ids": remote_workspace_ids,
-                    "target_workspace_id": remote_target_workspace_id,
-                    "privacy_ignored_workspace_ids": privacy_ignored_remote_workspace_ids,
-                },
-            },
-            "sections": pull_comparison,
-            "pull_sections": pull_comparison,
-            "push_sections": push_comparison,
-        }
-        _finish_sync_operation(
-            operation,
-            status="completed",
-            result={
-                "workspace_mode": workspace_mode,
-                "pull_sections": len(pull_comparison),
-                "push_sections": len(push_comparison),
-            },
-        )
-        return response_payload
-    except HTTPException as exc:
-        _finish_sync_operation(operation, status="failed", error=str(exc.detail))
-        raise
-    except requests.RequestException as exc:
-        _finish_sync_operation(operation, status="failed", error=str(exc))
-        _log_remote_sync_failure(
-            "sync_plan",
-            remote_url=payload.remote_url,
-            paired_device=payload.paired_device,
-            context={
-                "sections": service.normalize_sections(payload.sections),
-                "workspace_mode": payload.workspace_mode,
-                "local_workspace_ids": payload.local_workspace_ids or [],
-                "remote_workspace_ids": payload.remote_workspace_ids or [],
-                "local_target_workspace_id": payload.local_target_workspace_id or "",
-                "remote_target_workspace_id": payload.remote_target_workspace_id or "",
-            },
-            exc=exc,
-        )
-        raise HTTPException(status_code=502, detail=f"Remote sync probe failed: {exc}")
-    except ValueError as exc:
-        _finish_sync_operation(operation, status="failed", error=str(exc))
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-@router.post("/sync/apply")
-async def sync_apply(request: Request, payload: SyncApplyRequest):
-    service = _sync_service()
-    sections = service.normalize_sections(payload.sections)
-    item_selections = service.normalize_item_selections(
-        sections, payload.item_selections
-    )
-    operation = _begin_sync_operation(
-        kind=payload.direction,
-        remote_url=payload.remote_url,
-        operation_id=payload.operation_id,
-        operation_owner=payload.operation_owner,
-        paired_device=payload.paired_device,
-        sections=sections,
-        workspace_mode=payload.workspace_mode,
-        metadata={"item_selection_sections": sorted(item_selections.keys())},
-    )
-    try:
-        settings = user_settings.load_settings()
-        local_workspace_state = _workspace_state_summary(settings)
-        local_profiles = local_workspace_state["profiles"]
-        pairing = _coerce_saved_peer(payload.paired_device or {})
-        local_workspace_ids = normalize_workspace_ids(
-            payload.local_workspace_ids, local_profiles
-        ) or list(
-            (pairing or {}).get("local_workspace_ids")
-            or local_workspace_state["selected_workspace_ids"]
-        )
-        (
-            local_workspace_ids,
-            ignored_local_workspace_ids,
-        ) = _filter_recursive_workspace_ids(
-            local_profiles, local_workspace_ids, pairing
-        )
-        local_sync_filter = filter_workspace_ids_for_sync(
-            local_workspace_ids, local_profiles
-        )
-        local_workspace_ids = list(local_sync_filter["workspace_ids"])
-        privacy_ignored_local_workspace_ids = list(
-            local_sync_filter["privacy_ignored_workspace_ids"]
-        )
-        if not local_workspace_ids:
-            raise HTTPException(
-                status_code=400,
-                detail=_ignored_local_workspace_detail(
-                    ignored_local_workspace_ids, privacy_ignored_local_workspace_ids
-                ),
-            )
-        remote = RemoteFloatClient(
-            payload.remote_url,
-            paired_device=pairing,
-            device_name=str(settings.get("device_display_name") or "").strip()
-            or socket.gethostname(),
-        )
-        remote_overview = remote.get_sync_overview()
-        identity_status = _annotate_peer_identity_from_overview(
-            remote_overview,
-            pairing,
-            strict=True,
-        )
-        remote_workspace_state = (
-            remote_overview.get("workspaces")
-            if isinstance(remote_overview.get("workspaces"), dict)
-            else _workspace_state_summary({})
-        )
-        remote_profiles = (
-            remote_workspace_state.get("profiles")
-            if isinstance(remote_workspace_state.get("profiles"), list)
-            else []
-        )
-        remote_workspace_ids = normalize_workspace_ids(
-            payload.remote_workspace_ids
-            or (pairing or {}).get("remote_workspace_ids")
-            or remote_workspace_state.get("selected_workspace_ids")
-            or [
-                remote_workspace_state.get("active_workspace_id")
-                or DEFAULT_WORKSPACE_ID
-            ],
-            remote_profiles,
-        ) or [remote_workspace_state.get("active_workspace_id") or DEFAULT_WORKSPACE_ID]
-        remote_sync_filter = filter_workspace_ids_for_sync(
-            remote_workspace_ids, remote_profiles
-        )
-        remote_workspace_ids = list(remote_sync_filter["workspace_ids"])
-        privacy_ignored_remote_workspace_ids = list(
-            remote_sync_filter["privacy_ignored_workspace_ids"]
-        )
-        if not remote_workspace_ids:
-            raise HTTPException(
-                status_code=400,
-                detail="All selected remote workspaces were ignored by workspace privacy settings.",
-            )
-        workspace_mode = _normalize_workspace_mode(
-            payload.workspace_mode or (pairing or {}).get("workspace_mode")
-        )
-        local_target_workspace_id = (
-            str(
-                payload.local_target_workspace_id
-                or (pairing or {}).get("local_target_workspace_id")
-                or local_workspace_state["active_workspace_id"]
-            ).strip()
-            or local_workspace_state["active_workspace_id"]
-        )
-        remote_target_workspace_id = (
-            str(
-                payload.remote_target_workspace_id
-                or (pairing or {}).get("remote_target_workspace_id")
-                or remote_workspace_state.get("active_workspace_id")
-                or DEFAULT_WORKSPACE_ID
-            ).strip()
-            or DEFAULT_WORKSPACE_ID
-        )
-        if workspace_mode == "import" and (
-            len(remote_workspace_ids) != 1 or len(local_workspace_ids) != 1
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="Import mode currently supports one source workspace per side.",
-            )
-        local_identity = service.current_instance_identity(
-            source_namespace=payload.source_namespace,
-        )
-        local_target_workspace = _workspace_profile_from_state(
-            local_workspace_state, local_target_workspace_id
-        )
-        remote_target_workspace = _workspace_profile_from_state(
-            remote_workspace_state, remote_target_workspace_id
-        )
-        local_source_workspace = _workspace_profile_from_state(
-            local_workspace_state,
-            local_workspace_ids[0] if local_workspace_ids else DEFAULT_WORKSPACE_ID,
-        )
-        remote_source_workspace = _workspace_profile_from_state(
-            remote_workspace_state,
-            remote_workspace_ids[0] if remote_workspace_ids else DEFAULT_WORKSPACE_ID,
-        )
-        push_target_namespace = _workspace_target_namespace(
-            mode=workspace_mode,
-            target_profile=remote_target_workspace,
-            source_device_name=local_identity.get("display_name")
-            or local_identity.get("hostname"),
-            source_workspace_profile=local_source_workspace,
-        )
-        if payload.direction == "push":
-            snapshot = service.build_snapshot(
-                sections, workspace_ids=local_workspace_ids
-            )
-            snapshot = service.filter_snapshot_by_item_selections(
-                snapshot, item_selections
-            )
-            snapshot["instance"] = local_identity
-            remote_result = remote.ingest_snapshot(
-                snapshot,
-                link_to_source=payload.link_to_source or workspace_mode == "import",
-                source_namespace=local_identity.get("source_namespace"),
-                source_label=local_identity.get("display_name")
-                or local_identity.get("hostname"),
-                target_namespace=push_target_namespace or None,
-            )
-            pair_state = remote.get_pairing_state()
-            if pairing is not None:
-                pair_state.update(
-                    {
-                        "remote_url": remote.instance_base,
-                        "remote_public_key": (
-                            (identity_status.get("identity") or {}).get("public_key")
-                            or pairing.get("remote_public_key")
-                            or ""
-                        ),
-                        "local_workspace_ids": local_workspace_ids,
-                        "remote_workspace_ids": remote_workspace_ids,
-                        "workspace_mode": workspace_mode,
-                        "local_target_workspace_id": local_target_workspace_id,
-                        "remote_target_workspace_id": remote_target_workspace_id,
-                    }
-                )
-            persisted_pair = _persist_saved_peer_state(
-                pair_state,
-                remote_label=remote_result.get("source_label"),
-            )
-            response_payload = {
-                "direction": "push",
-                "sections": sections,
-                "remote": remote.instance_base,
-                "paired_device": persisted_pair or pair_state,
-                "ignored_local_workspace_ids": ignored_local_workspace_ids,
-                "privacy_ignored_local_workspace_ids": privacy_ignored_local_workspace_ids,
-                "privacy_ignored_remote_workspace_ids": privacy_ignored_remote_workspace_ids,
-                "workspace_mode": workspace_mode,
-                "effective_namespace": remote_result.get("effective_namespace"),
-                "item_selections": item_selections,
-                "result": remote_result,
-            }
-            _finish_sync_operation(
-                operation,
-                status="completed",
-                result={
-                    "direction": "push",
-                    "remote": remote.instance_base,
-                    "workspace_mode": workspace_mode,
-                    "remote_status": str(remote_result.get("status") or "").strip(),
-                },
-            )
-            return response_payload
-        before_snapshot = (
-            service.build_snapshot(sections, workspace_ids=local_workspace_ids)
-            if sections
-            else None
-        )
-        snapshot = remote.export_snapshot(sections, workspace_ids=remote_workspace_ids)
-        snapshot = service.filter_snapshot_by_item_selections(snapshot, item_selections)
-        remote_identity = (
-            snapshot.get("instance")
-            if isinstance(snapshot.get("instance"), dict)
-            else {}
-        )
-        pull_target_namespace = _workspace_target_namespace(
-            mode=workspace_mode,
-            target_profile=local_target_workspace,
-            source_device_name=remote_identity.get("display_name")
-            or remote_identity.get("hostname"),
-            source_workspace_profile=remote_source_workspace,
-        )
-        pair_state = remote.get_pairing_state()
-        if pairing is not None:
-            pair_state.update(
-                {
-                    "remote_url": remote.instance_base,
-                    "remote_public_key": (
-                        (identity_status.get("identity") or {}).get("public_key")
-                        or pairing.get("remote_public_key")
-                        or ""
-                    ),
-                    "local_workspace_ids": local_workspace_ids,
-                    "remote_workspace_ids": remote_workspace_ids,
-                    "workspace_mode": workspace_mode,
-                    "local_target_workspace_id": local_target_workspace_id,
-                    "remote_target_workspace_id": remote_target_workspace_id,
-                }
-            )
-        persisted_pair = _persist_saved_peer_state(
-            pair_state,
-            remote_label=remote_identity.get("display_name")
-            or remote_identity.get("hostname"),
-        )
-        local_result = service.merge_snapshot(
-            snapshot,
-            link_to_source=payload.link_to_source or workspace_mode == "import",
-            source_namespace=remote_identity.get("source_namespace"),
-            source_label=remote_identity.get("display_name")
-            or remote_identity.get("hostname"),
-            target_namespace=pull_target_namespace or None,
-        )
-        if _sync_section_applied((local_result.get("sections") or {}).get("memories")):
-            _reload_memory_manager_from_store(request)
-        await _refresh_sync_result_indexes(local_result)
-        if (
-            workspace_mode == "import"
-            and len(remote_workspace_ids) == 1
-            and persisted_pair is not None
-        ):
-            imported_profile = build_synced_workspace_profile(
-                parent_profile=local_target_workspace,
-                source_peer_id=str(persisted_pair.get("id") or "").strip(),
-                source_device_name=str(
-                    remote_identity.get("display_name")
-                    or remote_identity.get("hostname")
-                    or "Remote"
-                ).strip(),
-                source_workspace_id=str(
-                    remote_source_workspace.get("id") if remote_source_workspace else ""
-                ).strip(),
-                source_workspace_name=str(
-                    remote_source_workspace.get("name")
-                    if remote_source_workspace
-                    else ""
-                ).strip(),
-                source_workspace_slug=str(
-                    remote_source_workspace.get("slug")
-                    if remote_source_workspace
-                    else ""
-                ).strip(),
-            )
-            _upsert_workspace_profile(imported_profile)
-        after_snapshot = (
-            service.build_snapshot(sections, workspace_ids=local_workspace_ids)
-            if sections
-            else None
-        )
-        sync_record_changes(
-            [
-                {
-                    "type": "sync_apply",
-                    "direction": "pull",
-                    "remote": remote.instance_base,
-                    "sections": sections,
-                    "applied_at": local_result.get("applied_at"),
-                }
-            ]
-        )
-        _record_sync_action(
-            request,
-            name="sync_pull",
-            summary=f"Sync pull from {remote.instance_base}",
-            before_snapshot=before_snapshot,
-            after_snapshot=after_snapshot,
-            sections=sections,
-            args={
-                "remote_url": payload.remote_url,
-                "direction": payload.direction,
-                "sections": sections,
-                "link_to_source": payload.link_to_source,
-                "source_namespace": payload.source_namespace,
-                "workspace_mode": workspace_mode,
-                "local_workspace_ids": local_workspace_ids,
-                "remote_workspace_ids": remote_workspace_ids,
-                "item_selections": item_selections,
-            },
-            result=local_result,
-            batch_scope={
-                "scope": "sync_pull",
-                "remote": remote.instance_base,
-                "sections": sections,
-            },
-        )
-        response_payload = {
-            "direction": "pull",
-            "sections": sections,
-            "remote": remote.instance_base,
-            "paired_device": persisted_pair or pair_state,
-            "ignored_local_workspace_ids": ignored_local_workspace_ids,
-            "privacy_ignored_local_workspace_ids": privacy_ignored_local_workspace_ids,
-            "privacy_ignored_remote_workspace_ids": privacy_ignored_remote_workspace_ids,
-            "workspace_mode": workspace_mode,
-            "effective_namespace": local_result.get("effective_namespace"),
-            "item_selections": item_selections,
-            "result": local_result,
-        }
-        retired_pushes = _retire_pending_pushes_after_pull(
-            operation,
-            remote_url=remote.instance_base,
-        )
-        response_payload["superseded_pending_pushes"] = retired_pushes
-        _finish_sync_operation(
-            operation,
-            status="completed",
-            result={
-                "direction": "pull",
-                "remote": remote.instance_base,
-                "workspace_mode": workspace_mode,
-                "superseded_pending_pushes": retired_pushes.get("count", 0),
-                "superseded_pending_push_ids": retired_pushes.get("operation_ids", []),
-            },
-        )
-        return response_payload
-    except HTTPException as exc:
-        _finish_sync_operation(operation, status="failed", error=str(exc.detail))
-        raise
-    except requests.RequestException as exc:
-        _finish_sync_operation(operation, status="failed", error=str(exc))
-        _log_remote_sync_failure(
-            f"sync_apply_{payload.direction}",
-            remote_url=payload.remote_url,
-            paired_device=payload.paired_device,
-            context={
-                "direction": payload.direction,
-                "sections": sections,
-                "item_selections": item_selections,
-                "workspace_mode": payload.workspace_mode,
-                "local_workspace_ids": payload.local_workspace_ids or [],
-                "remote_workspace_ids": payload.remote_workspace_ids or [],
-                "local_target_workspace_id": payload.local_target_workspace_id or "",
-                "remote_target_workspace_id": payload.remote_target_workspace_id or "",
-            },
-            exc=exc,
-        )
-        raise HTTPException(status_code=502, detail=f"Remote sync failed: {exc}")
-    except ValueError as exc:
-        _finish_sync_operation(operation, status="failed", error=str(exc))
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-# ---------------------------------------------------------------------------
-# Legacy sync endpoints (cursor + changes + minimal blob up/download)
-
-
-@router.get("/sync/cursor")
-async def sync_cursor(request: Request):
-    _require_scope(request, "sync")
-    return {"cursor": sync_get_cursor(), "capabilities": {"blobs": True}}
-
-
-class SyncChangesRequest(BaseModel):
-    cursor: Optional[str] = None
-
-
-@router.post("/sync/changes")
-async def sync_changes(request: Request, payload: SyncChangesRequest):
-    _require_scope(request, "sync")
-    changes, next_cursor = sync_get_changes_since(payload.cursor or "0")
-    return {"changes": changes, "next_cursor": next_cursor}
-
-
-class SyncUploadPayload(BaseModel):
-    # base64 or utf-8 text for minimal Phase 1; clients can send raw bytes via
-    # /download later
-    content: str
-
-
-@router.post("/sync/upload")
-async def sync_upload(request: Request, payload: SyncUploadPayload):
-    _require_scope(request, "sync")
-    data = payload.content.encode("utf-8")
-    content_hash = put_blob(data)
-    # record a change for clients to discover new blob
-    sync_record_changes(
-        [{"type": "blob", "content_hash": content_hash, "size": len(data)}]
-    )
-    return {"content_hash": content_hash}
-
-
-@router.get("/sync/download/{content_hash}")
-async def sync_download(request: Request, content_hash: str):
-    _require_scope(request, "sync")
-    if not blob_exists(content_hash):
-        raise HTTPException(status_code=404, detail="Blob not found")
-    data = get_blob(content_hash)
-    return {
-        "content": data.decode("utf-8", errors="ignore"),
-        "content_hash": content_hash,
-    }
-
-
 # ---------------------------------------------------------------------------
 # Streaming/signaling (server-mediated) minimal in-memory broker
+
+
+device_sync_routes.configure_device_sync_runtime(
+    device_sync_routes.DeviceSyncRuntime(
+        current_request_id=_current_request_id,
+        get_or_create_device_public_key=_get_or_create_device_public_key,
+        is_local_control_request=_is_local_control_request,
+        local_control_or_device_claims=_local_control_or_device_claims,
+        optional_device_claims=_optional_device_claims,
+        record_sync_action=_record_sync_action,
+        require_local_control=_require_local_control,
+        require_scope=_require_scope,
+        knowledge_rag_rehydrate=lambda payload: knowledge_rag_rehydrate(payload),
+        knowledge_rag_payload_factory=lambda: KnowledgeRagRehydrate(),
+        attachments_rag_rehydrate=lambda payload: attachments_rag_rehydrate(payload),
+        attachments_rag_payload_factory=lambda content_hashes: AttachmentsRagRehydrate(
+            content_hashes=content_hashes
+        ),
+        calendar_rag_rehydrate=calendar_rag_rehydrate,
+        calendar_rag_payload_factory=CalendarRagRehydrate,
+    )
+)
+router.include_router(device_sync_routes.router)
+
+# Compatibility aliases while callers migrate to ``app.routers.device_sync``.
+DeviceRegisterPayload = device_sync_routes.DeviceRegisterPayload
+SYNC_DEVICE_SCOPE_ORDER = device_sync_routes.SYNC_DEVICE_SCOPE_ORDER
+_normalize_sync_scopes = device_sync_routes._normalize_sync_scopes
+_registered_device_scopes = device_sync_routes._registered_device_scopes
+_coerce_saved_peer = device_sync_routes._coerce_saved_peer
+_load_saved_peers = device_sync_routes._load_saved_peers
+_sync_ownership_summary = device_sync_routes._sync_ownership_summary
+_sync_operation_remote_label = device_sync_routes._sync_operation_remote_label
+_begin_sync_operation = device_sync_routes._begin_sync_operation
+_finish_sync_operation = device_sync_routes._finish_sync_operation
+_retire_pending_pushes_after_pull = device_sync_routes._retire_pending_pushes_after_pull
+_sync_operations_overview = device_sync_routes._sync_operations_overview
+_sync_suggestion_explanation = device_sync_routes._sync_suggestion_explanation
+_sync_suggestion = device_sync_routes._sync_suggestion
+_sync_saved_peer_ready = device_sync_routes._sync_saved_peer_ready
+_sync_saved_peer_requirements = device_sync_routes._sync_saved_peer_requirements
+_sync_overview_suggestions = device_sync_routes._sync_overview_suggestions
+_workspace_state_summary = device_sync_routes._workspace_state_summary
+_workspace_profile_from_state = device_sync_routes._workspace_profile_from_state
+_workspace_namespace_prefix = device_sync_routes._workspace_namespace_prefix
+_workspace_join_namespace = device_sync_routes._workspace_join_namespace
+_workspace_target_namespace = device_sync_routes._workspace_target_namespace
+_filter_recursive_workspace_ids = device_sync_routes._filter_recursive_workspace_ids
+_ignored_local_workspace_detail = device_sync_routes._ignored_local_workspace_detail
+_normalize_workspace_mode = device_sync_routes._normalize_workspace_mode
+_upsert_workspace_profile = device_sync_routes._upsert_workspace_profile
+_persist_saved_peer_state = device_sync_routes._persist_saved_peer_state
+_remove_saved_peer_state = device_sync_routes._remove_saved_peer_state
+_candidate_urls_for_request = device_sync_routes._candidate_urls_for_request
+_looks_like_legacy_browser_name = device_sync_routes._looks_like_legacy_browser_name
+_summarize_inbound_device = device_sync_routes._summarize_inbound_device
+_sync_review_summary = device_sync_routes._sync_review_summary
+_sync_reviews_snapshot = device_sync_routes._sync_reviews_snapshot
+_peer_connectivity_status = device_sync_routes._peer_connectivity_status
+_remote_identity_from_overview = device_sync_routes._remote_identity_from_overview
+_annotate_peer_identity = device_sync_routes._annotate_peer_identity
+_annotate_peer_identity_from_overview = (
+    device_sync_routes._annotate_peer_identity_from_overview
+)
+_log_remote_sync_failure = device_sync_routes._log_remote_sync_failure
+devices_register = device_sync_routes.devices_register
+DeviceTokenRequest = device_sync_routes.DeviceTokenRequest
+devices_token = device_sync_routes.devices_token
+devices_list = device_sync_routes.devices_list
+DeviceUpdatePayload = device_sync_routes.DeviceUpdatePayload
+devices_update = device_sync_routes.devices_update
+devices_delete = device_sync_routes.devices_delete
+devices_prune_legacy = device_sync_routes.devices_prune_legacy
+PairingOfferPayload = device_sync_routes.PairingOfferPayload
+PairingAcceptPayload = device_sync_routes.PairingAcceptPayload
+PairDevicePayload = device_sync_routes.PairDevicePayload
+PairDeviceSyncPayload = device_sync_routes.PairDeviceSyncPayload
+SyncPeerStatusPayload = device_sync_routes.SyncPeerStatusPayload
+MOBILE_FLOAT_DEFAULT_SERVE_PORT = device_sync_routes.MOBILE_FLOAT_DEFAULT_SERVE_PORT
+MobileFloatServePayload = device_sync_routes.MobileFloatServePayload
+PairDeviceRevokePayload = device_sync_routes.PairDeviceRevokePayload
+GatewayOfferPayload = device_sync_routes.GatewayOfferPayload
+GatewayAcceptPayload = device_sync_routes.GatewayAcceptPayload
+GatewaySessionPayload = device_sync_routes.GatewaySessionPayload
+pairing_create_offer = device_sync_routes.pairing_create_offer
+pairing_accept_offer = device_sync_routes.pairing_accept_offer
+sync_pair = device_sync_routes.sync_pair
+sync_peer_status = device_sync_routes.sync_peer_status
+sync_pair_update = device_sync_routes.sync_pair_update
+sync_pair_revoke = device_sync_routes.sync_pair_revoke
+gateway_create_offer = device_sync_routes.gateway_create_offer
+gateway_accept_offer = device_sync_routes.gateway_accept_offer
+gateway_create_session = device_sync_routes.gateway_create_session
+SyncSectionRequest = device_sync_routes.SyncSectionRequest
+SyncIngestRequest = device_sync_routes.SyncIngestRequest
+SyncPlanRequest = device_sync_routes.SyncPlanRequest
+SyncApplyRequest = device_sync_routes.SyncApplyRequest
+_sync_service = device_sync_routes._sync_service
+_sync_manifest_section_digests = device_sync_routes._sync_manifest_section_digests
+_sync_plan_allowed_selections = device_sync_routes._sync_plan_allowed_selections
+_sync_plan_context = device_sync_routes._sync_plan_context
+_SYNC_MANUAL_REFRESH_NOTE_SNIPPETS = (
+    device_sync_routes._SYNC_MANUAL_REFRESH_NOTE_SNIPPETS
+)
+_sync_section_applied = device_sync_routes._sync_section_applied
+_reload_memory_manager_from_store = device_sync_routes._reload_memory_manager_from_store
+_refresh_sync_result_indexes = device_sync_routes._refresh_sync_result_indexes
+_apply_sync_ingest = device_sync_routes._apply_sync_ingest
+_mobile_float_state_path = device_sync_routes._mobile_float_state_path
+_load_mobile_float_state = device_sync_routes._load_mobile_float_state
+_coerce_port = device_sync_routes._coerce_port
+_mobile_float_serve_port = device_sync_routes._mobile_float_serve_port
+_run_tailscale = device_sync_routes._run_tailscale
+_tailscale_command_error = device_sync_routes._tailscale_command_error
+_tailscale_self_status = device_sync_routes._tailscale_self_status
+_format_mobile_float_url_host = device_sync_routes._format_mobile_float_url_host
+_tailscale_serve_status_text = device_sync_routes._tailscale_serve_status_text
+_mobile_float_serve_status = device_sync_routes._mobile_float_serve_status
+mobile_float_serve_status = device_sync_routes.mobile_float_serve_status
+mobile_float_serve_start = device_sync_routes.mobile_float_serve_start
+mobile_float_serve_stop = device_sync_routes.mobile_float_serve_stop
+sync_overview = device_sync_routes.sync_overview
+sync_operation_cancel = device_sync_routes.sync_operation_cancel
+sync_manifest = device_sync_routes.sync_manifest
+sync_export = device_sync_routes.sync_export
+sync_ingest = device_sync_routes.sync_ingest
+SyncReviewDecisionPayload = device_sync_routes.SyncReviewDecisionPayload
+sync_review_approve = device_sync_routes.sync_review_approve
+sync_review_reject = device_sync_routes.sync_review_reject
+sync_plan = device_sync_routes.sync_plan
+sync_apply = device_sync_routes.sync_apply
+sync_cursor = device_sync_routes.sync_cursor
+SyncChangesRequest = device_sync_routes.SyncChangesRequest
+sync_changes = device_sync_routes.sync_changes
+SyncUploadPayload = device_sync_routes.SyncUploadPayload
+sync_upload = device_sync_routes.sync_upload
+sync_download = device_sync_routes.sync_download
 
 
 class StreamSessionRequest(BaseModel):
@@ -16934,6 +14090,7 @@ class UserSettingsPayload(BaseModel):
     active_workspace_id: str = DEFAULT_WORKSPACE_ID
     sync_selected_workspace_ids: List[str] = [DEFAULT_WORKSPACE_ID]
     local_model_registrations: List[Dict[str, Any]] = []
+    huggingface_model_registrations: List[Dict[str, Any]] = []
     model_config = ConfigDict(extra="ignore")
 
 
@@ -17335,24 +14492,6 @@ class KnowledgeCleanupPayload(BaseModel):
     tag_derived_items: bool = True
 
 
-class WorkspaceFileUpdatePayload(BaseModel):
-    text: str
-
-
-def _resolve_data_root() -> Path:
-    cfg = app_config.load_config()
-    data_dir = Path(cfg.get("data_dir") or app_config.DEFAULT_DATA_DIR)
-    if not data_dir.is_absolute():
-        data_dir = (app_config.REPO_ROOT / data_dir).resolve()
-    else:
-        try:
-            data_dir = data_dir.resolve()
-        except Exception:
-            pass
-    data_dir.mkdir(parents=True, exist_ok=True)
-    return data_dir
-
-
 def _resolve_data_files_path(path: Optional[str]) -> Path:
     files_dir = _resolve_data_files_root()
     if path:
@@ -17373,7 +14512,15 @@ def _resolve_data_files_path(path: Optional[str]) -> Path:
 
 
 def _resolve_data_files_root() -> Path:
-    data_dir = _resolve_data_root()
+    cfg = app_config.load_config()
+    data_dir = Path(cfg.get("data_dir") or app_config.DEFAULT_DATA_DIR)
+    if not data_dir.is_absolute():
+        data_dir = (app_config.REPO_ROOT / data_dir).resolve()
+    else:
+        try:
+            data_dir = data_dir.resolve()
+        except Exception:
+            pass
     files_dir = (data_dir / "files").resolve()
     files_dir.mkdir(parents=True, exist_ok=True)
     for dirname in ("uploads", "screenshots", "downloaded", "workspace"):
@@ -17409,12 +14556,18 @@ def _infer_relative_from_source(source: str, files_dir: Path) -> str:
         return ""
 
     candidate = Path(source_text).expanduser()
-    if not candidate.is_absolute():
-        candidate = files_dir / candidate
-    try:
-        resolved = candidate.resolve()
-    except Exception:
+    foreign_windows_absolute = (
+        PureWindowsPath(source_text).is_absolute() and not candidate.is_absolute()
+    )
+    if foreign_windows_absolute:
         resolved = candidate
+    else:
+        if not candidate.is_absolute():
+            candidate = files_dir / candidate
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            resolved = candidate
     try:
         return _coerce_relative_files_path(str(resolved.relative_to(files_dir)))
     except Exception:
@@ -17450,7 +14603,10 @@ def _is_external_knowledge_source(metadata: Dict[str, Any]) -> bool:
     rel = _infer_relative_from_source(source_text, _resolve_data_files_root())
     if rel:
         return False
-    return Path(source_text).expanduser().is_absolute()
+    return (
+        Path(source_text).expanduser().is_absolute()
+        or PureWindowsPath(source_text).is_absolute()
+    )
 
 
 def _sanitize_knowledge_metadata_for_api(metadata: Dict[str, Any]) -> Dict[str, Any]:
@@ -17663,110 +14819,6 @@ def _path_to_file_uri(path_value: Path) -> str:
     return f"file://{quote(normalized, safe='/:')}"
 
 
-def _workspace_browser_roots() -> Dict[str, Dict[str, Any]]:
-    data_dir = _resolve_data_root()
-    files_workspace = (_resolve_data_files_root() / "workspace").resolve()
-    tool_workspace = (data_dir / "workspace").resolve()
-    files_workspace.mkdir(parents=True, exist_ok=True)
-    tool_workspace.mkdir(parents=True, exist_ok=True)
-    return {
-        "files": {
-            "label": "Files workspace",
-            "path": files_workspace,
-            "display_root": "data/files/workspace",
-        },
-        "tool": {
-            "label": "Tool workspace",
-            "path": tool_workspace,
-            "display_root": "data/workspace",
-        },
-    }
-
-
-def _resolve_workspace_browser_root(root_key: str) -> Dict[str, Any]:
-    key = str(root_key or "").strip().lower()
-    roots = _workspace_browser_roots()
-    root = roots.get(key)
-    if not root:
-        raise HTTPException(status_code=400, detail="Unknown workspace root")
-    return {"key": key, **root}
-
-
-def _is_hidden_workspace_path(path_value: Path) -> bool:
-    return any(part.startswith(".") for part in path_value.parts if part not in {"."})
-
-
-def _workspace_relative_path(path_value: Path, root: Path) -> str:
-    try:
-        rel = path_value.relative_to(root)
-    except Exception:
-        return ""
-    return rel.as_posix()
-
-
-def _resolve_workspace_browser_path(
-    root_key: str, relative_path: str = ""
-) -> Dict[str, Any]:
-    root_info = _resolve_workspace_browser_root(root_key)
-    root = root_info["path"]
-    raw = str(relative_path or "").strip().replace("\\", "/")
-    if raw in {"", "."}:
-        candidate = root
-    else:
-        path_obj = Path(raw)
-        if path_obj.is_absolute():
-            raise HTTPException(
-                status_code=400, detail="Workspace path must be relative"
-            )
-        candidate = root / path_obj
-    try:
-        resolved = candidate.resolve()
-    except Exception:
-        resolved = candidate
-    try:
-        rel = resolved.relative_to(root)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Workspace path is outside root")
-    return {**root_info, "target": resolved, "relative_path": rel.as_posix()}
-
-
-def _workspace_file_entry(
-    root_key: str, root_info: Dict[str, Any], path_value: Path
-) -> Dict[str, Any]:
-    root = root_info["path"]
-    rel_path = _workspace_relative_path(path_value, root)
-    try:
-        stat = path_value.stat()
-        modified_at = float(stat.st_mtime)
-        size_bytes = int(stat.st_size) if path_value.is_file() else None
-    except Exception:
-        modified_at = None
-        size_bytes = None
-    entry = {
-        "id": f"workspace-file:{root_key}:{rel_path}",
-        "root": root_key,
-        "root_label": root_info["label"],
-        "root_path": root_info["display_root"],
-        "path": rel_path,
-        "display_path": (
-            f'{root_info["display_root"]}/{rel_path}'
-            if rel_path
-            else root_info["display_root"]
-        ),
-        "name": path_value.name or root_info["label"],
-        "type": "directory" if path_value.is_dir() else "file",
-        "modified_at": modified_at,
-    }
-    if size_bytes is not None:
-        entry["size_bytes"] = size_bytes
-    return entry
-
-
-def _workspace_file_media_type(target: Path) -> str:
-    guessed_type, _ = mimetypes.guess_type(target.name)
-    return guessed_type or "application/octet-stream"
-
-
 @router.post("/knowledge/add")
 async def knowledge_add(payload: KnowledgeAdd):
     service = _get_rag_service()
@@ -17896,14 +14948,54 @@ async def knowledge_ingest_folder(payload: KnowledgeFolderIngest):
 @router.post("/knowledge/upload")
 async def knowledge_upload(file: UploadFile = UploadFileType(...)):
     """Upload a file and ingest it into the knowledge base."""
-    if file.content_type not in ALLOWED_UPLOAD_TYPES:
+    safe_name = Path(file.filename or "document.txt").name
+    suffix = Path(safe_name).suffix.lower()
+    ctype = (file.content_type or "").lower()
+    markdown_extensions = {".md", ".markdown"}
+    markdown_content_types = {
+        "text/markdown",
+        "text/x-markdown",
+        "application/x-markdown",
+    }
+    safe_text_extensions = markdown_extensions | {".txt"}
+    if ctype in markdown_content_types and suffix not in safe_text_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail="Markdown uploads require a .md, .markdown, or .txt filename",
+        )
+    markdown_mime_allowed = (
+        ctype in markdown_content_types and suffix in safe_text_extensions
+    )
+    text_extension_fallback = suffix in safe_text_extensions and ctype in {
+        "",
+        "application/octet-stream",
+    }
+    is_markdown_upload = (
+        suffix in markdown_extensions or ctype in markdown_content_types
+    )
+    is_text_upload = is_markdown_upload or suffix == ".txt" or ctype == "text/plain"
+    if (
+        ctype not in ALLOWED_UPLOAD_TYPES
+        and not text_extension_fallback
+        and not markdown_mime_allowed
+    ):
         raise HTTPException(status_code=400, detail="Unsupported file type")
 
     data = await file.read()
     if len(data) > MAX_UPLOAD_SIZE:
         raise HTTPException(status_code=400, detail="File too large")
+    if is_text_upload:
+        try:
+            data.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(
+                status_code=400, detail="Text upload must be UTF-8"
+            ) from exc
+        if b"\x00" in data:
+            raise HTTPException(
+                status_code=400, detail="Text upload must not contain null bytes"
+            )
 
-    ctype = (file.content_type or "").lower()
     if ctype.startswith("image/"):
         return _caption_and_index_image_bytes(
             data,
@@ -17915,12 +15007,13 @@ async def knowledge_upload(file: UploadFile = UploadFileType(...)):
     files_dir = _resolve_data_files_root()
     workspace_dir = files_dir / "workspace"
     workspace_dir.mkdir(parents=True, exist_ok=True)
-    safe_name = Path(file.filename or "document.txt").name
     stem = Path(safe_name).stem or "document"
-    suffix = Path(safe_name).suffix
     target = workspace_dir / safe_name
     if target.exists():
-        target = workspace_dir / f"{stem}-{int(time.time())}{suffix}"
+        counter = 2
+        while target.exists():
+            target = workspace_dir / f"{stem}-{counter}{suffix}"
+            counter += 1
     target.write_bytes(data)
     try:
         relative_path = _coerce_relative_files_path(str(target.relative_to(files_dir)))
@@ -17930,10 +15023,13 @@ async def knowledge_upload(file: UploadFile = UploadFileType(...)):
             "source": relative_path or target.name,
             "relative_path": relative_path or target.name,
             "filename": target.name,
-            "content_type": file.content_type,
+            "content_type": ctype
+            or ("text/markdown" if is_markdown_upload else "text/plain"),
         }
         if ctype == "application/pdf":
             doc_id = service.ingest_pdf(str(target), metadata)
+        elif is_markdown_upload:
+            doc_id = service.ingest_markdown(str(target), metadata)
         else:
             doc_id = service.ingest_file(str(target), metadata)
     except Exception:
@@ -19150,107 +16246,6 @@ async def knowledge_rag_rehydrate(payload: KnowledgeRagRehydrate):
     return {"scanned": scanned, "reindexed": updated}
 
 
-@router.get("/knowledge/workspace-files")
-async def knowledge_workspace_files(
-    include_hidden: bool = False,
-    max_entries: int = 2000,
-):
-    """List managed workspace files for the Documents browser."""
-    roots = _workspace_browser_roots()
-    limit = max(1, min(int(max_entries or 2000), 5000))
-    entries: List[Dict[str, Any]] = []
-    truncated = False
-    for root_key, root_info in roots.items():
-        root_path = root_info["path"]
-        try:
-            candidates = sorted(
-                root_path.rglob("*"),
-                key=lambda item: (
-                    item.is_file(),
-                    _workspace_relative_path(item, root_path).lower(),
-                ),
-            )
-        except Exception:
-            continue
-        for candidate in candidates:
-            rel = _workspace_relative_path(candidate, root_path)
-            if not rel:
-                continue
-            if not include_hidden and _is_hidden_workspace_path(Path(rel)):
-                continue
-            if len(entries) >= limit:
-                truncated = True
-                break
-            entries.append(_workspace_file_entry(root_key, root_info, candidate))
-        if truncated:
-            break
-    return {
-        "roots": [
-            {
-                "root": key,
-                "root_label": value["label"],
-                "root_path": value["display_root"],
-            }
-            for key, value in roots.items()
-        ],
-        "entries": entries,
-        "count": len(entries),
-        "truncated": truncated,
-    }
-
-
-@router.get("/knowledge/workspace-file/{root_key}/{relative_path:path}")
-async def knowledge_workspace_file(root_key: str, relative_path: str):
-    """Serve a file from one of the managed workspace roots."""
-    resolved = _resolve_workspace_browser_path(root_key, relative_path)
-    target = resolved["target"]
-    if not target.exists() or not target.is_file():
-        raise HTTPException(status_code=404, detail="Workspace file not found")
-    return FileResponse(path=str(target), media_type=_workspace_file_media_type(target))
-
-
-@router.put("/knowledge/workspace-file/{root_key}/{relative_path:path}")
-async def knowledge_workspace_file_update(
-    root_key: str,
-    relative_path: str,
-    payload: WorkspaceFileUpdatePayload,
-):
-    """Edit a text-like file in one of the managed workspace roots."""
-    resolved = _resolve_workspace_browser_path(root_key, relative_path)
-    target = resolved["target"]
-    if not target.exists() or not target.is_file():
-        raise HTTPException(status_code=404, detail="Workspace file not found")
-    suffix = target.suffix.lower().lstrip(".")
-    if suffix not in _EDITABLE_KNOWLEDGE_TEXT_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail="Only markdown, text, and CSV-like workspace files can be edited inline",
-        )
-    target.write_text(payload.text, encoding="utf-8")
-    return {
-        "status": "updated",
-        "root": resolved["key"],
-        "path": resolved["relative_path"],
-    }
-
-
-@router.get("/knowledge/workspace-reveal/{root_key}/{relative_path:path}")
-async def knowledge_workspace_file_reveal(root_key: str, relative_path: str):
-    """Reveal a managed workspace file or folder in the host file browser."""
-    resolved = _resolve_workspace_browser_path(root_key, relative_path)
-    target = resolved["target"]
-    if not target.exists():
-        raise HTTPException(status_code=404, detail="Workspace path not found")
-    opened = _open_path_in_system_file_browser(target)
-    folder = target if target.is_dir() else target.parent
-    return {
-        "path": str(target),
-        "folder": str(folder),
-        "open_uri": _path_to_file_uri(folder),
-        "opened": opened,
-    }
-
-
 class KnowledgeUpdate(BaseModel):
     text: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
@@ -20248,6 +17243,8 @@ class SettingsRequest(BaseModel):
     harmony_format: Optional[bool] = None
     harmony_format_mode: Optional[str] = None
     server_url: Optional[str] = None
+    server_preset_id: Optional[str] = None
+    server_presets: Optional[List[Dict[str, Any]]] = None
     stt_model: Optional[str] = None
     tts_model: Optional[str] = None
     voice_model: Optional[str] = None
@@ -20416,6 +17413,8 @@ async def get_settings(request: Request):
         "harmony_format": cfg.get("harmony_format"),
         "harmony_format_mode": _harmony_format_mode_from_config(cfg),
         "server_url": cfg.get("server_url"),
+        "server_preset_id": cfg.get("server_preset_id", ""),
+        "server_presets": public_server_presets(cfg),
         "stt_model": cfg.get("stt_model"),
         "tts_model": cfg.get("tts_model"),
         "voice_model": cfg.get("voice_model"),
@@ -20763,8 +17762,27 @@ async def update_settings(request: Request, settings: SettingsRequest):
         cfg["harmony_format"] = enabled_flag
     # Update server URL
     if settings.server_url is not None:
-        safe_set("SERVER_URL", settings.server_url)
-        cfg["server_url"] = settings.server_url
+        server_url_value = str(settings.server_url or "").strip()
+        if server_url_value:
+            safe_set("SERVER_URL", server_url_value)
+        else:
+            safe_unset("SERVER_URL")
+        cfg["server_url"] = server_url_value
+    if settings.server_preset_id is not None:
+        preset_id_value = str(settings.server_preset_id or "").strip()
+        if preset_id_value:
+            safe_set("SERVER_PRESET_ID", preset_id_value)
+        else:
+            safe_unset("SERVER_PRESET_ID")
+        cfg["server_preset_id"] = preset_id_value
+    if settings.server_presets is not None:
+        custom_presets = normalize_custom_server_presets(settings.server_presets)
+        serialized_presets = serialize_custom_server_presets(custom_presets)
+        if custom_presets:
+            safe_set("SERVER_PRESETS_JSON", serialized_presets)
+        else:
+            safe_unset("SERVER_PRESETS_JSON")
+        cfg["server_presets"] = custom_presets
     # Update STT model
     if settings.stt_model is not None:
         safe_set("STT_MODEL", settings.stt_model)
@@ -21176,9 +18194,11 @@ async def update_settings(request: Request, settings: SettingsRequest):
         autonomy_service.update_config(cfg, reset_session=background_autonomy_changed)
     # Ensure the singleton RAG service picks up any backend/model changes.
     _update_rag_config(cfg)
+    response_settings = _redact_settings(cfg)
+    response_settings["server_presets"] = public_server_presets(cfg)
     return {
         "status": "success",
-        "settings": _redact_settings(cfg),
+        "settings": response_settings,
         "mode": cfg.get("mode", "api"),
     }
 
@@ -21190,622 +18210,9 @@ async def vram_estimate(context_length: int):
     return {"context_length": context_length, "estimate_mb": estimate}
 
 
-# Model download endpoints
-@router.get("/models/supported")
-async def list_supported_models(request: Request):
-    """Return a list of supported model identifiers."""
-    cfg = request.app.state.config
-    devices = cfg.get("available_devices", [])
-    filtered = filter_models_for_devices(devices)
-    return {"models": sorted(filtered)}
-
-
-@router.get("/models/downloadable")
-async def list_downloadable_model_aliases():
-    """Return model aliases that support background download jobs."""
-
-    return {"models": list_downloadable_models()}
-
-
-class LocalModelRegistrationPayload(BaseModel):
-    alias: Optional[str] = None
-    path: str
-    model_type: Optional[str] = None
-
-
-@router.get("/models/registered")
-async def list_registered_local_models():
-    return {"models": list_local_model_entries(include_missing=True)}
-
-
-@router.post("/models/registered")
-async def register_local_model(payload: LocalModelRegistrationPayload):
-    raw_path = str(payload.path or "").strip()
-    if not raw_path:
-        raise HTTPException(status_code=400, detail="path is required")
-    try:
-        entry = upsert_local_model_entry(
-            path=raw_path,
-            alias=payload.alias,
-            model_type=payload.model_type,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return {"model": entry}
-
-
-@router.delete("/models/registered/{alias}")
-async def unregister_local_model(alias: str):
-    if not remove_local_model_entry(alias):
-        raise HTTPException(status_code=404, detail="Registered model not found")
-    return {"status": "deleted"}
-
-
-def _is_hf_cache_dir(models_dir: Path) -> bool:
-    parts = [p.lower() for p in models_dir.parts]
-    return "huggingface" in parts and "hub" in parts
-
-
-def _hf_cache_model_allowed(name: str, *, allow_extras: bool) -> bool:
-    """Filter noisy HF cache entries to keep selectors usable."""
-    if allow_extras:
-        return True
-    lowered = name.lower()
-    allowed_prefixes = (
-        "gpt-oss",
-        "llama",
-        "qwen",
-        "gemma",
-        "mistral",
-        "mixtral",
-        "phi",
-        "falcon",
-        "zephyr",
-    )
-    allowed_exact = {
-        "gpt-5.4",
-        "gpt-5.1",
-        "gpt-4.1",
-        "gpt-4o-mini",
-    }
-    return lowered in allowed_exact or lowered.startswith(allowed_prefixes)
-
-
-MODEL_PAYLOAD_SUFFIXES = {".gguf", ".bin", ".safetensors", ".onnx", ".npz"}
-
-
-@router.get("/transformers/models")
-async def list_transformer_models(
-    request: Request,
-    path: Optional[str] = None,
-    include_cache_unfiltered: bool = False,
-):  # noqa: E501
-    """List available transformer models from all search directories.
-
-    Filters Hugging Face cache noise by default so selectors are not flooded
-    with unrelated tiny checkpoints; pass include_cache_unfiltered=true to
-    return every cache entry.
-    """
-    cfg = request.app.state.config
-    dirs = app_config.model_search_dirs(
-        path or cfg.get("models_folder", app_config.DEFAULT_MODELS_DIR)
-    )
-    models: set[str] = set()
-    for models_dir in dirs:
-        if not models_dir.exists():
-            continue
-        is_cache = _is_hf_cache_dir(models_dir)
-        for item in models_dir.iterdir():
-            if not item.is_dir():
-                continue
-            if any(
-                f.suffix.lower() in MODEL_PAYLOAD_SUFFIXES for f in item.glob("**/*")
-            ):
-                name = item.name
-                if name.startswith("models--"):
-                    parts = name.split("--")
-                    if len(parts) >= 3:
-                        name = parts[-1]
-                if is_cache and not _hf_cache_model_allowed(
-                    name, allow_extras=include_cache_unfiltered
-                ):
-                    continue
-                models.add(name)
-    for entry in list_local_model_entries(include_missing=False):
-        alias = str(entry.get("alias") or "").strip()
-        if alias:
-            models.add(alias)
-    return {"models": sorted(models)}
-
-
-def _resolve_hf_snapshot(models_root: Path, model_name: str) -> Optional[Path]:
-    """Best-effort resolve a Hugging Face cached snapshot dir for a model.
-
-    Looks for hub layout: models--ORG--NAME/{refs,snapshots}/... and resolves the
-    active snapshot (refs/main) or falls back to the newest snapshot folder.
-    Returns a concrete path to the snapshot directory if found, else None.
-    """
-    try:
-        # Glob any organization
-        for candidate in models_root.glob(f"models--*--{model_name}"):
-            if not candidate.is_dir():
-                continue
-            refs = candidate / "refs" / "main"
-            snap_root = candidate / "snapshots"
-            if refs.exists():
-                try:
-                    commit = refs.read_text().strip()
-                    snap = snap_root / commit
-                    if snap.exists() and snap.is_dir():
-                        return snap
-                except Exception:
-                    pass
-            # Fallback: pick the most recently modified snapshot
-            try:
-                snaps = [p for p in snap_root.iterdir() if p.is_dir()]
-                if snaps:
-                    snaps.sort(
-                        key=lambda p: getattr(p.stat(), "st_mtime", 0), reverse=True
-                    )
-                    return snaps[0]
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return None
-
-
-def _resolve_local_model_dir(
-    search_roots: list[Path], model_name: str
-) -> Optional[Path]:
-    """Return a concrete local directory for a model if present.
-
-    Order of checks per root:
-      1) <root>/<model_name>
-      2) HF cache layout: <root>/models--*--<model_name>/snapshots/<sha>
-    """
-    resolved_name = str(canonical_model_alias(model_name) or model_name).strip()
-    registered = resolve_registered_model_path(resolved_name, for_loading=False)
-    if registered is not None:
-        return registered
-    for root in search_roots:
-        direct = root / resolved_name
-        try:
-            if direct.exists() and direct.is_dir():
-                return direct
-        except Exception:
-            # Ignore permission or transient errors
-            pass
-        # Also check HF hub cache structure within this root
-        snap = _resolve_hf_snapshot(root, resolved_name)
-        if snap is not None:
-            return snap
-    return None
-
-
-@router.get("/models/exists/{model_name}")
-async def model_exists(
-    request: Request, model_name: str, path: Optional[str] = None
-):  # noqa: E501
-    cfg = request.app.state.config
-    dirs = app_config.model_search_dirs(
-        path or cfg.get("models_folder", app_config.DEFAULT_MODELS_DIR)
-    )
-    resolved = _resolve_local_model_dir(dirs, model_name)
-    return {"exists": bool(resolved)}
-
-
-@router.get("/models/local-size/{model_name}")
-async def model_local_size(
-    request: Request, model_name: str, path: Optional[str] = None
-):  # noqa: E501
-    """
-    Return the total on-disk size in bytes for the model folder if present.
-    Supports both direct folders and Hugging Face cache snapshots.
-    """
-    cfg = request.app.state.config
-    dirs = app_config.model_search_dirs(
-        path or cfg.get("models_folder", app_config.DEFAULT_MODELS_DIR)
-    )
-    resolved = _resolve_local_model_dir(dirs, model_name)
-    if resolved is not None:
-        try:
-            allow_patterns = get_download_allow_patterns(model_name)
-            return {
-                "exists": True,
-                "size": _folder_size_bytes(resolved, include_patterns=allow_patterns),
-            }
-        except Exception:
-            return {"exists": True, "size": 0}
-    return {"exists": False, "size": 0}
-
-
-@router.get("/models/verify/{model_name}")
-async def verify_model(
-    request: Request, model_name: str, path: Optional[str] = None
-):  # noqa: E501
-    """
-    Verify on-disk model files against the upstream repository manifest.
-
-    Returns:
-      - exists: whether a local model folder exists
-      - verified: True if all upstream files are present and checks pass
-      - expected_bytes: total bytes from upstream manifest
-      - installed_bytes: total bytes found locally (recursive)
-      - checked_files: number of files compared
-    Notes:
-      - Hash checks are only performed once all file sizes match; this keeps
-        the common case fast and avoids hashing partial downloads.
-    """
-    cfg = request.app.state.config
-    # Resolve local directory (direct or HF cache snapshot)
-    dirs = app_config.model_search_dirs(
-        path or cfg.get("models_folder", app_config.DEFAULT_MODELS_DIR)
-    )
-    model_alias = str(canonical_model_alias(model_name) or model_name).strip()
-    allow_patterns = get_download_allow_patterns(model_alias)
-    local_dir: Optional[Path] = _resolve_local_model_dir(dirs, model_alias)
-    installed = 0
-    if local_dir:
-        try:
-            installed = _folder_size_bytes(local_dir, include_patterns=allow_patterns)
-        except Exception:
-            installed = 0
-
-    repo_id = resolve_model_alias(model_alias)
-    if not local_dir:
-        return {
-            "exists": False,
-            "verified": False,
-            "expected_bytes": 0,
-            "installed_bytes": 0,
-            "checked_files": 0,
-            "downloadable": model_supports_download_job(model_alias),
-            "lane": get_model_lane(model_alias),
-        }
-    if not repo_id or str(repo_id).startswith("TODO"):
-        # Unknown or API-only; cannot verify against upstream
-        return {
-            "exists": True,
-            "verified": False,
-            "expected_bytes": 0,
-            "installed_bytes": int(installed),
-            "checked_files": 0,
-            "downloadable": model_supports_download_job(model_alias),
-            "lane": get_model_lane(model_alias),
-        }
-
-    # Build remote manifest
-    try:
-        # Offload blocking HF API call
-        token = cfg.get("hf_token") if isinstance(cfg, dict) else None
-        manifest, expected, _commit = await asyncio.to_thread(
-            _remote_manifest, repo_id, allow_patterns, token
-        )
-    except Exception:
-        fallback = _fallback_verification_from_job(
-            request, model_name, local_dir, installed
-        )
-        if fallback is not None:
-            return fallback
-
-        # Without manifest or job info we cannot assert verification
-        return {
-            "exists": True,
-            "verified": False,
-            "expected_bytes": 0,
-            "installed_bytes": int(installed),
-            "checked_files": 0,
-        }
-
-    # Quick path: if installed size is less than expected, definitely not verified
-    if expected > 0 and installed < expected:
-        return {
-            "exists": True,
-            "verified": False,
-            "expected_bytes": int(expected),
-            "installed_bytes": int(installed),
-            "checked_files": 0,
-            "downloadable": model_supports_download_job(model_name),
-            "lane": get_model_lane(model_name),
-        }
-
-    # Compare file-by-file sizes; only check hashes if sizes match everywhere
-    sizes_ok = True
-    checked = 0
-    for entry in manifest:
-        rel = entry.get("path") or ""
-        if not rel:
-            continue
-        local_path = local_dir / rel
-        try:
-            st = local_path.stat()
-        except Exception:
-            sizes_ok = False
-            break
-        if int(entry.get("size") or 0) != int(getattr(st, "st_size", 0)):
-            sizes_ok = False
-            break
-        checked += 1
-
-    if not sizes_ok:
-        return {
-            "exists": True,
-            "verified": False,
-            "expected_bytes": int(expected),
-            "installed_bytes": int(installed),
-            "checked_files": int(checked),
-            "downloadable": model_supports_download_job(model_name),
-            "lane": get_model_lane(model_name),
-        }
-
-    if expected <= 0 or not manifest:
-        fallback = _fallback_verification_from_job(
-            request, model_name, local_dir, installed
-        )
-        if fallback is not None:
-            return fallback
-
-    # Hash verification only if sizes match (avoid heavy hashing on partial downloads)
-    # Only verify entries that provide a sha256 in the manifest.
-    for entry in manifest:
-        sha = entry.get("sha256")
-        if not sha:
-            continue
-        rel = entry.get("path") or ""
-        if not rel:
-            continue
-        local_path = local_dir / rel
-        try:
-            local_sha = await asyncio.to_thread(_sha256_file, local_path)
-        except Exception:
-            return {
-                "exists": True,
-                "verified": False,
-                "expected_bytes": int(expected),
-                "installed_bytes": int(installed),
-                "checked_files": int(checked),
-                "downloadable": model_supports_download_job(model_name),
-                "lane": get_model_lane(model_name),
-            }
-        if local_sha != sha:
-            return {
-                "exists": True,
-                "verified": False,
-                "expected_bytes": int(expected),
-                "installed_bytes": int(installed),
-                "checked_files": int(checked),
-                "downloadable": model_supports_download_job(model_name),
-                "lane": get_model_lane(model_name),
-            }
-
-    if checked == 0 and installed > 0:
-        fallback = _fallback_verification_from_job(
-            request, model_name, local_dir, installed
-        )
-        if fallback is not None:
-            return fallback
-
-    if checked <= 0 and local_dir is not None:
-        checked = _count_local_files(local_dir)
-    expected_bytes = int(expected) if expected > 0 else int(installed)
-    return {
-        "exists": True,
-        "verified": installed > 0 and expected > 0,
-        "expected_bytes": expected_bytes,
-        "installed_bytes": int(installed),
-        "checked_files": int(checked),
-        "downloadable": model_supports_download_job(model_name),
-        "lane": get_model_lane(model_name),
-    }
-
-
-@router.get("/models/integrity/{model_name}")
-async def model_integrity(model_name: str):
-    """Return a quick summary of local model files for diagnostics."""
-    summary = llm_service.verify_local_model(model_name)
-    return {"integrity": summary}
-
-
 # ---------------------------
 # Download Job API (background)
 # ---------------------------
-
-
-class ModelJobRequest(BaseModel):
-    model: str
-    path: Optional[str] = None
-
-
-def _get_jobs_state(app) -> Dict[str, dict]:
-    if not hasattr(app.state, "model_jobs"):
-        app.state.model_jobs = {}
-    return app.state.model_jobs
-
-
-def _resolve_models_dir(cfg: dict, requested_path: Optional[str]) -> Path:
-    requested = requested_path or cfg.get(
-        "models_folder", str(app_config.DEFAULT_MODELS_DIR)
-    )
-    try:
-        p = Path(requested)
-    except Exception:
-        return Path(cfg.get("models_folder", app_config.DEFAULT_MODELS_DIR))
-    if (not p.is_absolute()) and (not p.exists()):
-        return Path(cfg.get("models_folder", app_config.DEFAULT_MODELS_DIR))
-    return p
-
-
-def _start_download_process(
-    repo_id: str, target_dir: Path, model_alias: Optional[str] = None
-) -> subprocess.Popen:
-    cmd = [
-        sys.executable,
-        "-m",
-        "app.download_worker",
-        "--repo",
-        repo_id,
-        "--dir",
-        str(target_dir),
-    ]
-    if model_alias:
-        cmd.extend(["--model", model_alias])
-    # Prefer fast transport on the current Hugging Face Xet stack.
-    env = os.environ.copy()
-    if env.get("HF_HUB_ENABLE_HF_TRANSFER") == "1":
-        env.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
-        env.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
-    env.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
-    # Detach stdio; logs aren't needed here
-    return subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        env=env,
-    )
-
-
-def _job_progress(job: dict) -> dict:
-    # Compute on-disk size; 'path' already includes the model folder
-    downloaded = 0
-    try:
-        p = Path(job["path"])
-        if p.exists():
-            allow_patterns = job.get("allow_patterns")
-            downloaded = _folder_size_bytes(
-                p,
-                include_patterns=(
-                    allow_patterns if isinstance(allow_patterns, list) else None
-                ),
-            )
-    except Exception:
-        downloaded = 0
-    total = int(job.get("total", 0) or 0)
-    pct = (downloaded / total) if total > 0 else 0.0
-    return {
-        "downloaded": downloaded,
-        "total": total,
-        "percent": min(1.0, pct),
-    }
-
-
-@router.post("/models/jobs")
-async def create_model_job(request: Request, body: ModelJobRequest):
-    cfg = request.app.state.config
-    token = cfg.get("hf_token") if isinstance(cfg, dict) else None
-    model_alias = str(canonical_model_alias(body.model) or body.model).strip()
-    repo_id = resolve_model_alias(model_alias)
-    if not repo_id or str(repo_id).startswith("TODO"):
-        raise HTTPException(status_code=400, detail="Unsupported model")
-    if not model_supports_download_job(model_alias):
-        raise HTTPException(
-            status_code=400,
-            detail="Model is not available for background download jobs.",
-        )
-
-    models_root = _resolve_models_dir(cfg, body.path)
-    target_dir = models_root / model_alias
-    target_dir.mkdir(parents=True, exist_ok=True)
-    allow_patterns = get_download_allow_patterns(model_alias)
-
-    def _norm_path(value: str) -> str:
-        try:
-            return str(Path(value).expanduser().resolve())
-        except Exception:
-            return str(Path(value).expanduser())
-
-    # Deduplicate or resume existing jobs so repeated clicks don't spawn multiple
-    # concurrent download processes for the same model.
-    jobs = _get_jobs_state(request.app)
-    target_key = _norm_path(str(target_dir))
-    candidates = [
-        j
-        for j in jobs.values()
-        if j.get("model") == model_alias
-        and _norm_path(str(j.get("path") or "")) == target_key
-    ]
-    if candidates:
-        candidates.sort(
-            key=lambda j: j.get("updated_at", j.get("started_at", 0)), reverse=True
-        )
-        job = candidates[0]
-        _refresh_job_status(job)
-        if job.get("status") == "running":
-            prog = _job_progress(job)
-            return {
-                "job": {k: v for k, v in job.items() if not k.startswith("_")},
-                **prog,
-            }
-        if job.get("status") in {"paused", "error"}:
-            proc = _start_download_process(
-                job.get("repo_id") or repo_id,
-                Path(job["path"]),
-                job.get("model") or model_alias,
-            )
-            job["_proc"] = proc
-            job["pid"] = proc.pid
-            job["status"] = "running"
-            job["error"] = None
-            job["updated_at"] = time.time()
-            prog = _job_progress(job)
-            return {
-                "job": {k: v for k, v in job.items() if not k.startswith("_")},
-                **prog,
-            }
-
-    # Determine expected total size using the Hub API; fallback to 0 if unknown
-    total_size = 0
-    # Lazy import to keep startup fast
-    from huggingface_hub import HfApi
-
-    try:
-        from huggingface_hub.utils import GatedRepoError
-    except Exception:  # pragma: no cover - fallback if import path changes
-        GatedRepoError = None  # type: ignore
-
-    api = HfApi(token=token) if token else HfApi()
-    try:
-        info = await asyncio.to_thread(api.model_info, repo_id, files_metadata=True)
-        total_size = sum(
-            (
-                int(getattr(s, "size", None) or 0)
-                for s in getattr(info, "siblings", []) or []
-                if _path_matches_any(
-                    str(getattr(s, "rfilename", None) or getattr(s, "path", "") or ""),
-                    allow_patterns,
-                )
-            )
-        )
-    except Exception as exc:
-        if GatedRepoError is not None and isinstance(exc, GatedRepoError):
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    "Model access is gated. Set a Hugging Face token (HF_TOKEN/HUGGINGFACE_HUB_TOKEN) "
-                    "and accept the model license on the repo page before retrying."
-                ),
-            )
-        total_size = 0
-
-    job_id = str(uuid4())
-    proc = _start_download_process(repo_id, target_dir, model_alias)
-    job = {
-        "id": job_id,
-        "model": model_alias,
-        "repo_id": repo_id,
-        "path": str(Path(target_dir).resolve()),
-        "status": "running",
-        "total": int(total_size),
-        "error": None,
-        "pid": proc.pid,
-        "_proc": proc,
-        "allow_patterns": allow_patterns,
-        "started_at": time.time(),
-        "updated_at": time.time(),
-    }
-    jobs[job_id] = job
-    prog = _job_progress(job)
-    return {"job": {k: v for k, v in job.items() if not k.startswith("_")}, **prog}
 
 
 # ---------------------------
@@ -21946,392 +18353,6 @@ async def stream_notifications(request: Request):
     return StreamingResponse(generator(), media_type="text/event-stream")
 
 
-def _refresh_job_status(job: dict) -> None:
-    proc: Optional[subprocess.Popen] = job.get("_proc")
-    if proc is not None:
-        code = proc.poll()
-        if code is None:
-            job["status"] = "running"
-        else:
-            job["_proc"] = None
-            job["pid"] = None
-            job["updated_at"] = time.time()
-            if code == 0:
-                job["status"] = "completed"
-            else:
-                job["status"] = "error"
-                job["error"] = f"process exited with code {code}"
-
-
-@router.get("/models/jobs")
-async def list_model_jobs(
-    request: Request,
-    limit: int = 50,
-    include_finished: bool = True,
-):
-    jobs = _get_jobs_state(request.app)
-    rows: list[dict[str, Any]] = []
-    safe_limit = max(1, min(int(limit or 50), 200))
-    for job in jobs.values():
-        if not isinstance(job, dict):
-            continue
-        _refresh_job_status(job)
-        status = str(job.get("status") or "")
-        if not include_finished and status in {"completed", "canceled"}:
-            continue
-        public = {k: v for k, v in job.items() if not k.startswith("_")}
-        public.update(_job_progress(job))
-        rows.append(public)
-    rows.sort(
-        key=lambda item: item.get("updated_at", item.get("started_at", 0)) or 0,
-        reverse=True,
-    )
-    return {"jobs": rows[:safe_limit]}
-
-
-@router.get("/models/jobs/{job_id}")
-async def get_model_job(request: Request, job_id: str):
-    jobs = _get_jobs_state(request.app)
-    job = jobs.get(job_id)
-    if not job:
-        return {
-            "job": {
-                "id": job_id,
-                "status": "unknown",
-                "error": "Job not found",
-            },
-            "downloaded": 0,
-            "total": 0,
-            "percent": 0.0,
-        }
-    _refresh_job_status(job)
-    prog = _job_progress(job)
-    return {"job": {k: v for k, v in job.items() if not k.startswith("_")}, **prog}
-
-
-def _terminate_proc(job: dict) -> None:
-    proc: Optional[subprocess.Popen] = job.get("_proc")
-    if proc is not None and proc.poll() is None:
-        try:
-            proc.terminate()
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        job["_proc"] = None
-        job["pid"] = None
-
-
-@router.post("/models/jobs/{job_id}/pause")
-async def pause_model_job(request: Request, job_id: str):
-    jobs = _get_jobs_state(request.app)
-    job = jobs.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    _refresh_job_status(job)
-    if job["status"] != "running":
-        return {"job": {k: v for k, v in job.items() if not k.startswith("_")}}
-    _terminate_proc(job)
-    job["status"] = "paused"
-    job["updated_at"] = time.time()
-    prog = _job_progress(job)
-    return {"job": {k: v for k, v in job.items() if not k.startswith("_")}, **prog}
-
-
-@router.post("/models/jobs/{job_id}/cancel")
-async def cancel_model_job(request: Request, job_id: str):
-    jobs = _get_jobs_state(request.app)
-    job = jobs.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    _terminate_proc(job)
-    job["status"] = "canceled"
-    job["updated_at"] = time.time()
-    prog = _job_progress(job)
-    return {"job": {k: v for k, v in job.items() if not k.startswith("_")}, **prog}
-
-
-@router.post("/models/jobs/{job_id}/resume")
-async def resume_model_job(request: Request, job_id: str):
-    jobs = _get_jobs_state(request.app)
-    job = jobs.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    _refresh_job_status(job)
-    if job["status"] not in {"paused", "error"}:
-        return {"job": {k: v for k, v in job.items() if not k.startswith("_")}}
-    # Restart process; snapshot_download will resume remaining files
-    proc = _start_download_process(job["repo_id"], Path(job["path"]), job.get("model"))
-    job["_proc"] = proc
-    job["pid"] = proc.pid
-    job["status"] = "running"
-    job["error"] = None
-    job["updated_at"] = time.time()
-    prog = _job_progress(job)
-    return {"job": {k: v for k, v in job.items() if not k.startswith("_")}, **prog}
-
-
-@router.get("/models/info/{model_name}")
-async def model_info(request: Request, model_name: str):
-    """Return basic metadata for a supported model.
-
-    For API-only or unknown identifiers, return size=0 with a TODO repo tag
-    rather than raising 400. This keeps the UI logic simple and avoids noisy
-    errors for provider-only voices (e.g., 'alloy').
-    """
-    model_alias = str(canonical_model_alias(model_name) or model_name).strip()
-    repo_id = resolve_model_alias(model_alias)
-    metadata = get_model_metadata(model_alias)
-    lane = get_model_lane(model_alias)
-    downloadable = model_supports_download_job(model_alias)
-    provider_supported = model_supports_provider_lane(model_alias)
-    supports_images = model_supports_images(model_alias)
-    local_loader = get_local_loader(model_alias)
-    mobile_catalog_allowed = model_allowed_in_mobile_catalog(model_alias)
-    if not repo_id:
-        return {
-            "repo_id": "TODO: unsupported",
-            "size": 0,
-            "downloadable": downloadable,
-            "provider_supported": provider_supported,
-            "supports_images": supports_images,
-            "local_loader": local_loader,
-            "lane": lane,
-            "mobile_catalog_allowed": mobile_catalog_allowed,
-            "metadata": metadata,
-        }
-    if str(repo_id).startswith("TODO"):
-        # Placeholder link; size unknown
-        return {
-            "repo_id": repo_id,
-            "size": 0,
-            "downloadable": downloadable,
-            "provider_supported": provider_supported,
-            "supports_images": supports_images,
-            "local_loader": local_loader,
-            "lane": lane,
-            "mobile_catalog_allowed": mobile_catalog_allowed,
-            "metadata": metadata,
-        }
-
-    # Lazy import to avoid heavy hub import on startup
-    from huggingface_hub import HfApi
-
-    cfg = request.app.state.config if request else {}
-    token = cfg.get("hf_token") if isinstance(cfg, dict) else None
-
-    try:
-        from huggingface_hub.utils import (
-            HfHubHTTPError,
-            RepositoryNotFoundError,
-            GatedRepoError,
-        )
-    except Exception:  # pragma: no cover - fallback if import path changes
-        HfHubHTTPError = RepositoryNotFoundError = GatedRepoError = Exception  # type: ignore
-    api = HfApi(token=token) if token else HfApi()
-    try:
-        info = await asyncio.to_thread(api.model_info, repo_id, files_metadata=True)
-        siblings = getattr(info, "siblings", []) or []
-        allow_patterns = get_download_allow_patterns(model_alias)
-        size = sum(
-            int(getattr(s, "size", None) or 0)
-            for s in siblings
-            if _path_matches_any(
-                str(getattr(s, "rfilename", None) or getattr(s, "path", "") or ""),
-                allow_patterns,
-            )
-        )
-        return {
-            "repo_id": repo_id,
-            "size": int(size),
-            "downloadable": downloadable,
-            "provider_supported": provider_supported,
-            "supports_images": supports_images,
-            "local_loader": local_loader,
-            "lane": lane,
-            "mobile_catalog_allowed": mobile_catalog_allowed,
-            "metadata": metadata,
-        }
-    except GatedRepoError as e:  # gated/private repo; likely requires auth
-        return {
-            "repo_id": repo_id,
-            "size": 0,
-            "requires_auth": True,
-            "error": str(e),
-            "downloadable": downloadable,
-            "provider_supported": provider_supported,
-            "supports_images": supports_images,
-            "local_loader": local_loader,
-            "lane": lane,
-            "mobile_catalog_allowed": mobile_catalog_allowed,
-            "metadata": metadata,
-        }
-    except (RepositoryNotFoundError, HfHubHTTPError) as e:
-        # repo missing or API error â€” report gracefully
-        return {
-            "repo_id": repo_id,
-            "size": 0,
-            "error": str(e),
-            "downloadable": downloadable,
-            "provider_supported": provider_supported,
-            "supports_images": supports_images,
-            "local_loader": local_loader,
-            "lane": lane,
-            "mobile_catalog_allowed": mobile_catalog_allowed,
-            "metadata": metadata,
-        }
-    except Exception as e:
-        return {
-            "repo_id": repo_id,
-            "size": 0,
-            "error": str(e),
-            "downloadable": downloadable,
-            "provider_supported": provider_supported,
-            "supports_images": supports_images,
-            "local_loader": local_loader,
-            "lane": lane,
-            "mobile_catalog_allowed": mobile_catalog_allowed,
-            "metadata": metadata,
-        }
-
-
-@router.get("/models/summary/{model_name}")
-async def model_summary(
-    request: Request,
-    model_name: str,
-    verify: bool = False,
-    path: Optional[str] = None,
-):  # noqa: E501
-    """Return a compact, aggregated status for a model.
-
-    Includes local presence and size, upstream expected size, optional
-    verification against the upstream manifest, and the most recent download
-    job status if present.
-    """
-    cfg = request.app.state.config
-    model_alias = str(canonical_model_alias(model_name) or model_name).strip()
-    repo_id = resolve_model_alias(model_alias)
-    metadata = get_model_metadata(model_alias)
-
-    # Resolve local dirs and compute installed size
-    dirs = app_config.model_search_dirs(
-        path or cfg.get("models_folder", app_config.DEFAULT_MODELS_DIR)
-    )
-    resolved = _resolve_local_model_dir(dirs, model_alias)
-    installed = 0
-    if resolved is not None:
-        try:
-            allow_patterns = get_download_allow_patterns(model_alias)
-            installed = _folder_size_bytes(resolved, include_patterns=allow_patterns)
-        except Exception:
-            installed = 0
-
-    # Expected upstream size (best-effort)
-    expected = 0
-    requires_auth = False
-    repo_error: Optional[str] = None
-    token = cfg.get("hf_token") if isinstance(cfg, dict) else None
-    if repo_id and not str(repo_id).startswith("TODO"):
-        # Lazy imports
-        from huggingface_hub import HfApi
-
-        try:
-            from huggingface_hub.utils import GatedRepoError
-        except Exception:  # pragma: no cover
-            GatedRepoError = Exception  # type: ignore
-        api = HfApi(token=token) if token else HfApi()
-        try:
-            info = await asyncio.to_thread(api.model_info, repo_id, files_metadata=True)
-            siblings = getattr(info, "siblings", []) or []
-            allow_patterns = get_download_allow_patterns(model_alias)
-            expected = int(
-                sum(
-                    int(getattr(s, "size", None) or 0)
-                    for s in siblings
-                    if _path_matches_any(
-                        str(
-                            getattr(s, "rfilename", None)
-                            or getattr(s, "path", "")
-                            or ""
-                        ),
-                        allow_patterns,
-                    )
-                )
-            )
-        except GatedRepoError as e:  # gated/private
-            requires_auth = True
-            repo_error = str(e)
-        except Exception as e:
-            repo_error = str(e)
-
-    # Optional verification
-    verified: Optional[bool] = None
-    checked_files = 0
-    if verify:
-        try:
-            v = await verify_model(request, model_alias, path=path)  # type: ignore[arg-type]
-            verified = bool(v.get("verified"))
-            checked_files = int(v.get("checked_files", 0) or 0)
-            # Prefer expected from verification if it produced one
-            expected = int(v.get("expected_bytes", expected) or expected)
-            installed = int(v.get("installed_bytes", installed) or installed)
-        except Exception:
-            verified = False
-
-    # Most recent job for this model (if any)
-    job_info = None
-    try:
-        jobs = _get_jobs_state(request.app)
-        # pick latest by updated_at
-        candidates = [j for j in jobs.values() if j.get("model") == model_alias]
-        if candidates:
-            candidates.sort(
-                key=lambda j: j.get("updated_at", j.get("started_at", 0)), reverse=True
-            )
-            job = candidates[0]
-            _refresh_job_status(job)
-            prog = _job_progress(job)
-            job_info = {
-                "id": job.get("id"),
-                "status": job.get("status"),
-                "pid": job.get("pid"),
-                "downloaded": prog.get("downloaded"),
-                "total": prog.get("total"),
-                "percent": prog.get("percent"),
-                "updated_at": job.get("updated_at"),
-            }
-    except Exception:
-        job_info = None
-
-    # Target path for convenience (first candidate root)
-    target_root = dirs[0] if dirs else app_config.DEFAULT_MODELS_DIR
-    target_path = target_root / model_alias
-
-    out = {
-        "model": model_alias,
-        "repo_id": repo_id or "TODO: unsupported",
-        "exists": bool(resolved),
-        "path": str(resolved or target_path),
-        "installed_bytes": int(installed),
-        "expected_bytes": int(expected),
-        "verified": verified,
-        "checked_files": int(checked_files),
-        "job": job_info,
-        "requires_auth": requires_auth,
-        "downloadable": model_supports_download_job(model_alias),
-        "provider_supported": model_supports_provider_lane(model_alias),
-        "supports_images": model_supports_images(model_alias),
-        "local_loader": get_local_loader(model_alias),
-        "lane": get_model_lane(model_alias),
-        "mobile_catalog_allowed": model_allowed_in_mobile_catalog(model_alias),
-        "metadata": metadata,
-    }
-    if repo_error:
-        out["repo_error"] = repo_error
-    return out
-
-
 # Catalog selection and readiness with optional health checks
 @router.get("/models/catalog/select")
 async def catalog_select(
@@ -22359,193 +18380,6 @@ async def catalog_readiness(
     catalog = load_model_catalog()
     status = catalog.readiness(workflow, check_health=check_health, timeout=timeout)
     return status
-
-
-@router.get("/models/reveal/{model_name}")
-async def reveal_model_directory(
-    request: Request, model_name: str, path: Optional[str] = None
-):
-    """Attempt to reveal/open the model folder on the server host.
-
-    Returns the resolved path and a best-effort 'opened' flag.
-    If no GUI is available, 'opened' may be false while still returning the path.
-    """
-    cfg = request.app.state.config
-    dirs = app_config.model_search_dirs(
-        path or cfg.get("models_folder", app_config.DEFAULT_MODELS_DIR)
-    )
-    target = _resolve_local_model_dir(dirs, model_name)
-    if not target:
-        raise HTTPException(status_code=404, detail="Model not found")
-    open_target = target.parent if target.is_file() else target
-    opened = False
-    try:
-        # Best-effort: open folder via platform default handler
-        if sys.platform.startswith("linux"):
-            subprocess.Popen(["xdg-open", str(open_target)])
-            opened = True
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", str(open_target)])
-            opened = True
-        elif os.name == "nt":
-            subprocess.Popen(["explorer.exe", f"/select,{str(open_target)}"])
-            opened = True
-    except Exception:
-        opened = False
-    return {"path": str(open_target), "opened": opened}
-
-
-def _provider_display_name(provider: str) -> str:
-    normalized = str(provider or "").strip().lower()
-    if normalized == "lmstudio":
-        return "LM Studio"
-    if normalized == "ollama":
-        return "Ollama"
-    if normalized == "custom-openai-compatible":
-        return "custom OpenAI-compatible server"
-    return normalized or "provider"
-
-
-def _local_model_delete_lock_detail(model_name: str) -> Optional[str]:
-    try:
-        runtime = llm_service.local_runtime_status()
-    except Exception:
-        return None
-    if not isinstance(runtime, dict):
-        return None
-    active_names = {
-        str(runtime.get("model") or "").strip(),
-        str(runtime.get("effective_model_id") or "").strip(),
-    }
-    active_names.discard("")
-    if model_name not in active_names:
-        return None
-    loaded = bool(runtime.get("loaded"))
-    load_state = str(runtime.get("load_state") or "").strip().lower()
-    if not loaded and load_state not in {"loading", "ready", "error"}:
-        return None
-    return (
-        f"Direct local runtime still has '{model_name}' loaded. "
-        "Use unload in the local runtime panel first, then try deleting it again."
-    )
-
-
-def _provider_model_delete_lock_details(model_name: str) -> List[str]:
-    details: List[str] = []
-    lock_hints = provider_manager.describe_model_locks(
-        model_name,
-        providers=["lmstudio"],
-    )
-    for hint in lock_hints:
-        if not isinstance(hint, dict):
-            continue
-        provider_label = _provider_display_name(str(hint.get("provider") or ""))
-        loaded_model = str(hint.get("loaded_model") or model_name).strip() or model_name
-        base_url = str(hint.get("base_url") or "").strip()
-        location = f" at {base_url}" if base_url else ""
-        if bool(hint.get("server_owned_by_float")):
-            details.append(
-                f"{provider_label} still reports '{loaded_model}' as loaded{location}. "
-                "Use unload or stop in Float before deleting the files."
-            )
-        else:
-            details.append(
-                f"{provider_label} is reachable{location} and still reports "
-                f"'{loaded_model}' as loaded outside Float. "
-                "Stop that server directly or switch this lane to External HTTP only "
-                "before deleting the files."
-            )
-    return details
-
-
-def _build_model_delete_lock_parts(model_name: str) -> List[str]:
-    details: List[str] = []
-    local_detail = _local_model_delete_lock_detail(model_name)
-    if local_detail:
-        details.append(local_detail)
-    details.extend(_provider_model_delete_lock_details(model_name))
-    if not details:
-        details.append(
-            "Another process still has this model directory open. Close file explorers, "
-            "terminals, or model runtimes that may be using it, then try again."
-        )
-    return details
-
-
-def _build_model_delete_lock_message(model_name: str) -> str:
-    details = _build_model_delete_lock_parts(model_name)
-    return (
-        f"Couldn't delete model '{model_name}' because one or more files are still in use. "
-        + " ".join(details)
-    )
-
-
-def _build_model_delete_lock_detail(model_name: str) -> Dict[str, Any]:
-    details = _build_model_delete_lock_parts(model_name)
-    message = (
-        f"Couldn't delete model '{model_name}' because one or more files are still in use. "
-        + " ".join(details)
-    )
-    rows: List[Dict[str, str]] = [
-        {"label": "Source", "value": "model delete guard"},
-        {"label": "Model", "value": model_name},
-    ]
-    for index, detail in enumerate(details, start=1):
-        rows.append({"label": f"Evidence {index}", "value": detail})
-    rows.append(
-        {
-            "label": "Next",
-            "value": (
-                "Unload or stop the runtime that owns this model, then retry delete. "
-                "For externally managed providers, switch the lane to External HTTP only "
-                "before removing files."
-            ),
-        }
-    )
-    return {
-        "message": message,
-        "state_explanation": {
-            "title": "Why this model cannot be deleted",
-            "summary": (
-                "Float refused the delete because runtime ownership checks still show "
-                "the model or its directory in use."
-            ),
-            "rows": rows,
-        },
-    }
-
-
-@router.delete("/models/{model_name}")
-async def delete_model(
-    request: Request, model_name: str, path: Optional[str] = None
-):  # noqa: E501
-    # For explicitly registered paths, delete acts as an unregister operation
-    # so we do not remove arbitrary external folders/files.
-    if remove_local_model_entry(model_name):
-        return {"status": "unregistered"}
-    cfg = request.app.state.config
-    dirs = app_config.model_search_dirs(
-        path or cfg.get("models_folder", app_config.DEFAULT_MODELS_DIR)
-    )
-    for models_dir in dirs:
-        target = models_dir / model_name
-        if target.exists():
-            try:
-                shutil.rmtree(target)
-            except PermissionError as exc:
-                raise HTTPException(
-                    status_code=409,
-                    detail=_build_model_delete_lock_detail(model_name),
-                ) from exc
-            except OSError as exc:
-                if getattr(exc, "errno", None) in {errno.EACCES, errno.EPERM}:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=_build_model_delete_lock_detail(model_name),
-                    ) from exc
-                raise HTTPException(status_code=500, detail=str(exc)) from exc
-            return {"status": "deleted"}
-    raise HTTPException(status_code=404, detail="Model not found")
 
 
 # OpenAI Responses API Proxy Endpoints
@@ -22600,45 +18434,6 @@ async def get_response_completions(request: Request, response_id: str):
     except Exception:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     return resp.json()
-
-
-@router.get("/openai/models")
-async def openai_models(request: Request, include_non_chat: bool = False):
-    """List models available to the configured API key (OpenAI-compatible)."""
-    cfg = request.app.state.config
-    api_key = cfg.get("api_key")
-    if not api_key:
-        raise HTTPException(status_code=400, detail="API key not configured")
-    base = _responses_api_base(cfg.get("api_url"))
-    cached_models = _get_cached_openai_models(base, api_key)
-    if cached_models is not None:
-        return {
-            "models": _filter_openai_model_ids(
-                cached_models, include_non_chat=include_non_chat
-            )
-        }
-    headers = {"Authorization": f"Bearer {api_key}"}
-    url = f"{base.rstrip('/')}/models"
-    resp = http_session.get(url, headers=headers, timeout=10)
-    try:
-        resp.raise_for_status()
-    except Exception:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    data = resp.json()
-    raw = data.get("data", [])
-    if not isinstance(raw, list):
-        raw = []
-    model_ids = sorted(
-        {
-            m.get("id")
-            for m in raw
-            if isinstance(m, dict) and isinstance(m.get("id"), str) and m.get("id")
-        }
-    )
-    _store_cached_openai_models(base, api_key, model_ids)
-    return {
-        "models": _filter_openai_model_ids(model_ids, include_non_chat=include_non_chat)
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -22887,6 +18682,13 @@ def _reflection_event_metadata(
                 "novelty": run.get("novelty"),
                 "repetition": run.get("repetition"),
                 "should_continue": run.get("should_continue"),
+                "thought_trace_count": run.get("thought_trace_count") or 0,
+                "reasoning_trace_preserved": bool(run.get("thought_trace")),
+                "generation": (
+                    run.get("generation")
+                    if isinstance(run.get("generation"), dict)
+                    else {}
+                ),
             }
         )
     return payload
@@ -22925,6 +18727,12 @@ def _save_reflection_conversation(
         {
             "role": "ai",
             "content": note,
+            "thought": str(run.get("thought") or ""),
+            "thought_trace": (
+                run.get("thought_trace")
+                if isinstance(run.get("thought_trace"), list)
+                else []
+            ),
             "metadata": {
                 "reflection": True,
                 "task_id": task.get("id"),
@@ -23285,6 +19093,45 @@ class ActionRevertRequest(BaseModel):
     force: bool = False
 
 
+def _deployment_event_actions_for_history(
+    existing_actions: List[Dict[str, Any]], *, limit: int
+) -> List[Dict[str, Any]]:
+    try:
+        events = deployment_event_store.list_events(limit=limit)
+    except Exception:
+        logger.warning(
+            "Failed to project deployment events into work history", exc_info=True
+        )
+        return []
+    projected: List[Dict[str, Any]] = []
+    for event in events:
+        event_type = str(event.get("event_type") or "")
+        if event_type not in {
+            "software.install",
+            "data.sync",
+            "data.delete",
+            "data.bulk_replace",
+            "data.restore",
+            "data.safety_snapshot",
+        }:
+            continue
+        if event_type == "data.sync":
+            direction = str(event.get("direction") or "")
+            action_name = {
+                "pull": "sync_pull",
+                "incoming_push": "sync_ingest",
+            }.get(direction)
+            event_ts = float(event.get("recorded_at_ts") or 0.0)
+            if action_name and any(
+                str(action.get("name") or "") == action_name
+                and abs(float(action.get("created_at_ts") or 0.0) - event_ts) <= 10.0
+                for action in existing_actions
+            ):
+                continue
+        projected.append(deployment_event_store.event_to_action_summary(event))
+    return projected
+
+
 @router.get("/actions")
 async def get_actions(
     request: Request,
@@ -23294,24 +19141,42 @@ async def get_actions(
     limit: int = Query(default=200, ge=1, le=500),
 ) -> dict:
     service = _get_action_history_service(request.app)
-    if service is None:
-        return {"actions": []}
-    return {
-        "actions": service.list_actions(
+    actions = (
+        service.list_actions(
             conversation_id=conversation_id,
             response_id=response_id,
             include_reverted=include_reverted,
             limit=limit,
         )
-    }
+        if service is not None
+        else []
+    )
+    if not conversation_id and not response_id:
+        actions.extend(_deployment_event_actions_for_history(actions, limit=limit))
+        actions.sort(
+            key=lambda action: float(
+                action.get("created_at_ts") or action.get("timestamp") or 0.0
+            ),
+            reverse=True,
+        )
+        actions = actions[:limit]
+    return {"actions": actions}
 
 
 @router.get("/actions/{action_id}")
 async def get_action_detail(request: Request, action_id: str) -> dict:
     service = _get_action_history_service(request.app)
-    if service is None:
-        raise HTTPException(status_code=404, detail="Action history unavailable")
-    detail = service.get_action_detail(action_id)
+    detail = service.get_action_detail(action_id) if service is not None else None
+    if detail is None:
+        event_id = deployment_event_store.event_id_from_action_id(action_id)
+        event = deployment_event_store.get_event(event_id) if event_id else None
+        if event is not None:
+            return {
+                "action": {
+                    **deployment_event_store.event_to_action_summary(event),
+                    "items": [],
+                }
+            }
     if detail is None:
         raise HTTPException(status_code=404, detail="Action not found")
     return {"action": detail}
@@ -23613,16 +19478,12 @@ async def _apply_agent_console_control(
             "agent_label": record.get("label") or agent_id,
             "agent_status": next_status,
             "content": message,
-            "workflow": (
-                record.get("workflow")
-                if isinstance(record.get("workflow"), dict)
-                else None
-            ),
-            "provenance": (
-                record.get("provenance")
-                if isinstance(record.get("provenance"), dict)
-                else None
-            ),
+            "workflow": record.get("workflow")
+            if isinstance(record.get("workflow"), dict)
+            else None,
+            "provenance": record.get("provenance")
+            if isinstance(record.get("provenance"), dict)
+            else None,
             "handoff": handoff,
             "controls": updated_controls,
             "note": note or None,
@@ -23759,26 +19620,20 @@ async def get_task_status(task_id: str, request: Request):
             "agent_label": "Celery task chain",
             "content": f"Task chain state: {state}",
             "result_ready": "result" in data,
-            "workflow": (
-                existing_record.get("workflow")
-                if isinstance(existing_record, dict)
-                else None
-            ),
-            "provenance": (
-                existing_record.get("provenance")
-                if isinstance(existing_record, dict)
-                else None
-            ),
-            "handoff": (
-                existing_record.get("handoff")
-                if isinstance(existing_record, dict)
-                else None
-            ),
+            "workflow": existing_record.get("workflow")
+            if isinstance(existing_record, dict)
+            else None,
+            "provenance": existing_record.get("provenance")
+            if isinstance(existing_record, dict)
+            else None,
+            "handoff": existing_record.get("handoff")
+            if isinstance(existing_record, dict)
+            else None,
             "controls": controls_for_status(
                 console_status,
-                existing=(
-                    existing_controls if isinstance(existing_controls, dict) else None
-                ),
+                existing=existing_controls
+                if isinstance(existing_controls, dict)
+                else None,
             ),
         },
         default_agent=f"task:{task_id}",
@@ -23789,7 +19644,7 @@ async def get_task_status(task_id: str, request: Request):
 class VoiceConnect(BaseModel):
     identity: str
     room: str = "float"
-    thinking: Optional[Union[bool, str]] = None
+    thinking: Optional[Union[bool, str, float]] = None
     workflow: Optional[str] = None
 
 

@@ -162,12 +162,11 @@ class LMStudioAdapter(LocalProviderAdapter):
         cfg: Dict[str, Any],
         *,
         timeout: float = 2.5,
-        openai_compatible_only: bool = False,
     ) -> Dict[str, Any]:
         headers = self._headers(cfg)
         api_base = self.resolve_base_url(cfg, with_v1=False)
         base_v1 = self.resolve_base_url(cfg, with_v1=True)
-        if openai_compatible_only or self._provider(cfg) == "custom-openai-compatible":
+        if self._provider(cfg) == "custom-openai-compatible":
             candidates = [f"{base_v1}/models"]
         else:
             candidates = [
@@ -191,6 +190,37 @@ class LMStudioAdapter(LocalProviderAdapter):
                 }
         return {"ok": reachable, "models": [], "items": []}
 
+    def _quick_inventory_probe(
+        self,
+        cfg: Dict[str, Any],
+        *,
+        timeout: float = 0.35,
+    ) -> Dict[str, Any]:
+        """Confirm the OpenAI-compatible inventory surface without a full refresh."""
+        headers = self._headers(cfg)
+        api_base = self.resolve_base_url(cfg, with_v1=False)
+        base_v1 = self.resolve_base_url(cfg, with_v1=True)
+        if self._provider(cfg) == "custom-openai-compatible":
+            candidates = [f"{base_v1}/models"]
+        else:
+            candidates = [
+                f"{api_base}/api/v0/models",
+                f"{api_base}/api/v1/models",
+                f"{base_v1}/models",
+            ]
+        for endpoint in candidates:
+            payload = self._http_get_json(endpoint, timeout=timeout, headers=headers)
+            if not isinstance(payload, dict):
+                continue
+            models, items = self._extract_inventory_items(payload)
+            return {
+                "ok": True,
+                "models": sorted(set(models)),
+                "items": items,
+                "endpoint": endpoint,
+            }
+        return {"ok": False, "models": [], "items": [], "endpoint": None}
+
     def list_models(self, cfg: Dict[str, Any]) -> Dict[str, Any]:
         inventory = self._inventory_snapshot(cfg)
         return {
@@ -205,6 +235,7 @@ class LMStudioAdapter(LocalProviderAdapter):
         base = self.resolve_base_url(cfg, with_v1=False)
         headers = self._headers(cfg)
         status_payload = None
+        inventory_result: Dict[str, Any]
         if quick:
             status_endpoints = (
                 f"{base}/api/v1/status",
@@ -230,13 +261,19 @@ class LMStudioAdapter(LocalProviderAdapter):
 
         loaded_model = None
         context_length = None
+        model_state_known = False
+        model_state_source = "unknown"
         if isinstance(status_payload, dict):
-            for key in (
+            model_keys = (
                 "loaded_model",
                 "active_model",
                 "current_model",
                 "model",
-            ):
+            )
+            if any(key in status_payload for key in model_keys):
+                model_state_known = True
+                model_state_source = "status"
+            for key in model_keys:
                 value = status_payload.get(key)
                 if isinstance(value, str) and value.strip():
                     loaded_model = value.strip()
@@ -256,17 +293,35 @@ class LMStudioAdapter(LocalProviderAdapter):
 
         status_indicates_running = bool(
             isinstance(status_payload, dict)
-            and not str(status_payload.get("error") or "").strip()
-        )
-        quick_inventory_needed = quick and not status_indicates_running
-        if quick_inventory_needed:
-            inventory_result = self._inventory_snapshot(
-                cfg,
-                timeout=0.35,
-                openai_compatible_only=True,
+            and (
+                not str(status_payload.get("error") or "").strip()
+                or any(
+                    key in status_payload
+                    for key in (
+                        "loaded_model",
+                        "active_model",
+                        "current_model",
+                        "model",
+                        "status",
+                        "uptime",
+                        "version",
+                    )
+                )
             )
-        elif quick:
-            inventory_result = {"ok": False, "models": [], "items": []}
+        )
+        if quick:
+            inventory_result = {
+                "ok": False,
+                "models": [],
+                "items": [],
+                "endpoint": None,
+            }
+            # Keep quick status cheap, but fall back to the OpenAI-compatible
+            # inventory surface when LM Studio's status endpoints are missing or
+            # misleading. This avoids false "offline" reports without reloading
+            # the full provider model list.
+            if not loaded_model and not status_indicates_running:
+                inventory_result = self._quick_inventory_probe(cfg, timeout=0.35)
         else:
             inventory_result = self._inventory_snapshot(cfg, timeout=2.5)
         models = (
@@ -279,6 +334,15 @@ class LMStudioAdapter(LocalProviderAdapter):
         )
         if not isinstance(inventory_items, list):
             inventory_items = []
+        inventory_state_known = any(
+            isinstance(item, dict)
+            and bool(str(item.get("state") or item.get("status") or "").strip())
+            for item in inventory_items
+        )
+        if inventory_state_known:
+            model_state_known = True
+            if model_state_source == "unknown":
+                model_state_source = "inventory"
         if loaded_model is None:
             for item in inventory_items:
                 if not isinstance(item, dict):
@@ -292,17 +356,6 @@ class LMStudioAdapter(LocalProviderAdapter):
                 if isinstance(value, str) and value.strip():
                     loaded_model = value.strip()
                     break
-        if loaded_model is None and quick_inventory_needed:
-            for item in inventory_items:
-                if not isinstance(item, dict):
-                    continue
-                value = item.get("id") or item.get("model")
-                candidate = str(value or "").strip()
-                if candidate and "embedding" not in candidate.lower():
-                    loaded_model = candidate
-                    break
-        if loaded_model is None and quick_inventory_needed and models:
-            loaded_model = str(models[0]).strip() or None
         if context_length is None and loaded_model:
             for item in inventory_items:
                 if not isinstance(item, dict):
@@ -346,6 +399,9 @@ class LMStudioAdapter(LocalProviderAdapter):
             "models": models,
             "model_loaded": bool(loaded_model),
             "loaded_model": loaded_model,
+            "model_state_known": model_state_known,
+            "model_state_source": model_state_source,
+            "model_state_stale": False,
             "context_length": context_length,
             "base_url": base_v1,
             "details": status_payload or {},
@@ -405,7 +461,7 @@ class LMStudioAdapter(LocalProviderAdapter):
         binary = str(install.get("binary") or "")
         args = [binary, "server", "start", "--port", str(self._port(cfg))]
         if bool(cfg.get("local_provider_allow_lan")):
-            args.extend(["--host", "0.0.0.0"])
+            args.extend(["--bind", "0.0.0.0"])
         if bool(cfg.get("local_provider_enable_cors")):
             args.append("--cors")
         result = self._run_cmd(args)

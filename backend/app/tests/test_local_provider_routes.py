@@ -294,7 +294,7 @@ def test_provider_models_endpoint_can_force_refresh(monkeypatch, client):
 
 
 def test_server_models_endpoint_polls_lmstudio_inventory(monkeypatch, client):
-    from app import routes
+    from app.services import model_inventory_service
 
     called_urls = []
 
@@ -316,13 +316,18 @@ def test_server_models_endpoint_polls_lmstudio_inventory(monkeypatch, client):
                 {
                     "data": [
                         {"id": "text-embedding-nomic", "state": "not-loaded"},
-                        {"id": "gemma-4-26B-A4B-it", "state": "loaded"},
+                        {
+                            "id": "gemma-4-26B-A4B-it",
+                            "state": "loaded",
+                            "context_length": 262144,
+                            "capabilities": {"max_output_tokens": 65536},
+                        },
                     ]
                 }
             )
         raise AssertionError(f"unexpected url {url}")
 
-    monkeypatch.setattr(routes, "_server_model_probe_request", fake_get)
+    monkeypatch.setattr(model_inventory_service, "server_model_probe_request", fake_get)
     response = client.get(
         "/llm/server/models",
         params={"server_url": "http://127.0.0.1:1234"},
@@ -333,11 +338,54 @@ def test_server_models_endpoint_polls_lmstudio_inventory(monkeypatch, client):
     assert payload["models"] == ["gemma-4-26B-A4B-it", "text-embedding-nomic"]
     assert payload["loaded_model"] == "gemma-4-26B-A4B-it"
     assert payload["reachable"] is True
+    assert {
+        "id": "gemma-4-26B-A4B-it",
+        "max_context_length": 262144,
+        "max_output_tokens": 65536,
+    } in payload["model_details"]
     assert called_urls == ["http://127.0.0.1:1234/api/v0/models"]
 
 
+def test_server_models_endpoint_uses_tinker_account_inventory(monkeypatch, client):
+    from app.routers import provider as provider_router
+    from app.server_presets import TINKER_OPENAI_BASE_URL
+
+    captured = {}
+
+    def fake_inventory(api_key):
+        captured["api_key"] = api_key
+        return {
+            "reachable": True,
+            "models": ["tinker://run:train:0/sampler_weights/custom"],
+            "loaded_model": "",
+            "inventory_source": "tinker-sdk",
+            "model_details": [
+                {
+                    "id": "tinker://run:train:0/sampler_weights/custom",
+                    "kind": "checkpoint",
+                    "source": "tinker-sdk",
+                }
+            ],
+        }
+
+    monkeypatch.setenv("TINKER_API_KEY", "tinker-secret")
+    monkeypatch.setattr(provider_router, "list_tinker_account_models", fake_inventory)
+    response = client.get(
+        "/llm/server/models",
+        params={"server_url": TINKER_OPENAI_BASE_URL, "preset_id": "tinker"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert captured["api_key"] == "tinker-secret"
+    assert payload["preset_id"] == "tinker"
+    assert payload["provider"] == "tinker"
+    assert payload["models"] == ["tinker://run:train:0/sampler_weights/custom"]
+    assert payload["model_details"][0]["kind"] == "checkpoint"
+
+
 def test_server_models_probe_has_total_timeout_budget(monkeypatch):
-    from app import routes
+    from app.services import model_inventory_service
 
     ticks = [1000.0]
     called_urls = []
@@ -350,10 +398,12 @@ def test_server_models_probe_has_total_timeout_budget(monkeypatch):
         ticks[0] += 1.1
         raise requests.ConnectTimeout("slow provider")
 
-    monkeypatch.setattr(routes.time, "monotonic", fake_monotonic)
-    monkeypatch.setattr(routes, "_server_model_probe_request", fake_get)
+    monkeypatch.setattr(model_inventory_service.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(model_inventory_service, "server_model_probe_request", fake_get)
 
-    payload = routes._probe_server_model_inventory("http://127.0.0.1:1234")
+    payload = model_inventory_service.probe_server_model_inventory(
+        "http://127.0.0.1:1234"
+    )
 
     assert payload["status"] == "success"
     assert payload["reachable"] is False

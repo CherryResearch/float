@@ -18,7 +18,6 @@ import {
 } from "./utils/proxy";
 import { buildHistoryFromConversation } from "./utils/conversationHistory";
 import { shouldRefreshProviderModels } from "./utils/providerProbe";
-import { ensureDeviceAndToken } from "./utils/sync";
 import { isGptOssModel, isLocalRuntimeEntry } from "./utils/modelUtils";
 import ReactDOM from "react-dom/client";
 import App from "./components/App"; // Clean import path
@@ -35,6 +34,11 @@ import {
   normalizeToolDisplayMode,
   normalizeToolLinkBehavior,
 } from "./utils/toolDisplayModes";
+import { normalizeThinkingMode } from "./utils/reasoningEffort";
+import {
+  normalizeCustomOutputTokens,
+  normalizeOutputTokenMode,
+} from "./utils/generationLimits";
 
 // Generate a default conversation name like "New Chat 2024-05-01 13:37"
 const generateDefaultName = (timestamp = Date.now()) => {
@@ -221,7 +225,7 @@ const GlobalProvider = ({ children }) => {
     const storedBackendModeRaw =
       localStorage.getItem("backendMode") || "api";
     const storedBackendMode = normalizeBackendMode(storedBackendModeRaw);
-    const storedApiModel = localStorage.getItem("apiModel") || "gpt-5.4";
+    const storedApiModel = localStorage.getItem("apiModel") || "chat-latest";
     const storedLocalModel =
       localStorage.getItem("localModel") || "mistral:7b";
     const storedTransformerModel =
@@ -304,16 +308,15 @@ const GlobalProvider = ({ children }) => {
     const storedToolLinkBehavior = normalizeToolLinkBehavior(
       localStorage.getItem("toolLinkBehavior"),
     );
-    const storedThinkingModeRaw = localStorage.getItem("thinkingMode");
-    const storedThinkingMode = (() => {
-      const raw = storedThinkingModeRaw == null ? "" : String(storedThinkingModeRaw).trim().toLowerCase();
-      if (raw === "high") return "high";
-      if (raw === "low") return "low";
-      if (raw === "auto") return "auto";
-      if (raw === "true") return "high";
-      if (raw === "false") return "low";
-      return "auto";
-    })();
+    const storedThinkingMode = normalizeThinkingMode(
+      localStorage.getItem("thinkingMode"),
+    );
+    const storedOutputTokenMode = normalizeOutputTokenMode(
+      localStorage.getItem("outputTokenMode"),
+    );
+    const storedCustomOutputTokens = normalizeCustomOutputTokens(
+      localStorage.getItem("customOutputTokens"),
+    );
     const storedTextRagEnabled = localStorage.getItem("textRagEnabled") !== "false";
     const storedVisionRagEnabled = localStorage.getItem("visionRagEnabled") !== "false";
     const storedRagEmbeddingModel =
@@ -345,8 +348,12 @@ const GlobalProvider = ({ children }) => {
       backendMode: storedBackendMode,
       apiModel: storedApiModel,
       apiModels: [],
+      apiModelAliases: {},
+      apiModelCatalog: [],
       apiModelsUpdatedAt: null,
       registeredLocalModels: [],
+      serverModelDetails: [],
+      serverInventorySource: "",
       localModel: storedLocalModel,
       transformerModel: storedTransformerModel,
       staticModel: storedStaticModel,
@@ -389,6 +396,8 @@ const GlobalProvider = ({ children }) => {
       requestTimeoutSec: storedRequestTimeoutSec ?? 30,
       streamIdleTimeoutSec: storedStreamIdleTimeoutSec ?? 120,
       thinkingMode: storedThinkingMode,
+      outputTokenMode: storedOutputTokenMode,
+      customOutputTokens: storedCustomOutputTokens,
       textRagEnabled: storedTextRagEnabled,
       visionRagEnabled: storedVisionRagEnabled,
       ragEmbeddingModel: storedRagEmbeddingModel,
@@ -404,6 +413,7 @@ const GlobalProvider = ({ children }) => {
   const apiProbeStateRef = useRef({
     apiModelsUpdatedAt: null,
     apiProviderStatus: "unknown",
+    apiModel: state.apiModel,
   });
   registerCustomThemes(Array.isArray(state.customThemes) ? state.customThemes : []);
 
@@ -411,18 +421,24 @@ const GlobalProvider = ({ children }) => {
     apiProbeStateRef.current = {
       apiModelsUpdatedAt: state.apiModelsUpdatedAt,
       apiProviderStatus: state.apiProviderStatus,
+      apiModel: state.apiModel,
     };
-  }, [state.apiModelsUpdatedAt, state.apiProviderStatus]);
+  }, [state.apiModel, state.apiModelsUpdatedAt, state.apiProviderStatus]);
 
   // Check API health and update status
   useEffect(() => {
-    const updateApiState = (status, providerStatus, models) => {
+    const updateApiState = (status, providerStatus, models, aliases, catalog) => {
       setState((prev) => {
-        const prevProvider = prev.apiProviderStatus ?? "unknown";
-        const nextProvider = providerStatus ?? "unknown";
         const hasModelsUpdate = Array.isArray(models);
         const nextModels = hasModelsUpdate ? models : prev.apiModels;
         const nextModelsUpdatedAt = hasModelsUpdate ? Date.now() : prev.apiModelsUpdatedAt;
+        const nextAliases =
+          aliases && typeof aliases === "object" && !Array.isArray(aliases)
+            ? aliases
+            : prev.apiModelAliases;
+        const nextCatalog = Array.isArray(catalog)
+          ? catalog
+          : prev.apiModelCatalog;
         return {
           ...prev,
           apiStatus: status,
@@ -430,6 +446,8 @@ const GlobalProvider = ({ children }) => {
           ...(hasModelsUpdate
             ? {
                 apiModels: nextModels,
+                apiModelAliases: nextAliases,
+                apiModelCatalog: nextCatalog,
                 apiModelsUpdatedAt: nextModelsUpdatedAt,
               }
             : {}),
@@ -471,17 +489,36 @@ const GlobalProvider = ({ children }) => {
           const probeState = apiProbeStateRef.current;
           let providerStatus = probeState.apiProviderStatus ?? "online";
           let apiModels = null;
+          let apiModelAliases = null;
+          let apiModelCatalog = null;
           if (shouldRefreshProviderModels(probeState)) {
             try {
-              const r = await axios.get("/api/openai/models");
-              const models = r?.data?.models;
+              const r = await axios.get("/api/openai/models", {
+                params: { selected_model: probeState.apiModel || undefined },
+              });
+              const models = Array.isArray(r?.data?.selectable_models)
+                ? r.data.selectable_models
+                : r?.data?.models;
+              const aliases = r?.data?.model_aliases;
+              const catalog = r?.data?.catalog;
               providerStatus = "online";
               apiModels = Array.isArray(models) ? models : [];
+              apiModelAliases =
+                aliases && typeof aliases === "object" && !Array.isArray(aliases)
+                  ? aliases
+                  : {};
+              apiModelCatalog = Array.isArray(catalog) ? catalog : [];
             } catch (providerErr) {
               providerStatus = classifyProviderStatus(providerErr);
             }
           }
-          updateApiState("online", providerStatus, apiModels);
+          updateApiState(
+            "online",
+            providerStatus,
+            apiModels,
+            apiModelAliases,
+            apiModelCatalog,
+          );
           attempts = 0;
           timeoutId = setTimeout(checkApi, onlinePollMs);
           return;
@@ -648,13 +685,6 @@ const GlobalProvider = ({ children }) => {
     ensureServiceWorker();
   }, []);
 
-  // Phase 1: auto-enroll device and fetch a token on startup when API is online
-  useEffect(() => {
-    if (state.apiStatus === "online" && state.backendMode === "api") {
-      ensureDeviceAndToken().catch(() => {});
-    }
-  }, [state.apiStatus, state.backendMode]);
-
   useEffect(() => {
     localStorage.setItem("conversation", JSON.stringify(state.conversation));
     if (state.conversationTrimMeta?.truncated) {
@@ -684,7 +714,9 @@ const GlobalProvider = ({ children }) => {
               return;
             }
           }
-        } catch {}
+        } catch (err) {
+          void err;
+        }
       }
       const clientWindow = state.conversationTrimMeta?.truncated
         ? state.conversationTrimMeta
@@ -936,6 +968,20 @@ const GlobalProvider = ({ children }) => {
   useEffect(() => {
     localStorage.setItem("thinkingMode", String(state.thinkingMode || "auto"));
   }, [state.thinkingMode]);
+
+  useEffect(() => {
+    localStorage.setItem(
+      "outputTokenMode",
+      normalizeOutputTokenMode(state.outputTokenMode),
+    );
+  }, [state.outputTokenMode]);
+
+  useEffect(() => {
+    localStorage.setItem(
+      "customOutputTokens",
+      String(normalizeCustomOutputTokens(state.customOutputTokens)),
+    );
+  }, [state.customOutputTokens]);
 
   useEffect(() => {
     localStorage.setItem("textRagEnabled", String(state.textRagEnabled !== false));

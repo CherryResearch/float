@@ -1,10 +1,18 @@
 import json
 import sys
+import time
 from pathlib import Path
 
+import jwt
 import pytest
 import requests
 from fastapi.testclient import TestClient
+
+
+def _device_sync_routes():
+    from app.routers import device_sync
+
+    return device_sync
 
 
 @pytest.fixture
@@ -16,6 +24,7 @@ def client(tmp_path, monkeypatch):
     from app.utils import (
         device_registry,
         rendezvous_store,
+        sync_checkpoint_store,
         sync_review_store,
         sync_store,
         user_settings,
@@ -33,9 +42,50 @@ def client(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(sync_store, "SYNC_PATH", tmp_path / "sync_state.json")
     monkeypatch.setattr(
+        sync_checkpoint_store,
+        "CHECKPOINTS_PATH",
+        tmp_path / "sync_checkpoints.json",
+    )
+    monkeypatch.setattr(
         sync_store, "LEGACY_SYNC_PATH", tmp_path / "legacy_sync_state.json"
     )
+    monkeypatch.setenv("FLOAT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv(
+        "FLOAT_DEPLOYMENT_REGISTRY_PATH",
+        str(tmp_path / "machine_deployments.json"),
+    )
     return TestClient(app)
+
+
+def _stub_plan_receipt_validation(monkeypatch):
+    monkeypatch.setattr(
+        _device_sync_routes(),
+        "decode_sync_plan_receipt",
+        lambda _token: {"context": {"previewed_sections": []}},
+    )
+    monkeypatch.setattr(
+        _device_sync_routes(),
+        "assert_sync_plan_authorized",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        _device_sync_routes().RemoteFloatClient,
+        "get_manifest",
+        lambda self, sections, workspace_ids=None: {
+            "sections": {section: [] for section in sections or []}
+        },
+    )
+
+
+def test_mobile_float_state_path_defaults_to_repo_root(monkeypatch):
+    from app import config as app_config
+
+    monkeypatch.delenv("FLOAT_DEV_STATE_PATH", raising=False)
+
+    assert (
+        _device_sync_routes()._mobile_float_state_path()
+        == app_config.REPO_ROOT / ".dev_state.json"
+    )
 
 
 def test_pairing_offer_accept_registers_device(client):
@@ -105,6 +155,68 @@ def test_pairing_accept_allows_lan_when_enabled(client):
     assert accepted.status_code == 200
 
 
+def test_direct_lan_cannot_reach_sync_control_plane(client):
+    client.post("/user-settings", json={"sync_visible_on_lan": True})
+    headers = {"x-forwarded-for": "192.168.1.25"}
+
+    attempts = [
+        client.post(
+            "/devices/register",
+            headers=headers,
+            json={"public_key": "self-enroll", "capabilities": {"sync": True}},
+        ),
+        client.get("/devices", headers=headers),
+        client.post(
+            "/pairing/offers",
+            headers=headers,
+            json={"requested_scopes": ["sync"]},
+        ),
+        client.post(
+            "/sync/plan",
+            headers=headers,
+            json={"remote_url": "http://peer.test:5000"},
+        ),
+        client.post(
+            "/sync/apply",
+            headers=headers,
+            json={"remote_url": "http://peer.test:5000", "direction": "pull"},
+        ),
+    ]
+
+    assert [response.status_code for response in attempts] == [403, 403, 403, 403, 403]
+    assert all(
+        "control" in response.json()["detail"].lower()
+        or "local frontend" in response.json()["detail"].lower()
+        for response in attempts
+    )
+
+
+def test_pairing_offer_caps_requested_scopes_and_scrubs_offer(client):
+    from app.utils import rendezvous_store
+
+    offer = client.post("/pairing/offers", json={"requested_scopes": ["sync"]}).json()[
+        "offer"
+    ]
+    accepted = client.post(
+        "/pairing/offers/accept",
+        json={
+            "code": offer["code"],
+            "device_name": "laptop",
+            "public_key": "pk-laptop",
+            "requested_scopes": ["sync", "stream", "files"],
+        },
+    )
+
+    assert accepted.status_code == 200
+    assert accepted.json()["paired_device"]["scopes"] == ["sync"]
+    stored = next(iter(client.get("/devices").json()["devices"].values()))
+    assert stored["capabilities"]["requested_scopes"] == ["sync"]
+    rendezvous = json.loads(
+        rendezvous_store.RENDEZVOUS_PATH.read_text(encoding="utf-8")
+    )
+    assert rendezvous["offers"] == {}
+
+
 def test_sync_overview_reports_visibility_and_urls(client):
     client.post("/user-settings", json={"sync_visible_on_lan": True})
     overview = client.get("/sync/overview", headers={"host": "localhost:5000"})
@@ -119,6 +231,19 @@ def test_sync_overview_reports_visibility_and_urls(client):
     assert payload["workspaces"]["active_workspace_id"] == "root"
     assert payload["workspaces"]["selected_workspace_ids"] == ["root"]
     assert payload["workspaces"]["profiles"][0]["id"] == "root"
+    assert payload["deployment_status"]["software"]["release_version"] == "0.1.0a1"
+    assert payload["deployment_status"]["data"]["deployment_id"] == (
+        payload["current_device"]["deployment_id"]
+    )
+    assert payload["deployment_status"]["data"]["revision"]["code"].startswith("d-")
+    assert (
+        payload["deployment_status"]["data"]["sync_checkpoint"]["state"]
+        == "never_synced"
+    )
+    assert (
+        payload["deployment_status"]["data"]["workspaces"][0]["custody_role"]
+        == "primary"
+    )
     assert payload["egress_summary"]["private_network_only"] is True
     assert payload["egress_summary"]["inbound_visibility"]["lan_enabled"] is True
     assert payload["egress_summary"]["outbound_target"]["mode"] == "none"
@@ -135,19 +260,50 @@ def test_sync_overview_reports_visibility_and_urls(client):
     assert payload["sync_suggestions"][0]["id"] == "pair-a-device"
     assert payload["sync_suggestions"][0]["auto_sync_enabled"] is False
 
+    instance = client.get("/api/instance")
+    assert instance.status_code == 200
+    instance_payload = instance.json()
+    assert set(instance_payload) == {"schema_version", "software", "data"}
+    assert (
+        instance_payload["data"]["deployment_id"]
+        == payload["deployment_status"]["data"]["deployment_id"]
+    )
+    assert instance_payload["data"]["revision"]["code"].startswith("d-")
+
+
+def test_sync_events_exposes_local_content_free_ledger(client):
+    from app.utils import deployment_event_store
+
+    deployment_event_store.record_event(
+        event_type="data.sync",
+        direction="pull",
+        peer_deployment_id="peer-deployment-id",
+        sections=["memories"],
+        counts={"before_count": 1, "after_count": 2},
+    )
+
+    response = client.get("/sync/events")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["chain"]["valid"] is True
+    assert payload["events"][0]["event_type"] == "data.sync"
+    assert payload["events"][0]["counts"] == {
+        "after_count": 2,
+        "before_count": 1,
+    }
+
 
 def test_mobile_float_serve_start_uses_current_frontend_port(
     client, tmp_path, monkeypatch
 ):
-    from app import routes
-
     state_path = tmp_path / ".dev_state.json"
     state_path.write_text(
         json.dumps({"frontend_port": 5173, "backend_port": 8000}),
         encoding="utf-8",
     )
     monkeypatch.setenv("FLOAT_DEV_STATE_PATH", str(state_path))
-    monkeypatch.setattr(routes.shutil, "which", lambda name: "tailscale")
+    monkeypatch.setattr(_device_sync_routes().shutil, "which", lambda name: "tailscale")
     calls = []
     started = {"value": False}
 
@@ -155,7 +311,7 @@ def test_mobile_float_serve_start_uses_current_frontend_port(
         calls.append(cmd)
         args = cmd[1:]
         if args == ["status", "--self", "--json"]:
-            return routes.subprocess.CompletedProcess(
+            return _device_sync_routes().subprocess.CompletedProcess(
                 cmd,
                 0,
                 stdout=json.dumps(
@@ -175,7 +331,9 @@ def test_mobile_float_serve_start_uses_current_frontend_port(
                 if started["value"]
                 else "No serve config"
             )
-            return routes.subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+            return _device_sync_routes().subprocess.CompletedProcess(
+                cmd, 0, stdout=stdout, stderr=""
+            )
         if args == [
             "serve",
             "--http=64345",
@@ -184,10 +342,12 @@ def test_mobile_float_serve_start_uses_current_frontend_port(
             "localhost:5173",
         ]:
             started["value"] = True
-            return routes.subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return _device_sync_routes().subprocess.CompletedProcess(
+                cmd, 0, stdout="", stderr=""
+            )
         raise AssertionError(f"Unexpected tailscale command: {args}")
 
-    monkeypatch.setattr(routes.subprocess, "run", fake_run)
+    monkeypatch.setattr(_device_sync_routes().subprocess, "run", fake_run)
 
     res = client.post("/sync/mobile-serve/start", json={"serve_port": 64345})
 
@@ -209,9 +369,7 @@ def test_mobile_float_serve_start_uses_current_frontend_port(
 
 
 def test_mobile_float_serve_status_reports_missing_tailscale(client, monkeypatch):
-    from app import routes
-
-    monkeypatch.setattr(routes.shutil, "which", lambda name: None)
+    monkeypatch.setattr(_device_sync_routes().shutil, "which", lambda name: None)
 
     res = client.get("/sync/mobile-serve/status")
 
@@ -262,12 +420,10 @@ def test_sync_overview_suggests_reviewed_sync_without_auto_sync(client):
 
 
 def test_sync_peer_status_records_operation_lifecycle(client, monkeypatch):
-    from app import routes
-
     monkeypatch.setattr(
-        routes,
+        _device_sync_routes(),
         "_peer_connectivity_status",
-        lambda _remote_url: {
+        lambda _remote_url, _paired_device=None: {
             "reachable": True,
             "instance_base": "http://peer.float:5000",
             "identity": {"public_key": "pk-peer", "display_name": "Peer"},
@@ -303,13 +459,38 @@ def test_sync_peer_status_records_operation_lifecycle(client, monkeypatch):
     assert rows["Remote"] == "http://peer.float:5000"
 
 
-def test_sync_operation_records_failure_and_cancel_intent(client, monkeypatch):
-    from app import routes
+def test_sync_operation_history_expires_inactive_address_records(client, monkeypatch):
+    from app.utils import sync_store
 
-    def _raise_timeout(_remote_url):
+    monkeypatch.setattr(sync_store, "_now", lambda: 1_700_000_000.0)
+    sync_store.start_operation(
+        kind="check",
+        operation_id="old-check",
+        remote_url="http://192.168.50.45:59185",
+    )
+    sync_store.finish_operation("old-check")
+
+    monkeypatch.setattr(
+        sync_store,
+        "_now",
+        lambda: 1_700_000_000.0
+        + sync_store.MAX_INACTIVE_SYNC_OPERATION_AGE_SECONDS
+        + 1,
+    )
+    snapshot = sync_store.operations_snapshot()
+
+    assert snapshot["last_attempt"] is None
+    persisted = json.loads(sync_store.SYNC_PATH.read_text(encoding="utf-8"))
+    assert persisted["sync_operations"] == {}
+
+
+def test_sync_operation_records_failure_and_cancel_intent(client, monkeypatch):
+    def _raise_timeout(_remote_url, _paired_device=None):
         raise requests.Timeout("timed out")
 
-    monkeypatch.setattr(routes, "_peer_connectivity_status", _raise_timeout)
+    monkeypatch.setattr(
+        _device_sync_routes(), "_peer_connectivity_status", _raise_timeout
+    )
 
     failed = client.post(
         "/sync/peer/status",
@@ -390,8 +571,6 @@ def test_sync_overview_prefers_resolvable_hostname_for_lan_url(client, monkeypat
 
 
 def test_sync_pair_stores_saved_peer(client, monkeypatch):
-    from app import routes
-
     class FakeResponse:
         def raise_for_status(self):
             return None
@@ -403,7 +582,9 @@ def test_sync_pair_stores_saved_peer(client, monkeypatch):
             }
 
     monkeypatch.setattr(
-        routes.http_session, "post", lambda *args, **kwargs: FakeResponse()
+        _device_sync_routes().http_session,
+        "post",
+        lambda *args, **kwargs: FakeResponse(),
     )
 
     res = client.post(
@@ -442,8 +623,6 @@ def test_sync_pair_stores_saved_peer(client, monkeypatch):
 def test_sync_pair_updates_existing_saved_peer_when_peer_id_supplied(
     client, monkeypatch
 ):
-    from app import routes
-
     client.post(
         "/user-settings",
         json={
@@ -469,7 +648,9 @@ def test_sync_pair_updates_existing_saved_peer_when_peer_id_supplied(
             }
 
     monkeypatch.setattr(
-        routes.http_session, "post", lambda *args, **kwargs: FakeResponse()
+        _device_sync_routes().http_session,
+        "post",
+        lambda *args, **kwargs: FakeResponse(),
     )
 
     res = client.post(
@@ -509,8 +690,6 @@ def test_sync_pair_rejects_incomplete_private_ip(client):
 
 
 def test_sync_pair_revoke_removes_local_pair(client, monkeypatch):
-    from app import routes
-
     paired = {
         "id": "peer-1",
         "label": "studio",
@@ -519,14 +698,19 @@ def test_sync_pair_revoke_removes_local_pair(client, monkeypatch):
         "remote_device_id": "remote-device-1",
         "public_key": "pk-local",
     }
-    client.post("/user-settings", json={"sync_saved_peers": [paired]})
+    client.post(
+        "/user-settings",
+        json={"sync_saved_peers": [paired], "sync_remote_url": paired["remote_url"]},
+    )
 
     called = {"value": False}
 
     def _fake_delete(self):
         called["value"] = True
 
-    monkeypatch.setattr(routes.RemoteFloatClient, "delete_remote_device", _fake_delete)
+    monkeypatch.setattr(
+        _device_sync_routes().RemoteFloatClient, "delete_remote_device", _fake_delete
+    )
 
     res = client.post(
         "/sync/pair/revoke",
@@ -536,6 +720,7 @@ def test_sync_pair_revoke_removes_local_pair(client, monkeypatch):
     assert called["value"] is True
     overview = client.get("/sync/overview").json()
     assert overview["sync_defaults"]["saved_peers"] == []
+    assert overview["sync_defaults"]["remote_url"] == ""
 
 
 def test_device_token_requires_device_proof_and_caps_scopes(client):
@@ -588,6 +773,100 @@ def test_device_token_requires_device_proof_and_caps_scopes(client):
         json={"device_id": device_id, "scopes": ["sync"]},
     )
     assert refreshed.status_code == 200
+
+
+def test_device_token_is_bounded_and_revocation_invalidates_it(client):
+    registered = client.post(
+        "/devices/register",
+        json={
+            "public_key": "pk-revocable",
+            "name": "Revocable",
+            "capabilities": {
+                "requested_scopes": ["sync"],
+                "paired_via_offer": True,
+            },
+        },
+    ).json()["device"]
+    issued = client.post(
+        "/devices/token",
+        json={
+            "device_id": registered["id"],
+            "scopes": ["sync"],
+            "ttl_seconds": 86400,
+            "public_key": "pk-revocable",
+        },
+    )
+    token = issued.json()["token"]
+    claims = jwt.decode(token, options={"verify_signature": False})
+    assert claims["exp"] - claims["iat"] == 3600
+
+    client.post("/user-settings", json={"sync_visible_on_lan": True})
+    remote_headers = {
+        "Authorization": f"Bearer {token}",
+        "x-forwarded-for": "192.168.1.25",
+    }
+    assert client.get("/sync/overview", headers=remote_headers).status_code == 200
+
+    assert client.delete(f"/devices/{registered['id']}").status_code == 200
+    revoked = client.get("/sync/cursor", headers=remote_headers)
+    assert revoked.status_code == 401
+    assert revoked.json()["detail"] == "Device is no longer registered"
+
+
+def test_scoped_sync_route_rejects_expired_device_token(client):
+    from app.utils import device_registry
+
+    secret = device_registry.get_device_jwt_secret()
+    now = int(time.time())
+    token = jwt.encode(
+        {
+            "iss": "float-backend",
+            "sub": "expired-device",
+            "typ": "device",
+            "scopes": ["sync"],
+            "iat": now - 120,
+            "nbf": now - 120,
+            "exp": now - 60,
+        },
+        secret,
+        algorithm="HS256",
+    )
+
+    response = client.get(
+        "/sync/cursor",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid token"
+
+
+def test_scoped_sync_route_rejects_non_device_token(client):
+    from app.utils import device_registry
+
+    secret = device_registry.get_device_jwt_secret()
+    now = int(time.time())
+    token = jwt.encode(
+        {
+            "iss": "float-backend",
+            "sub": "wrong-token-kind",
+            "typ": "session",
+            "scopes": ["sync"],
+            "iat": now,
+            "nbf": now,
+            "exp": now + 300,
+        },
+        secret,
+        algorithm="HS256",
+    )
+
+    response = client.get(
+        "/sync/cursor",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid token"
 
 
 def test_sync_ingest_queues_review_until_approved(client):
@@ -656,7 +935,11 @@ def test_prune_legacy_devices_removes_browser_records_only(client):
         json={
             "public_key": "real-pk",
             "name": "Pear",
-            "capabilities": {"instance_sync": True, "requested_scopes": ["sync"]},
+            "capabilities": {
+                "instance_sync": True,
+                "requested_scopes": ["sync"],
+                "paired_via_offer": True,
+            },
         },
     )
 
@@ -685,7 +968,10 @@ def test_sync_overview_buckets_browser_shaped_records_as_legacy_even_with_scopes
         json={
             "public_key": "real-pk",
             "name": "Pear Laptop",
-            "capabilities": {"requested_scopes": ["sync"]},
+            "capabilities": {
+                "requested_scopes": ["sync"],
+                "paired_via_offer": True,
+            },
         },
     )
 
@@ -696,9 +982,7 @@ def test_sync_overview_buckets_browser_shaped_records_as_legacy_even_with_scopes
     assert overview["legacy_inbound_devices"][0]["name"].startswith("Mozilla/5.0")
 
 
-def test_sync_peer_status_reports_remote_visibility(client, monkeypatch):
-    from app import routes
-
+def test_unpaired_sync_peer_status_reports_reachability_only(client, monkeypatch):
     class FakeResponse:
         def raise_for_status(self):
             return None
@@ -736,7 +1020,9 @@ def test_sync_peer_status_reports_remote_visibility(client, monkeypatch):
             }
 
     monkeypatch.setattr(
-        routes.http_session, "get", lambda *args, **kwargs: FakeResponse()
+        _device_sync_routes().http_session,
+        "get",
+        lambda *args, **kwargs: FakeResponse(),
     )
 
     res = client.post(
@@ -746,14 +1032,12 @@ def test_sync_peer_status_reports_remote_visibility(client, monkeypatch):
     assert res.status_code == 200
     payload = res.json()
     assert payload["reachable"] is True
-    assert payload["display_name"] == "Pear"
-    assert payload["visible_on_lan"] is True
+    assert payload["display_name"] == ""
+    assert payload["visible_on_lan"] is False
     assert payload["workspaces"]["profiles"][0]["id"] == "root"
 
 
 def test_sync_peer_status_updates_moved_url_when_identity_matches(client, monkeypatch):
-    from app import routes
-
     old_pair = {
         "id": "peer-1",
         "label": "Pear",
@@ -778,11 +1062,32 @@ def test_sync_peer_status_updates_moved_url_when_identity_matches(client, monkey
 
         def json(self):
             return {
+                "deployment_status": {
+                    "schema_version": 1,
+                    "software": {
+                        "release_version": "0.1.0a1",
+                        "build_code": "b12",
+                        "label": "0.1.0a1 // b12",
+                        "snapshot_digest": "sha256:matching-snapshot",
+                    },
+                    "data": {
+                        "deployment_id": "deployment-pear-1234",
+                        "display_name": "Pear",
+                        "workspace_count": 1,
+                    },
+                },
                 "current_device": {
+                    "deployment_id": "deployment-pear-1234",
                     "display_name": "Pear",
                     "hostname": "pear-host",
                     "public_key": "pk-pear",
                     "source_namespace": "Pear",
+                    "software": {
+                        "release_version": "0.1.0a1",
+                        "build_code": "b12",
+                        "label": "0.1.0a1 // b12",
+                        "snapshot_digest": "sha256:matching-snapshot",
+                    },
                 },
                 "device_access": {
                     "visibility": {"lan_enabled": True},
@@ -796,7 +1101,27 @@ def test_sync_peer_status_updates_moved_url_when_identity_matches(client, monkey
             }
 
     monkeypatch.setattr(
-        routes.http_session, "get", lambda *args, **kwargs: FakeResponse()
+        _device_sync_routes().RemoteFloatClient,
+        "get_sync_overview",
+        lambda self: FakeResponse().json(),
+    )
+    monkeypatch.setattr(
+        _device_sync_routes(),
+        "build_instance_status",
+        lambda **kwargs: {
+            "schema_version": 1,
+            "software": {
+                "release_version": "0.1.0a1",
+                "build_code": "b12",
+                "label": "0.1.0a1 // b12",
+                "snapshot_digest": "sha256:matching-snapshot",
+            },
+            "data": {
+                "deployment_id": "deployment-studio-1234",
+                "display_name": "Studio",
+                "workspace_count": 1,
+            },
+        },
     )
 
     res = client.post(
@@ -812,7 +1137,13 @@ def test_sync_peer_status_updates_moved_url_when_identity_matches(client, monkey
     payload = res.json()
     assert payload["identity_verified"] is True
     assert payload["identity_state"] == "verified"
+    assert (
+        payload["deployment_status"]["data"]["deployment_id"] == "deployment-pear-1234"
+    )
+    assert payload["software_comparison"]["state"] == "exact"
     assert payload["paired_device"]["remote_url"] == "http://pear.local:61234"
+    assert payload["paired_device"]["remote_deployment_id"] == ("deployment-pear-1234")
+    assert payload["paired_device"]["remote_software"]["build_code"] == "b12"
 
     overview = client.get("/sync/overview").json()
     assert overview["sync_defaults"]["remote_url"] == "http://pear.local:61234"
@@ -820,13 +1151,16 @@ def test_sync_peer_status_updates_moved_url_when_identity_matches(client, monkey
         overview["sync_defaults"]["saved_peers"][0]["remote_url"]
         == "http://pear.local:61234"
     )
+    assert overview["sync_defaults"]["saved_peers"][0]["remote_data"] == {
+        "deployment_id": "deployment-pear-1234",
+        "display_name": "Pear",
+        "workspace_count": 1,
+    }
 
 
 def test_sync_peer_status_anchors_legacy_pair_when_remote_knows_local_device(
     client, monkeypatch
 ):
-    from app import routes
-
     old_pair = {
         "id": "peer-1",
         "label": "Pear",
@@ -873,7 +1207,9 @@ def test_sync_peer_status_anchors_legacy_pair_when_remote_knows_local_device(
             }
 
     monkeypatch.setattr(
-        routes.http_session, "get", lambda *args, **kwargs: FakeResponse()
+        _device_sync_routes().RemoteFloatClient,
+        "get_sync_overview",
+        lambda self: FakeResponse().json(),
     )
 
     res = client.post(
@@ -902,8 +1238,6 @@ def test_sync_peer_status_anchors_legacy_pair_when_remote_knows_local_device(
 def test_sync_peer_status_rejects_legacy_pair_when_remote_does_not_know_local_device(
     client, monkeypatch
 ):
-    from app import routes
-
     old_pair = {
         "id": "peer-1",
         "label": "Pear",
@@ -944,7 +1278,9 @@ def test_sync_peer_status_rejects_legacy_pair_when_remote_does_not_know_local_de
             }
 
     monkeypatch.setattr(
-        routes.http_session, "get", lambda *args, **kwargs: FakeResponse()
+        _device_sync_routes().RemoteFloatClient,
+        "get_sync_overview",
+        lambda self: FakeResponse().json(),
     )
 
     res = client.post(
@@ -963,8 +1299,6 @@ def test_sync_peer_status_rejects_legacy_pair_when_remote_does_not_know_local_de
 def test_sync_peer_status_rejects_legacy_pair_when_remote_label_differs(
     client, monkeypatch
 ):
-    from app import routes
-
     old_pair = {
         "id": "peer-1",
         "label": "Pear_dev",
@@ -1005,7 +1339,9 @@ def test_sync_peer_status_rejects_legacy_pair_when_remote_label_differs(
             }
 
     monkeypatch.setattr(
-        routes.http_session, "get", lambda *args, **kwargs: FakeResponse()
+        _device_sync_routes().RemoteFloatClient,
+        "get_sync_overview",
+        lambda self: FakeResponse().json(),
     )
 
     res = client.post(
@@ -1022,8 +1358,6 @@ def test_sync_peer_status_rejects_legacy_pair_when_remote_label_differs(
 
 
 def test_sync_peer_status_rejects_moved_url_when_identity_changes(client, monkeypatch):
-    from app import routes
-
     old_pair = {
         "id": "peer-1",
         "label": "Pear",
@@ -1056,7 +1390,9 @@ def test_sync_peer_status_rejects_moved_url_when_identity_changes(client, monkey
             }
 
     monkeypatch.setattr(
-        routes.http_session, "get", lambda *args, **kwargs: FakeResponse()
+        _device_sync_routes().RemoteFloatClient,
+        "get_sync_overview",
+        lambda self: FakeResponse().json(),
     )
 
     res = client.post(
@@ -1118,8 +1454,23 @@ def test_gateway_offer_accept_and_session(client):
     assert session["candidate_urls"] == ["http://desktop.local:5000"]
 
 
+def test_sync_apply_requires_preview_receipt(client):
+    response = client.post(
+        "/sync/apply",
+        json={
+            "remote_url": "http://peer.test:5000",
+            "direction": "pull",
+            "sections": ["conversations"],
+            "item_selections": {"conversations": ["conv-1"]},
+        },
+    )
+
+    assert response.status_code == 409
+    assert "Preview required" in response.json()["detail"]
+
+
 def test_sync_apply_pull_import_adds_synced_workspace_profile(client, monkeypatch):
-    from app import routes
+    _stub_plan_receipt_validation(monkeypatch)
 
     paired = {
         "id": "peer-1",
@@ -1138,9 +1489,14 @@ def test_sync_apply_pull_import_adds_synced_workspace_profile(client, monkeypatc
     client.post("/user-settings", json={"sync_saved_peers": [paired]})
 
     monkeypatch.setattr(
-        routes.RemoteFloatClient,
+        _device_sync_routes().RemoteFloatClient,
         "get_sync_overview",
         lambda self: {
+            "deployment_status": {
+                "data": {
+                    "deployment_id": "pear-deployment",
+                }
+            },
             "workspaces": {
                 "active_workspace_id": "root",
                 "selected_workspace_ids": ["root"],
@@ -1153,16 +1509,19 @@ def test_sync_apply_pull_import_adds_synced_workspace_profile(client, monkeypatc
                         "root_path": "data/files/workspace",
                         "kind": "root",
                         "is_root": True,
+                        "lineage_id": "self-lineage-uuid",
+                        "origin_deployment_id": "pear-origin-deployment",
                     }
                 ],
-            }
+            },
         },
     )
     monkeypatch.setattr(
-        routes.RemoteFloatClient,
+        _device_sync_routes().RemoteFloatClient,
         "export_snapshot",
         lambda self, sections, workspace_ids=None: {
             "instance": {
+                "deployment_id": "pear-deployment",
                 "display_name": "Pear",
                 "hostname": "pear-host",
                 "source_namespace": "",
@@ -1185,7 +1544,7 @@ def test_sync_apply_pull_import_adds_synced_workspace_profile(client, monkeypatc
         },
     )
     monkeypatch.setattr(
-        routes.RemoteFloatClient,
+        _device_sync_routes().RemoteFloatClient,
         "get_pairing_state",
         lambda self: dict(paired),
     )
@@ -1196,6 +1555,8 @@ def test_sync_apply_pull_import_adds_synced_workspace_profile(client, monkeypatc
             "remote_url": "http://example.test:5000",
             "direction": "pull",
             "sections": ["conversations"],
+            "item_selections": {"conversations": ["conv-1"]},
+            "plan_receipt": "test-receipt",
             "paired_device": paired,
             "workspace_mode": "import",
             "local_workspace_ids": ["root"],
@@ -1218,10 +1579,13 @@ def test_sync_apply_pull_import_adds_synced_workspace_profile(client, monkeypatc
     assert imported["name"] == "Pear"
     assert imported["namespace"] == "Pear"
     assert imported["root_path"] == "data/sync/Pear/workspace"
+    assert imported["lineage_id"] == "self-lineage-uuid"
+    assert imported["origin_deployment_id"] == "pear-origin-deployment"
+    assert imported["upstream_deployment_id"] == "pear-deployment"
 
 
 def test_sync_apply_push_filters_selected_items(client, monkeypatch):
-    from app import routes
+    _stub_plan_receipt_validation(monkeypatch)
 
     captured = {}
 
@@ -1231,6 +1595,9 @@ def test_sync_apply_push_filters_selected_items(client, monkeypatch):
 
         def normalize_item_selections(self, sections, selections):
             return selections or {}
+
+        def build_manifest(self, sections, workspace_ids=None):
+            return {"sections": {section: [] for section in sections or []}}
 
         def current_instance_identity(self, source_namespace=None):
             return {
@@ -1273,11 +1640,19 @@ def test_sync_apply_push_filters_selected_items(client, monkeypatch):
                 },
             }
 
-    monkeypatch.setattr(routes, "_sync_service", lambda: FakeSyncService())
     monkeypatch.setattr(
-        routes.RemoteFloatClient,
+        _device_sync_routes(), "_sync_service", lambda: FakeSyncService()
+    )
+    monkeypatch.setattr(
+        _device_sync_routes().RemoteFloatClient,
         "get_sync_overview",
         lambda self: {
+            "current_device": {
+                "deployment_id": "deployment-pear",
+                "display_name": "Pear",
+                "hostname": "pear-host",
+                "public_key": "pk-pear",
+            },
             "workspaces": {
                 "active_workspace_id": "root",
                 "selected_workspace_ids": ["root"],
@@ -1292,7 +1667,7 @@ def test_sync_apply_push_filters_selected_items(client, monkeypatch):
                         "is_root": True,
                     }
                 ],
-            }
+            },
         },
     )
 
@@ -1300,8 +1675,12 @@ def test_sync_apply_push_filters_selected_items(client, monkeypatch):
         captured["snapshot"] = snapshot
         return {"status": "applied", "effective_namespace": None}
 
-    monkeypatch.setattr(routes.RemoteFloatClient, "ingest_snapshot", _fake_ingest)
-    monkeypatch.setattr(routes.RemoteFloatClient, "get_pairing_state", lambda self: {})
+    monkeypatch.setattr(
+        _device_sync_routes().RemoteFloatClient, "ingest_snapshot", _fake_ingest
+    )
+    monkeypatch.setattr(
+        _device_sync_routes().RemoteFloatClient, "get_pairing_state", lambda self: {}
+    )
 
     res = client.post(
         "/sync/apply",
@@ -1310,12 +1689,23 @@ def test_sync_apply_push_filters_selected_items(client, monkeypatch):
             "direction": "push",
             "sections": ["conversations"],
             "item_selections": {"conversations": ["conv-2"]},
+            "plan_receipt": "test-receipt",
             "operation_id": "push-1",
             "operation_owner": "QA",
+            "paired_device": {
+                "id": "peer-pear",
+                "label": "Pear",
+                "remote_url": "http://example.test:5000",
+                "remote_public_key": "pk-pear",
+                "remote_deployment_id": "deployment-pear",
+                "local_workspace_ids": ["root"],
+                "remote_workspace_ids": ["root"],
+            },
         },
     )
 
     assert res.status_code == 200
+    assert res.json()["data_checkpoint"]["state"] == "synced"
     assert captured["item_selections"] == {"conversations": ["conv-2"]}
     assert [
         record["sync_id"]
@@ -1331,7 +1721,7 @@ def test_sync_apply_push_filters_selected_items(client, monkeypatch):
 
 
 def test_sync_apply_pull_refreshes_search_mirrors(client, monkeypatch):
-    from app import routes
+    _stub_plan_receipt_validation(monkeypatch)
 
     class FakeSyncService:
         def normalize_sections(self, sections):
@@ -1339,6 +1729,9 @@ def test_sync_apply_pull_refreshes_search_mirrors(client, monkeypatch):
 
         def normalize_item_selections(self, sections, selections):
             return selections or {}
+
+        def build_manifest(self, sections, workspace_ids=None):
+            return {"sections": {section: [] for section in sections or []}}
 
         def current_instance_identity(self, source_namespace=None):
             return {
@@ -1382,9 +1775,11 @@ def test_sync_apply_pull_refreshes_search_mirrors(client, monkeypatch):
         ]
         return result["post_refresh"]
 
-    monkeypatch.setattr(routes, "_sync_service", lambda: FakeSyncService())
     monkeypatch.setattr(
-        routes.RemoteFloatClient,
+        _device_sync_routes(), "_sync_service", lambda: FakeSyncService()
+    )
+    monkeypatch.setattr(
+        _device_sync_routes().RemoteFloatClient,
         "get_sync_overview",
         lambda self: {
             "workspaces": {
@@ -1405,7 +1800,7 @@ def test_sync_apply_pull_refreshes_search_mirrors(client, monkeypatch):
         },
     )
     monkeypatch.setattr(
-        routes.RemoteFloatClient,
+        _device_sync_routes().RemoteFloatClient,
         "export_snapshot",
         lambda self, sections, workspace_ids=None: {
             "instance": {
@@ -1417,18 +1812,24 @@ def test_sync_apply_pull_refreshes_search_mirrors(client, monkeypatch):
         },
     )
     monkeypatch.setattr(
-        routes.RemoteFloatClient,
+        _device_sync_routes().RemoteFloatClient,
         "get_pairing_state",
         lambda self: {"id": "peer-1", "remote_url": "http://example.test:5000"},
     )
-    monkeypatch.setattr(routes, "_refresh_sync_result_indexes", fake_refresh)
     monkeypatch.setattr(
-        routes,
+        _device_sync_routes(), "_refresh_sync_result_indexes", fake_refresh
+    )
+    monkeypatch.setattr(
+        _device_sync_routes(),
         "_persist_saved_peer_state",
         lambda pair_state, remote_label=None: pair_state,
     )
-    monkeypatch.setattr(routes, "sync_record_changes", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(routes, "_record_sync_action", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        _device_sync_routes(), "sync_record_changes", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        _device_sync_routes(), "_record_sync_action", lambda *_args, **_kwargs: None
+    )
 
     res = client.post(
         "/sync/apply",
@@ -1436,6 +1837,12 @@ def test_sync_apply_pull_refreshes_search_mirrors(client, monkeypatch):
             "remote_url": "http://example.test:5000",
             "direction": "pull",
             "sections": ["knowledge", "attachments", "calendar"],
+            "item_selections": {
+                "knowledge": ["knowledge-1"],
+                "attachments": ["attachment-1"],
+                "calendar": ["calendar-1"],
+            },
+            "plan_receipt": "test-receipt",
         },
     )
 
@@ -1452,8 +1859,9 @@ def test_sync_apply_pull_refreshes_search_mirrors(client, monkeypatch):
 
 
 def test_sync_apply_pull_supersedes_prior_pending_review_push(client, monkeypatch):
-    from app import routes
     from app.utils import sync_store
+
+    _stub_plan_receipt_validation(monkeypatch)
 
     sync_store.start_operation(
         kind="push",
@@ -1481,6 +1889,9 @@ def test_sync_apply_pull_supersedes_prior_pending_review_push(client, monkeypatc
         def normalize_item_selections(self, sections, selections):
             return selections or {}
 
+        def build_manifest(self, sections, workspace_ids=None):
+            return {"sections": {section: [] for section in sections or []}}
+
         def current_instance_identity(self, source_namespace=None):
             return {
                 "display_name": "Local",
@@ -1502,9 +1913,11 @@ def test_sync_apply_pull_supersedes_prior_pending_review_push(client, monkeypatc
                 "notes": [],
             }
 
-    monkeypatch.setattr(routes, "_sync_service", lambda: FakeSyncService())
     monkeypatch.setattr(
-        routes.RemoteFloatClient,
+        _device_sync_routes(), "_sync_service", lambda: FakeSyncService()
+    )
+    monkeypatch.setattr(
+        _device_sync_routes().RemoteFloatClient,
         "get_sync_overview",
         lambda self: {
             "workspaces": {
@@ -1525,7 +1938,7 @@ def test_sync_apply_pull_supersedes_prior_pending_review_push(client, monkeypatc
         },
     )
     monkeypatch.setattr(
-        routes.RemoteFloatClient,
+        _device_sync_routes().RemoteFloatClient,
         "export_snapshot",
         lambda self, sections, workspace_ids=None: {
             "instance": {
@@ -1537,7 +1950,7 @@ def test_sync_apply_pull_supersedes_prior_pending_review_push(client, monkeypatc
         },
     )
     monkeypatch.setattr(
-        routes.RemoteFloatClient,
+        _device_sync_routes().RemoteFloatClient,
         "get_pairing_state",
         lambda self: {"id": "peer-1", "remote_url": "http://example.test:5000"},
     )
@@ -1545,14 +1958,20 @@ def test_sync_apply_pull_supersedes_prior_pending_review_push(client, monkeypatc
     async def fake_refresh(_result):
         return {}
 
-    monkeypatch.setattr(routes, "_refresh_sync_result_indexes", fake_refresh)
     monkeypatch.setattr(
-        routes,
+        _device_sync_routes(), "_refresh_sync_result_indexes", fake_refresh
+    )
+    monkeypatch.setattr(
+        _device_sync_routes(),
         "_persist_saved_peer_state",
         lambda pair_state, remote_label=None: pair_state,
     )
-    monkeypatch.setattr(routes, "sync_record_changes", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(routes, "_record_sync_action", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        _device_sync_routes(), "sync_record_changes", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        _device_sync_routes(), "_record_sync_action", lambda *_args, **_kwargs: None
+    )
 
     res = client.post(
         "/sync/apply",
@@ -1560,6 +1979,8 @@ def test_sync_apply_pull_supersedes_prior_pending_review_push(client, monkeypatc
             "remote_url": "http://example.test:5000",
             "direction": "pull",
             "sections": ["conversations"],
+            "item_selections": {"conversations": ["conv-1"]},
+            "plan_receipt": "test-receipt",
             "operation_id": "pull-new",
         },
     )
@@ -1578,6 +1999,130 @@ def test_sync_apply_pull_supersedes_prior_pending_review_push(client, monkeypatc
     assert (
         recent_by_id["push-old"]["result"]["superseded_by_operation_id"] == "pull-new"
     )
+
+
+def test_sync_plan_issues_receipt_without_persisting_peer_state(client, monkeypatch):
+    from app.utils.sync_plan_receipt import decode_sync_plan_receipt
+
+    paired = {
+        "id": "peer-pear",
+        "label": "Pear",
+        "remote_url": "http://peer.test:5000",
+        "scopes": ["sync"],
+        "remote_device_id": "remote-device-1",
+        "public_key": "pk-local",
+        "remote_public_key": "pk-pear",
+        "remote_workspace_ids": ["root"],
+        "local_workspace_ids": ["root"],
+    }
+    client.post(
+        "/user-settings",
+        json={"sync_saved_peers": [paired], "sync_remote_url": paired["remote_url"]},
+    )
+
+    class FakeSyncService:
+        def normalize_sections(self, sections):
+            return list(sections or ["conversations"])
+
+        def current_instance_identity(self, source_namespace=None):
+            return {
+                "display_name": "Studio",
+                "hostname": "studio-host",
+                "source_namespace": source_namespace or "Studio",
+            }
+
+        def build_manifest(self, sections, workspace_ids=None):
+            return {
+                "instance": self.current_instance_identity(),
+                "sections": {"conversations": [{"sync_id": "conv-local"}]},
+            }
+
+        def namespace_manifest(self, manifest, namespace=None):
+            return manifest
+
+        def resolve_source_namespace(self, **_kwargs):
+            return ""
+
+        def compare_manifests(self, local, remote, sections=None):
+            return [
+                {
+                    "key": "conversations",
+                    "label": "Conversations",
+                    "all_items": [
+                        {
+                            "resource_id": "conv-remote",
+                            "selection_id": "conv-remote",
+                            "status": "only_remote",
+                        }
+                    ],
+                }
+            ]
+
+    monkeypatch.setattr(
+        _device_sync_routes(), "_sync_service", lambda: FakeSyncService()
+    )
+    monkeypatch.setattr(
+        _device_sync_routes().RemoteFloatClient,
+        "get_sync_overview",
+        lambda self: {
+            "current_device": {
+                "display_name": "Pear",
+                "hostname": "pear-host",
+                "public_key": "pk-pear",
+                "source_namespace": "Pear",
+            },
+            "workspaces": {
+                "active_workspace_id": "root",
+                "selected_workspace_ids": ["root"],
+                "profiles": [
+                    {
+                        "id": "root",
+                        "name": "Main workspace",
+                        "namespace": "",
+                        "root_path": "data/files/workspace",
+                        "kind": "root",
+                        "is_root": True,
+                    }
+                ],
+            },
+        },
+    )
+    monkeypatch.setattr(
+        _device_sync_routes().RemoteFloatClient,
+        "get_manifest",
+        lambda self, sections, workspace_ids=None: {
+            "instance": {
+                "display_name": "Pear",
+                "hostname": "pear-host",
+                "public_key": "pk-pear",
+                "source_namespace": "Pear",
+            },
+            "sections": {"conversations": [{"sync_id": "conv-remote"}]},
+        },
+    )
+    monkeypatch.setattr(
+        _device_sync_routes().RemoteFloatClient,
+        "get_pairing_state",
+        lambda self: dict(paired),
+    )
+
+    response = client.post(
+        "/sync/plan",
+        json={
+            "remote_url": paired["remote_url"],
+            "sections": ["conversations"],
+            "paired_device": paired,
+            "local_workspace_ids": ["root"],
+            "remote_workspace_ids": ["root"],
+        },
+    )
+
+    assert response.status_code == 200
+    receipt = response.json()["plan_receipt"]
+    claims = decode_sync_plan_receipt(receipt)
+    assert claims["allowed"]["pull"]["conversations"] == ["conv-remote"]
+    overview = client.get("/sync/overview").json()
+    assert overview["sync_defaults"]["saved_peers"][0]["last_used_at"] == ""
 
 
 def test_sync_plan_rejects_recursive_workspace_selection(client):
@@ -1649,8 +2194,6 @@ def test_sync_plan_rejects_recursive_workspace_selection(client):
 
 
 def test_sync_plan_rejects_saved_peer_identity_mismatch(client, monkeypatch):
-    from app import routes
-
     paired = {
         "id": "peer-1",
         "label": "Pear",
@@ -1668,7 +2211,7 @@ def test_sync_plan_rejects_saved_peer_identity_mismatch(client, monkeypatch):
     }
 
     monkeypatch.setattr(
-        routes.RemoteFloatClient,
+        _device_sync_routes().RemoteFloatClient,
         "get_sync_overview",
         lambda self: {
             "current_device": {

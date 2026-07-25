@@ -140,7 +140,10 @@ def test_chat_continue_new_inline_tool_request_stays_pending(monkeypatch, tmp_pa
             "text": "[[tool_call:0]]",
             "thought": "",
             "tools_used": [{"name": "recall", "args": {}}],
-            "metadata": {"inline_tool_payload": '{"tool":"recall","args":{}}'},
+            "metadata": {
+                "inline_tool_payload": '{"tool":"recall","args":{}}',
+                "output_truncated": True,
+            },
         }
 
     monkeypatch.setattr(routes.llm_service, "generate", fake_generate)
@@ -170,6 +173,7 @@ def test_chat_continue_new_inline_tool_request_stays_pending(monkeypatch, tmp_pa
     payload = resp.json()
     assert payload.get("message") == "Requested tool recall. Awaiting approval."
     metadata = payload.get("metadata") or {}
+    assert metadata.get("status") == "pending"
     assert metadata.get("tool_response_pending") is True
     assert metadata.get("tool_continued") is not True
     tools_used = payload.get("tools_used") or []
@@ -182,6 +186,7 @@ def test_chat_continue_new_inline_tool_request_stays_pending(monkeypatch, tmp_pa
         item for item in saved if isinstance(item, dict) and item.get("id") == "m1"
     )
     assert saved_entry["text"] == payload["message"]
+    assert saved_entry["metadata"]["status"] == "pending"
     assert saved_entry["metadata"]["tool_response_pending"] is True
     assert saved_entry["metadata"].get("tool_continued") is not True
 
@@ -405,11 +410,13 @@ def test_chat_continue_unresolved_loop_returns_minimal_error_note(
     metadata = payload.get("metadata") or {}
     assert metadata.get("retry_without_tools") is True
     assert metadata.get("unresolved_tool_loop") is True
+    assert metadata.get("status") == "partial"
     assert payload.get("tools_used") == []
 
     messages = conv_store.load_conversation("sess")
     ai = next(m for m in messages if m.get("id") == "m1")
     assert ai.get("text") == payload.get("message")
+    assert ai.get("metadata", {}).get("status") == "partial"
 
 
 def test_chat_continue_ignores_repeated_tool_requests_with_text(monkeypatch, tmp_path):
@@ -959,7 +966,7 @@ def test_chat_continue_passes_recalled_image_attachments_to_generate(
     from app.base_services import ModelContext
 
     routes.llm_service.contexts = {"default": ModelContext(system_prompt="")}
-    captured = {}
+    captured = {"attachments": []}
 
     def fake_generate(
         prompt,
@@ -969,7 +976,14 @@ def test_chat_continue_passes_recalled_image_attachments_to_generate(
         context=None,
         **kwargs,
     ):
-        captured["attachments"] = attachments
+        captured["attachments"].append(attachments)
+        if len(captured["attachments"]) == 1:
+            return {
+                "text": "",
+                "thought": "",
+                "tools_used": [],
+                "metadata": {"finish_reason": "stop"},
+            }
         return {
             "text": "I found the cat photos.",
             "thought": "",
@@ -1024,7 +1038,7 @@ def test_chat_continue_passes_recalled_image_attachments_to_generate(
         },
     )
     assert resp.status_code == 200
-    assert captured["attachments"] == [
+    expected_attachments = [
         {
             "name": "cat.png",
             "type": "image/png",
@@ -1032,6 +1046,8 @@ def test_chat_continue_passes_recalled_image_attachments_to_generate(
             "content_hash": "hash-cat",
         }
     ]
+    assert captured["attachments"] == [expected_attachments, expected_attachments]
+    assert resp.json()["message"] == "I found the cat photos."
 
 
 def test_chat_continue_extracts_nested_attachment_value_and_sets_signature(
@@ -1702,6 +1718,8 @@ def test_tool_events_prompt_text_preserves_file_memory_compat_suggestions():
 
 
 def test_tool_events_prompt_text_uses_named_budget_policy():
+    import json
+
     from app import routes
 
     payload = [
@@ -1731,6 +1749,64 @@ def test_tool_events_prompt_text_uses_named_budget_policy():
     assert len(text) < 1800
     assert text.rstrip().endswith("```")
     assert "..." in text
+    fenced_json = text.split("Tool result data:\n```json\n", 1)[1].split("\n```", 1)[0]
+    assert len(fenced_json) <= 1200
+    assert isinstance(json.loads(fenced_json), list)
+
+
+def test_tool_events_prompt_text_preserves_trailing_read_file_content():
+    from app import routes
+
+    file_text = "\n".join(
+        [
+            "NORTHWIND_CITY_A=Halifax",
+            "NORTHWIND_VALUE_A=7",
+            "middle filler " * 180,
+            "NORTHWIND_CITY_B=Victoria",
+            "NORTHWIND_VALUE_B=11",
+            "NORTHWIND_CITY_C=Iqaluit",
+            "NORTHWIND_VALUE_C=13",
+            "NORTHWIND_TOTAL=31",
+        ]
+    )
+    payload = [
+        {
+            "name": "read_file",
+            "status": "invoked",
+            "args": {"path": "workspace/imports/northwind.txt"},
+            "result": {
+                "status": "invoked",
+                "ok": True,
+                "message": None,
+                "data": {
+                    "path": "workspace/imports/northwind.txt",
+                    "scope": "data",
+                    "root": "D:/notebooks/float_dev/data",
+                    "encoding": "utf-8",
+                    "start_line": 1,
+                    "end_line": 24,
+                    "returned_line_count": 24,
+                    "requested_line_count": 24,
+                    "total_lines": 24,
+                    "max_chars": 5000,
+                    "truncated": False,
+                    "truncated_by": None,
+                    "has_more": False,
+                    "next_start_line": None,
+                    "size_bytes": len(file_text.encode("utf-8")),
+                    "summary": "Read lines 1-24 of 24.",
+                    "text": file_text,
+                },
+            },
+        }
+    ]
+
+    text = routes._tool_events_prompt_text(payload)
+
+    assert '"path": "workspace/imports/northwind.txt"' in text
+    assert "NORTHWIND_CITY_A=Halifax" in text
+    assert "NORTHWIND_CITY_C=Iqaluit" in text
+    assert "NORTHWIND_TOTAL=31" in text
 
 
 def test_chat_continue_retries_discovery_only_persistence_claim(monkeypatch, tmp_path):
@@ -2150,7 +2226,7 @@ def test_chat_continue_strips_inline_tool_markers_from_saved_reply(
     assert metadata.get("tool_continued") is True
 
 
-def test_chat_continue_uses_history_only_through_target_message(monkeypatch, tmp_path):
+def test_chat_continue_stops_when_target_has_later_messages(monkeypatch, tmp_path):
     monkeypatch.setenv("FLOAT_CONV_DIR", str(tmp_path))
     conv_store = importlib.import_module("app.utils.conversation_store")
     importlib.reload(conv_store)
@@ -2220,14 +2296,11 @@ def test_chat_continue_uses_history_only_through_target_message(monkeypatch, tmp
         },
     )
     assert resp.status_code == 200
-
-    ctx = captured.get("context")
-    assert ctx is not None
-    ctx_text = " ".join(
-        str(msg.get("content") or "") for msg in ctx.messages if isinstance(msg, dict)
-    )
-    assert "first request" in ctx_text
-    assert "later request" not in ctx_text
+    payload = resp.json()
+    assert captured == {}
+    assert payload["metadata"]["continuation_superseded"] is True
+    assert payload["metadata"]["continuation_stop_reason"] == "newer_conversation_turn"
+    assert payload["tools_used"] == []
 
     saved = conv_store.load_conversation("sess")
     first_ai = next(
@@ -2236,7 +2309,8 @@ def test_chat_continue_uses_history_only_through_target_message(monkeypatch, tmp
     later_user = next(
         item for item in saved if isinstance(item, dict) and item.get("id") == "m2:user"
     )
-    assert "Finished the first request." in str(first_ai.get("text") or "")
+    assert first_ai.get("text") == "Checking tools."
+    assert first_ai.get("metadata", {}).get("status") == "partial"
     assert later_user.get("text") == "later request"
 
 

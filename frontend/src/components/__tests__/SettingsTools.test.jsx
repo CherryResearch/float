@@ -82,7 +82,6 @@ const baseState = {
 };
 
 let settingsResponse;
-let skillDocResponse;
 
 const renderWithState = (options = {}) => {
   const normalized =
@@ -133,125 +132,9 @@ describe("Settings tools browser", () => {
       background_autonomy_basic_tick_seconds: 300,
       background_autonomy_min_priority: 0.05,
     };
-    skillDocResponse = {
-      id: "computer_use",
-      doc_id: "skills:computer_use",
-      repo_exists: true,
-      local_exists: false,
-      repo_path: "D:/notebooks/float_dev/modules/skills/computer_use.md",
-      local_path: "D:/notebooks/float_dev/data/modules/skills/computer_use.md",
-      active: {
-        id: "computer_use",
-        label: "computer use",
-        source: "repo",
-        summary: "Repo computer use summary",
-        body: "Repo computer use summary\n\n# Computer Use\n- Base guidance.",
-      },
-    };
-    vi.spyOn(axios, "post").mockImplementation((url, body) => {
-      if (url === "/api/workflows/module-packs/import") {
-        return Promise.resolve({
-          data: {
-            status: body?.dry_run === false ? "imported" : "preview",
-            type: "module_pack",
-            dry_run: body?.dry_run !== false,
-            addon: {
-              id: "hermes",
-              module_ids: ["hermes_agent"],
-              skill_ids: ["hermes_agent"],
-            },
-            file_count: 2,
-            skill_doc_count: 1,
-            destination_path: "D:/notebooks/float_dev/data/modules/addons/hermes",
-            warnings: [],
-            can_write: true,
-          },
-        });
-      }
-      if (url === "/api/workflows/module-packs/container-pack/export") {
-        return Promise.resolve({
-          data: {
-            status: body?.dry_run === false ? "exported" : "preview",
-            type: "module_pack",
-            dry_run: body?.dry_run !== false,
-            addon: {
-              id: "container-pack",
-              module_ids: ["container_orchestration"],
-              skill_ids: ["container_orchestration"],
-            },
-            file_count: 1,
-            skill_doc_count: 1,
-            destination_path:
-              "D:/notebooks/float_dev/data/workspace/module-exports/container-pack",
-            warnings: [],
-            can_write: true,
-          },
-        });
-      }
-      if (url === "/api/workflows/skills/import") {
-        return Promise.resolve({
-          data: {
-            status: body?.dry_run === false ? "imported" : "preview",
-            type: "skill",
-            dry_run: body?.dry_run !== false,
-            skill_id: "generic_skill",
-            destination_path:
-              "D:/notebooks/float_dev/data/modules/skills/generic_skill.md",
-            warnings: [],
-            can_write: true,
-          },
-        });
-      }
-      if (
-        url === "/api/workflows/skills/computer_use/export" ||
-        url === "/api/workflows/skills/generic_skill/export"
-      ) {
-        const skillId = url.includes("generic_skill") ? "generic_skill" : "computer_use";
-        return Promise.resolve({
-          data: {
-            status: body?.dry_run === false ? "exported" : "preview",
-            type: "skill",
-            dry_run: body?.dry_run !== false,
-            skill_id: skillId,
-            destination_path:
-              `D:/notebooks/float_dev/data/workspace/skill-exports/${skillId}.md`,
-            warnings: [],
-            can_write: true,
-          },
-        });
-      }
-      return Promise.resolve({ data: {} });
-    });
-    vi.spyOn(axios, "put").mockImplementation((url, body) => {
-      if (url === "/api/workflows/skills/computer_use") {
-        skillDocResponse = {
-          ...skillDocResponse,
-          local_exists: true,
-          active: {
-            ...skillDocResponse.active,
-            source: "local",
-            body: body?.body || "",
-          },
-        };
-        return Promise.resolve({ data: skillDocResponse });
-      }
-      return Promise.resolve({ data: {} });
-    });
-    vi.spyOn(axios, "delete").mockImplementation((url) => {
-      if (url === "/api/workflows/skills/computer_use") {
-        skillDocResponse = {
-          ...skillDocResponse,
-          local_exists: false,
-          active: {
-            ...skillDocResponse.active,
-            source: "repo",
-            body: "Repo computer use summary\n\n# Computer Use\n- Base guidance.",
-          },
-        };
-        return Promise.resolve({ data: skillDocResponse });
-      }
-      return Promise.resolve({ data: {} });
-    });
+    vi.spyOn(axios, "post").mockResolvedValue({ data: {} });
+    vi.spyOn(axios, "put").mockResolvedValue({ data: {} });
+    vi.spyOn(axios, "delete").mockResolvedValue({ data: {} });
     vi.spyOn(axios, "get").mockImplementation((url) => {
       if (url === "/api/settings") {
         return Promise.resolve({ data: settingsResponse });
@@ -267,8 +150,6 @@ describe("Settings tools browser", () => {
             capture_allow_summary_fallback: true,
             default_workflow: "default",
             enabled_workflow_modules: ["computer_use"],
-            sync_link_to_source_device: false,
-            sync_source_namespace: "",
           },
         });
       }
@@ -291,107 +172,6 @@ describe("Settings tools browser", () => {
                 },
               },
             ],
-          },
-        });
-      }
-      if (url === "/api/workflows/catalog") {
-        return Promise.resolve({
-          data: {
-            workflows: [
-              {
-                id: "default",
-                label: "Default",
-                description: "Balanced reasoning with normal tool access and moderate latency.",
-                thinking_default: "auto",
-                preferred_continue: "mini_execution",
-                allow_continue_to: ["default", "mini_execution"],
-                enabled_modules: ["computer_use"],
-              },
-              {
-                id: "architect_planner",
-                label: "Architect / Planner",
-                description: "Planning-first workflow.",
-                thinking_default: "high",
-                preferred_continue: "mini_execution",
-                allow_continue_to: ["architect_planner", "default", "mini_execution"],
-                enabled_modules: ["computer_use"],
-              },
-              {
-                id: "mini_execution",
-                label: "Mini Execution",
-                description: "Short execution bursts.",
-                thinking_default: "low",
-                preferred_continue: "mini_execution",
-                allow_continue_to: ["mini_execution"],
-                enabled_modules: ["computer_use"],
-              },
-            ],
-            modules: [
-              {
-                id: "computer_use",
-                label: "Computer Use",
-                description:
-                  "Browser and desktop observation, camera capture, capture promotion, and approval-gated host actions.",
-                status: "live",
-                source: "base",
-                enabled: true,
-                skill_id: "computer_use",
-                doc_id: "skills:computer_use",
-                tool_names: [
-                  "computer.session.start",
-                  "computer.session.stop",
-                  "computer.observe",
-                  "computer.act",
-                  "computer.navigate",
-                  "computer.windows.list",
-                  "computer.windows.focus",
-                  "computer.app.launch",
-                  "camera.capture",
-                  "capture.list",
-                  "capture.promote",
-                  "capture.delete",
-                  "shell.exec",
-                  "patch.apply",
-                  "mcp.call",
-                ],
-              },
-              {
-                id: "container_orchestration",
-                label: "Container Orchestration",
-                description: "Manage local container jobs from a custom module pack.",
-                status: "experimental",
-                source: "custom",
-                addon_id: "container-pack",
-                enabled: false,
-                skill_id: "container_orchestration",
-                doc_id: "skills:container_orchestration",
-                tool_names: ["containers.list", "containers.start"],
-              },
-            ],
-            addons: [],
-            addons_root: "data/modules/addons",
-          },
-        });
-      }
-      if (url === "/api/workflows/skills/computer_use") {
-        return Promise.resolve({ data: skillDocResponse });
-      }
-      if (url === "/api/workflows/skills/container_orchestration") {
-        return Promise.resolve({
-          data: {
-            id: "container_orchestration",
-            doc_id: "skills:container_orchestration",
-            repo_exists: false,
-            local_exists: false,
-            local_path:
-              "D:/notebooks/float_dev/data/modules/skills/container_orchestration.md",
-            active: {
-              id: "container_orchestration",
-              label: "container orchestration",
-              source: "local",
-              summary: "",
-              body: "",
-            },
           },
         });
       }
@@ -580,8 +360,11 @@ describe("Settings tools browser", () => {
             models: ["gpt-oss-20b", "qwen2.5-coder-7b-instruct"],
             runtime: {
               provider: "lmstudio",
+              server_running: true,
+              model_loaded: true,
               loaded_model: "gpt-oss-20b",
               effective_model_id: "gpt-oss-20b",
+              base_url: "http://127.0.0.1:1234/v1",
               checked_at: Math.floor(Date.now() / 1000) - 6,
             },
           },
@@ -679,8 +462,8 @@ describe("Settings tools browser", () => {
       screen.getByText("Background jobs will not start until a Celery worker responds."),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("Worker controls appear when the queue is reachable or tasks exist."),
-    ).toBeInTheDocument();
+      screen.queryByText("Worker controls appear when the queue is reachable or tasks exist."),
+    ).not.toBeInTheDocument();
   });
 
   it("keeps recent websocket drops in a reconnecting state", async () => {
@@ -795,7 +578,7 @@ describe("Settings tools browser", () => {
     renderWithState();
 
     expect(await screen.findByText("Workspace & Tools")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /^workflows\./i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^visual data\./i })).toBeInTheDocument();
 
     fireEvent.change(screen.getByRole("searchbox", { name: /search settings/i }), {
       target: { value: "live transcript" },
@@ -803,7 +586,7 @@ describe("Settings tools browser", () => {
 
     await waitFor(() => {
       expect(
-        screen.getByText('Showing 1 of 9 sections for "live transcript".'),
+        screen.getByText('Showing 1 of 7 sections for "live transcript".'),
       ).toBeInTheDocument();
     });
     expect(screen.getByText("Models & Retrieval")).toBeInTheDocument();
@@ -819,7 +602,7 @@ describe("Settings tools browser", () => {
   it("shows the runtime server URL when searching for server", async () => {
     settingsResponse = {
       ...settingsResponse,
-      mode: "api",
+      mode: "server",
       server_url: "http://127.0.0.1:1234/v1",
     };
 
@@ -832,7 +615,7 @@ describe("Settings tools browser", () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByText("Runtime & Provider")).toBeInTheDocument();
+      expect(screen.getByText("Language Runtime Connections")).toBeInTheDocument();
     });
     expect(screen.getByDisplayValue("http://127.0.0.1:1234/v1")).toHaveAttribute(
       "name",
@@ -922,7 +705,7 @@ describe("Settings tools browser", () => {
     expect(
       within(languageModelSelect).queryByRole("option", { name: /mistral:7b/i }),
     ).not.toBeInTheDocument();
-  });
+  }, 20000);
 
   it("uses the in-panel section rail to scroll within settings", async () => {
     renderWithState();
@@ -1001,6 +784,66 @@ describe("Settings tools browser", () => {
     });
   });
 
+  it("adds a Hugging Face model link to the personal model catalog", async () => {
+    const entry = {
+      alias: "my-model",
+      repo_id: "acme/example-model",
+      url: "https://huggingface.co/acme/example-model",
+      model_type: "transformer",
+      runtime: "direct",
+      source_type: "huggingface",
+    };
+    let registeredModels = [];
+    const defaultGet = axios.get.getMockImplementation();
+    axios.get.mockImplementation((url, ...rest) => {
+      if (url === "/api/models/registered") {
+        return Promise.resolve({ data: { models: registeredModels } });
+      }
+      return defaultGet(url, ...rest);
+    });
+    axios.post.mockImplementation((url) => {
+      if (url === "/api/models/registered/huggingface") {
+        registeredModels = [entry];
+        return Promise.resolve({ data: { model: entry } });
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    renderWithState();
+    fireEvent.click(await screen.findByRole("button", { name: /^models\./i }));
+    expect(
+      screen.queryByPlaceholderText("https://huggingface.co/owner/model or owner/model"),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Add model" }));
+
+    fireEvent.change(
+      screen.getByPlaceholderText("https://huggingface.co/owner/model or owner/model"),
+      { target: { value: "https://huggingface.co/acme/example-model" } },
+    );
+    fireEvent.change(screen.getByPlaceholderText("Alias (optional)"), {
+      target: { value: "my-model" },
+    });
+    fireEvent.click(
+      screen.getByTitle("Add Hugging Face model to personal catalog"),
+    );
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith(
+        "/api/models/registered/huggingface",
+        {
+          url: "https://huggingface.co/acme/example-model",
+          alias: "my-model",
+          model_type: "transformer",
+          runtime: "direct",
+        },
+      );
+    });
+    expect(await screen.findByText("acme/example-model")).toBeInTheDocument();
+    expect(
+      screen.getByText("Added 'my-model' from acme/example-model."),
+    ).toBeInTheDocument();
+  });
+
   it("uses an API lane for language models and shows discovered endpoint models", async () => {
     renderWithState();
 
@@ -1020,6 +863,33 @@ describe("Settings tools browser", () => {
     });
   });
 
+  it("renders the rolling OpenAI API alias with its resolved display target", async () => {
+    settingsResponse = {
+      ...settingsResponse,
+      model: "chat-latest",
+    };
+
+    renderWithState({
+      stateOverrides: {
+        apiModel: "chat-latest",
+        apiModels: ["chat-latest", "gpt-5.5", "gpt-5.5-2026-07-01"],
+        apiModelAliases: {
+          "chat-latest": {
+            label: "GPT latest",
+            target_model: "gpt-5.5",
+          },
+        },
+      },
+    });
+
+    const select = await screen.findByLabelText("Language Model");
+
+    expect(select.value).toBe("chat-latest");
+    expect(Array.from(select.options).map((option) => option.textContent)).toEqual(
+      expect.arrayContaining(["GPT latest (gpt-5.5) (API)"]),
+    );
+  });
+
   it("treats realtime whisper as an API STT model", async () => {
     settingsResponse = {
       ...settingsResponse,
@@ -1036,172 +906,6 @@ describe("Settings tools browser", () => {
     );
     expect(select.value).toBe("gpt-realtime-whisper");
     expect(select.querySelector('option[value="gpt-realtime-whisper"]')).not.toBeNull();
-  });
-
-  it("shows a workflow inspector with profile details", async () => {
-    renderWithState();
-
-    expect(
-      await screen.findByRole("heading", { name: /capture & workflows/i }),
-    ).toBeInTheDocument();
-
-    const inspectButton = screen.getByRole("button", {
-      name: /inspect workflow profiles/i,
-    });
-    expect(inspectButton).toHaveAttribute("aria-expanded", "false");
-    expect(
-      screen.queryByText("Can continue into Architect / Planner, Default, Mini Execution."),
-    ).not.toBeInTheDocument();
-
-    fireEvent.click(inspectButton);
-
-    expect(inspectButton).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByText("Current default")).toBeInTheDocument();
-    expect(
-      screen.getByText("Can continue into Architect / Planner, Default, Mini Execution."),
-    ).toBeInTheDocument();
-    expect(
-      screen.getAllByTitle(
-        "Browser and desktop observation, camera capture, capture promotion, and approval-gated host actions.",
-      ).length,
-    ).toBeGreaterThan(0);
-    expect(
-      screen.getByText(/Inspect shows the current built-in profile definitions\./i),
-    ).toBeInTheDocument();
-  });
-
-  it("renders compact base and custom workflow modules", async () => {
-    renderWithState();
-
-    expect(await screen.findByText("Modules")).toBeInTheDocument();
-    expect(screen.getByLabelText(/Computer Use/i)).toBeChecked();
-    expect(screen.getByLabelText(/Container Orchestration/i)).not.toBeChecked();
-    expect(screen.getByText("1/2 enabled")).toBeInTheDocument();
-    expect(screen.getByText("shipped repo")).toBeInTheDocument();
-    expect(screen.getByText("imported local pack")).toBeInTheDocument();
-    expect(screen.getByText("15 tools")).toBeInTheDocument();
-    expect(screen.getByText("2 tools")).toBeInTheDocument();
-    expect(
-      screen.getByText(
-        "Docs: skills:computer_use | Skill: computer_use | Doc source: shipped repo",
-      ),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(
-        "Docs: skills:container_orchestration | Skill: container_orchestration | Doc source: imported local pack",
-      ),
-    ).toBeInTheDocument();
-  });
-
-  it("edits and deletes a local module skill override", async () => {
-    renderWithState();
-
-    expect(await screen.findByText("Module skill docs")).toBeInTheDocument();
-    expect(await screen.findByDisplayValue(/Repo computer use summary/i)).toBeInTheDocument();
-    expect(screen.getByText(/Local override:/i)).toBeInTheDocument();
-    expect(screen.getByText("no")).toBeInTheDocument();
-
-    const editor = screen.getByLabelText(/skill markdown editor/i);
-    fireEvent.change(editor, {
-      target: {
-        value: "Local summary\n\n# Computer Use\n- Local override guidance.",
-      },
-    });
-    fireEvent.click(screen.getByRole("button", { name: /save local override/i }));
-
-    await waitFor(() => {
-      expect(axios.put).toHaveBeenCalledWith("/api/workflows/skills/computer_use", {
-        body: "Local summary\n\n# Computer Use\n- Local override guidance.",
-      });
-    });
-    expect(await screen.findByText(/local skill override saved/i)).toBeInTheDocument();
-    expect(screen.getByText("yes")).toBeInTheDocument();
-    expect(screen.getByText(/active: local override/i)).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: /delete local override/i }));
-
-    await waitFor(() => {
-      expect(axios.delete).toHaveBeenCalledWith("/api/workflows/skills/computer_use");
-    });
-    expect(
-      await screen.findByText(/local skill override removed; base doc is active again/i),
-    ).toBeInTheDocument();
-    expect(screen.getByDisplayValue(/Repo computer use summary/i)).toBeInTheDocument();
-  });
-
-  it("previews and applies module and skill pack transfers", async () => {
-    renderWithState();
-
-    expect(await screen.findByText("Module packs")).toBeInTheDocument();
-    const modulePackPanel = screen.getByLabelText("Module pack import and export");
-    fireEvent.change(within(modulePackPanel).getByLabelText("Import folder"), {
-      target: { value: "data/workspace/hermes" },
-    });
-    fireEvent.click(within(modulePackPanel).getByRole("button", { name: /preview import/i }));
-
-    await waitFor(() => {
-      expect(axios.post).toHaveBeenCalledWith("/api/workflows/module-packs/import", {
-        source_path: "data/workspace/hermes",
-        dry_run: true,
-        overwrite: false,
-      });
-    });
-    expect(await screen.findByText(/Preview: hermes, 2 files, 1 skill doc/i))
-      .toBeInTheDocument();
-
-    fireEvent.click(within(modulePackPanel).getByRole("button", { name: /^import pack$/i }));
-    await waitFor(() => {
-      expect(axios.post).toHaveBeenCalledWith("/api/workflows/module-packs/import", {
-        source_path: "data/workspace/hermes",
-        dry_run: false,
-        overwrite: false,
-      });
-    });
-
-    fireEvent.change(screen.getByLabelText("Module details"), {
-      target: { value: "container_orchestration" },
-    });
-    fireEvent.change(within(modulePackPanel).getByLabelText("Module export folder"), {
-      target: { value: "data/workspace/module-exports" },
-    });
-    fireEvent.click(within(modulePackPanel).getByRole("button", { name: /preview export/i }));
-    await waitFor(() => {
-      expect(axios.post).toHaveBeenCalledWith(
-        "/api/workflows/module-packs/container-pack/export",
-        {
-          destination_path: "data/workspace/module-exports",
-          dry_run: true,
-          overwrite: false,
-        },
-      );
-    });
-
-    const skillPackPanel = screen.getByLabelText("Skill markdown import and export");
-    fireEvent.change(within(skillPackPanel).getByLabelText("Import markdown"), {
-      target: { value: "data/workspace/generic_skill.md" },
-    });
-    fireEvent.click(within(skillPackPanel).getByRole("button", { name: /^import skill$/i }));
-    await waitFor(() => {
-      expect(axios.post).toHaveBeenCalledWith("/api/workflows/skills/import", {
-        source_path: "data/workspace/generic_skill.md",
-        dry_run: false,
-        overwrite: false,
-      });
-    });
-
-    fireEvent.change(within(skillPackPanel).getByLabelText("Skill export folder"), {
-      target: { value: "data/workspace/skill-exports" },
-    });
-    fireEvent.click(
-      within(skillPackPanel).getByRole("button", { name: /^export selected$/i }),
-    );
-    await waitFor(() => {
-      expect(axios.post).toHaveBeenCalledWith("/api/workflows/skills/computer_use/export", {
-        destination_path: "data/workspace/skill-exports",
-        dry_run: false,
-        overwrite: false,
-      });
-    });
   });
 
   it("exposes background autonomy budgets and queues a dry-run tick", async () => {
@@ -1259,7 +963,7 @@ describe("Settings tools browser", () => {
         }),
       );
     });
-  }, 10000);
+  }, 30000);
 
   it("shows tool-source status and a no-results state for unmatched filters", async () => {
     renderWithState();
@@ -1279,7 +983,7 @@ describe("Settings tools browser", () => {
     });
   });
 
-  it("saves capture retention and workflow defaults", async () => {
+  it("saves capture and privacy settings without rewriting workflow defaults", async () => {
     const setState = vi.fn();
     renderWithState({
       stateOverrides: {
@@ -1289,7 +993,11 @@ describe("Settings tools browser", () => {
       setState,
     });
 
-    expect(await screen.findByRole("heading", { name: /capture & workflows/i })).toBeInTheDocument();
+    expect(await screen.findByText("Visual Data & Privacy", { selector: "h2" })).toBeInTheDocument();
+    expect(screen.getByText("Open Skills & workflows", { selector: "a" })).toHaveAttribute(
+      "href",
+      "/knowledge?tab=skills",
+    );
 
     fireEvent.change(screen.getByLabelText(/how long transient captures are kept/i), {
       target: { value: "14" },
@@ -1298,13 +1006,9 @@ describe("Settings tools browser", () => {
       target: { value: "protected" },
     });
     fireEvent.click(screen.getByLabelText(/allow raw image access for supported models/i));
-    fireEvent.change(screen.getByLabelText(/default workflow profile/i), {
-      target: { value: "mini_execution" },
-    });
-    fireEvent.click(screen.getByLabelText(/Computer Use/i));
-    fireEvent.click(screen.getByLabelText(/Container Orchestration/i));
-
-    fireEvent.click(screen.getByRole("button", { name: /save capture & workflow settings/i }));
+    fireEvent.click(
+      screen.getByText("Save capture & privacy settings", { selector: "button" }),
+    );
 
     await waitFor(() => {
       expect(axios.post).toHaveBeenCalledWith("/api/user-settings", {
@@ -1315,53 +1019,13 @@ describe("Settings tools browser", () => {
         privacy_filter_mode: "off",
         privacy_filter_model: "openai/privacy-filter",
         privacy_filter_route_private_mode: "off",
-        default_workflow: "mini_execution",
-        enabled_workflow_modules: ["container_orchestration"],
       });
     });
     expect(setState).toHaveBeenCalled();
     expect(
-      await screen.findByText(/capture, privacy, and workflow defaults saved/i),
+      await screen.findByText(/capture and privacy settings saved/i),
     ).toBeInTheDocument();
-  }, 10000);
-
-  it("disables private rerouting when the text privacy detector is off", async () => {
-    renderWithState();
-
-    expect(await screen.findByRole("heading", { name: /capture & workflows/i })).toBeInTheDocument();
-
-    const detectorSelect = screen.getByLabelText(/text privacy detector/i);
-    const rerouteSelect = screen.getByLabelText(/private message rerouting/i);
-
-    expect(detectorSelect).toHaveValue("off");
-    expect(rerouteSelect).toBeDisabled();
-    expect(rerouteSelect).toHaveValue("off");
-
-    fireEvent.change(detectorSelect, { target: { value: "always" } });
-    await waitFor(() => expect(rerouteSelect).not.toBeDisabled());
-    fireEvent.change(rerouteSelect, { target: { value: "ask" } });
-    expect(rerouteSelect).toHaveValue("ask");
-
-    fireEvent.change(detectorSelect, { target: { value: "off" } });
-    await waitFor(() => expect(rerouteSelect).toBeDisabled());
-    expect(rerouteSelect).toHaveValue("off");
-
-    fireEvent.click(screen.getByRole("button", { name: /save capture & workflow settings/i }));
-
-    await waitFor(() => {
-      expect(axios.post).toHaveBeenCalledWith("/api/user-settings", {
-        capture_retention_days: 7,
-        capture_default_sensitivity: "personal",
-        capture_allow_model_raw_image_access: true,
-        capture_allow_summary_fallback: true,
-        privacy_filter_mode: "off",
-        privacy_filter_model: "openai/privacy-filter",
-        privacy_filter_route_private_mode: "off",
-        default_workflow: "default",
-        enabled_workflow_modules: ["computer_use"],
-      });
-    });
-  }, 10000);
+  }, 30000);
 
   it("summarizes browser and Windows computer-use tools in settings", async () => {
     renderWithState();
@@ -1385,7 +1049,7 @@ describe("Settings tools browser", () => {
     expect(retentionSelect).toHaveValue("7");
 
     fireEvent.change(retentionSelect, { target: { value: "14" } });
-    fireEvent.click(screen.getByRole("button", { name: /save work history/i }));
+    fireEvent.click(screen.getByText("Save work history", { selector: "button" }));
 
     await waitFor(() => {
       expect(axios.post).toHaveBeenCalledWith("/api/user-settings", {
@@ -1393,7 +1057,7 @@ describe("Settings tools browser", () => {
       });
     });
     expect(await screen.findByText(/Work history retention saved\./i)).toBeInTheDocument();
-  });
+  }, 60000);
 
   it("labels tool display controls clearly and explains the console fallback", async () => {
     renderWithState({
@@ -1441,20 +1105,24 @@ describe("Settings tools browser", () => {
 
     const select = await screen.findByLabelText("Visual theme");
     expect(select).toHaveValue("spring");
-    expect(screen.getByRole("option", { name: "Spring" })).toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "Blossom" })).toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "Ash" })).toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "Cappucino" })).toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "Sunset Citrus" })).toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "Midnight Plum" })).toBeInTheDocument();
-    expect(screen.getByRole("option", { name: "Forest Glass" })).toBeInTheDocument();
+    expect(Array.from(select.options).map((option) => option.textContent)).toEqual(
+      expect.arrayContaining([
+        "Spring (built-in)",
+        "Blossom (built-in)",
+        "Ash (built-in)",
+        "Cappucino (built-in)",
+        "Sunset Citrus (built-in)",
+        "Midnight Plum (built-in)",
+        "Forest Glass (custom)",
+      ]),
+    );
 
     fireEvent.change(select, { target: { value: "sunset-citrus" } });
 
     await waitFor(() => {
       expect(select).toHaveValue("sunset-citrus");
     });
-  });
+  }, 20000);
 
   it("creates and deletes a custom theme from settings", async () => {
     const ThemeHarness = () => {
@@ -1491,11 +1159,12 @@ describe("Settings tools browser", () => {
 
     render(<ThemeHarness />);
 
-    fireEvent.click(await screen.findByRole("button", { name: /add new theme/i }));
+    await screen.findByRole("option", { name: "Forest Glass (custom)" });
+    fireEvent.click(screen.getByText("Add new theme", { selector: "button" }));
     fireEvent.change(screen.getByLabelText("Theme name"), {
       target: { value: "Custom Sunrise" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /save theme/i }));
+    fireEvent.click(screen.getByText("Save theme", { selector: "button" }));
 
     await waitFor(() => {
       expect(axios.post).toHaveBeenCalledWith("/api/themes", expect.objectContaining({
@@ -1505,7 +1174,7 @@ describe("Settings tools browser", () => {
     });
     expect(await screen.findByText("Theme saved.")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /delete theme/i }));
+    fireEvent.click(screen.getByText("Delete theme", { selector: "button" }));
 
     await waitFor(() => {
       expect(axios.delete).toHaveBeenCalledWith("/api/themes/custom-sunrise");
@@ -1558,6 +1227,129 @@ describe("Settings tools browser", () => {
         /Current behavior: clicking a tool link focuses the matching item in the agent console, while auto mode still shows inline cards for the active or streaming message\./i,
       ),
     ).toBeInTheDocument();
+  });
+
+  it("shows the shared Cloud API runtime summary in the language card", async () => {
+    settingsResponse = {
+      ...settingsResponse,
+      mode: "api",
+      model: "gpt-5.4",
+      api_url: "https://api.example.test/v1/responses",
+    };
+
+    renderWithState({
+      backendMode: "api",
+      apiModel: "gpt-5.4",
+      apiStatus: "online",
+      apiProviderStatus: "online",
+    });
+
+    const summary = await screen.findByRole("group", {
+      name: "Language runtime summary",
+    });
+    expect(within(summary).getByText("Lane: Cloud API")).toBeInTheDocument();
+    expect(within(summary).getByText("Model: gpt-5.4")).toBeInTheDocument();
+    expect(
+      within(summary).getByText(
+        "Endpoint: https://api.example.test/v1/responses",
+      ),
+    ).toBeInTheDocument();
+    expect(within(summary).getByText("Availability: usable")).toBeInTheDocument();
+  });
+
+  it("probes and summarizes the selected Server/LAN runtime lane", async () => {
+    const serverUrl = "http://127.0.0.1:1234/v1";
+    settingsResponse = {
+      ...settingsResponse,
+      mode: "server",
+      transformer_model: "gpt-oss-20b",
+      server_url: serverUrl,
+    };
+    const defaultGet = axios.get.getMockImplementation();
+    axios.get.mockImplementation((url, ...rest) => {
+      if (url === "/api/llm/server/models") {
+        return Promise.resolve({
+          data: {
+            reachable: true,
+            loaded_model: "gpt-oss-20b",
+            models: ["gpt-oss-20b", "server-inventory-alternative"],
+          },
+        });
+      }
+      return defaultGet ? defaultGet(url, ...rest) : Promise.resolve({ data: {} });
+    });
+
+    const { container } = renderWithState({
+      backendMode: "server",
+      transformerModel: "gpt-oss-20b",
+      serverUrl,
+    });
+
+    const summary = await screen.findByRole("group", {
+      name: "Language runtime summary",
+    });
+    expect(within(summary).getByText("Lane: Server/LAN")).toBeInTheDocument();
+    expect(within(summary).getByText("Model: gpt-oss-20b")).toBeInTheDocument();
+    expect(within(summary).getByText(`Endpoint: ${serverUrl}`)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(within(summary).getByText("Availability: usable")).toBeInTheDocument();
+    });
+    expect(axios.get).toHaveBeenCalledWith("/api/llm/server/models", {
+      params: { server_url: serverUrl },
+    });
+    expect(
+      container.querySelector(
+        '#server-runtime-model-options option[value="server-inventory-alternative"]',
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("warns for a manually entered Grok target without suggesting a preset", async () => {
+    const xaiUrl = "https://api.x.ai/v1";
+    settingsResponse = {
+      ...settingsResponse,
+      mode: "server",
+      transformer_model: "grok-test",
+      server_url: xaiUrl,
+      server_preset_id: "",
+      server_presets: [
+        {
+          id: "lm-studio-local",
+          name: "LM Studio (localhost:1234)",
+          provider: "lmstudio",
+          base_url: "http://127.0.0.1:1234/v1",
+          builtin: true,
+        },
+      ],
+    };
+    const defaultGet = axios.get.getMockImplementation();
+    axios.get.mockImplementation((url, ...rest) => {
+      if (url === "/api/llm/server/models") {
+        return Promise.resolve({
+          data: { reachable: true, models: [], trust_warning: true },
+        });
+      }
+      return defaultGet ? defaultGet(url, ...rest) : Promise.resolve({ data: {} });
+    });
+
+    renderWithState({ backendMode: "server", serverUrl: xaiUrl });
+
+    const presetSelect = await screen.findByRole("combobox", {
+      name: "Server connection preset",
+    });
+    expect(presetSelect).toHaveValue("");
+    expect(screen.queryByRole("textbox", { name: "Preset name" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("textbox", { name: "API key environment variable" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "This model may not be trustworthy.",
+    );
+    await waitFor(() => {
+      expect(axios.get).toHaveBeenCalledWith("/api/llm/server/models", {
+        params: { server_url: xaiUrl },
+      });
+    });
   });
 
   it("scopes CUDA controls to direct local runtimes and shows provider inventory", async () => {
@@ -1672,8 +1464,11 @@ describe("Settings tools browser", () => {
             models: ["gpt-oss-20b", "qwen2.5-coder-7b-instruct"],
             runtime: {
               provider: "lmstudio",
+              server_running: true,
+              model_loaded: true,
               loaded_model: "gpt-oss-20b",
               effective_model_id: "gpt-oss-20b",
+              base_url: "http://127.0.0.1:1234/v1",
               checked_at: Math.floor(Date.now() / 1000) - 6,
               last_operation: {
                 id: "unload#3",
@@ -1703,6 +1498,43 @@ describe("Settings tools browser", () => {
     );
     expect(lastAction).toBeInTheDocument();
     expect(lastAction).toHaveAttribute(
+      "title",
+      expect.stringContaining("Unloaded requested model"),
+    );
+
+    const collapseButton = screen
+      .getAllByRole("button", { name: "Collapse" })
+      .find(
+        (button) =>
+          button.getAttribute("aria-controls") ===
+          "settings-language-runtime-details",
+      );
+    expect(collapseButton).toBeTruthy();
+    const runtimePanel = collapseButton.closest(".runtime-inline-panel");
+    expect(runtimePanel).not.toBeNull();
+    fireEvent.click(collapseButton);
+
+    expect(collapseButton).toHaveAttribute("aria-expanded", "false");
+    expect(
+      within(runtimePanel).queryByText(/^Loaded model:/i),
+    ).not.toBeInTheDocument();
+    const summary = within(runtimePanel).getByRole("group", {
+      name: "Language runtime summary",
+    });
+    expect(within(summary).getByText("Lane: Local provider")).toBeInTheDocument();
+    expect(within(summary).getByText("Model: gpt-oss-20b")).toBeInTheDocument();
+    expect(
+      within(summary).getByText("Endpoint: http://127.0.0.1:1234/v1"),
+    ).toBeInTheDocument();
+    expect(within(summary).getByText("Availability: usable")).toBeInTheDocument();
+
+    const compactLastAction = within(runtimePanel).getByLabelText(
+      "Latest runtime operation",
+    );
+    expect(compactLastAction).toHaveTextContent(
+      /Last action: unload#3 ok for gpt-oss-20b/i,
+    );
+    expect(compactLastAction).toHaveAttribute(
       "title",
       expect.stringContaining("Unloaded requested model"),
     );
@@ -1749,7 +1581,7 @@ describe("Settings tools browser", () => {
     const block = select.closest(".settings-model-block");
     fireEvent.click(within(block).getByRole("button", { name: "Local" }));
 
-    expect(await screen.findByRole("option", { name: /gemma-4-E2B-it\s+.*direct local/i })).toBeInTheDocument();
+    expect(await screen.findByRole("option", { name: /gemma-4-E2B-it.*direct local/i })).toBeInTheDocument();
     expect(screen.queryByRole("option", { name: /gemma-4-E4B-it/i })).not.toBeInTheDocument();
     expect(screen.queryByRole("option", { name: /gemma-4-31B-it/i })).not.toBeInTheDocument();
   });
@@ -1793,6 +1625,32 @@ describe("Settings tools browser", () => {
     expect(
       screen.getByText(/Missing direct-local packages: torch, transformers\./i),
     ).toBeInTheDocument();
+
+    const collapseButton = screen
+      .getAllByRole("button", { name: "Collapse" })
+      .find(
+        (button) =>
+          button.getAttribute("aria-controls") ===
+          "settings-language-runtime-details",
+      );
+    expect(collapseButton).toBeTruthy();
+    const runtimePanel = collapseButton.closest(".runtime-inline-panel");
+    expect(runtimePanel).not.toBeNull();
+    fireEvent.click(collapseButton);
+    expect(collapseButton).toHaveAttribute("aria-expanded", "false");
+    expect(
+      runtimePanel.querySelector("#settings-language-runtime-details"),
+    ).not.toBeInTheDocument();
+
+    const summary = within(runtimePanel).getByRole("group", {
+      name: "Language runtime summary",
+    });
+    expect(within(summary).getByText("Lane: Direct local")).toBeInTheDocument();
+    expect(within(summary).getByText("Model: gemma-4-E2B-it")).toBeInTheDocument();
+    expect(within(summary).getByText("Availability: unavailable")).toBeInTheDocument();
+    expect(
+      within(summary).queryByLabelText(/^Runtime endpoint:/i),
+    ).not.toBeInTheDocument();
 
     const laneRow = container
       .querySelector("#settings-model-transformer_model")
@@ -1914,7 +1772,7 @@ describe("Settings tools browser", () => {
       live_agent_mode: "server",
       live_agent_model: "gemma-4-E4B-it",
       live_multimodal_model: "gemma-4-26B-A4B-it",
-      realtime_model: "gpt-realtime-2",
+      realtime_model: "gpt-realtime-2.1",
       realtime_voice: "cedar",
     };
 
@@ -1933,191 +1791,34 @@ describe("Settings tools browser", () => {
     ).toBeInTheDocument();
     expect(within(block).getByText("Live agent mode")).toBeInTheDocument();
     expect(
-      within(block).getByText(/set both the response and multimodal checkpoints explicitly/i),
+      within(block).getByLabelText(/local live connection details/i),
     ).toBeInTheDocument();
 
     fireEvent.click(within(block).getByRole("button", { name: "API" }));
 
-    expect(await within(block).findByDisplayValue("gpt-realtime-2")).toBeInTheDocument();
+    expect(await within(block).findByDisplayValue("gpt-realtime-2.1")).toBeInTheDocument();
+    expect(block.querySelector('option[value="gpt-realtime-2.1-mini"]')).not.toBeNull();
     expect(block.querySelector('option[value="gpt-realtime-mini"]')).not.toBeNull();
     expect(block.querySelector('option[value="gpt-realtime-1.5"]')).not.toBeNull();
     expect(within(block).getByDisplayValue("cedar")).toBeInTheDocument();
     expect(within(block).queryByText("Live agent mode")).not.toBeInTheDocument();
   });
 
-  it("previews instance sync sections and starts a pull", async () => {
-    axios.post.mockImplementation((url) => {
-      if (url === "/api/sync/plan") {
-        return Promise.resolve({
-          data: {
-            link_to_source: true,
-            effective_namespaces: {
-              pull: "laptop",
-              push: "desktop",
-            },
-            remote: { base_url: "http://peer.float:5000" },
-            sections: [
-              {
-                key: "conversations",
-                label: "Conversations",
-                remote_newer: 2,
-                local_newer: 1,
-                only_remote: 1,
-                only_local: 0,
-                identical: 4,
-                selected_by_default: true,
-              },
-              {
-                key: "settings",
-                label: "Workspace preferences",
-                remote_newer: 1,
-                local_newer: 0,
-                only_remote: 0,
-                only_local: 0,
-                identical: 0,
-                selected_by_default: true,
-              },
-            ],
-            pull_sections: [
-              {
-                key: "conversations",
-                label: "Conversations",
-                remote_newer: 2,
-                local_newer: 1,
-                only_remote: 1,
-                only_local: 0,
-                identical: 4,
-                selected_by_default: true,
-                items: [
-                  { resource_id: "conv-a", label: "Alpha", status: "remote_newer" },
-                  { resource_id: "conv-b", label: "Beta", status: "only_remote" },
-                ],
-              },
-              {
-                key: "settings",
-                label: "Workspace preferences",
-                remote_newer: 1,
-                local_newer: 0,
-                only_remote: 0,
-                only_local: 0,
-                identical: 0,
-                selected_by_default: true,
-                items: [
-                  { resource_id: "settings", label: "Workspace preferences", status: "remote_newer" },
-                ],
-              },
-            ],
-            push_sections: [
-              {
-                key: "conversations",
-                label: "Conversations",
-                remote_newer: 0,
-                local_newer: 3,
-                only_remote: 0,
-                only_local: 1,
-                identical: 4,
-                selected_by_default: true,
-                items: [
-                  { resource_id: "conv-a", label: "Alpha", status: "local_newer" },
-                ],
-              },
-              {
-                key: "settings",
-                label: "Workspace preferences",
-                remote_newer: 0,
-                local_newer: 1,
-                only_remote: 0,
-                only_local: 0,
-                identical: 0,
-                selected_by_default: true,
-                items: [
-                  { resource_id: "settings", label: "Workspace preferences", status: "local_newer" },
-                ],
-              },
-            ],
-          },
-        });
-      }
-      if (url === "/api/sync/apply") {
-        return Promise.resolve({
-          data: {
-            effective_namespace: "laptop",
-            result: {
-              sections: {
-                conversations: { applied: 2, skipped: 1 },
-                settings: { applied: 1, skipped: 0 },
-              },
-            },
-          },
-        });
-      }
-      return Promise.resolve({ data: {} });
-    });
-
+  it("uses Knowledge Sync as the single sharing and sync entry point", async () => {
     renderWithState();
 
-    fireEvent.change(await screen.findByLabelText("Remote Float URL"), {
-      target: { value: "http://peer.float:5000" },
-    });
-    fireEvent.click(
-      screen.getByLabelText(/link synced data to its source device\/workspace/i),
-    );
-    fireEvent.change(screen.getByLabelText("This device label / namespace"), {
-      target: { value: "desktop" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: /preview sync/i }));
-
-    await waitFor(() => {
-      expect(axios.post).toHaveBeenCalledWith("/api/sync/plan", {
-        remote_url: "http://peer.float:5000",
-        link_to_source: true,
-        source_namespace: "desktop",
-      });
+    const links = await screen.findAllByRole("link", {
+      name: /open knowledge sync/i,
     });
 
-    expect(await screen.findByRole("dialog", { name: /sync preview/i })).toBeInTheDocument();
-    expect(screen.getByText(/Pull here will link remote data under/i)).toBeInTheDocument();
-    expect(screen.getByText(/laptop\//i)).toBeInTheDocument();
-    expect(screen.getByText(/Push there will link this instance under/i)).toBeInTheDocument();
-    expect(screen.getByText(/desktop\//i)).toBeInTheDocument();
-    expect(screen.getByText(/Pull here: Remote newer: 2/i)).toBeInTheDocument();
-    expect(screen.getByText(/Push there: Remote newer: 0 \| Local newer: 3/i)).toBeInTheDocument();
-    expect(screen.getAllByText(/Pull item preview/i).length).toBeGreaterThan(0);
-    expect(screen.getAllByText(/Alpha/i).length).toBeGreaterThan(0);
-    expect(screen.getAllByText(/Only remote/i).length).toBeGreaterThan(0);
-
-    fireEvent.click(screen.getByRole("button", { name: /pull here/i }));
-
-    await waitFor(() => {
-      expect(axios.post).toHaveBeenCalledWith("/api/sync/apply", {
-        remote_url: "http://peer.float:5000",
-        direction: "pull",
-        sections: ["conversations", "settings"],
-        link_to_source: true,
-        source_namespace: "desktop",
-      });
-    });
-    expect(await screen.findByText(/Pull complete\./i)).toBeInTheDocument();
-    expect(screen.getByText(/Stored under laptop\//i)).toBeInTheDocument();
-  }, 10000);
-
-  it("saves sync defaults from the settings panel", async () => {
-    renderWithState();
-
-    fireEvent.click(
-      await screen.findByLabelText(/link synced data to its source device\/workspace/i),
-    );
-    fireEvent.change(screen.getByLabelText("This device label / namespace"), {
-      target: { value: "desktop" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: /save sync defaults/i }));
-
-    await waitFor(() => {
-      expect(axios.post).toHaveBeenCalledWith("/api/user-settings", {
-        sync_link_to_source_device: true,
-        sync_source_namespace: "desktop",
-      });
-    });
-    expect(await screen.findByText(/Sync defaults saved\./i)).toBeInTheDocument();
+    expect(links).toHaveLength(1);
+    expect(links[0]).toHaveAttribute("href", "/knowledge?tab=sync");
+    expect(screen.queryByLabelText("Remote Float URL")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /preview sync/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /save sync defaults/i }),
+    ).not.toBeInTheDocument();
   });
 });

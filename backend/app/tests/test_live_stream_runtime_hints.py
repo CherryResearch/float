@@ -24,7 +24,7 @@ def test_lookup_message_runtime_hints_falls_back_to_live_stream_metadata(monkeyp
                 "metadata": {
                     "live_stream": {
                         "mode": "api",
-                        "model": "gpt-realtime-2",
+                        "model": "gpt-realtime-2.1",
                         "provider": "openai-realtime",
                     }
                 },
@@ -33,6 +33,6 @@ def test_lookup_message_runtime_hints_falls_back_to_live_stream_metadata(monkeyp
     )
 
     assert routes._lookup_message_runtime_hints("sess-live", "live-msg-1") == (
-        "gpt-realtime-2",
+        "gpt-realtime-2.1",
         "api",
     )

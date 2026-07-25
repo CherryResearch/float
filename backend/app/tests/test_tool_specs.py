@@ -26,6 +26,7 @@ def test_tool_specs_endpoint_returns_schemas(tmp_path, monkeypatch):
     expected_tools = [
         "remember",
         "recall",
+        "graph.update",
         "help",
         "tool_help",
         "tool_info",
@@ -77,6 +78,16 @@ def test_tool_specs_endpoint_returns_schemas(tmp_path, monkeypatch):
     assert "occurs_at" in props
     assert "review_at" in props
     assert "decay_at" in props
+    assert "graph_nodes" in props
+    assert "graph_claims" in props
+    assert props["graph_nodes"]["items"]["properties"]["node_type"]["type"] == "string"
+    assert props["graph_claims"]["items"]["required"] == ["predicate", "roles"]
+    graph_update = next((t for t in tools if t.get("name") == "graph.update"), None)
+    assert graph_update is not None
+    graph_props = graph_update["parameters"].get("properties") or {}
+    assert graph_props["nodes"]["items"]["required"] == ["node_type"]
+    assert graph_props["claims"]["items"]["required"] == ["predicate", "roles"]
+    assert graph_update["policy"]["approval"] == "high"
     assert "reflect_after_save" in props
     assert "reflection_prompt" in props
     assert "reflection_run_now" in props

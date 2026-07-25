@@ -111,8 +111,93 @@ def test_register_local_model_rejects_missing_path(tmp_path: Path, monkeypatch):
     assert "path does not exist" in str(register.json().get("detail", ""))
 
 
+def test_register_huggingface_model_is_persisted_downloadable_and_resolvable(
+    tmp_path: Path, monkeypatch
+):
+    from app.model_registry import (
+        get_model_metadata,
+        model_supports_download_job,
+        resolve_model_alias,
+    )
+
+    client = _make_client(tmp_path, monkeypatch)
+
+    register = client.post(
+        "/api/models/registered/huggingface",
+        json={
+            "url": "https://huggingface.co/acme/example-model/tree/main",
+            "alias": "my-hf-model",
+            "model_type": "transformer",
+            "runtime": "direct",
+        },
+    )
+
+    assert register.status_code == 200
+    entry = register.json()["model"]
+    assert entry["alias"] == "my-hf-model"
+    assert entry["repo_id"] == "acme/example-model"
+    assert entry["source_type"] == "huggingface"
+
+    listed = client.get("/api/models/registered")
+    assert listed.status_code == 200
+    assert any(item.get("alias") == "my-hf-model" for item in listed.json()["models"])
+
+    downloadable = client.get("/api/models/downloadable")
+    assert "my-hf-model" in downloadable.json()["models"]
+    assert resolve_model_alias("my-hf-model") == "acme/example-model"
+    assert model_supports_download_job("my-hf-model") is True
+    assert get_model_metadata("my-hf-model")["lane"] == "direct"
+    settings = client.get("/api/user-settings")
+    assert settings.status_code == 200
+    assert settings.json()["huggingface_model_registrations"][0]["repo_id"] == (
+        "acme/example-model"
+    )
+
+    removed = client.delete("/api/models/registered/my-hf-model")
+    assert removed.status_code == 200
+    assert removed.json()["source"] == "huggingface"
+    assert resolve_model_alias("my-hf-model") == "my-hf-model"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://example.com/acme/model",
+        "https://huggingface.co/spaces/acme/demo",
+        "acme/model/extra",
+    ],
+)
+def test_register_huggingface_model_rejects_non_model_links(
+    tmp_path: Path, monkeypatch, value: str
+):
+    client = _make_client(tmp_path, monkeypatch)
+
+    response = client.post(
+        "/api/models/registered/huggingface",
+        json={"url": value},
+    )
+
+    assert response.status_code == 400
+
+
+def test_register_huggingface_model_rejects_builtin_alias(tmp_path: Path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch)
+
+    response = client.post(
+        "/api/models/registered/huggingface",
+        json={
+            "url": "acme/example-model",
+            "alias": "gpt-oss-20b",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "conflicts with a built-in model" in response.json()["detail"]
+
+
 def test_delete_model_reports_runtime_lock_details(tmp_path: Path, monkeypatch):
     from app import routes
+    from app.routers import model_filesystem
 
     client = _make_client(tmp_path, monkeypatch)
     model_dir = tmp_path / "models_root" / "gpt-oss-20b"
@@ -122,7 +207,7 @@ def test_delete_model_reports_runtime_lock_details(tmp_path: Path, monkeypatch):
     def _raise_permission_error(path):
         raise PermissionError("access denied")
 
-    monkeypatch.setattr(routes.shutil, "rmtree", _raise_permission_error)
+    monkeypatch.setattr(model_filesystem.shutil, "rmtree", _raise_permission_error)
     monkeypatch.setattr(
         routes.llm_service,
         "local_runtime_status",

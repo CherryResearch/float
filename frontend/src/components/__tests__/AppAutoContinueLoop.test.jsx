@@ -180,6 +180,52 @@ describe("Full Auto tool loop", () => {
     );
   });
 
+  test("tracks server-owned auto decisions without posting a duplicate accept", async () => {
+    axiosMocks.get.mockResolvedValue({ data: { agents: [] } });
+    axiosMocks.post.mockResolvedValue({
+      data: { message: "done", metadata: {}, tools_used: [] },
+    });
+
+    const { default: App } = await import("../App");
+    render(<App />);
+
+    await waitFor(() => expect(wsInstances.length).toBeGreaterThan(0));
+    const ws = wsInstances[0];
+    await act(async () => {
+      ws.emit({
+        type: "tool",
+        id: "tool-server-owned",
+        name: "remember",
+        args: { key: "one", value: "once" },
+        status: "proposed",
+        server_auto_decide: true,
+        session_id: "sess-1",
+        message_id: "msg-1",
+        chain_id: "msg-1",
+      });
+      ws.emit({
+        type: "tool",
+        id: "tool-server-owned",
+        name: "remember",
+        args: { key: "one", value: "once" },
+        status: "invoked",
+        result: { status: "invoked", ok: true, data: "ok" },
+        session_id: "sess-1",
+        message_id: "msg-1",
+        chain_id: "msg-1",
+      });
+    });
+
+    await waitFor(() =>
+      expect(
+        axiosMocks.post.mock.calls.filter(([url]) => url === "/api/chat/continue"),
+      ).toHaveLength(1),
+    );
+    expect(
+      axiosMocks.post.mock.calls.filter(([url]) => url === "/api/tools/decision"),
+    ).toHaveLength(0);
+  });
+
   test("does not auto-continue the same semantic tool batch twice when request ids change", async () => {
     axiosMocks.get.mockResolvedValue({ data: { agents: [] } });
     axiosMocks.post.mockImplementation((url) => {

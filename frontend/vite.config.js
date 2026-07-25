@@ -8,6 +8,7 @@ const configuredAllowedHosts = (process.env.VITE_ALLOWED_HOSTS || '')
   .map((host) => host.trim())
   .filter(Boolean);
 const allowedHosts = Array.from(new Set(['.ts.net', ...configuredAllowedHosts]));
+const trustedBackendProxyHeaders = { 'x-float-frontend-proxy': '1' };
 const connectionErrorCodes = new Set(['ECONNREFUSED', 'ECONNRESET']);
 const STARTUP_COLOR = '\x1b[33m';
 const COLOR_RESET = '\x1b[0m';
@@ -83,6 +84,7 @@ export default defineConfig({
         target: backendTarget,
         changeOrigin: true,
         secure: false,
+        headers: trustedBackendProxyHeaders,
         ws: true,
         configure: attachProxyHandlers,
       },
@@ -91,6 +93,7 @@ export default defineConfig({
         target: backendTarget,
         changeOrigin: true,
         secure: false,
+        headers: trustedBackendProxyHeaders,
         configure: attachProxyHandlers,
       },
       "/conversations": {
@@ -98,6 +101,7 @@ export default defineConfig({
         target: backendTarget,
         changeOrigin: true,
         secure: false,
+        headers: trustedBackendProxyHeaders,
         configure: attachProxyHandlers,
       },
     },

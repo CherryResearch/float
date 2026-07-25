@@ -1517,7 +1517,7 @@ const MediaViewer = ({
   return (
     <div className="media-viewer">
       <div
-        className={`media-preview media-preview--${previewKind || "file"}`}
+        className="media-preview"
         onClick={openViewer}
         onKeyDown={handlePreviewKey}
         role="button"

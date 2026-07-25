@@ -28,6 +28,92 @@ def _spec(
 
 _SENSITIVITY_ENUM = ["mundane", "public", "personal", "protected", "secret"]
 
+_GRAPH_NODE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "node_id": {"type": "string", "title": "Node ID"},
+        "ref": {"type": "string", "title": "Local reference"},
+        "node_kind": {
+            "type": "string",
+            "title": "Node kind",
+            "enum": ["entity", "event"],
+            "default": "entity",
+        },
+        "node_type": {"type": "string", "title": "Node type"},
+        "canonical_name": {"type": "string", "title": "Canonical name"},
+        "summary_text": {"type": "string", "title": "Summary"},
+        "attributes": {"type": "object", "title": "Attributes"},
+        "status": {"type": "string", "title": "Status", "default": "active"},
+    },
+    "required": ["node_type"],
+}
+
+_GRAPH_CLAIM_ROLE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "role_name": {"type": "string", "title": "Role name"},
+        "node_id": {"type": "string", "title": "Node ID"},
+        "node_ref": {"type": "string", "title": "Local node reference"},
+        "value": {
+            "type": ["string", "number", "boolean", "object", "array"],
+            "title": "Literal value",
+            "items": {},
+        },
+        "metadata": {"type": "object", "title": "Role metadata"},
+    },
+    "required": ["role_name"],
+}
+
+_GRAPH_CLAIM_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "claim_id": {"type": "string", "title": "Claim ID"},
+        "claim_type": {
+            "type": "string",
+            "title": "Claim type",
+            "default": "relation",
+        },
+        "predicate": {"type": "string", "title": "Predicate"},
+        "status": {"type": "string", "title": "Status", "default": "active"},
+        "epistemic_status": {
+            "type": "string",
+            "title": "Epistemic status",
+            "enum": [
+                "observed",
+                "asserted",
+                "scheduled",
+                "predicted",
+                "hypothesized",
+                "cancelled",
+                "superseded",
+            ],
+            "default": "asserted",
+        },
+        "confidence": {
+            "type": "number",
+            "title": "Confidence",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 1,
+        },
+        "valid_from": {"type": ["number", "string"], "title": "Valid from"},
+        "valid_to": {"type": ["number", "string"], "title": "Valid to"},
+        "occurred_at": {"type": ["number", "string"], "title": "Occurred at"},
+        "source_kind": {"type": "string", "title": "Source kind"},
+        "source_ref": {"type": "string", "title": "Source reference"},
+        "metadata": {"type": "object", "title": "Claim metadata"},
+        "roles": {
+            "type": "array",
+            "title": "Roles",
+            "items": _GRAPH_CLAIM_ROLE_SCHEMA,
+        },
+    },
+    "required": ["predicate", "roles"],
+}
+
 
 BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
     "help": _spec(
@@ -1665,6 +1751,16 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                     "title": "Graph triples",
                     "items": {"type": "string"},
                 },
+                "graph_nodes": {
+                    "type": "array",
+                    "title": "Graph nodes",
+                    "items": _GRAPH_NODE_SCHEMA,
+                },
+                "graph_claims": {
+                    "type": "array",
+                    "title": "Graph claims",
+                    "items": _GRAPH_CLAIM_SCHEMA,
+                },
                 "privacy": {"type": "string", "title": "Privacy"},
                 "source": {"type": "string", "title": "Source"},
                 "reflect_after_save": {
@@ -1688,6 +1784,9 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
         metadata={
             "ui": {
                 "text": {"multiline": True, "rows": 6},
+                "graph_nodes": {"advanced": True},
+                "graph_claims": {"advanced": True},
+                "graph_triples": {"advanced": True},
                 "reflect_after_save": {"advanced": True},
                 "reflection_prompt": {
                     "advanced": True,
@@ -1752,6 +1851,16 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                     "type": ["number", "string"],
                     "title": "Decay at",
                 },
+                "graph_nodes": {
+                    "type": "array",
+                    "title": "Graph nodes",
+                    "items": _GRAPH_NODE_SCHEMA,
+                },
+                "graph_claims": {
+                    "type": "array",
+                    "title": "Graph claims",
+                    "items": _GRAPH_CLAIM_SCHEMA,
+                },
                 "reflect_after_save": {
                     "type": "boolean",
                     "title": "Reflect after save",
@@ -1784,6 +1893,8 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                 "occurs_at": {"advanced": True},
                 "review_at": {"advanced": True},
                 "decay_at": {"advanced": True},
+                "graph_nodes": {"advanced": True},
+                "graph_claims": {"advanced": True},
                 "reflect_after_save": {"advanced": True},
                 "reflection_prompt": {
                     "advanced": True,
@@ -1791,6 +1902,47 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
                     "rows": 3,
                 },
                 "reflection_run_now": {"advanced": True},
+            }
+        },
+    ),
+    "graph.update": _spec(
+        "graph.update",
+        "Create or update durable graph nodes and multi-role claims.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "nodes": {
+                    "type": "array",
+                    "title": "Graph nodes",
+                    "items": _GRAPH_NODE_SCHEMA,
+                    "default": [],
+                },
+                "claims": {
+                    "type": "array",
+                    "title": "Graph claims",
+                    "items": _GRAPH_CLAIM_SCHEMA,
+                    "default": [],
+                },
+                "source_kind": {
+                    "type": "string",
+                    "title": "Source kind",
+                    "default": "tool",
+                },
+                "source_ref": {
+                    "type": "string",
+                    "title": "Source reference",
+                    "default": "",
+                },
+            },
+            "anyOf": [{"required": ["nodes"]}, {"required": ["claims"]}],
+        },
+        metadata={
+            "ui": {
+                "nodes": {"multiline": True, "rows": 8},
+                "claims": {"multiline": True, "rows": 8},
+                "source_kind": {"advanced": True},
+                "source_ref": {"advanced": True},
             }
         },
     ),

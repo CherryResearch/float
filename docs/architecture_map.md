@@ -1,22 +1,29 @@
 # Architecture Map
 
-Updated: 2026-04-18
+Updated: 2026-07-15
 
-This map summarizes Float's current code layout, runtime lanes, storage model, and request flow. It is intentionally shorter than the route table; use `docs/api_reference.md` for the public endpoint overview and `backend/app/routes.py` for the implementation source of truth.
+This map summarizes Float's current code layout, runtime lanes, storage model, and request flow. It is intentionally shorter than the route table; use `docs/api_reference.md` for the public endpoint overview and the routers included by `backend/app/routes.py` for the implementation source of truth.
 
 ## Repository Layout
 
 - `backend/`
   - `app/main.py`: FastAPI app setup, middleware, health probes, route mounting, startup wiring.
-  - `app/routes.py`: Current large route module for chat, memory, knowledge, attachments, tools, computer use, calendar, sync, settings, providers, model jobs, actions, and diagnostics.
+  - `app/routes.py`: Compatibility route aggregate for chat, memory, knowledge, attachments, computer use, calendar, sync, settings, model jobs, actions, and diagnostics. New domain routers should be included here while legacy clients/tests still import this aggregate.
+  - `app/routers/`: Domain HTTP routers. This name deliberately avoids colliding with the compatibility `app/routes.py` module.
+    - `provider.py`: provider status, inventory, lifecycle, logs, and generic OpenAI-compatible server inventory routes. The router is built with the aggregate's shared provider-manager instance.
+  - `app/routes_graph.py`: Graph request models plus schema, projection, and update routes; this was the first behavior-preserving extraction and can move under `app/routers/` in a later mechanical cleanup.
+  - `app/routes_tools.py`: Tool catalog/specification routes.
   - `app/base_services.py`: LLM service orchestration, context assembly, API/local/server dispatch, multimodal payload handling, Harmony handling, and direct-local loading helpers.
   - `app/config.py`: Environment/settings defaults, including API model defaults, streaming settings, local/provider modes, RAG settings, and user settings.
   - `app/tools/`: Built-in tool implementations and tool registration.
   - `app/tool_specs.py`: JSON-schema-like tool argument specs used by the UI and model guidance.
   - `app/tool_catalog.py`: Capability metadata for built-in tools, including status, sandbox, limits, and safety hints.
-  - `app/local_providers/`: Managed provider adapters for LM Studio, Ollama, and provider-manager behavior.
-  - `app/services/`: Business services for sync, RAG, live/voice transport, model jobs, computer runtime, conversations, and related subsystems.
-  - `app/utils/`: Shared stores, blob resolution, graph store, time resolution, argument normalization, device visibility, and other helpers.
+  - `app/local_providers/`: Managed provider adapters for LM Studio and Ollama, provider-manager behavior, and pure provider-selection policy in `selection.py`.
+  - `app/model_catalog/`: Provider-model lifecycle policy, shutdown metadata, and persisted-selection migration hints.
+  - `app/utils/user_model_catalog.py`: User-owned Hugging Face model registrations persisted in `user_settings.json`; these dynamically extend central alias resolution and download-job availability without modifying the shipped built-in registry.
+  - `app/routers/`: Extracted domain routers. `model_catalog.py` owns cloud inventory/catalog responses and `provider.py` owns managed/local provider controls while `app/routes.py` remains the compatibility aggregate.
+  - `app/services/`: Business services for sync, RAG, live/voice transport, model jobs, computer runtime, conversations, graph payload normalization, provider-agnostic model inventory, and related subsystems.
+  - `app/utils/`: Shared stores, blob resolution, graph store, deployment/build status, time resolution, argument normalization, device visibility, and other helpers.
   - `app/tests/`: Backend regression tests.
 - `frontend/`
   - `src/main.jsx`: React app bootstrap and global state hydration.
@@ -24,8 +31,8 @@ This map summarizes Float's current code layout, runtime lanes, storage model, a
   - `src/components/TopBar.jsx`: Mode/model controls and top-level navigation.
   - `src/components/HistorySidebar.jsx`: Conversation history, folders, import/export, and navigation.
   - `src/components/AgentConsole.jsx`: Tool/thought/task cards and runtime status side rail.
-  - `src/components/KnowledgeViewer.jsx`, `DocumentsTab.jsx`, `KnowledgeSyncTab.jsx`, `ThreadsTab.jsx`, `MediaViewer.jsx`: Knowledge, documents, sync, threads, visualizations, and media surfaces.
-  - `src/components/Settings.jsx`: Runtime lanes, provider controls, model jobs, voice/live settings, workflows, tools, sync/device settings, themes, and diagnostics.
+  - `src/components/KnowledgeViewer.jsx`, `KnowledgeSkillsTab.jsx`, `DocumentsTab.jsx`, `KnowledgeSyncTab.jsx`, `ThreadsTab.jsx`, `MediaViewer.jsx`: Knowledge, skill/workflow management, documents, sync, threads, visualizations, and media surfaces.
+  - `src/components/Settings.jsx`: Runtime lanes, provider controls, model jobs, voice/live settings, capture/privacy controls, tools, sync/device settings, themes, and diagnostics.
   - `src/utils/modelUtils.js`: Frontend model/mode resolution helpers used by chat, top bar, settings, and console.
 - `docs/`
   - `feature_overviews/`: Plain-language feature descriptions.
@@ -34,27 +41,31 @@ This map summarizes Float's current code layout, runtime lanes, storage model, a
 - `data/` (gitignored): Runtime data root.
 - `modules/`: Tracked repo-shipped add-on/skill assets.
 
+User model custody stays split by source: local path registrations point at existing files and are never deleted as part of unregistering; Hugging Face registrations store only normalized repository metadata until the user explicitly starts a download job.
+
 ## Runtime Lanes
 
 Float keeps these concepts separate:
 
-- `Cloud API` / backend mode `api`: OpenAI-compatible API calls through the configured `api_url` and `api_key`. Defaults currently focus on `gpt-5.4`.
+- The local launcher binds the backend to `127.0.0.1` by default. `--lan` is an explicit listener opt-in; ordinary remote browser traffic should still enter through Float's same-host frontend proxy, while paired-device endpoints retain LAN visibility and bearer-scope checks.
+
+- `Cloud API` / backend mode `api`: OpenAI-compatible API calls through the configured `api_url` and `api_key`. The only static frontend default is `chat-latest`; live provider inventory supplies the concrete choices. The backend catalog hides officially deprecated/removed ids from new selection while retaining a persisted old choice long enough to show its lifecycle and migration target.
 - `Local (on-device)` / backend mode `local`: Direct local Transformers checkpoints or managed provider markers.
 - Managed local providers: LM Studio/Ollama-style OpenAI-compatible runtimes managed or probed through `backend/app/local_providers/`.
-- `Server/LAN` / backend mode `server`: An already-running OpenAI-compatible server configured by `server_url`; Float does not manage that process.
+- `Server/LAN` / backend mode `server`: An already-running OpenAI-compatible server configured by `server_url`; Float does not manage that process. Built-in and user presets keep endpoint/auth-environment metadata in `server_presets.py`, while the official Tinker SDK supplies account base-model and sampler-checkpoint inventory. Inference still uses the shared OpenAI-compatible chat transport.
 - Live voice: OpenAI Realtime is the current cloud-default through `/api/voice/connect`; LiveKit remains a fallback transport and Pipecat is still an explored pipeline option. Gemma 4 is not a live voice transport in this pass.
 
 Gemma 4 is lane-scoped:
 
 - `gemma-4-E2B-it` is the current direct-local target.
-- `gemma-4-E2B-it-qat-q4_0` and `gemma-4-12B-it-qat-q4_0` are direct-local QAT aliases for unquantized Hugging Face checkpoints.
-- `gemma-4-E2B-it-qat-q4_0-gguf`, `gemma-4-E4B-it-qat-q4_0-gguf`, `gemma-4-12B-it-qat-q4_0-gguf`, `gemma-4-26B-A4B-it-qat-q4_0-gguf`, and `gemma-4-31B-it-qat-q4_0-gguf` are provider/server-first.
+- `gemma-4-E4B-it`, `gemma-4-26B-A4B-it`, and `gemma-4-31B-it` are provider/server-first.
 - Raw GGUF weights should run behind LM Studio, Ollama, or another OpenAI-compatible server, not the direct local Transformers path.
 
 ## Data And Storage Model
 
 - `data/conversations/`: Saved conversation JSON files plus `.meta.json` sidecars. Metadata-only sidecars can exist without API-visible conversation JSON.
 - `data/databases/memory.sqlite3`: Canonical memory and knowledge store.
+- `data/databases/deployment_events.sqlite3`: Deployment-local, append-only metadata ledger for software installs, syncs, and data-store mutations. It stores UUIDs, revisions, sections, and counts only; it does not store item ids, filenames, prompts, conversation text, memory text, or sync payloads.
 - `data/databases/chroma/`: Default Chroma vector mirror for retrieval.
 - `data/files/uploads/`: User-uploaded files.
 - `data/files/screenshots/`: Capture/screenshot artifacts.
@@ -63,7 +74,12 @@ Gemma 4 is lane-scoped:
 - `data/sync/<peer>/workspace/`: Canonical custody path for imported synced workspace files.
 - `data/models/`: Default local model payload/cache target.
 - `data/themes/`: User-created themes from Settings.
+- `data/deployment.json`: Runtime-owned stable UUID for this deployment/data root. It is created lazily and is not shipped in release snapshots.
 - `data/workspace/`: General tool-writable scratch/workspace area.
+
+The shipped source root may also contain `.float-build.json`, generated by the release snapshot helper. It keeps the stable release version separate from the occasional human build code and records the source revision, dirty-source flag, deterministic snapshot digest, and build time. A non-Git installation managed by `scripts/deploy_release_snapshot.py` also owns `.float-deployment-manifest.json`, which records the exact installed shipped-file set so later pushes can remove only previously managed stale files while preserving runtime data, settings, logs, models, notebooks, and dependencies. Each successful managed install appends a content-free `software.install` event to that deployment's ledger. The machine-local deployment registry lives outside every repo/data root at `%LOCALAPPDATA%/Float/deployments.json`, so independent deployments can discover one another without sharing their runtime data.
+
+The deployment event ledger is deliberately separate from synced user content and from the short-retention Action History snapshots used for undo. Each deployment keeps its own chain; ledgers are not synced between peers. Every newly observed deterministic full-data revision appends a local timestamped revision event, while memory-store writes additionally record count-only update/delete/bulk-replacement detail. Event hashes chain to the previous event so later metadata edits are detectable, while normal user content can still be deleted, cleaned, or allowed to expire without being copied into an audit archive.
 
 SQLite is the durable source of truth for memory/knowledge text rows and chunks. Chroma mirrors searchable vector snippets. Weaviate remains optional.
 
@@ -113,11 +129,11 @@ Important caption rule from the 2026-04-12 sync consolidation: imported/manual i
 
 1. The receiving device turns on LAN visibility.
 2. A one-time pairing code creates a trusted-device relationship.
-3. `/api/sync/overview` exposes current device state, visibility, pairings, workspaces, and review items.
-4. `/api/sync/plan` previews pull/push differences by section and item.
-5. `/api/sync/apply` applies selected changes.
+3. `/api/sync/overview` exposes current device state, software and data identity, deterministic data revision, latest per-peer checkpoint, recent content-free deployment events, visibility, pairings, workspaces, and review items. Workspace summaries carry an inherited logical lineage UUID plus origin and immediate-upstream deployment UUIDs. A verified peer check retains the peer's last observed deployment UUID and software/data summary in its pairing record.
+4. `/api/sync/plan` previews pull/push differences by section and item. It uses a peer/workspace-scoped common ancestor when available. The first authenticated comparison may anchor a complete observed section without calling it a successful sync; later previews do not advance that anchor, so downstream creations remain identifiable until selected sync applies them.
+5. `/api/sync/apply` applies selected changes, records successful selected-item fingerprints, and appends local sync metadata with before/after revisions and counts. A push sends only a causal event UUID to the receiver, so the two local ledgers can be correlated without copying either ledger or user content.
 6. Remote `/api/sync/manifest`, `/api/sync/export`, and `/api/sync/ingest` handle authenticated peer exchange.
-7. Imported workspace custody is recorded under source metadata and canonical sync folders so recursive sync loops can be avoided.
+7. Imported workspace custody is recorded under source metadata and canonical sync folders. Replicas inherit the original workspace lineage/origin, record their immediate upstream deployment, and use that deployment identity in the recursive-sync guard.
 
 The sync stack is an alpha trusted-device flow. It is not yet background sync, a public relay, or a generic cloud gateway.
 

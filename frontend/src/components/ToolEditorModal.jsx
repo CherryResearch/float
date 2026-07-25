@@ -8,6 +8,7 @@ import { GlobalContext } from "../main";
 import {
   buildModelGroups,
   DEFAULT_API_MODELS,
+  formatApiModelLabel,
   formatLocalRuntimeLabel,
   isLocalRuntimeEntry,
   LOCAL_RUNTIME_ENTRIES,
@@ -185,6 +186,7 @@ const timezones = (() => {
   try {
     return Intl.supportedValuesOf("timeZone");
   } catch (err) {
+    void err;
     return [Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"];
   }
 })();
@@ -290,6 +292,13 @@ const ToolEditorModal = ({
     () => (Array.isArray(state.apiModels) ? state.apiModels : []),
     [state.apiModels],
   );
+  const apiModelAliases =
+    state.apiModelAliases && typeof state.apiModelAliases === "object"
+      ? state.apiModelAliases
+      : {};
+  const apiModelCatalog = Array.isArray(state.apiModelCatalog)
+    ? state.apiModelCatalog
+    : [];
   const apiModelsAvailableSet = useMemo(
     () => new Set(apiModelsAvailable),
     [apiModelsAvailable],
@@ -868,6 +877,7 @@ const ToolEditorModal = ({
       setError("");
       return parsed;
     } catch (err) {
+      void err;
       setError("Arguments must be valid JSON.");
       return null;
     }
@@ -1563,7 +1573,14 @@ const ToolEditorModal = ({
                             const disabled =
                               apiModelsAvailableSet.size > 0 &&
                               !apiModelsAvailableSet.has(model);
-                            const label = disabled ? `${model} (unavailable)` : model;
+                            const displayLabel = formatApiModelLabel(model, {
+                              aliases: apiModelAliases,
+                              availableModels: apiModelsAvailable,
+                              catalog: apiModelCatalog,
+                            });
+                            const label = disabled
+                              ? `${displayLabel || model} (unavailable)`
+                              : displayLabel || model;
                             return (
                               <option key={model} value={model} disabled={disabled}>
                                 {label}
@@ -1577,7 +1594,11 @@ const ToolEditorModal = ({
                           >
                             {apiModelGroups.extras.map((model) => (
                               <option key={model} value={model}>
-                                {model}
+                                {formatApiModelLabel(model, {
+                                  aliases: apiModelAliases,
+                                  availableModels: apiModelsAvailable,
+                                  catalog: apiModelCatalog,
+                                }) || model}
                               </option>
                             ))}
                           </optgroup>

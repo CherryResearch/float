@@ -16,7 +16,6 @@ import {
   memoryStore,
   apiWrapper,
 } from "../utils/proxy";
-import { ensureDeviceAndToken } from "../utils/sync";
 import { GlobalContext } from "../main";
 import DOMPurify from "dompurify";
 import { marked } from "marked";
@@ -65,13 +64,16 @@ import {
   isContinuationPlaceholderText,
   mergeContinuationText,
   normalizeToolContinuationPhases,
-  stripInlineToolPlaceholders,
 } from "../utils/continuationText";
 import {
   buildHistoryFromConversation,
   hasRenderableAssistantContent,
 } from "../utils/conversationHistory";
-import { resolveRequestModelForMode } from "../utils/modelUtils";
+import {
+  formatApiModelLabel,
+  resolveRequestModelForMode,
+} from "../utils/modelUtils";
+import { getMessageVisionNotice } from "../utils/visionDelivery";
 import {
   canResizeChatWindow,
   CHAT_WINDOW_KEYBOARD_STEP,
@@ -80,6 +82,36 @@ import {
   clampChatWindowWidth,
   getChatWindowWidthBounds,
 } from "../utils/chatWindowSizing";
+import { resolveAnchoredPopoverPosition } from "../utils/popoverPosition";
+import {
+  FALLBACK_WORKFLOW_PROFILES,
+  normalizeWorkflowProfiles,
+} from "../utils/workflowCatalog";
+import {
+  isCustomReasoningEffort,
+  normalizeThinkingMode,
+  REASONING_EFFORT_PRESETS,
+  reasoningEffortValue,
+  thinkingPayloadForMode,
+} from "../utils/reasoningEffort";
+import {
+  formatTokenLimit,
+  MAX_CUSTOM_OUTPUT_TOKENS,
+  normalizeCustomOutputTokens,
+  normalizeOutputTokenMode,
+  OUTPUT_TOKEN_PRESETS,
+  outputTokenPayload,
+  resolveModelCapabilities,
+  selectedOutputTokenLimit,
+} from "../utils/generationLimits";
+import {
+  ATTACHMENT_OUTBOX_TTL_MS,
+  cleanupExpiredAttachmentOutboxEntries,
+  deleteAttachmentOutboxEntry,
+  deleteSentAttachmentOutboxEntries,
+  listAttachmentOutboxEntries,
+  putAttachmentOutboxEntry,
+} from "../utils/attachmentOutbox";
 
 const DEFAULT_COMPOSER_ROWS = 4;
 const MAX_COMPOSER_ROWS = 72;
@@ -126,15 +158,17 @@ const COMMAND_REFERENCE_RE = /(^|[\s\n])(\.\/\/|\.\/|\/\/)(\[[^\]\n]+\]|[^\s]+)/
 const TOOL_DIRECTIVE_RE = /^(\s*)%([a-z0-9._-]+)(?:\s+([\s\S]*))?$/i;
 const TOOL_DIRECTIVE_TOKEN_RE = /(^|[\s\n])%([a-z0-9._-]+)(?=$|[\s\n.,;:!?])/gi;
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
-const LIVE_TOOL_PANEL_OFFSETS = {
-  camera: 0,
-  microphone: 44,
-  volume: 88,
-  thinking: 132,
-  workflow: 176,
-};
+const REASONING_EFFORT_TOOLTIP_TEXT =
+  "Reasoning effort and output length are independent. Tinker uses the exact slider value; other supported models round custom values to the nearest named level.";
 const RAG_TOOLTIP_TEXT =
-  "Memory: automatic Retrieval Augmented Generation to find similar memories.";
+  "Memory retrieval searches saved content before the reply. Text models find similar text memories; vision models find similar image memories. Enable a lane, then choose its retrieval model.";
+const CHAT_SETTINGS_SECTIONS = [
+  ["workflow", "Workflow"],
+  ["thinking", "Reasoning & memory"],
+  ["camera", "Camera"],
+  ["microphone", "Microphone"],
+  ["volume", "Voice"],
+];
 const RAG_TEXT_MODEL_OPTIONS = [
   { value: "simple", label: "Hash fallback", lane: "local" },
   { value: "local:all-MiniLM-L6-v2", label: "all-MiniLM-L6-v2", lane: "local" },
@@ -843,13 +877,15 @@ const createClientMessageId = (prefix = "msg") => {
 };
 
 const COMPOSER_DRAFT_STORAGE_PREFIX = "float:chat-composer-draft:v1:";
+const COMPOSER_ATTACHMENT_TOMBSTONE_STORAGE_PREFIX =
+  "float:chat-composer-attachment-tombstones:v1:";
 const MAX_STORED_COMPOSER_ATTACHMENTS = 12;
 
 const getComposerDraftStorage = () => {
   try {
     if (typeof window === "undefined" || !window.sessionStorage) return null;
     return window.sessionStorage;
-  } catch (_) {
+  } catch {
     return null;
   }
 };
@@ -857,8 +893,64 @@ const getComposerDraftStorage = () => {
 const getComposerDraftStorageKey = (sessionId) =>
   `${COMPOSER_DRAFT_STORAGE_PREFIX}${String(sessionId || "default")}`;
 
+const getComposerAttachmentTombstoneStorageKey = (sessionId) =>
+  `${COMPOSER_ATTACHMENT_TOMBSTONE_STORAGE_PREFIX}${String(sessionId || "default")}`;
+
 const normalizeStoredString = (value) =>
   typeof value === "string" ? value.trim() : "";
+
+const readStoredComposerAttachmentTombstones = (
+  sessionId,
+  now = Date.now(),
+) => {
+  const storage = getComposerDraftStorage();
+  if (!storage) return new Set();
+  const key = getComposerAttachmentTombstoneStorageKey(sessionId);
+  try {
+    const parsed = JSON.parse(storage.getItem(key) || "null");
+    const updatedAt = Number(parsed?.updatedAt);
+    if (
+      !Number.isFinite(updatedAt) ||
+      updatedAt + ATTACHMENT_OUTBOX_TTL_MS <= now
+    ) {
+      storage.removeItem(key);
+      return new Set();
+    }
+    return new Set(
+      (Array.isArray(parsed?.ids) ? parsed.ids : [])
+        .map(normalizeStoredString)
+        .filter(Boolean),
+    );
+  } catch {
+    try {
+      storage.removeItem(key);
+    } catch {
+      // Privacy-restricted storage should degrade to an empty tombstone set.
+    }
+    return new Set();
+  }
+};
+
+const markStoredComposerAttachmentTombstones = (
+  sessionId,
+  attachmentIds = [],
+) => {
+  const storage = getComposerDraftStorage();
+  if (!storage) return;
+  const ids = readStoredComposerAttachmentTombstones(sessionId);
+  attachmentIds.map(normalizeStoredString).filter(Boolean).forEach((id) => {
+    ids.add(id);
+  });
+  if (!ids.size) return;
+  try {
+    storage.setItem(
+      getComposerAttachmentTombstoneStorageKey(sessionId),
+      JSON.stringify({ ids: Array.from(ids), updatedAt: Date.now() }),
+    );
+  } catch {
+    // Storage quota/privacy failures should never block attachment removal.
+  }
+};
 
 const isPersistableAttachmentUrl = (value) => {
   const url = normalizeStoredString(value);
@@ -874,6 +966,8 @@ const normalizeVisionWorkflow = (value) => {
 
 const draftAttachmentId = (attachment, index) => {
   const raw =
+    attachment?.outboxId ||
+    attachment?.outbox_id ||
     attachment?.id ||
     attachment?.contentHash ||
     attachment?.content_hash ||
@@ -917,6 +1011,14 @@ export const serializeComposerDraftAttachments = (attachments = []) => {
         normalizeStoredString(attachment.content_hash);
       return {
         id: draftAttachmentId(attachment, index),
+        outboxId:
+          normalizeStoredString(attachment.outboxId) ||
+          normalizeStoredString(attachment.outbox_id) ||
+          null,
+        outbox_id:
+          normalizeStoredString(attachment.outboxId) ||
+          normalizeStoredString(attachment.outbox_id) ||
+          null,
         name,
         type,
         size,
@@ -962,12 +1064,20 @@ const readStoredComposerDraft = (sessionId) => {
     if (!parsed || typeof parsed !== "object") {
       return { message: "", attachments: [], visionWorkflow: "auto" };
     }
+    const tombstonedAttachmentIds =
+      readStoredComposerAttachmentTombstones(sessionId);
+    const attachments = serializeComposerDraftAttachments(parsed.attachments).filter(
+      (attachment) =>
+        !storedComposerAttachmentKeys(attachment).some((key) =>
+          tombstonedAttachmentIds.has(key),
+        ),
+    );
     return {
       message: typeof parsed.message === "string" ? parsed.message : "",
-      attachments: serializeComposerDraftAttachments(parsed.attachments),
+      attachments,
       visionWorkflow: normalizeVisionWorkflow(parsed.visionWorkflow),
     };
-  } catch (_) {
+  } catch {
     return { message: "", attachments: [], visionWorkflow: "auto" };
   }
 };
@@ -994,7 +1104,7 @@ const writeStoredComposerDraft = (sessionId, draft = {}) => {
         updatedAt: new Date().toISOString(),
       }),
     );
-  } catch (_) {
+  } catch {
     // Storage quota/privacy failures should never block chat composition.
   }
 };
@@ -1014,6 +1124,63 @@ const mergeStoredComposerDraftAttachment = (sessionId, attachment) => {
     ...draft,
     attachments,
   });
+};
+
+const storedComposerAttachmentKeys = (attachment) =>
+  [
+    attachment?.outboxId,
+    attachment?.outbox_id,
+    attachment?.contentHash,
+    attachment?.content_hash,
+    attachment?.remoteUrl,
+    attachment?.url,
+    attachment?.id,
+  ]
+    .map(normalizeStoredString)
+    .filter(Boolean);
+
+const removeStoredComposerDraftAttachments = (sessionId, attachments = []) => {
+  const submittedKeys = new Set(
+    attachments.flatMap((attachment) => storedComposerAttachmentKeys(attachment)),
+  );
+  if (!submittedKeys.size) return;
+  const draft = readStoredComposerDraft(sessionId);
+  const remainingAttachments = (draft.attachments || []).filter(
+    (attachment) =>
+      !storedComposerAttachmentKeys(attachment).some((key) =>
+        submittedKeys.has(key),
+      ),
+  );
+  if (remainingAttachments.length === (draft.attachments || []).length) return;
+  writeStoredComposerDraft(sessionId, {
+    ...draft,
+    attachments: remainingAttachments,
+  });
+};
+
+const fileFromAttachmentOutboxEntry = (entry) => {
+  const storedFile = entry?.file;
+  if (!storedFile) return null;
+  if (typeof File !== "undefined" && storedFile instanceof File) {
+    return storedFile;
+  }
+  if (typeof Blob === "undefined" || !(storedFile instanceof Blob)) {
+    return null;
+  }
+  if (typeof File === "undefined") return storedFile;
+  return new File([storedFile], entry.name || "attachment", {
+    type: entry.type || storedFile.type || "application/octet-stream",
+    lastModified: Number(entry.lastModified) || Date.now(),
+  });
+};
+
+const createAttachmentPreviewUrl = (file) => {
+  if (!file || typeof URL === "undefined" || !URL.createObjectURL) return "";
+  try {
+    return URL.createObjectURL(file);
+  } catch {
+    return "";
+  }
 };
 
 const getLiveStreamingStatusLabel = (phase) => {
@@ -1841,6 +2008,13 @@ const getMessageStatusBadge = (msg) => {
         : "Float is waiting on a tool call before continuing the answer.",
     };
   }
+  if (meta.output_truncated) {
+    return {
+      label: "token cap",
+      tone: "warn",
+      title: "The provider stopped after reaching the configured output-token budget.",
+    };
+  }
   const status = typeof meta.status === "string" ? meta.status.trim().toLowerCase() : "";
   if (status === "error") {
     return { label: "error", tone: "error", title: "Generation ended with an error." };
@@ -1954,17 +2128,58 @@ const buildMessageMetadataRows = (
           .filter(Boolean)
           .join(" / ")
       : "";
+  const usageLabel =
+    String(metadata.usage?.source || "").trim().toLowerCase() === "estimate"
+      ? "Usage (estimated)"
+      : "Usage";
+  const reasoning =
+    metadata.reasoning && typeof metadata.reasoning === "object"
+      ? metadata.reasoning
+      : null;
+  const generation =
+    metadata.generation && typeof metadata.generation === "object"
+      ? metadata.generation
+      : null;
+  const effectiveReasoningEffort = reasoning?.effective_effort;
+  const reasoningPrimary =
+    typeof effectiveReasoningEffort === "number"
+      ? `${reasoning.preset || "custom"} · ${effectiveReasoningEffort.toFixed(2)}`
+      : reasoning?.preset || effectiveReasoningEffort;
+  const reasoningLabel = reasoning
+    ? [
+        reasoningPrimary,
+        reasoning.rounded ? `rounded from ${reasoning.requested_effort}` : "",
+      ]
+        .filter(Boolean)
+        .join(" / ")
+    : "";
   return [
     { label: "Status", value: metadata.status },
     { label: "Source", value: sourceLabel },
     { label: "Mode", value: metadata.mode },
     { label: "Model", value: metadata.model || metadata.model_received || metadata.model_requested },
     { label: "Workflow", value: workflow },
+    { label: "Reasoning", value: reasoningLabel },
+    {
+      label: "Response limit",
+      value: generation?.max_output_tokens
+        ? `${generation.max_output_tokens} tokens`
+        : generation?.output_limit_source === "provider_default"
+          ? "provider default"
+          : reasoning?.output_token_budget
+            ? `${reasoning.output_token_budget} tokens`
+            : "",
+    },
+    { label: "Finish", value: metadata.finish_reason },
+    {
+      label: "Termination",
+      value: metadata.termination_category || metadata.category,
+    },
     { label: "Tools", value: toolCount ? `${toolCount}` : "" },
     { label: "Context", value: ragCount ? `${ragCount}` : "" },
     { label: "Response", value: compactMetadataValue(metadata.response_id, 42) },
     { label: "Request", value: compactMetadataValue(metadata.request_id, 42) },
-    { label: "Usage", value: usage },
+    { label: usageLabel, value: usage },
   ].filter((row) => compactMetadataValue(row.value));
 };
 
@@ -1989,6 +2204,9 @@ const Chat = ({
   if (initialComposerDraftRef.current === undefined) {
     initialComposerDraftRef.current = readStoredComposerDraft(state.sessionId);
   }
+  const composerDraftSessionRef = useRef(state.sessionId);
+  const activeComposerSessionRef = useRef(state.sessionId);
+  activeComposerSessionRef.current = state.sessionId;
   const initialComposerDraft = initialComposerDraftRef.current || {};
   const [message, setMessage] = useState(() => initialComposerDraft.message || "");
   const [composerCursor, setComposerCursor] = useState(() =>
@@ -2009,6 +2227,8 @@ const Chat = ({
       ? initialComposerDraft.attachments
       : [],
   );
+  const attachmentsRef = useRef(attachments);
+  attachmentsRef.current = attachments;
   const [visionWorkflow, setVisionWorkflow] = useState(() =>
     normalizeVisionWorkflow(initialComposerDraft.visionWorkflow),
   );
@@ -2020,6 +2240,9 @@ const Chat = ({
   const [liveVisualError, setLiveVisualError] = useState("");
   const [chatSettingsOpen, setChatSettingsOpen] = useState(false);
   const [chatSettingsSection, setChatSettingsSection] = useState("camera");
+  const [chatWorkflowProfiles, setChatWorkflowProfiles] = useState(
+    FALLBACK_WORKFLOW_PROFILES,
+  );
   const [availableInputDevices, setAvailableInputDevices] = useState({
     audioinput: [],
     videoinput: [],
@@ -2048,6 +2271,7 @@ const Chat = ({
   const chatSettingsPopoverRef = useRef(null);
   const attachmentMenuRef = useRef(null);
   const removedAttachmentIdsRef = useRef(new Set());
+  const activeAttachmentUploadsRef = useRef(new Set());
   const toolCatalogRef = useRef(null);
   const knowledgeDocsRef = useRef(null);
   const commandLookupRequestRef = useRef(0);
@@ -2121,8 +2345,34 @@ const Chat = ({
   const ttsRequestIdRef = useRef(0);
   const [collapsedTools, setCollapsedTools] = useState({});
   const [collapseAllTools, setCollapseAllTools] = useState(true);
-  const thinkingMode = state.thinkingMode || "auto";
+  const thinkingMode = normalizeThinkingMode(state.thinkingMode);
+  const thinkingEffortValue = reasoningEffortValue(thinkingMode);
+  const customThinkingEffort = isCustomReasoningEffort(thinkingMode);
+  const outputTokenMode = normalizeOutputTokenMode(state.outputTokenMode);
+  const customOutputTokens = normalizeCustomOutputTokens(
+    state.customOutputTokens,
+  );
+  const outputTokenLimit = selectedOutputTokenLimit(
+    outputTokenMode,
+    customOutputTokens,
+  );
   const workflowProfile = state.workflowProfile || "default";
+  const workflowOptions = chatWorkflowProfiles.some(
+    (profile) => profile.id === workflowProfile,
+  )
+    ? chatWorkflowProfiles
+    : [
+        {
+          id: workflowProfile,
+          label: workflowProfile,
+          description: "Current profile from saved settings.",
+        },
+        ...chatWorkflowProfiles,
+      ];
+  const activeWorkflowProfile =
+    workflowOptions.find((profile) => profile.id === workflowProfile) ||
+    workflowOptions[0] ||
+    null;
   const textRagEnabled = state.textRagEnabled !== false;
   const visionRagEnabled = state.visionRagEnabled !== false;
   const ragEmbeddingModel = state.ragEmbeddingModel || "local:all-MiniLM-L6-v2";
@@ -2143,8 +2393,15 @@ const Chat = ({
     () => resolveTtsRoute(state.ttsModel, state.voiceModel),
     [state.ttsModel, state.voiceModel],
   );
-  const thinkingPayload =
-    thinkingMode === "auto" ? {} : { thinking: thinkingMode };
+  const thinkingPayload = thinkingPayloadForMode(thinkingMode);
+  const outputTokensPayload = outputTokenPayload(
+    outputTokenMode,
+    customOutputTokens,
+  );
+  const generationControlPayload = {
+    ...thinkingPayload,
+    ...outputTokensPayload,
+  };
   const ragPayload = {
     use_rag: textRagEnabled || visionRagEnabled,
     use_text_rag: textRagEnabled,
@@ -2166,11 +2423,26 @@ const Chat = ({
       ? commandSuggestions[activeCommandSuggestionIndex]
       : null;
   const setThinkingMode = useCallback((mode) => {
-    const normalized =
-      mode === "high" || mode === "low" || mode === "auto" ? mode : "auto";
+    const normalized = normalizeThinkingMode(mode);
     setState((prev) => {
-      if ((prev.thinkingMode || "auto") === normalized) return prev;
+      if (normalizeThinkingMode(prev.thinkingMode) === normalized) return prev;
       return { ...prev, thinkingMode: normalized };
+    });
+  }, [setState]);
+  const setOutputTokenMode = useCallback((mode) => {
+    const normalized = normalizeOutputTokenMode(mode);
+    setState((prev) => {
+      if (normalizeOutputTokenMode(prev.outputTokenMode) === normalized) return prev;
+      return { ...prev, outputTokenMode: normalized };
+    });
+  }, [setState]);
+  const setCustomOutputTokens = useCallback((value) => {
+    const normalized = normalizeCustomOutputTokens(value);
+    setState((prev) => {
+      if (normalizeCustomOutputTokens(prev.customOutputTokens) === normalized) {
+        return prev;
+      }
+      return { ...prev, customOutputTokens: normalized };
     });
   }, [setState]);
   const setRagEnabled = useCallback((field, enabled) => {
@@ -2195,11 +2467,7 @@ const Chat = ({
     });
   }, [setError, setState]);
   const setWorkflowProfile = useCallback((workflow) => {
-    const normalized = ["default", "architect_planner", "mini_execution"].includes(
-      workflow,
-    )
-      ? workflow
-      : "default";
+    const normalized = String(workflow || "").trim() || "default";
     setState((prev) => {
       if ((prev.workflowProfile || "default") === normalized) return prev;
       return { ...prev, workflowProfile: normalized };
@@ -2207,7 +2475,7 @@ const Chat = ({
   }, [setState]);
   const openWorkflowSettings = useCallback(() => {
     setChatSettingsOpen(false);
-    navigate("/settings#settings-workflows");
+    navigate("/knowledge?tab=skills&view=workflows");
   }, [navigate]);
   const placeComposerSelection = useCallback((nextText, nextCursor) => {
     const safeText = typeof nextText === "string" ? nextText : "";
@@ -2563,9 +2831,69 @@ const Chat = ({
     () => resolveModeModel(state.backendMode, state),
     [state.backendMode, state.apiModel, state.localModel, state.transformerModel],
   );
+  const activeModelCapabilities = useMemo(() => {
+    const mode = String(activeModeModel.mode || "").toLowerCase();
+    const entries =
+      mode === "server"
+        ? state.serverModelDetails
+        : mode === "api"
+          ? state.apiModelCatalog
+          : [];
+    return resolveModelCapabilities(entries, activeModeModel.model);
+  }, [
+    activeModeModel.mode,
+    activeModeModel.model,
+    state.apiModelCatalog,
+    state.serverModelDetails,
+  ]);
+  const outputLimitWarning = useMemo(() => {
+    if (!outputTokenLimit || !activeModelCapabilities) return "";
+    if (
+      activeModelCapabilities.maxOutputTokens &&
+      outputTokenLimit > activeModelCapabilities.maxOutputTokens
+    ) {
+      return `Selected response limit exceeds the reported ${formatTokenLimit(
+        activeModelCapabilities.maxOutputTokens,
+      )} maximum response.`;
+    }
+    if (
+      activeModelCapabilities.maxContextLength &&
+      outputTokenLimit >= activeModelCapabilities.maxContextLength
+    ) {
+      return `Selected response limit leaves no room for the prompt inside the reported ${formatTokenLimit(
+        activeModelCapabilities.maxContextLength,
+      )} context.`;
+    }
+    return "";
+  }, [activeModelCapabilities, outputTokenLimit]);
+  const outputLimitTooltipText = useMemo(() => {
+    const source = activeModelCapabilities?.source
+      ? ` Capacity source: ${activeModelCapabilities.source}.`
+      : "";
+    return `Context is the full working window for the prompt, history, retrieved memory, tools, and reply. The response limit caps only newly generated reply tokens; Auto leaves it to the provider. Reported capacity: ${formatTokenLimit(
+      activeModelCapabilities?.maxContextLength,
+    )} context and ${formatTokenLimit(
+      activeModelCapabilities?.maxOutputTokens,
+    )} maximum response.${source} Local runtimes may use a configured context below the model's theoretical maximum.`;
+  }, [activeModelCapabilities]);
   const activeModelLabel = useMemo(
-    () => formatModelSourceLabel(activeModeModel.mode, activeModeModel.model),
-    [activeModeModel.mode, activeModeModel.model],
+    () => {
+      const displayModel =
+        String(activeModeModel.mode || "").toLowerCase() === "api"
+          ? formatApiModelLabel(activeModeModel.model, {
+              aliases: state.apiModelAliases,
+              availableModels: state.apiModels,
+              catalog: state.apiModelCatalog,
+            }) || activeModeModel.model
+          : activeModeModel.model;
+      return formatModelSourceLabel(activeModeModel.mode, displayModel);
+    },
+    [
+      activeModeModel.mode,
+      activeModeModel.model,
+      state.apiModelAliases,
+      state.apiModels,
+    ],
   );
   const toolChainIds = useMemo(() => {
     const ids = new Set();
@@ -2700,9 +3028,11 @@ const Chat = ({
             sessionId,
             history,
           })
-          .catch(() => {});
+          .catch((err) => void err);
       }
-    } catch {}
+    } catch (err) {
+      void err;
+    }
   }, []);
 
   const syncHistoryFromConversation = useCallback(
@@ -3026,7 +3356,9 @@ const Chat = ({
     if (!stream || typeof stream.getTracks !== "function") return;
     try {
       stream.getTracks().forEach((track) => track.stop());
-    } catch (_) {}
+    } catch (err) {
+      void err;
+    }
   }, []);
 
   const refreshAvailableInputDevices = useCallback(async () => {
@@ -3068,7 +3400,7 @@ const Chat = ({
     const audioContext = voiceAudioContextRef.current;
     voiceAudioContextRef.current = null;
     if (audioContext && typeof audioContext.close === "function") {
-      audioContext.close().catch(() => {});
+      audioContext.close().catch((err) => void err);
     }
   }, [stopMediaStream]);
 
@@ -3121,7 +3453,9 @@ const Chat = ({
     if (audioContext.state === "suspended") {
       try {
         await audioContext.resume();
-      } catch (_) {}
+      } catch (err) {
+        void err;
+      }
     }
     const source = audioContext.createMediaStreamSource(rawStream);
     const gainNode = audioContext.createGain();
@@ -3158,33 +3492,31 @@ const Chat = ({
     if (typeof window === "undefined") return;
     const trigger = chatSettingsTriggerRef.current;
     if (!trigger) return;
-    const triggerRect = trigger.getBoundingClientRect();
-    const popoverRect = chatSettingsPopoverRef.current?.getBoundingClientRect();
-    const width = popoverRect?.width || 388;
-    const height = popoverRect?.height || 312;
-    const margin = 12;
-    const gap = 10;
-    const viewportWidth =
-      window.innerWidth || document.documentElement.clientWidth || 0;
-    const viewportHeight =
-      window.innerHeight || document.documentElement.clientHeight || 0;
-    const maxLeft = Math.max(margin, viewportWidth - width - margin);
-    const left = clamp(triggerRect.right - width, margin, maxLeft);
-    const aboveTop = triggerRect.top - height - gap;
-    const belowTop = triggerRect.bottom + gap;
-    const top =
-      aboveTop >= margin
-        ? aboveTop
-        : clamp(
-            belowTop,
-            margin,
-            Math.max(margin, viewportHeight - height - margin),
-          );
+    const visualViewport = window.visualViewport;
+    const position = resolveAnchoredPopoverPosition({
+      anchorRect: trigger.getBoundingClientRect(),
+      popoverRect: chatSettingsPopoverRef.current?.getBoundingClientRect(),
+      viewport: {
+        left: visualViewport?.offsetLeft || 0,
+        top: visualViewport?.offsetTop || 0,
+        width:
+          visualViewport?.width ||
+          window.innerWidth ||
+          document.documentElement.clientWidth ||
+          0,
+        height:
+          visualViewport?.height ||
+          window.innerHeight ||
+          document.documentElement.clientHeight ||
+          0,
+      },
+    });
     setChatSettingsPopoverStyle({
       position: "fixed",
-      top: `${Math.round(top)}px`,
-      left: `${Math.round(left)}px`,
-      maxWidth: `min(calc(100vw - ${margin * 2}px), 388px)`,
+      top: `${position.top}px`,
+      left: `${position.left}px`,
+      maxWidth: `${position.maxWidth}px`,
+      maxHeight: `${position.maxHeight}px`,
       zIndex: 3600,
     });
   }, []);
@@ -5283,29 +5615,80 @@ const Chat = ({
     } catch (_) {}
   }, []);
 
-  const clearComposerAttachments = useCallback(() => {
-    setAttachments((prev) => {
-      prev.forEach((attachment) => {
-        if (attachment?.id) {
-          removedAttachmentIdsRef.current.add(attachment.id);
-        }
-        revokeAttachmentPreview(attachment);
-      });
-      return [];
+  const clearComposerAttachments = useCallback((options = {}) => {
+    const submissionSessionId =
+      options.sessionId || activeComposerSessionRef.current;
+    const submittedAttachments = Array.isArray(options.attachments)
+      ? options.attachments
+      : attachmentsRef.current;
+    const attachmentIds = submittedAttachments
+      .map(
+        (attachment) =>
+          attachment?.outboxId || attachment?.outbox_id || attachment?.id,
+      )
+      .filter(Boolean);
+    if (!attachmentIds.length) return;
+
+    const submittedIds = new Set(attachmentIds);
+    submittedAttachments.forEach((attachment) => {
+      const attachmentId =
+        attachment?.outboxId || attachment?.outbox_id || attachment?.id;
+      if (attachmentId) removedAttachmentIdsRef.current.add(attachmentId);
     });
-    if (fileInputRef.current) {
-      fileInputRef.current.value = "";
-    }
-    setVisionWorkflow("auto");
+    removeStoredComposerDraftAttachments(
+      submissionSessionId,
+      submittedAttachments,
+    );
+    markStoredComposerAttachmentTombstones(
+      submissionSessionId,
+      attachmentIds,
+    );
+    void deleteSentAttachmentOutboxEntries(
+      submissionSessionId,
+      attachmentIds,
+    );
+
+    if (activeComposerSessionRef.current !== submissionSessionId) return;
+    setAttachments((currentAttachments) => {
+      const next = currentAttachments.filter((attachment) => {
+        const attachmentId =
+          attachment?.outboxId || attachment?.outbox_id || attachment?.id;
+        if (!attachmentId || !submittedIds.has(attachmentId)) return true;
+        revokeAttachmentPreview(attachment);
+        return false;
+      });
+      attachmentsRef.current = next;
+      return next;
+    });
+    if (fileInputRef.current) fileInputRef.current.value = "";
   }, [revokeAttachmentPreview]);
 
   useEffect(() => {
+    void cleanupExpiredAttachmentOutboxEntries();
+  }, []);
+
+  useEffect(() => {
+    if (composerDraftSessionRef.current !== state.sessionId) {
+      const nextDraft = readStoredComposerDraft(state.sessionId);
+      composerDraftSessionRef.current = state.sessionId;
+      setMessage(nextDraft.message || "");
+      setComposerCursor((nextDraft.message || "").length);
+      setAttachments((previous) => {
+        previous.forEach(revokeAttachmentPreview);
+        return Array.isArray(nextDraft.attachments) ? nextDraft.attachments : [];
+      });
+      setVisionWorkflow(normalizeVisionWorkflow(nextDraft.visionWorkflow));
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+      return;
+    }
     writeStoredComposerDraft(state.sessionId, {
       message,
       attachments,
       visionWorkflow,
     });
-  }, [attachments, message, state.sessionId, visionWorkflow]);
+  }, [attachments, message, revokeAttachmentPreview, state.sessionId, visionWorkflow]);
 
   const stopCameraCapture = useCallback(() => {
     const stream = cameraStreamRef.current;
@@ -5379,6 +5762,26 @@ const Chat = ({
   }, [chatSettingsOpen, refreshAvailableInputDevices]);
 
   useEffect(() => {
+    if (!chatSettingsOpen || chatSettingsSection !== "workflow") return undefined;
+    let cancelled = false;
+    axios
+      .get("/api/workflows/catalog")
+      .then((response) => {
+        if (!cancelled) {
+          setChatWorkflowProfiles(normalizeWorkflowProfiles(response?.data));
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setChatWorkflowProfiles(FALLBACK_WORKFLOW_PROFILES);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [chatSettingsOpen, chatSettingsSection]);
+
+  useEffect(() => {
     if (!chatSettingsOpen) return undefined;
     const handlePointerDown = (event) => {
       const target = event.target;
@@ -5389,6 +5792,7 @@ const Chat = ({
     const handleEscape = (event) => {
       if (event.key === "Escape") {
         setChatSettingsOpen(false);
+        window.requestAnimationFrame(() => chatSettingsTriggerRef.current?.focus());
       }
     };
     document.addEventListener("mousedown", handlePointerDown);
@@ -5439,16 +5843,32 @@ const Chat = ({
       });
     };
     syncPosition();
+    const resizeObserver =
+      typeof ResizeObserver === "function"
+        ? new ResizeObserver(syncPosition)
+        : null;
+    if (chatSettingsPopoverRef.current) {
+      resizeObserver?.observe(chatSettingsPopoverRef.current);
+    }
+    if (chatSettingsTriggerRef.current) {
+      resizeObserver?.observe(chatSettingsTriggerRef.current);
+    }
+    const visualViewport = window.visualViewport;
     window.addEventListener("resize", syncPosition);
     window.addEventListener("scroll", syncPosition, true);
+    visualViewport?.addEventListener("resize", syncPosition);
+    visualViewport?.addEventListener("scroll", syncPosition);
     return () => {
       if (frameId !== null) {
         window.cancelAnimationFrame(frameId);
       }
       window.removeEventListener("resize", syncPosition);
       window.removeEventListener("scroll", syncPosition, true);
+      visualViewport?.removeEventListener("resize", syncPosition);
+      visualViewport?.removeEventListener("scroll", syncPosition);
+      resizeObserver?.disconnect();
     };
-  }, [chatSettingsOpen, updateChatSettingsPopoverPosition]);
+  }, [chatSettingsOpen, chatSettingsSection, updateChatSettingsPopoverPosition]);
 
   useEffect(() => {
     if (remoteAudioRef.current) {
@@ -5525,9 +5945,17 @@ const Chat = ({
       setError("Attachments are still uploading. Please wait.");
       return;
     }
+    if (attachments.some((attachment) => !attachment?.remoteUrl)) {
+      setError("Retry or remove failed attachments before sending.");
+      return;
+    }
+    const submissionSessionId = state.sessionId;
+    const submittedAttachments = attachments.map((attachment) => ({
+      ...attachment,
+    }));
     abortActiveRequest();
     clearActiveRequest();
-    const normalizedAttachments = attachments.map((a) => {
+    const normalizedAttachments = submittedAttachments.map((a) => {
       const name = a.file?.name || a.name || "attachment";
       const type = a.file?.type || a.type || "";
       const size = typeof a.file?.size === "number" ? a.file.size : a.size;
@@ -5630,10 +6058,6 @@ const Chat = ({
     debugLog("Sending message:", displayMessage);
 
     try {
-      // Ensure device token for any sync-enabled features
-      if (state.backendMode === "api") {
-        await ensureDeviceAndToken();
-      }
       memoryStore["last_message"] = { content: displayMessage, importance: 5 };
     setState((prev) => {
       const newHistory = [...prev.history, { role: "user", text: displayMessage }];
@@ -5709,7 +6133,7 @@ const Chat = ({
               message_id: msgId,
               attachments: apiAttachments,
               vision_workflow: effectiveVisionWorkflow,
-              ...thinkingPayload,
+              ...generationControlPayload,
               ...ragPayload,
             },
             { signal: controller?.signal },
@@ -5733,7 +6157,7 @@ const Chat = ({
                 attachments: apiAttachments,
                 vision_workflow: effectiveVisionWorkflow,
                 ...workflowPayload,
-                ...thinkingPayload,
+                ...generationControlPayload,
                 ...ragPayload,
               },
               { signal: controller?.signal },
@@ -5784,7 +6208,7 @@ const Chat = ({
           attachments: apiAttachments,
           vision_workflow: effectiveVisionWorkflow,
           ...workflowPayload,
-          ...thinkingPayload,
+          ...generationControlPayload,
           ...ragPayload,
         };
         const r = await requestModelCompletion(payload, effectiveMessage, {
@@ -5910,7 +6334,10 @@ const Chat = ({
         };
       });
       applySubchatControlFromTools(responseTools);
-      clearComposerAttachments();
+      clearComposerAttachments({
+        sessionId: submissionSessionId,
+        attachments: submittedAttachments,
+      });
       stopCameraCapture();
     } catch (err) {
       if (isUserCancelledError(err)) {
@@ -6139,7 +6566,7 @@ const Chat = ({
               attachments: previousAttachments,
               vision_workflow: previousVisionWorkflow,
               ...workflowPayload,
-              ...thinkingPayload,
+              ...generationControlPayload,
               ...ragPayload,
             },
             { signal: controller?.signal },
@@ -6179,7 +6606,7 @@ const Chat = ({
           attachments: previousAttachments,
           vision_workflow: previousVisionWorkflow,
           ...workflowPayload,
-          ...thinkingPayload,
+          ...generationControlPayload,
           ...ragPayload,
         };
         const r = await requestModelCompletion(payload, userText, {
@@ -6483,7 +6910,7 @@ const Chat = ({
           workflow: overrideWorkflow || workflowProfile,
           // Provide fallback results so denials can still unblock continuation.
           tools: toolPayload,
-          ...thinkingPayload,
+          ...generationControlPayload,
         });
         if (res?.data?.error) {
           throw new Error(res.data.error);
@@ -7126,15 +7553,15 @@ const Chat = ({
       const label = toolName;
       const toolId = entry?.id || entry?.request_id || null;
       const attrs = [
-        `href=\"#\"`,
-        `data-tool-index=\"${toolIndex}\"`,
-        chainId ? `data-chain-id=\"${escapeHtml(chainId)}\"` : "",
-        toolId ? `data-tool-id=\"${escapeHtml(toolId)}\"` : "",
-        `aria-label=\"Open ${escapeHtml(label)}\"`,
+        `href="#"`,
+        `data-tool-index="${toolIndex}"`,
+        chainId ? `data-chain-id="${escapeHtml(chainId)}"` : "",
+        toolId ? `data-tool-id="${escapeHtml(toolId)}"` : "",
+        `aria-label="Open ${escapeHtml(label)}"`,
       ]
         .filter(Boolean)
         .join(" ");
-      return `<a class=\"inline-tool-placeholder\" ${attrs}>${escapeHtml(label)}</a>`;
+      return `<a class="inline-tool-placeholder" ${attrs}>${escapeHtml(label)}</a>`;
     });
     const maybeMath = renderMath(withPlaceholders);
     try {
@@ -7306,7 +7733,7 @@ const Chat = ({
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
-  const uploadAndAttach = async (file, options = {}) => {
+  const uploadAndAttach = useCallback(async (file, options = {}) => {
     // basic client-side checks mirroring backend
     const max = 8 * 1024 * 1024;
     if (file.size > max) {
@@ -7329,28 +7756,77 @@ const Chat = ({
       setError("Unsupported file type");
       return;
     }
-    const id = createClientMessageId("attachment");
-    const url = URL.createObjectURL(file);
+    const id = options.attachmentId || createClientMessageId("attachment");
+    const uploadSessionId = options.sessionId || state.sessionId;
+    const uploadKey = `${uploadSessionId}:${id}`;
+    if (activeAttachmentUploadsRef.current.has(uploadKey)) return;
+    activeAttachmentUploadsRef.current.add(uploadKey);
+    const existingAttachment = attachmentsRef.current.find(
+      (attachment) =>
+        attachment?.id === id ||
+        attachment?.outboxId === id ||
+        attachment?.outbox_id === id,
+    );
+    const url =
+      options.previewUrl || existingAttachment?.url || createAttachmentPreviewUrl(file);
     const origin = options.origin || "upload";
     const captureSource = options.captureSource || null;
     const isTransientCapture = origin === "captured";
-    const uploadSessionId = state.sessionId;
     removedAttachmentIdsRef.current.delete(id);
-    setAttachments((prev) => [
-      ...prev,
-      {
-        id,
-        file,
-        url,
-        remoteUrl: null,
-        uploading: true,
-        contentHash: null,
-        origin,
-        capture_source: captureSource,
-        transient: isTransientCapture,
-      },
-    ]);
+    const pendingAttachment = {
+      ...(existingAttachment || {}),
+      id,
+      outboxId: id,
+      outbox_id: id,
+      file,
+      name: file.name || options.name || "attachment",
+      type: file.type || options.type || "",
+      size: typeof file.size === "number" ? file.size : options.size,
+      url,
+      remoteUrl: null,
+      uploading: true,
+      uploadState: "uploading",
+      uploadFailed: false,
+      uploadError: "",
+      contentHash: null,
+      origin,
+      capture_source: captureSource,
+      transient: isTransientCapture,
+    };
+    setAttachments((prev) => {
+      const index = prev.findIndex(
+        (attachment) =>
+          attachment?.id === id ||
+          attachment?.outboxId === id ||
+          attachment?.outbox_id === id,
+      );
+      const next = [...prev];
+      if (index >= 0) {
+        next[index] = { ...next[index], ...pendingAttachment };
+      } else {
+        next.push(pendingAttachment);
+      }
+      attachmentsRef.current = next;
+      return next;
+    });
+    if (activeComposerSessionRef.current === uploadSessionId) {
+      setError(null);
+    }
     try {
+      await putAttachmentOutboxEntry(uploadSessionId, {
+        id,
+        state: "uploading",
+        file,
+        name: pendingAttachment.name,
+        type: pendingAttachment.type,
+        size: pendingAttachment.size,
+        lastModified: Number(file.lastModified) || Date.now(),
+        origin,
+        captureSource,
+        transient: isTransientCapture,
+        descriptor: null,
+        error: "",
+      });
       const formData = new FormData();
       formData.append("file", file);
       let res;
@@ -7373,54 +7849,75 @@ const Chat = ({
         });
       }
       const remoteUrl = res.data?.url;
+      if (!remoteUrl) {
+        throw new Error("Attachment upload completed without a file URL.");
+      }
       const contentHash = res.data?.content_hash || null;
       const captureId = res.data?.capture_id || null;
-      if (!removedAttachmentIdsRef.current.has(id)) {
-        mergeStoredComposerDraftAttachment(uploadSessionId, {
-          id,
-          name: file.name,
-          type: file.type,
-          size: file.size,
-          url: remoteUrl,
-          remoteUrl,
-          contentHash,
-          origin: res.data?.origin || origin,
-          relative_path: res.data?.relative_path || "",
-          capture_source: captureSource,
-          capture_id: captureId,
-          transient:
-            typeof res.data?.transient === "boolean"
-              ? res.data.transient
-              : isTransientCapture,
-          expires_at: res.data?.expires_at_iso || res.data?.expires_at || null,
-          index_status: res.data?.index_status || null,
-          caption_status: res.data?.caption_status || null,
+      if (removedAttachmentIdsRef.current.has(id)) {
+        await deleteAttachmentOutboxEntry(uploadSessionId, id);
+        return;
+      }
+      const readyAttachment = {
+        id,
+        outboxId: id,
+        outbox_id: id,
+        name: file.name,
+        type: file.type,
+        size: file.size,
+        url: remoteUrl,
+        remoteUrl,
+        contentHash,
+        content_hash: contentHash,
+        uploading: false,
+        uploadState: "ready",
+        uploadFailed: false,
+        uploadError: "",
+        origin: res.data?.origin || origin,
+        relative_path: res.data?.relative_path || "",
+        capture_source: captureSource,
+        capture_id: captureId,
+        transient:
+          typeof res.data?.transient === "boolean"
+            ? res.data.transient
+            : isTransientCapture,
+        promoted: res.data?.promoted === true,
+        expires_at: res.data?.expires_at_iso || res.data?.expires_at || null,
+        index_status: res.data?.index_status || null,
+        caption_status: res.data?.caption_status || null,
+      };
+      const [storedDescriptor] = serializeComposerDraftAttachments([readyAttachment]);
+      await putAttachmentOutboxEntry(uploadSessionId, {
+        id,
+        state: "ready",
+        file: null,
+        name: readyAttachment.name,
+        type: readyAttachment.type,
+        size: readyAttachment.size,
+        origin: readyAttachment.origin,
+        captureSource,
+        transient: readyAttachment.transient,
+        descriptor: storedDescriptor || readyAttachment,
+        error: "",
+      });
+      if (removedAttachmentIdsRef.current.has(id)) {
+        await deleteAttachmentOutboxEntry(uploadSessionId, id);
+        return;
+      }
+      mergeStoredComposerDraftAttachment(uploadSessionId, readyAttachment);
+      if (activeComposerSessionRef.current === uploadSessionId) {
+        setAttachments((prev) => {
+          const next = prev.map((attachment) =>
+            attachment.id === id ||
+            attachment.outboxId === id ||
+            attachment.outbox_id === id
+              ? { ...attachment, ...readyAttachment, file, url: attachment.url || url }
+              : attachment,
+          );
+          attachmentsRef.current = next;
+          return next;
         });
       }
-      setAttachments((prev) =>
-        prev.map((a) =>
-          a.id === id
-            ? {
-                ...a,
-                remoteUrl,
-                contentHash,
-                uploading: false,
-                origin: res.data?.origin || origin,
-                relative_path: res.data?.relative_path || "",
-                capture_source: captureSource,
-                capture_id: captureId,
-                transient:
-                  typeof res.data?.transient === "boolean"
-                    ? res.data.transient
-                    : isTransientCapture,
-                promoted: res.data?.promoted === true,
-                expires_at: res.data?.expires_at_iso || res.data?.expires_at || null,
-                index_status: res.data?.index_status || a.index_status || null,
-                caption_status: res.data?.caption_status || a.caption_status || null,
-              }
-            : a,
-        ),
-      );
       if (!isTransientCapture) {
         // best-effort: record durable attachments in memory for future recall
         try {
@@ -7437,12 +7934,196 @@ const Chat = ({
       }
     } catch (err) {
       console.error("Attachment upload failed", err);
-      setError(getRequestErrorDetail(err, "Attachment upload failed"));
-      setAttachments((prev) => prev.map((a) => (
-        a.id === id ? { ...a, uploading: false } : a
-      )));
+      const detail = getRequestErrorDetail(err, "Attachment upload failed");
+      if (!removedAttachmentIdsRef.current.has(id)) {
+        await putAttachmentOutboxEntry(uploadSessionId, {
+          id,
+          state: "failed",
+          file,
+          name: pendingAttachment.name,
+          type: pendingAttachment.type,
+          size: pendingAttachment.size,
+          lastModified: Number(file.lastModified) || Date.now(),
+          origin,
+          captureSource,
+          transient: isTransientCapture,
+          descriptor: null,
+          error: detail,
+        });
+      }
+      if (activeComposerSessionRef.current === uploadSessionId) {
+        setError(detail);
+        setAttachments((prev) => {
+          const next = prev.map((attachment) =>
+            attachment.id === id ||
+            attachment.outboxId === id ||
+            attachment.outbox_id === id
+              ? {
+                  ...attachment,
+                  uploading: false,
+                  uploadState: "failed",
+                  uploadFailed: true,
+                  uploadError: detail,
+                }
+              : attachment,
+          );
+          attachmentsRef.current = next;
+          return next;
+        });
+      }
+    } finally {
+      activeAttachmentUploadsRef.current.delete(uploadKey);
     }
-  };
+  }, [state.sessionId]);
+
+  const retryAttachmentUpload = useCallback((attachment) => {
+    const file = attachment?.file;
+    const attachmentId =
+      attachment?.outboxId || attachment?.outbox_id || attachment?.id;
+    if (!file || !attachmentId) {
+      setError("This attachment can no longer be retried. Remove it and select it again.");
+      return;
+    }
+    void uploadAndAttach(file, {
+      attachmentId,
+      sessionId: state.sessionId,
+      previewUrl: attachment.url || "",
+      origin: attachment.origin || "upload",
+      captureSource: attachment.capture_source || attachment.captureSource || null,
+    });
+  }, [state.sessionId, uploadAndAttach]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const sessionId = state.sessionId;
+
+    const restoreOutbox = async () => {
+      const entries = await listAttachmentOutboxEntries(sessionId);
+      if (
+        cancelled ||
+        !entries.length ||
+        activeComposerSessionRef.current !== sessionId
+      ) {
+        return;
+      }
+      const tombstonedAttachmentIds =
+        readStoredComposerAttachmentTombstones(sessionId);
+
+      const retryEntries = [];
+      setAttachments((previous) => {
+        const next = [...previous];
+        for (const entry of entries) {
+          if (
+            removedAttachmentIdsRef.current.has(entry.id) ||
+            tombstonedAttachmentIds.has(entry.id)
+          ) {
+            void deleteAttachmentOutboxEntry(sessionId, entry.id);
+            continue;
+          }
+          let restored = null;
+          if (entry.state === "ready" && entry.descriptor) {
+            const [descriptor] = serializeComposerDraftAttachments([entry.descriptor]);
+            if (descriptor) {
+              restored = {
+                ...descriptor,
+                id: entry.id,
+                outboxId: entry.id,
+                outbox_id: entry.id,
+                uploading: false,
+                uploadState: "ready",
+                uploadFailed: false,
+                uploadError: "",
+              };
+            }
+          } else {
+            const file = fileFromAttachmentOutboxEntry(entry);
+            if (!file) continue;
+            const previewUrl = createAttachmentPreviewUrl(file);
+            restored = {
+              id: entry.id,
+              outboxId: entry.id,
+              outbox_id: entry.id,
+              file,
+              name: entry.name || file.name || "attachment",
+              type: entry.type || file.type || "",
+              size: typeof entry.size === "number" ? entry.size : file.size,
+              url: previewUrl,
+              remoteUrl: null,
+              contentHash: null,
+              uploading: false,
+              uploadState: entry.state || "pending",
+              uploadFailed: entry.state === "failed",
+              uploadError: entry.error || "",
+              origin: entry.origin || "upload",
+              capture_source: entry.captureSource || null,
+              transient: entry.transient === true,
+            };
+            retryEntries.push({ entry, file, previewUrl });
+          }
+          if (!restored) continue;
+
+          const restoredRemote = restored.remoteUrl || restored.url || "";
+          const existingIndex = next.findIndex((attachment) => {
+            const attachmentOutboxId =
+              attachment?.outboxId || attachment?.outbox_id || attachment?.id;
+            const attachmentRemote = attachment?.remoteUrl || attachment?.url || "";
+            return (
+              attachmentOutboxId === entry.id ||
+              (restoredRemote && attachmentRemote === restoredRemote)
+            );
+          });
+          if (existingIndex >= 0) {
+            if (
+              restored.url &&
+              restored.url.startsWith("blob:") &&
+              next[existingIndex]?.url &&
+              next[existingIndex].url !== restored.url &&
+              next[existingIndex].url.startsWith("blob:")
+            ) {
+              try {
+                URL.revokeObjectURL(next[existingIndex].url);
+              } catch {
+                // Releasing a stale preview is best-effort.
+              }
+            }
+            next[existingIndex] = { ...next[existingIndex], ...restored };
+          } else {
+            next.push(restored);
+          }
+        }
+        attachmentsRef.current = next;
+        return next;
+      });
+
+      for (const { entry, file, previewUrl } of retryEntries) {
+        if (cancelled || activeComposerSessionRef.current !== sessionId) break;
+        if (removedAttachmentIdsRef.current.has(entry.id)) continue;
+        void uploadAndAttach(file, {
+          attachmentId: entry.id,
+          sessionId,
+          previewUrl,
+          origin: entry.origin || "upload",
+          captureSource: entry.captureSource || null,
+        });
+      }
+    };
+
+    void restoreOutbox();
+    return () => {
+      cancelled = true;
+    };
+  }, [state.sessionId, uploadAndAttach]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+    const retryFailedAttachments = () => {
+      attachmentsRef.current
+        .filter((attachment) => attachment?.uploadFailed && attachment?.file)
+        .forEach(retryAttachmentUpload);
+    };
+    window.addEventListener("online", retryFailedAttachments);
+    return () => window.removeEventListener("online", retryFailedAttachments);
+  }, [retryAttachmentUpload]);
 
   const handleComposerPaste = (event) => {
     const clipboardData = event?.clipboardData;
@@ -7512,11 +8193,28 @@ const Chat = ({
 
   const removeAttachment = (id) => {
     removedAttachmentIdsRef.current.add(id);
-    setAttachments((prev) => {
-      const found = prev.find((a) => a.id === id);
-      if (found) revokeAttachmentPreview(found);
-      return prev.filter((a) => a.id !== id);
-    });
+    const found = attachmentsRef.current.find(
+      (attachment) =>
+        attachment?.id === id ||
+        attachment?.outboxId === id ||
+        attachment?.outbox_id === id,
+    );
+    if (found) revokeAttachmentPreview(found);
+    const outboxId = found?.outboxId || found?.outbox_id || found?.id || id;
+    removedAttachmentIdsRef.current.add(outboxId);
+    removeStoredComposerDraftAttachments(state.sessionId, [
+      found || { outboxId },
+    ]);
+    markStoredComposerAttachmentTombstones(state.sessionId, [outboxId]);
+    const next = attachmentsRef.current.filter(
+      (attachment) =>
+        attachment?.id !== id &&
+        attachment?.outboxId !== id &&
+        attachment?.outbox_id !== id,
+    );
+    attachmentsRef.current = next;
+    setAttachments(next);
+    void deleteAttachmentOutboxEntry(state.sessionId, outboxId);
   };
 
   const handleAudioStop = async () => {
@@ -7712,17 +8410,23 @@ const Chat = ({
   ) : null;
 
   const hasUploadingAttachments = attachments.some((att) => Boolean(att?.uploading));
+  const hasUnreadyAttachments = attachments.some((att) => !att?.remoteUrl);
   const hasDraftText = Boolean(message && message.trim());
-  const hasSendableAttachments = attachments.length > 0;
+  const hasSendableAttachments = attachments.some((att) => Boolean(att?.remoteUrl));
   const compareNeedsMoreImages =
     hasImageAttachments && visionWorkflow === "compare" && imageAttachmentCount < 2;
   const sendDisabled = isStreaming
     ? false
-    : loading || (!hasDraftText && !hasSendableAttachments) || hasUploadingAttachments || compareNeedsMoreImages;
+    : loading ||
+      (!hasDraftText && !hasSendableAttachments) ||
+      hasUnreadyAttachments ||
+      compareNeedsMoreImages;
   const sendTooltip = isStreaming
     ? "Stop generation"
     : hasUploadingAttachments
       ? "Attachments are still uploading"
+      : hasUnreadyAttachments
+        ? "Retry or remove failed attachments"
       : compareNeedsMoreImages
         ? "Compare mode needs at least two images"
         : !hasDraftText && hasSendableAttachments
@@ -8048,27 +8752,67 @@ const Chat = ({
       ? createPortal(
           <div
             ref={chatSettingsPopoverRef}
+            id="chat-settings-popover"
             className="chat-settings-popover"
-            role="menu"
+            role="dialog"
+            aria-label="Chat settings"
             style={chatSettingsPopoverStyle || { visibility: "hidden" }}
           >
-            <div className="chat-settings-list">
-              {[
-                ["camera", "camera"],
-                ["microphone", "microphone"],
-                ["volume", "volume"],
-                ["thinking", "thinking"],
-                ["workflow", "workflow"],
-              ].map(([key, label]) => (
+            <header className="chat-settings-header">
+              <div>
+                <strong>Chat settings</strong>
+                <span>Controls for this composer and active chat.</span>
+              </div>
+              <button
+                type="button"
+                className="chat-settings-close"
+                aria-label="Close chat settings"
+                onClick={() => {
+                  setChatSettingsOpen(false);
+                  window.requestAnimationFrame(() =>
+                    chatSettingsTriggerRef.current?.focus(),
+                  );
+                }}
+              >
+                <CloseIcon fontSize="small" />
+              </button>
+            </header>
+            <div className="chat-settings-body">
+            <div className="chat-settings-list" role="tablist" aria-label="Chat setting sections">
+              {CHAT_SETTINGS_SECTIONS.map(([key, label], index) => (
                 <button
                   key={key}
+                  id={`chat-settings-tab-${key}`}
                   type="button"
+                  role="tab"
+                  aria-selected={chatSettingsSection === key}
+                  aria-controls="chat-settings-active-panel"
+                  tabIndex={chatSettingsSection === key ? 0 : -1}
                   className={`chat-settings-item${
                     chatSettingsSection === key ? " is-active" : ""
                   }`}
-                  onMouseEnter={() => setChatSettingsSection(key)}
-                  onFocus={() => setChatSettingsSection(key)}
                   onClick={() => setChatSettingsSection(key)}
+                  onKeyDown={(event) => {
+                    let nextIndex = null;
+                    if (event.key === "ArrowDown" || event.key === "ArrowRight") {
+                      nextIndex = (index + 1) % CHAT_SETTINGS_SECTIONS.length;
+                    } else if (event.key === "ArrowUp" || event.key === "ArrowLeft") {
+                      nextIndex =
+                        (index - 1 + CHAT_SETTINGS_SECTIONS.length) %
+                        CHAT_SETTINGS_SECTIONS.length;
+                    } else if (event.key === "Home") {
+                      nextIndex = 0;
+                    } else if (event.key === "End") {
+                      nextIndex = CHAT_SETTINGS_SECTIONS.length - 1;
+                    }
+                    if (nextIndex === null) return;
+                    event.preventDefault();
+                    const [nextSection] = CHAT_SETTINGS_SECTIONS[nextIndex];
+                    setChatSettingsSection(nextSection);
+                    window.requestAnimationFrame(() =>
+                      document.getElementById(`chat-settings-tab-${nextSection}`)?.focus(),
+                    );
+                  }}
                 >
                   <span>{label}</span>
                   <KeyboardArrowRightIcon fontSize="inherit" />
@@ -8076,10 +8820,11 @@ const Chat = ({
               ))}
             </div>
             <div
+              id="chat-settings-active-panel"
               className="chat-settings-panel"
-              style={{
-                marginTop: `${LIVE_TOOL_PANEL_OFFSETS[chatSettingsSection] || 0}px`,
-              }}
+              role="tabpanel"
+              aria-labelledby={`chat-settings-tab-${chatSettingsSection}`}
+              tabIndex={0}
             >
               {chatSettingsSection === "camera" && (
                 <>
@@ -8271,143 +9016,244 @@ const Chat = ({
               )}
               {chatSettingsSection === "thinking" && (
                 <>
-                  <label>thinking mode</label>
-                  <div className="chat-settings-choice-row">
-                    {["auto", "low", "high"].map((mode) => (
-                      <button
-                        key={mode}
-                        type="button"
-                        className={`chat-settings-choice${
-                          thinkingMode === mode ? " is-active" : ""
+                  <div className="chat-settings-compact-section">
+                    <div className="chat-settings-label-row">
+                      <label>thinking mode</label>
+                      <Tooltip
+                        title={REASONING_EFFORT_TOOLTIP_TEXT}
+                        placement="top"
+                        arrow
+                      >
+                        <button
+                          type="button"
+                          className="chat-settings-help"
+                          aria-label="About reasoning effort"
+                        >
+                          ?
+                        </button>
+                      </Tooltip>
+                    </div>
+                    <div className="chat-settings-choice-row">
+                      {[
+                        { id: "auto", label: "auto" },
+                        ...REASONING_EFFORT_PRESETS,
+                      ].map((preset) => (
+                        <button
+                          key={preset.id}
+                          type="button"
+                          className={`chat-settings-choice${
+                            thinkingMode === preset.id ? " is-active" : ""
+                          }`}
+                          onClick={() => setThinkingMode(preset.id)}
+                        >
+                          {preset.label}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="chat-settings-label-row">
+                      <label htmlFor="chat-reasoning-effort">effort</label>
+                      <span className="chat-settings-slider-value">
+                        {customThinkingEffort
+                          ? thinkingEffortValue.toFixed(2)
+                          : thinkingMode === "auto"
+                            ? "provider default"
+                            : `${thinkingMode} · ${thinkingEffortValue.toFixed(2)}`}
+                      </span>
+                    </div>
+                    <input
+                      id="chat-reasoning-effort"
+                      aria-label="reasoning effort"
+                      type="range"
+                      min="0"
+                      max="0.99"
+                      step="0.01"
+                      value={thinkingEffortValue}
+                      onChange={(event) => setThinkingMode(event.target.value)}
+                    />
+                  </div>
+
+                  <div className="chat-settings-compact-section">
+                    <div className="chat-settings-label-row">
+                      <span className="chat-settings-label-with-help">
+                        <label htmlFor="chat-max-output-tokens">response limit</label>
+                        <Tooltip title={outputLimitTooltipText} placement="top" arrow>
+                          <button
+                            type="button"
+                            className="chat-settings-help"
+                            aria-label="About response limit"
+                          >
+                            ?
+                          </button>
+                        </Tooltip>
+                      </span>
+                      <span className="chat-settings-slider-value">
+                        {outputTokenLimit
+                          ? `${formatTokenLimit(outputTokenLimit)} tokens`
+                          : "Auto"}
+                      </span>
+                    </div>
+                    <select
+                      id="chat-max-output-tokens"
+                      aria-label="response limit"
+                      value={outputTokenMode}
+                      onChange={(event) => setOutputTokenMode(event.target.value)}
+                    >
+                      <option value="auto">auto (provider default)</option>
+                      {OUTPUT_TOKEN_PRESETS.map((preset) => (
+                        <option key={preset.id} value={preset.id}>
+                          {preset.label}
+                        </option>
+                      ))}
+                      <option value="custom">custom</option>
+                    </select>
+                    {outputTokenMode === "custom" && (
+                      <input
+                        aria-label="custom response limit"
+                        type="number"
+                        min="1"
+                        max={MAX_CUSTOM_OUTPUT_TOKENS}
+                        step="1024"
+                        value={customOutputTokens}
+                        onChange={(event) => setCustomOutputTokens(event.target.value)}
+                      />
+                    )}
+                    <span className="chat-settings-capacity">
+                      {formatTokenLimit(activeModelCapabilities?.maxContextLength)} context
+                      {" · response max "}
+                      {formatTokenLimit(activeModelCapabilities?.maxOutputTokens)}
+                    </span>
+                    {outputLimitWarning && (
+                      <span className="chat-settings-warning" role="alert">
+                        {outputLimitWarning}
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="chat-settings-compact-section">
+                    <div className="chat-settings-label-row">
+                      <label>memory</label>
+                      <Tooltip title={RAG_TOOLTIP_TEXT} placement="top" arrow>
+                        <button
+                          type="button"
+                          className="chat-settings-help"
+                          aria-label="About memory retrieval"
+                        >
+                          ?
+                        </button>
+                      </Tooltip>
+                    </div>
+                    <div className="chat-settings-toggle-stack">
+                      <div
+                        className={`chat-settings-rag-card${
+                          textRagEnabled ? " is-enabled" : ""
                         }`}
-                        onClick={() => setThinkingMode(mode)}
                       >
-                        {mode}
-                      </button>
-                    ))}
-                  </div>
-                  <div className="chat-settings-label-row">
-                    <label>memory</label>
-                    <Tooltip title={RAG_TOOLTIP_TEXT} placement="top" arrow>
-                      <span
-                        className="chat-settings-help"
-                        tabIndex={0}
-                        role="note"
-                        aria-label={RAG_TOOLTIP_TEXT}
+                        <label className="chat-settings-rag-toggle">
+                          <input
+                            type="checkbox"
+                            checked={textRagEnabled}
+                            onChange={(event) =>
+                              setRagEnabled("textRagEnabled", event.target.checked)
+                            }
+                          />
+                          <strong>text models</strong>
+                        </label>
+                        <select
+                          aria-label="text retrieval model"
+                          title={`Text retrieval model: ${ragEmbeddingModel}`}
+                          value={ragEmbeddingModel}
+                          disabled={!textRagEnabled}
+                          onChange={(event) =>
+                            setRagModel("rag_embedding_model", event.target.value)
+                          }
+                        >
+                          {RAG_TEXT_MODEL_OPTIONS.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {optionLabelWithLane(option)}
+                            </option>
+                          ))}
+                          {!RAG_TEXT_MODEL_OPTIONS.some(
+                            (option) => option.value === ragEmbeddingModel,
+                          ) && (
+                            <option value={ragEmbeddingModel}>{ragEmbeddingModel}</option>
+                          )}
+                        </select>
+                      </div>
+
+                      <div
+                        className={`chat-settings-rag-card${
+                          visionRagEnabled ? " is-enabled" : ""
+                        }`}
                       >
-                        ?
-                      </span>
-                    </Tooltip>
-                  </div>
-                  <div className="chat-settings-toggle-stack">
-                    <label className="chat-settings-toggle" title={RAG_TOOLTIP_TEXT}>
-                      <input
-                        type="checkbox"
-                        checked={textRagEnabled}
-                        onChange={(event) =>
-                          setRagEnabled("textRagEnabled", event.target.checked)
-                        }
-                      />
-                      <span>
-                        <strong>text models</strong>
-                        <small>similar text memories</small>
-                      </span>
-                    </label>
-                    <label
-                      className="chat-settings-mini-field"
-                      title={`Text retrieval model: ${ragEmbeddingModel}`}
-                    >
-                      <span>text retrieval model</span>
-                      <select
-                        value={ragEmbeddingModel}
-                        disabled={!textRagEnabled}
-                        onChange={(event) =>
-                          setRagModel("rag_embedding_model", event.target.value)
-                        }
-                      >
-                        {RAG_TEXT_MODEL_OPTIONS.map((option) => (
-                          <option key={option.value} value={option.value}>
-                            {optionLabelWithLane(option)}
-                          </option>
-                        ))}
-                        {!RAG_TEXT_MODEL_OPTIONS.some(
-                          (option) => option.value === ragEmbeddingModel,
-                        ) && (
-                          <option value={ragEmbeddingModel}>{ragEmbeddingModel}</option>
-                        )}
-                      </select>
-                    </label>
-                    <label className="chat-settings-toggle" title={RAG_TOOLTIP_TEXT}>
-                      <input
-                        type="checkbox"
-                        checked={visionRagEnabled}
-                        onChange={(event) =>
-                          setRagEnabled("visionRagEnabled", event.target.checked)
-                        }
-                      />
-                      <span>
-                        <strong>vision models</strong>
-                        <small>similar image memories</small>
-                      </span>
-                    </label>
-                    <label
-                      className="chat-settings-mini-field"
-                      title={`Vision retrieval model: ${ragClipModel}`}
-                    >
-                      <span>vision retrieval model</span>
-                      <select
-                        value={ragClipModel}
-                        disabled={!visionRagEnabled}
-                        onChange={(event) =>
-                          setRagModel("rag_clip_model", event.target.value)
-                        }
-                      >
-                        {RAG_VISION_MODEL_OPTIONS.map((option) => (
-                          <option key={option.value} value={option.value}>
-                            {optionLabelWithLane(option)}
-                          </option>
-                        ))}
-                        {!RAG_VISION_MODEL_OPTIONS.some(
-                          (option) => option.value === ragClipModel,
-                        ) && <option value={ragClipModel}>{ragClipModel}</option>}
-                      </select>
-                    </label>
+                        <label className="chat-settings-rag-toggle">
+                          <input
+                            type="checkbox"
+                            checked={visionRagEnabled}
+                            onChange={(event) =>
+                              setRagEnabled("visionRagEnabled", event.target.checked)
+                            }
+                          />
+                          <strong>vision models</strong>
+                        </label>
+                        <select
+                          aria-label="vision retrieval model"
+                          title={`Vision retrieval model: ${ragClipModel}`}
+                          value={ragClipModel}
+                          disabled={!visionRagEnabled}
+                          onChange={(event) =>
+                            setRagModel("rag_clip_model", event.target.value)
+                          }
+                        >
+                          {RAG_VISION_MODEL_OPTIONS.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {optionLabelWithLane(option)}
+                            </option>
+                          ))}
+                          {!RAG_VISION_MODEL_OPTIONS.some(
+                            (option) => option.value === ragClipModel,
+                          ) && <option value={ragClipModel}>{ragClipModel}</option>}
+                        </select>
+                      </div>
+                    </div>
                   </div>
                 </>
               )}
               {chatSettingsSection === "workflow" && (
                 <>
-                  <label>workflow profile</label>
-                  <div className="chat-settings-choice-row">
-                    {[
-                      ["default", "default"],
-                      ["architect_planner", "architect"],
-                      ["mini_execution", "mini"],
-                    ].map(([workflow, label]) => (
-                      <button
-                        key={workflow}
-                        type="button"
-                        className={`chat-settings-choice${
-                          workflowProfile === workflow ? " is-active" : ""
-                        }`}
-                        onClick={() => setWorkflowProfile(workflow)}
-                      >
-                        {label}
-                      </button>
+                  <label htmlFor="chat-workflow-profile">active workflow profile</label>
+                  <select
+                    id="chat-workflow-profile"
+                    value={workflowProfile}
+                    onChange={(event) => setWorkflowProfile(event.target.value)}
+                  >
+                    {workflowOptions.map((profile) => (
+                      <option key={profile.id} value={profile.id}>
+                        {profile.label}
+                      </option>
                     ))}
-                  </div>
+                  </select>
                   <span className="chat-settings-note">
-                    Default balances quality. Architect plans more. Mini is for short execution bursts.
+                    {activeWorkflowProfile?.description || "Select how this chat should approach the work."}
+                  </span>
+                  <span className="chat-settings-note">
+                    {Array.isArray(state.enabledWorkflowModules)
+                      ? state.enabledWorkflowModules.length
+                      : 0}{" "}
+                    optional {state.enabledWorkflowModules?.length === 1 ? "module" : "modules"} enabled.
+                  </span>
+                  <span className="chat-settings-note">
+                    This changes the active chat profile. Defaults, modules, and skill docs are managed in Knowledge.
                   </span>
                   <button
                     type="button"
                     className="chat-settings-link"
                     onClick={openWorkflowSettings}
                   >
-                    open workflow editor
+                    Manage workflows &amp; modules in Knowledge
                   </button>
                 </>
               )}
+            </div>
             </div>
           </div>,
           document.body,
@@ -8664,6 +9510,10 @@ const Chat = ({
                   ragCount: ragMatches.length,
                 })
               : [];
+          const messageVisionNotice =
+            isAssistantMessage && !isRegeneratingMessage
+              ? getMessageVisionNotice(displayMsg)
+              : null;
           const messageId = msg?.id || msg?.message_id || null;
           const subchatLinks =
             messageId &&
@@ -8731,6 +9581,16 @@ const Chat = ({
                 : isRegeneratingMessage
                   ? null
                   : renderContent(displayMsg, idx, resolvedTools)}
+              {messageVisionNotice && (
+                <div
+                  className={`message-vision-notice message-vision-notice--${messageVisionNotice.tone}`}
+                  role="status"
+                  aria-label="Image delivery notice"
+                >
+                  <strong>{messageVisionNotice.title}</strong>
+                  <span>{messageVisionNotice.message}</span>
+                </div>
+              )}
               {(() => {
                 if (!Array.isArray(msg.attachments) || !msg.attachments.length) return null;
                 const attachmentsList = msg.attachments;
@@ -10034,34 +10894,51 @@ const Chat = ({
                     return (
                       <div
                         key={att.id}
-                        className="attachment-chip"
-                        title={attachmentName}
-                        onClick={() =>
-                          window.open(attachmentUrl, "_blank", "noopener")
-                        }
-                        role="button"
-                        tabIndex={0}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter" || e.key === " ") {
-                            e.preventDefault();
-                            window.open(attachmentUrl, "_blank", "noopener");
-                          }
-                        }}
+                        className={`attachment-chip${att.uploadFailed ? " attachment-chip--failed" : ""}`}
+                        title={att.uploadError || attachmentName}
                       >
-                        {showImagePreview ? (
-                          <img src={attachmentUrl} alt="preview" className="chip-thumb" />
-                        ) : (
-                          <span className="chip-icon" aria-hidden>
-                            <AttachFileIcon fontSize="inherit" />
+                        <button
+                          type="button"
+                          className="chip-preview"
+                          aria-label={`Open ${attachmentName}`}
+                          disabled={!attachmentUrl}
+                          onClick={() =>
+                            window.open(attachmentUrl, "_blank", "noopener")
+                          }
+                        >
+                          {showImagePreview ? (
+                            <img src={attachmentUrl} alt="" className="chip-thumb" />
+                          ) : (
+                            <span className="chip-icon" aria-hidden>
+                              <AttachFileIcon fontSize="inherit" />
+                            </span>
+                          )}
+                          <span className="chip-name">
+                            {truncateFilename(attachmentName)}
                           </span>
-                        )}
-                        <span className="chip-name">
-                          {truncateFilename(attachmentName)}
-                        </span>
+                        </button>
                         {att.uploading && (
                           <span className="chip-uploading" aria-live="polite">
                             uploading{"\u2026"}
                           </span>
+                        )}
+                        {att.uploadFailed && (
+                          <>
+                            <span className="chip-upload-failed" aria-live="polite">
+                              failed
+                            </span>
+                            <button
+                              type="button"
+                              className="chip-retry"
+                              aria-label={`Retry ${attachmentName}`}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                retryAttachmentUpload(att);
+                              }}
+                            >
+                              retry
+                            </button>
+                          </>
                         )}
                         <button
                           type="button"
@@ -10164,6 +11041,9 @@ const Chat = ({
                         setChatSettingsSection((prev) => prev || "camera");
                       }}
                       aria-label="Chat settings"
+                      aria-expanded={chatSettingsOpen}
+                      aria-controls={chatSettingsOpen ? "chat-settings-popover" : undefined}
+                      aria-haspopup="dialog"
                     >
                       <TuneIcon fontSize="small" />
                     </button>

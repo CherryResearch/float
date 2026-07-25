@@ -15,14 +15,14 @@ import webbrowser
 from urllib.parse import urlparse
 
 
-def _build_backend_cmd(port: int) -> list[str]:
+def _build_backend_cmd(port: int, host: str = "127.0.0.1") -> list[str]:
     return [
         sys.executable,
         "-m",
         "uvicorn",
         "app.main:app",
         "--host",
-        "0.0.0.0",
+        host,
         "--port",
         str(port),
         "--reload",
@@ -148,6 +148,16 @@ def main():
         help="Port for the backend server (default: auto-select)",
     )
     parser.add_argument(
+        "--backend-host",
+        default=os.getenv("FLOAT_BACKEND_HOST", "127.0.0.1"),
+        help="Backend bind host (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--lan",
+        action="store_true",
+        help="Bind the backend to 0.0.0.0 for explicit LAN/device access",
+    )
+    parser.add_argument(
         "--frontend-port",
         type=int,
         default=0,
@@ -262,6 +272,10 @@ def main():
         help="Start frontend only (skip backend)",
     )
     args = parser.parse_args()
+
+    args.backend_host = str(args.backend_host or "127.0.0.1").strip()
+    if args.lan:
+        args.backend_host = "0.0.0.0"
 
     if args.dev_mode:
         os.environ["FLOAT_DEV_MODE"] = "true"
@@ -392,9 +406,9 @@ def main():
             return list(processes.items())
 
     def _launch_backend() -> subprocess.Popen:
-        print(f"[INFO] Starting backend on port {args.backend_port}...")
+        print(f"[INFO] Starting backend on {args.backend_host}:{args.backend_port}...")
         backend_proc = subprocess.Popen(
-            _build_backend_cmd(args.backend_port),
+            _build_backend_cmd(args.backend_port, args.backend_host),
             cwd=os.path.join(basedir, "backend"),
             env=service_env,
         )
@@ -569,6 +583,7 @@ def main():
     if not args.skip_backend or not args.skip_frontend:
         if not args.skip_backend:
             state["backend_port"] = args.backend_port
+            state["backend_host"] = args.backend_host
             if args.sticky_ports:
                 state["sticky_backend_port"] = args.backend_port
         if not args.skip_frontend:
