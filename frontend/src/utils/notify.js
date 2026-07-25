@@ -9,5 +9,7 @@ export function notify({ title, body, data = {}, category = "general" }) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title, body, data, category }),
     }).catch(() => {});
-  } catch {}
+  } catch (err) {
+    void err;
+  }
 }

@@ -44,7 +44,7 @@ export const normalizeToolReviewTarget = (value = {}) => {
   return {
     toolIds,
     toolId: toolIds[0] || "",
-    selectedToolId: selectedToolId || toolIds[0] || "",
+    selectedToolId,
     toolNames,
     toolName: toolNames[0] || "",
     messageId,
@@ -104,12 +104,18 @@ export const escapeToolReviewSelectorValue = (value) => {
 export const toolReviewScopeSelectors = (target) => {
   const normalized = normalizeToolReviewTarget(target);
   const selectors = [];
-  const scopedToolIds = normalized.scope !== "batch" && normalized.selectedToolId
-    ? [normalized.selectedToolId]
-    : normalized.toolIds;
+  const scopedToolIds =
+    normalized.scope === "batch"
+      ? normalized.toolIds
+      : normalized.selectedToolId
+        ? [normalized.selectedToolId]
+        : [];
   scopedToolIds.forEach((id) => {
     selectors.push(`[data-tool-id="${escapeToolReviewSelectorValue(id)}"]`);
   });
+  if (normalized.scope !== "batch") {
+    return normalizeToolReviewStringArray(selectors);
+  }
   [normalized.chainId, normalized.messageId]
     .filter(Boolean)
     .forEach((id) => {

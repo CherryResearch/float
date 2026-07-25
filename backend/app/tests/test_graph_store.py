@@ -1,8 +1,13 @@
+import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from app.base_services import MemoryManager
+from app.services.graph_payload_service import apply_graph_payload
 from app.utils.graph_store import GraphStore
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
 def test_graph_store_supports_event_predictions_and_multi_role_claims(tmp_path):
@@ -96,3 +101,43 @@ def test_memory_manager_initializes_graph_tables_for_persistent_store(tmp_path):
     assert "graph_nodes" in tables
     assert "graph_claims" in tables
     assert "graph_claim_roles" in tables
+
+
+def test_graph_store_projects_basic_social_network_fixture(tmp_path):
+    fixture = json.loads((FIXTURES / "basic_social_graph.json").read_text())
+    store = GraphStore(tmp_path / "memory.sqlite3")
+
+    summary = apply_graph_payload(
+        store,
+        graph_nodes=fixture["nodes"],
+        graph_claims=fixture["claims"],
+        default_source_kind="fixture",
+        default_source_ref="basic_social_graph",
+    )
+
+    assert summary["errors"] == []
+    assert summary["node_count"] == 7
+    assert summary["claim_count"] == 7
+
+    self_node = store.get_node("person:self")
+    assert self_node is not None
+    assert self_node["attributes"]["relation_to_self"] == "self"
+    assert self_node["attributes"]["interests"] == ["graph workflows", "tool traces"]
+
+    projection = store.projection()
+    assert projection["metadata"]["node_count"] == 7
+    assert projection["metadata"]["claim_count"] == 7
+    assert projection["metadata"]["link_count"] == 7
+    assert all(node["attributes"] for node in projection["nodes"])
+    assert {
+        (link["source"], link["target"], link["predicate"])
+        for link in projection["links"]
+    } == {
+        ("knowledge:person:self", "knowledge:person:friend-maya", "friend_of"),
+        ("knowledge:person:self", "knowledge:person:friend-jules", "friend_of"),
+        ("knowledge:person:self", "knowledge:person:coworker-ren", "works_with"),
+        ("knowledge:person:self", "knowledge:person:family-lena", "family_of"),
+        ("knowledge:person:friend-jules", "knowledge:org:computer-club", "member_of"),
+        ("knowledge:person:self", "knowledge:org:job", "works_at"),
+        ("knowledge:person:coworker-ren", "knowledge:org:job", "works_at"),
+    }

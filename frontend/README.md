@@ -34,18 +34,19 @@ frontend/
 
 1. **Install Dependencies**:
    ```bash
+   # Run from the repository root; package-lock.json is workspace-owned.
    npm install
    ```
    This installs React, D3, and all other packages required by the UI.
 
 2. **Run the Development Server**:
    ```bash
-   npm start
+   npm run dev --workspace frontend
    ```
 
 3. **Build for Production**:
    ```bash
-   npm run build
+   npm run build --workspace frontend
    ```
 
 ### Configuration

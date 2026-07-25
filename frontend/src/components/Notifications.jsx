@@ -18,6 +18,25 @@ const OPERATION_PROGRESS_STALE_DISMISS_MS = 120000;
 const OPERATION_PROGRESS_TICK_MS = 1000;
 const RECENT_COMPLETE_PROGRESS_MAX_AGE_MS = 8000;
 const RUNTIME_RAG_OPERATION_EVENT = "float:runtime-rag-operation";
+const MAX_TERMINAL_TOOL_REVIEW_IDS = 500;
+const TERMINAL_TOOL_REVIEW_STATUSES = new Set([
+  "cancelled",
+  "canceled",
+  "complete",
+  "completed",
+  "denied",
+  "error",
+  "failed",
+  "forbidden",
+  "invoked",
+  "ok",
+  "rejected",
+  "scheduled",
+  "succeeded",
+  "success",
+  "timeout",
+  "timed_out",
+]);
 
 const isTypingTarget = (target) => {
   if (!target) return false;
@@ -38,6 +57,55 @@ const isToolReviewToast = (toast) => {
 const isToolReviewPayload = (payload) => {
   if (!payload || payload.category !== "tool_resolution") return false;
   return toolReviewItems(payload.data || {}).length > 0;
+};
+
+const normalizeToolReviewStatus = (value) =>
+  String(value || "").trim().toLowerCase();
+
+const toolReviewPayloadItems = (payload) => {
+  const data = payload?.data && typeof payload.data === "object" ? payload.data : {};
+  const fallbackStatus = normalizeToolReviewStatus(data.status);
+  return toolReviewItems(data).map((item) => ({
+    ...item,
+    status: normalizeToolReviewStatus(item.status) || fallbackStatus,
+  }));
+};
+
+const isTerminalToolReviewItem = (item) =>
+  TERMINAL_TOOL_REVIEW_STATUSES.has(normalizeToolReviewStatus(item?.status));
+
+const toolReviewDataForItems = (data, items) => {
+  const source = data && typeof data === "object" ? data : {};
+  const toolIds = items.map((item) => item.toolId || "");
+  const toolNames = items.map((item) => item.toolName || "");
+  const toolArgs = items.map((item) => item.args);
+  const toolStatuses = items.map((item) => normalizeToolReviewStatus(item.status));
+  const selectedToolId = String(
+    source.selectedToolId ?? source.selected_tool_id ?? "",
+  ).trim();
+  const nextSelectedToolId = toolIds.includes(selectedToolId)
+    ? selectedToolId
+    : toolIds.find(Boolean) || "";
+  return {
+    ...source,
+    toolIds,
+    tool_ids: toolIds,
+    toolNames,
+    tool_names: toolNames,
+    toolArgs,
+    tool_args: toolArgs,
+    toolStatuses,
+    tool_statuses: toolStatuses,
+    selectedToolId: nextSelectedToolId,
+    selected_tool_id: nextSelectedToolId,
+  };
+};
+
+const toolReviewToastMatchesItems = (toast, items) => {
+  if (!isToolReviewToast(toast) || !items.length) return false;
+  const incomingIds = new Set(items.map((item) => item.toolId).filter(Boolean));
+  if (!incomingIds.size) return false;
+  return toolReviewItems(toast.data || {}).some((item) => incomingIds.has(item.toolId));
 };
 
 const toolReviewToastId = (payload) => {
@@ -167,13 +235,15 @@ const shouldHydrateRecentNotification = (entry) => {
   return Date.now() - timestampMs <= RECENT_COMPLETE_PROGRESS_MAX_AGE_MS;
 };
 
-const Notifications = ({ onOpenToolReview }) => {
+const Notifications = ({ onOpenToolReview, autoMinimize = false }) => {
   const [toasts, setToasts] = useState([]);
   const [nowMs, setNowMs] = useState(Date.now());
+  const [minimized, setMinimized] = useState(Boolean(autoMinimize));
   const [activeShortcut, setActiveShortcut] = useState(null);
   const [activeReviewKey, setActiveReviewKey] = useState(null);
   const [selectedReviewKeysByToast, setSelectedReviewKeysByToast] = useState({});
   const esRef = useRef(null);
+  const terminalToolReviewIdsRef = useRef(new Set());
   const toastTimersRef = useRef(new Map());
   const shortcutTimerRef = useRef(null);
   const actionTimersRef = useRef(new Set());
@@ -238,17 +308,41 @@ const Notifications = ({ onOpenToolReview }) => {
   const addToast = useCallback((payload) => {
     const progressPayload = isOperationProgressPayload(payload);
     const toolReviewPayload = isToolReviewPayload(payload);
+    const incomingToolItems = toolReviewPayload ? toolReviewPayloadItems(payload) : [];
+    const terminalToolIds = new Set(
+      incomingToolItems
+        .filter(isTerminalToolReviewItem)
+        .map((item) => item.toolId)
+        .filter(Boolean),
+    );
+    terminalToolIds.forEach((toolId) => terminalToolReviewIdsRef.current.add(toolId));
+    while (terminalToolReviewIdsRef.current.size > MAX_TERMINAL_TOOL_REVIEW_IDS) {
+      const oldestToolId = terminalToolReviewIdsRef.current.values().next().value;
+      terminalToolReviewIdsRef.current.delete(oldestToolId);
+    }
+    const unresolvedToolItems = incomingToolItems.filter(
+      (item) =>
+        !isTerminalToolReviewItem(item) &&
+        (!item.toolId || !terminalToolReviewIdsRef.current.has(item.toolId)),
+    );
+    const activeToolReviewPayload = toolReviewPayload && unresolvedToolItems.length > 0;
+    const activeToolReviewData = activeToolReviewPayload
+      ? toolReviewDataForItems(payload?.data, unresolvedToolItems)
+      : payload?.data || {};
+    const activeToolReviewEnvelope = activeToolReviewPayload
+      ? { ...payload, data: activeToolReviewData }
+      : payload;
     const id = progressPayload
       ? operationToastId(payload?.data?.operation_id)
-      : toolReviewPayload
-        ? toolReviewToastId(payload) ||
+      : activeToolReviewPayload
+        ? toolReviewToastId(activeToolReviewEnvelope) ||
           `${payload?.ts || Date.now()}-${Math.random().toString(36).slice(2)}`
       : `${payload?.ts || Date.now()}-${Math.random().toString(36).slice(2)}`;
     const nextToast = {
       id,
       title: payload?.title,
       body: payload?.body,
-      data: payload?.data || {},
+      data: activeToolReviewData,
       category: payload?.category || "general",
     };
 
@@ -260,24 +354,61 @@ const Notifications = ({ onOpenToolReview }) => {
     }
 
     setToasts((prev) => {
-      if (!progressPayload && !toolReviewPayload) {
-        return [...prev, nextToast];
+      let reconciled = prev;
+      if (terminalToolIds.size) {
+        reconciled = prev.flatMap((toast) => {
+          if (!isToolReviewToast(toast)) return [toast];
+          const remainingItems = toolReviewItems(toast.data || {}).filter(
+            (item) => !terminalToolIds.has(item.toolId),
+          );
+          if (!remainingItems.length) return [];
+          if (remainingItems.length === toolReviewItems(toast.data || {}).length) {
+            return [toast];
+          }
+          return [
+            {
+              ...toast,
+              data: toolReviewDataForItems(toast.data, remainingItems),
+            },
+          ];
+        });
       }
-      const existingIndex = prev.findIndex((toast) => toast.id === id);
+
+      if (toolReviewPayload && !activeToolReviewPayload) {
+        return reconciled;
+      }
+      if (!progressPayload && !activeToolReviewPayload) {
+        return [...reconciled, nextToast];
+      }
+      const existingIndex = reconciled.findIndex(
+        (toast) =>
+          toast.id === id ||
+          (activeToolReviewPayload && toolReviewToastMatchesItems(toast, unresolvedToolItems)),
+      );
       if (existingIndex < 0) {
-        return [...prev, nextToast];
+        return [...reconciled, nextToast];
       }
       const merged = {
-        ...prev[existingIndex],
+        ...reconciled[existingIndex],
         ...nextToast,
+        id: reconciled[existingIndex].id,
+        ...(terminalToolIds.size
+          ? {
+              title: reconciled[existingIndex].title,
+              body: reconciled[existingIndex].body,
+            }
+          : {}),
         data: {
-          ...(prev[existingIndex]?.data || {}),
-          ...(payload?.data || {}),
+          ...(reconciled[existingIndex]?.data || {}),
+          ...activeToolReviewData,
         },
       };
-      return prev.map((toast, index) => (index === existingIndex ? merged : toast));
+      return reconciled.map((toast, index) => (index === existingIndex ? merged : toast));
     });
 
+    if (toolReviewPayload && !activeToolReviewPayload) {
+      return;
+    }
     if (!progressPayload) {
       scheduleToastDismiss(id, dismissDelayForToast(nextToast));
       return;
@@ -316,6 +447,21 @@ const Notifications = ({ onOpenToolReview }) => {
             }))
           : [],
       ),
+    [toasts],
+  );
+  const hasErrorToast = useMemo(
+    () =>
+      toasts.some((toast) => {
+        const status = String(toast?.data?.status || "").trim().toLowerCase();
+        const severity = String(toast?.data?.severity || "").trim().toLowerCase();
+        const category = String(toast?.category || "").trim().toLowerCase();
+        return (
+          status === "error" ||
+          status === "failed" ||
+          severity === "error" ||
+          category === "error"
+        );
+      }),
     [toasts],
   );
 
@@ -534,6 +680,36 @@ const Notifications = ({ onOpenToolReview }) => {
     ],
   );
 
+  const runAcceptContinueSelected = useCallback(
+    (toast, selectedOption = null) => {
+      if (!toast || !isToolReviewToast(toast)) return;
+      const toolId = String(selectedOption?.item?.toolId || "").trim();
+      if (!toolId) return;
+      const target = normalizeToolReviewTarget(toast.data || {});
+      const item = selectedOption.item;
+      const exactSelection = { toast, toastId: toast.id, item };
+      pauseToastDismiss(toast.id);
+      runToolReviewAction(toast, "accept", {
+        selectedOption: exactSelection,
+        selectedOptions: [exactSelection],
+        keepOpen: true,
+        flashAction: "accept_continue",
+      });
+      const continueTimer = setTimeout(() => {
+        actionTimersRef.current.delete(continueTimer);
+        runToolReviewAction(toast, "continue", {
+          scope: "selected",
+          selectedOption: exactSelection,
+          selectedOptions: [exactSelection],
+          keepOpen: target.toolIds.length > 1,
+          flashAction: "accept_continue",
+        });
+      }, ACCEPT_CONTINUE_BATCH_DELAY_MS);
+      actionTimersRef.current.add(continueTimer);
+    },
+    [pauseToastDismiss, runToolReviewAction],
+  );
+
   const runAcceptContinueBatch = useCallback(
     (toast, selectedOption = null) => {
       if (!toast || !isToolReviewToast(toast)) return;
@@ -541,7 +717,8 @@ const Notifications = ({ onOpenToolReview }) => {
       const items = toolReviewItems(toast.data || {});
       const targetIds = target.toolIds.length
         ? target.toolIds
-        : [selectedOption?.item?.toolId || target.selectedToolId || target.toolId].filter(Boolean);
+        : [selectedOption?.item?.toolId || target.toolId].filter(Boolean);
+      if (!targetIds.length) return;
       pauseToastDismiss(toast.id);
       targetIds.forEach((toolId) => {
         const item =
@@ -581,7 +758,9 @@ const Notifications = ({ onOpenToolReview }) => {
           items.filter(shouldHydrateRecentNotification).forEach((entry) => addToast(entry));
         })
         .catch(() => {});
-    } catch {}
+    } catch (err) {
+      void err;
+    }
     if (typeof EventSource !== "function") {
       return undefined;
     }
@@ -599,7 +778,9 @@ const Notifications = ({ onOpenToolReview }) => {
     return () => {
       try {
         source.close();
-      } catch {}
+      } catch (err) {
+        void err;
+      }
     };
   }, [addToast]);
 
@@ -629,7 +810,19 @@ const Notifications = ({ onOpenToolReview }) => {
   }, []);
 
   useEffect(() => {
-    if (!toasts.some(isToolReviewToast)) return undefined;
+    if (hasErrorToast) {
+      setMinimized(false);
+      return;
+    }
+    if (autoMinimize) {
+      setMinimized(true);
+    } else {
+      setMinimized(false);
+    }
+  }, [autoMinimize, hasErrorToast]);
+
+  useEffect(() => {
+    if (minimized || !toasts.some(isToolReviewToast)) return undefined;
     const handleKeyDown = (event) => {
       if (event.defaultPrevented || isTypingTarget(event.target)) return;
       const key = String(event.key || "").toLowerCase();
@@ -657,7 +850,7 @@ const Notifications = ({ onOpenToolReview }) => {
       event.preventDefault();
       event.stopPropagation();
       if (action === "accept_continue") {
-        runAcceptContinueBatch(activeOption.toast, activeOption);
+        runAcceptContinueSelected(activeOption.toast, activeOption);
       } else {
         runToolReviewAction(activeOption.toast, action, {
           selectedOption: activeOption,
@@ -670,23 +863,79 @@ const Notifications = ({ onOpenToolReview }) => {
     activeReviewKey,
     cycleReviewSelection,
     reviewOptions,
-    runAcceptContinueBatch,
+    runAcceptContinueSelected,
     runToolReviewAction,
+    minimized,
     toasts,
   ]);
 
   if (toasts.length === 0) return null;
 
   const operationOnly = toasts.every(isOperationProgressToast);
+  const toolReviewCount = reviewOptions.length;
+  const activeOperationCount = toasts.filter((toast) => {
+    if (!isOperationProgressToast(toast)) return false;
+    const status = String(toast.data?.status || "").trim().toLowerCase();
+    return status !== "complete" && status !== "error";
+  }).length;
+  const compactSummary = toolReviewCount
+    ? `${toolReviewCount} tool${toolReviewCount === 1 ? "" : "s"} awaiting review`
+    : activeOperationCount
+      ? `${activeOperationCount} operation${activeOperationCount === 1 ? "" : "s"} running`
+      : `${toasts.length} notification${toasts.length === 1 ? "" : "s"}`;
 
   return (
     <div
-      className={`download-tray expanded notification-tray${
+      className={`download-tray ${minimized ? "collapsed notification-tray-minimized" : "expanded"} notification-tray${
         operationOnly ? " operation-only" : ""
-      }`}
+      }${hasErrorToast ? " has-attention" : ""}`}
       style={{ pointerEvents: "none" }}
     >
-      <div className="download-tray-content" style={{ pointerEvents: "auto" }}>
+      {minimized && (
+        <div className="download-tray-rail center-rail notification-tray-rail">
+          <button
+            type="button"
+            className="download-tray-peek notification-tray-peek"
+            title={`Show notifications: ${compactSummary}`}
+            aria-label={`Show notifications: ${compactSummary}`}
+            aria-expanded="false"
+            aria-controls="notification-tray-list"
+            onClick={() => setMinimized(false)}
+          >
+            <span
+              className="download-tray-peek-icon notification-tray-peek-icon"
+              aria-hidden="true"
+            >
+              {"\u25CF"}
+            </span>
+            <span className="notification-tray-count" aria-hidden="true">
+              {toasts.length}
+            </span>
+          </button>
+        </div>
+      )}
+      <div
+        id="notification-tray-list"
+        className="download-tray-content"
+        hidden={minimized}
+        style={{ pointerEvents: "auto" }}
+      >
+        <div className="download-tray-header notification-tray-header">
+          <button
+            type="button"
+            className="download-tray-toggle notification-tray-toggle"
+            title="Minimize notifications"
+            aria-label="Minimize notifications"
+            aria-expanded="true"
+            onClick={() => setMinimized(true)}
+          >
+            {"\u2212"}
+          </button>
+          <div className="download-tray-title">Notifications</div>
+          <span className="notification-tray-count" aria-label={`${toasts.length} visible`}>
+            {toasts.length}
+          </span>
+        </div>
         <div className="download-toasts">
           {toasts.map((t) => {
             const toolReview = isToolReviewToast(t);
@@ -715,9 +964,7 @@ const Notifications = ({ onOpenToolReview }) => {
             const acceptLabel = isToolBatch ? "Accept selected" : "Accept";
             const denyLabel = isToolBatch ? "Deny selected" : "Deny";
             const editLabel = isToolBatch ? "Edit selected" : "Edit";
-            const acceptContinueLabel = isToolBatch
-              ? "Accept all + continue"
-              : "Accept + continue";
+            const acceptContinueLabel = "Accept + continue";
             const toastSelected = Boolean(
               selectedOption && selectedOption.key === activeReviewKey,
             );
@@ -940,19 +1187,24 @@ const Notifications = ({ onOpenToolReview }) => {
                       </button>
                       <button
                         type="button"
-                        className={`tool-action-btn continue notification-tool-action accept-continue${
-                          isToolBatch ? " batch" : ""
-                        }${shortcutClass("accept_continue")}`}
-                        title={
-                          isToolBatch
-                            ? "Accept every tool in this notification, then continue the batch (Ctrl+Y)"
-                            : `Accept ${selectedToolLabel}, then continue (Ctrl+Y)`
-                        }
+                        className={`tool-action-btn continue notification-tool-action accept-continue${shortcutClass("accept_continue")}`}
+                        title={`Accept ${selectedToolLabel}, then continue only that tool (Ctrl+Y)`}
                         aria-keyshortcuts="Control+Y"
-                        onClick={() => runAcceptContinueBatch(t, selectedOption)}
+                        disabled={!selectedItem?.toolId}
+                        onClick={() => runAcceptContinueSelected(t, selectedOption)}
                       >
                         {acceptContinueLabel}
                       </button>
+                      {isToolBatch && (
+                        <button
+                          type="button"
+                          className="tool-action-btn continue notification-tool-action accept-continue batch"
+                          title="Accept every tool in this notification, then continue the whole batch"
+                          onClick={() => runAcceptContinueBatch(t, selectedOption)}
+                        >
+                          Accept all + continue
+                        </button>
+                      )}
                     </>
                   )}
                   {t.data?.action_url && (

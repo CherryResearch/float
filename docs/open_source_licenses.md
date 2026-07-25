@@ -2,7 +2,7 @@
 
 Purpose: track every open source license used by Float (runtime, dev, and bundled services). This is a living document; complete before launch.
 
-Status note (2026-04-13): dependency versions below are aligned with the direct dependency pins in `pyproject.toml` and `frontend/package.json`, but most licenses are still marked `TBD` until the audit workflow at the bottom is run.
+Status note (2026-07-25): dependency versions below are aligned with the direct dependency pins in `pyproject.toml` and `frontend/package.json`, but most licenses are still marked `TBD` until the formal launch audit workflow at the bottom is run.
 
 ## Project license
 - Float repository: GNU Affero General Public License v3.0 only (see `LICENSE`).
@@ -47,10 +47,10 @@ Status note (2026-04-13): dependency versions below are aligned with the direct 
 | python-dateutil | ^2.9.0 | TBD | runtime |
 | pywebpush | ^1.14.0 | TBD | runtime |
 | python-json-logger | ^2.0.7 | TBD | optional (telemetry) |
-| opentelemetry-exporter-otlp | ^1.27.0 | TBD | optional (telemetry) |
-| opentelemetry-instrumentation-fastapi | ^0.48b0 | TBD | optional (telemetry) |
-| opentelemetry-instrumentation-requests | ^0.48b0 | TBD | optional (telemetry) |
-| opentelemetry-instrumentation-logging | ^0.48b0 | TBD | optional (telemetry) |
+| opentelemetry-exporter-otlp | ^1.39.1 | TBD | optional (telemetry) |
+| opentelemetry-instrumentation-fastapi | ^0.60b1 | TBD | optional (telemetry) |
+| opentelemetry-instrumentation-requests | ^0.60b1 | TBD | optional (telemetry) |
+| opentelemetry-instrumentation-logging | ^0.60b1 | TBD | optional (telemetry) |
 | prometheus-client | ^0.20.0 | TBD | optional (telemetry) |
 | flower | ^2.0.1 | TBD | optional worker monitoring dashboard |
 | scikit-learn | ^1.5.0 | TBD | runtime |
@@ -58,12 +58,14 @@ Status note (2026-04-13): dependency versions below are aligned with the direct 
 | hf-transfer | ^0.1.9 | TBD | runtime Hugging Face transfer helper |
 | hf-xet | ^1.4.2 | TBD | runtime Hugging Face transfer helper |
 | chromadb | ^1.1.0 | TBD | runtime |
-| mcp-server | ^0.1.4 | TBD | runtime |
 | accelerate | ^1.10.1 | TBD | runtime |
 | playwright | ^1.58.0 | TBD | runtime computer-use |
 | pywinauto | ^0.6.9 | TBD | runtime Windows desktop computer-use |
 | open-clip-torch | 3.2.0 | TBD | runtime vision indexing |
+| torch | 2.10.0 | TBD | runtime inference; wheel index may be CPU or CUDA |
 | torchvision | 0.25.0 | TBD | runtime vision indexing/direct-local |
+| openai | ^2.44.0 | TBD | runtime OpenAI-compatible client |
+| tinker | ^0.23.0 | TBD | runtime Tinker / Inkling provider client |
 
 ## Python dev dependencies
 | Package | Version | License | Notes |
@@ -78,9 +80,9 @@ Status note (2026-04-13): dependency versions below are aligned with the direct 
 | --- | --- | --- | --- |
 | react | ^18.3.1 | TBD | runtime |
 | react-dom | ^18.3.1 | TBD | runtime |
-| react-router-dom | ^7.1.3 | TBD | runtime |
-| axios | ^1.7.9 | TBD | runtime |
-| dompurify | ^3.1.6 | TBD | runtime |
+| react-router-dom | ^7.18.1 | TBD | runtime |
+| axios | ^1.18.1 | TBD | runtime |
+| dompurify | ^3.4.12 | TBD | runtime |
 | d3 | ^7.9.0 | TBD | runtime |
 | marked | ^15.0.6 | TBD | runtime |
 | livekit-client | ^2.15.4 | TBD | runtime |
@@ -94,7 +96,7 @@ Status note (2026-04-13): dependency versions below are aligned with the direct 
 ## Frontend dev dependencies
 | Package | Version | License | Notes |
 | --- | --- | --- | --- |
-| vite | ^6.0.5 | TBD | dev |
+| vite | ^6.4.3 | TBD | dev |
 | @vitejs/plugin-react | ^4.3.4 | TBD | dev |
 | eslint | ^9.17.0 | TBD | dev |
 | @eslint/js | ^9.17.0 | TBD | dev |
@@ -106,7 +108,7 @@ Status note (2026-04-13): dependency versions below are aligned with the direct 
 | @types/react-dom | ^18.3.5 | TBD | dev |
 | @testing-library/react | ^16.0.1 | TBD | dev |
 | @testing-library/jest-dom | ^6.5.0 | TBD | dev |
-| vitest | ^1.6.0 | TBD | dev |
+| vitest | ^4.1.10 | TBD | dev |
 | jsdom | ^24.0.0 | TBD | dev |
 
 ## Runtime services and external components (verify licenses)

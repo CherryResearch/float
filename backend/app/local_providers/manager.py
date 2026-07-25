@@ -237,6 +237,16 @@ class LocalProviderManager:
             runtime = entry.get("runtime")
             return dict(runtime) if isinstance(runtime, dict) else None
 
+    def _last_runtime(self, provider: str) -> Optional[Dict[str, Any]]:
+        """Return the latest runtime snapshot even after its polling TTL expires."""
+        provider_key = _normalize_provider(provider)
+        with self._lock:
+            entry = self._runtime_cache.get(provider_key)
+            if not entry:
+                return None
+            runtime = entry.get("runtime")
+            return dict(runtime) if isinstance(runtime, dict) else None
+
     def _cached_models(self, provider: str) -> Optional[List[str]]:
         provider_key = _normalize_provider(provider)
         now = time.monotonic()
@@ -274,6 +284,7 @@ class LocalProviderManager:
         current: Dict[str, Any],
         *,
         cached: Optional[Dict[str, Any]] = None,
+        preserve_unknown_model_state: bool = False,
     ) -> Dict[str, Any]:
         merged = dict(current or {})
         cached_runtime = cached or self._cached_runtime(provider) or {}
@@ -283,6 +294,23 @@ class LocalProviderManager:
             merged["context_length"] = cached_runtime.get("context_length")
         if merged.get("details") in (None, {}) and cached_runtime.get("details"):
             merged["details"] = cached_runtime.get("details")
+        if preserve_unknown_model_state and merged.get("model_state_known") is False:
+            last_runtime = self._last_runtime(provider) or {}
+            last_loaded_model = _normalize_model_name(last_runtime.get("loaded_model"))
+            if (
+                bool(merged.get("server_running"))
+                and bool(last_runtime.get("server_running"))
+                and bool(last_runtime.get("model_loaded"))
+                and last_loaded_model
+            ):
+                merged["model_loaded"] = True
+                merged["loaded_model"] = last_loaded_model
+                merged["model_state_source"] = "cache"
+                merged["model_state_stale"] = True
+                if merged.get("context_length") in (None, 0) and last_runtime.get(
+                    "context_length"
+                ):
+                    merged["context_length"] = last_runtime.get("context_length")
         return merged
 
     def _runtime_with_inventory(
@@ -310,6 +338,13 @@ class LocalProviderManager:
             {str(name).strip() for name in owned_models_map.keys() if str(name).strip()}
         )
         loaded_model = _normalize_model_name(runtime.get("loaded_model")) or None
+        raw_model_state_known = runtime.get("model_state_known")
+        model_state_is_explicit = isinstance(raw_model_state_known, bool)
+        model_state_known = (
+            raw_model_state_known
+            if model_state_is_explicit
+            else bool(runtime.get("loaded_model"))
+        )
         loaded_model_chat_capable = bool(
             loaded_model and not _is_likely_embedding_model_name(loaded_model)
         )
@@ -324,7 +359,11 @@ class LocalProviderManager:
         )
         inventory_models = list(models or [])
         chat_inventory_models = _chat_candidate_models(inventory_models)
-        if not loaded_model and len(chat_inventory_models) == 1:
+        if (
+            not loaded_model
+            and not model_state_is_explicit
+            and len(chat_inventory_models) == 1
+        ):
             loaded_model = chat_inventory_models[0]
             loaded_model_chat_capable = True
         effective_model = (
@@ -347,6 +386,18 @@ class LocalProviderManager:
         runtime_entry_checked_at = runtime_entry.get("checked_at")
         models_entry_fetched_at = models_entry.get("checked_at")
         server_running = bool(runtime.get("server_running"))
+        raw_status_reachable = runtime.get("status_reachable")
+        status_reachable = (
+            bool(raw_status_reachable)
+            if isinstance(raw_status_reachable, bool)
+            else server_running
+        )
+        raw_inventory_reachable = runtime.get("inventory_reachable")
+        inventory_reachable_value = bool(inventory_reachable)
+        if isinstance(raw_inventory_reachable, bool):
+            inventory_reachable_value = (
+                inventory_reachable_value or raw_inventory_reachable
+            )
         server_owner = (
             "float"
             if server_running and server_owned_by_float
@@ -358,6 +409,9 @@ class LocalProviderManager:
             loaded_model and loaded_model_chat_capable and server_running
         )
         chat_ready = bool(server_running and loaded_model_is_chat)
+        model_state_source = str(runtime.get("model_state_source") or "").strip()
+        if not model_state_source:
+            model_state_source = "runtime" if model_state_known else "unknown"
         return {
             "provider": provider_key,
             "mode": cfg.get("local_provider_mode"),
@@ -365,13 +419,16 @@ class LocalProviderManager:
             "server_running": server_running,
             "server_owned_by_float": server_owned_by_float,
             "server_owner": server_owner,
-            "status_reachable": server_running,
-            "inventory_reachable": bool(inventory_reachable),
+            "status_reachable": status_reachable,
+            "inventory_reachable": inventory_reachable_value,
             "inventory_source": models_source,
             "inventory_stale": models_source == "cache",
             "chat_ready": chat_ready,
             "model_loaded": loaded_model_is_chat,
             "loaded_model": loaded_model,
+            "model_state_known": model_state_known,
+            "model_state_source": model_state_source,
+            "model_state_stale": bool(runtime.get("model_state_stale")),
             "loaded_model_chat_capable": loaded_model_chat_capable,
             "loaded_model_owned_by_float": loaded_model_owned_by_float,
             "owned_model_ids": owned_model_ids,
@@ -423,34 +480,23 @@ class LocalProviderManager:
         cached_models = None if force else self._cached_models(provider_key)
         should_refresh_models = refresh_models or (cached_models is None and not quick)
 
-        cached_runtime = None if force else self._cached_runtime(provider_key)
         current = adapter.poll_status(cfg, quick=quick)
+        current_inventory_reachable = (
+            bool(current.get("inventory_reachable"))
+            if isinstance(current.get("inventory_reachable"), bool)
+            else None
+        )
+        probe_models = self._clean_models(current)
         runtime = self._merge_cached_runtime(
             provider_key,
             current,
-            cached=cached_runtime,
+            preserve_unknown_model_state=quick and provider_key == "lmstudio",
         )
-        current_inventory_reachable = (
-            current.get("inventory_reachable") if isinstance(current, dict) else None
-        )
-        inventory_reachable = (
-            bool(current_inventory_reachable)
-            if isinstance(current_inventory_reachable, bool)
-            else None
-        )
+        inventory_reachable = current_inventory_reachable
         models_source = "cache" if cached_models is not None else "unknown"
-        current_models = self._clean_models(current)
-        if quick and inventory_reachable and current_models:
-            cached_models = current_models
-            self._store_models(provider_key, current_models)
-            models_source = "quick"
-            if not _normalize_model_name(runtime.get("loaded_model")):
-                cached_loaded = _normalize_model_name(
-                    (cached_runtime or {}).get("loaded_model")
-                )
-                if cached_loaded and cached_loaded in current_models:
-                    runtime["loaded_model"] = cached_loaded
-                    runtime["model_loaded"] = True
+        if cached_models is None and current_inventory_reachable:
+            cached_models = probe_models
+            models_source = "probe"
         if should_refresh_models:
             listed_result = adapter.list_models(cfg)
             inventory_reachable = bool(

@@ -13,6 +13,7 @@
   flex: 1 1 auto;
   min-height: 0;
   max-height: calc(100vh - var(--topbar-total-height) - 40px);
+  max-height: calc(100dvh - var(--topbar-total-height) - 40px);
   overflow-y: auto;
   overflow-x: hidden;
   overscroll-behavior: none;
@@ -132,11 +133,11 @@ body.dark-mode .settings-container {
   background:
     linear-gradient(
       180deg,
-      color-mix(in oklab, var(--theme-c1-dark) 24%, transparent),
-      color-mix(in oklab, var(--theme-warm-black) 18%, transparent)
+      color-mix(in oklab, var(--theme-c1-light) 18%, transparent),
+      color-mix(in oklab, var(--theme-c1-dark) 14%, transparent)
     ),
-    color-mix(in oklab, var(--glass-tint-strong) 88%, transparent);
-  color: color-mix(in oklab, var(--theme-very-light) 72%, var(--color-text-muted) 28%);
+    color-mix(in oklab, var(--glass-tint-strong) 96%, var(--color-background-secondary) 4%);
+  color: var(--color-text);
   padding: 7px 12px;
   font-size: 0.74rem;
   font-weight: 700;
@@ -149,7 +150,7 @@ body.dark-mode .settings-container {
 
 .settings-container .settings-topbar .settings-topbar-button:hover:not(:disabled) {
   transform: translateY(-1px);
-  color: color-mix(in oklab, var(--theme-very-light) 82%, var(--color-mint-green) 18%);
+  color: var(--color-text);
   background:
     linear-gradient(
       180deg,
@@ -176,9 +177,10 @@ body.dark-mode .settings-container {
 }
 
 .settings-container .settings-topbar .settings-topbar-button.is-filtered {
-  opacity: 0.46;
-  filter: saturate(0.58);
-  background: color-mix(in oklab, var(--glass-tint) 92%, transparent);
+  opacity: 0.76;
+  filter: saturate(0.78);
+  background: color-mix(in oklab, var(--glass-tint-strong) 94%, transparent);
+  color: var(--color-text-muted);
   box-shadow: none;
 }
 
@@ -242,352 +244,6 @@ body.dark-mode .settings-container {
   margin: 0 4px;
 }
 
-.workflow-profile-grid {
-  display: grid;
-  gap: 12px;
-  margin-top: 12px;
-}
-
-.workflow-profile-card {
-  display: grid;
-  gap: 10px;
-  padding: 14px 16px;
-  border: 1px solid var(--glass-border);
-  border-radius: 16px;
-  background: color-mix(in oklab, var(--glass-panel-bg) 86%, transparent);
-}
-
-.workflow-profile-card.is-selected {
-  border-color: color-mix(in oklab, var(--color-accent) 52%, var(--glass-border) 48%);
-  box-shadow: 0 0 0 1px color-mix(in oklab, var(--color-accent) 18%, transparent);
-}
-
-.workflow-profile-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.workflow-profile-header h3 {
-  margin: 0;
-}
-
-.workflow-profile-header .status-note {
-  margin: 6px 0 0;
-}
-
-.workflow-profile-badge {
-  display: inline-flex;
-  align-items: center;
-  padding: 4px 10px;
-  border-radius: 999px;
-  border: 1px solid color-mix(in oklab, var(--color-accent) 46%, var(--glass-border) 54%);
-  background: color-mix(in oklab, var(--color-accent) 18%, transparent);
-  color: var(--color-text);
-  font-size: 0.82rem;
-  font-weight: 600;
-  white-space: nowrap;
-}
-
-.workflow-profile-meta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px 16px;
-  color: var(--color-text-muted);
-  font-size: 0.92rem;
-}
-
-.workflow-profile-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.workflow-profile-tag {
-  display: inline-flex;
-  align-items: center;
-  padding: 4px 10px;
-  border-radius: 999px;
-  border: 1px solid color-mix(in oklab, var(--glass-border) 82%, transparent);
-  background: color-mix(in oklab, var(--glass-border) 18%, transparent);
-  color: var(--color-text);
-  font-size: 0.84rem;
-}
-
-.workflow-profile-tag--muted {
-  opacity: 0.72;
-}
-
-.workflow-modules-heading {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 8px;
-}
-
-.workflow-modules-heading .status-note {
-  margin: 4px 0 0;
-}
-
-.workflow-module-count,
-.workflow-module-status,
-.workflow-module-tools,
-.workflow-module-source {
-  display: inline-flex;
-  align-items: center;
-  white-space: nowrap;
-  border-radius: 999px;
-  font-size: 0.78rem;
-  line-height: 1;
-}
-
-.workflow-module-count {
-  padding: 5px 9px;
-  border: 1px solid var(--glass-border);
-  color: var(--color-text-muted);
-}
-
-.workflow-modules-card {
-  display: grid;
-  gap: 10px;
-  margin-top: 12px;
-}
-
-.workflow-module-heading-actions {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.workflow-module-heading-actions select {
-  width: auto;
-  min-width: 180px;
-  margin: 0;
-}
-
-.workflow-module-location code {
-  font-size: 0.82rem;
-}
-
-.settings-help-dot {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 18px;
-  height: 18px;
-  border: 1px solid var(--glass-border);
-  border-radius: 999px;
-  color: var(--color-text-muted);
-  font-size: 0.76rem;
-  font-weight: 700;
-  cursor: help;
-}
-
-.workflow-module-list {
-  display: grid;
-  gap: 6px;
-}
-
-.workflow-module-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 10px;
-  align-items: start;
-  padding: 8px 10px;
-  border: 1px solid color-mix(in oklab, var(--glass-border) 74%, transparent);
-  border-radius: 10px;
-  background: color-mix(in oklab, var(--glass-panel-bg) 58%, transparent);
-}
-
-.settings-container label.workflow-module-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  margin-top: 0;
-  font-weight: inherit;
-}
-
-.settings-container label.workflow-module-row input[type="checkbox"] {
-  width: auto;
-  margin-top: 3px;
-  justify-self: end;
-}
-
-.workflow-module-main {
-  min-width: 0;
-}
-
-.workflow-module-title {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-}
-
-.workflow-module-source {
-  padding: 3px 7px;
-  border: 1px solid color-mix(in oklab, var(--color-text-muted) 28%, transparent);
-  color: var(--color-text-muted);
-}
-
-.workflow-module-source--base {
-  border-color: color-mix(in oklab, var(--color-accent) 34%, transparent);
-  color: var(--color-accent);
-}
-
-.workflow-module-source--custom,
-.workflow-module-source--local {
-  border-color: color-mix(in oklab, var(--color-success, #4f9f68) 42%, transparent);
-  color: var(--color-success, #4f9f68);
-}
-
-.workflow-module-status,
-.workflow-module-tools {
-  color: var(--color-text-muted);
-}
-
-.workflow-module-description {
-  display: block;
-  margin: 3px 0 0;
-}
-
-.workflow-module-details {
-  display: grid;
-  gap: 10px;
-  padding: 10px;
-  border: 1px dashed color-mix(in oklab, var(--glass-border) 82%, transparent);
-  border-radius: 12px;
-  background: color-mix(in oklab, var(--glass-panel-bg) 42%, transparent);
-}
-
-.workflow-module-detail-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 10px;
-}
-
-.workflow-module-detail-grid p {
-  margin: 4px 0 0;
-  color: var(--color-text-muted);
-  font-size: 0.86rem;
-  line-height: 1.4;
-  overflow-wrap: anywhere;
-}
-
-.workflow-detail-label {
-  color: var(--color-text);
-  font-size: 0.78rem;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-}
-
-.workflow-config-editor {
-  width: 100%;
-  min-height: 120px;
-  padding: 8px 10px;
-  border: 1px solid var(--glass-border);
-  border-radius: 10px;
-  background: color-mix(in oklab, var(--glass-panel-bg) 72%, transparent);
-  color: var(--color-text);
-  font-family: "Cascadia Code", "Fira Code", Consolas, monospace;
-  font-size: 0.82rem;
-  line-height: 1.4;
-}
-
-.workflow-skill-manager {
-  display: grid;
-  gap: 8px;
-  margin-top: 14px;
-  padding: 10px;
-  border: 1px solid color-mix(in oklab, var(--glass-border) 72%, transparent);
-  border-radius: 12px;
-  background: color-mix(in oklab, var(--glass-panel-bg) 50%, transparent);
-}
-
-.workflow-skill-manager--subcard {
-  margin-top: 0;
-}
-
-.workflow-skill-meta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px 14px;
-  color: var(--color-text-muted);
-  font-size: 0.86rem;
-}
-
-.workflow-skill-meta code {
-  font-size: 0.78rem;
-}
-
-.workflow-skill-editor {
-  width: 100%;
-  min-height: 180px;
-  resize: vertical;
-  padding: 10px 12px;
-  border: 1px solid var(--glass-border);
-  border-radius: 10px;
-  background: color-mix(in oklab, var(--glass-panel-bg) 78%, transparent);
-  color: var(--color-text);
-  font-family: "Cascadia Code", "Fira Code", Consolas, monospace;
-  font-size: 0.88rem;
-  line-height: 1.45;
-}
-
-.workflow-pack-manager {
-  display: grid;
-  gap: 8px;
-  padding: 10px;
-  border: 1px solid color-mix(in oklab, var(--glass-border) 72%, transparent);
-  border-radius: 10px;
-  background: color-mix(in oklab, var(--glass-panel-bg) 50%, transparent);
-}
-
-.workflow-pack-manager--flat {
-  padding: 0;
-  border: 0;
-  background: transparent;
-}
-
-.workflow-pack-grid {
-  display: grid;
-  grid-template-columns: minmax(120px, 0.8fr) minmax(220px, 1.6fr) auto;
-  align-items: center;
-  gap: 8px;
-}
-
-.workflow-pack-grid .field-label {
-  margin-top: 0;
-}
-
-.workflow-pack-grid input[type="text"] {
-  min-width: 0;
-  margin: 0;
-}
-
-.workflow-pack-actions,
-.workflow-pack-overwrite {
-  display: inline-flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.workflow-pack-overwrite {
-  color: var(--color-text-muted);
-  font-size: 0.86rem;
-}
-
-.workflow-pack-overwrite input[type="checkbox"] {
-  width: auto;
-  margin: 0;
-}
-
 .settings-container label {
   display: block;
   margin-top: 10px;
@@ -605,6 +261,117 @@ body.dark-mode .settings-container {
   flex: 0 0 auto;
   cursor: help;
 }
+.settings-heading-with-help {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.settings-heading-with-help h3,
+.settings-heading-with-help h4 {
+  margin: 0;
+}
+
+.settings-info-tip {
+  position: relative;
+  z-index: 2;
+  display: inline-flex;
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  align-items: center;
+  justify-content: center;
+  margin-left: 5px;
+  border: 1px solid color-mix(in oklab, var(--color-mint-green) 58%, var(--glass-border) 42%);
+  border-radius: 50%;
+  background: color-mix(in oklab, var(--glass-tint-strong) 88%, var(--color-mint-green) 12%);
+  color: var(--color-text);
+  font-size: 0.72rem;
+  font-weight: 800;
+  line-height: 1;
+  cursor: help;
+}
+
+.settings-info-tip:focus-visible {
+  outline: 2px solid var(--color-mint-green);
+  outline-offset: 2px;
+}
+
+.settings-info-tip-content {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 9px);
+  z-index: 20;
+  width: min(320px, 72vw);
+  padding: 9px 11px;
+  border: 1px solid var(--glass-border);
+  border-radius: 9px;
+  background: var(--color-background-secondary);
+  box-shadow: 0 12px 28px color-mix(in oklab, var(--theme-warm-black) 24%, transparent);
+  color: var(--color-text);
+  font-size: 0.8rem;
+  font-weight: 500;
+  line-height: 1.4;
+  text-align: left;
+  text-transform: none;
+  letter-spacing: normal;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translate(-50%, 4px);
+  transition: opacity 120ms ease, transform 120ms ease, visibility 120ms ease;
+}
+
+.settings-info-tip:hover .settings-info-tip-content,
+.settings-info-tip:focus .settings-info-tip-content,
+.settings-info-tip:focus-within .settings-info-tip-content {
+  opacity: 1;
+  visibility: visible;
+  transform: translate(-50%, 0);
+}
+
+.settings-container label.settings-toggle-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  cursor: pointer;
+}
+
+.settings-container label.settings-toggle-row input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  padding: 0;
+}
+
+.settings-container label.settings-toggle-row .settings-info-tip {
+  margin-left: 0;
+}
+
+.settings-container label.settings-toggle-row--compact {
+  margin-top: 0;
+  white-space: nowrap;
+}
+
+.settings-toggle-stack {
+  display: flex;
+  align-items: center;
+  gap: 12px 18px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.settings-toggle-stack .settings-toggle-row {
+  margin-top: 0;
+}
+
+.advanced-grid .advanced-grid-span {
+  grid-column: 1 / -1;
+}
+
 .settings-container input,
 .settings-container select {
   width: 100%;
@@ -637,6 +404,160 @@ body.dark-mode .settings-container {
   text-decoration: none;
   box-sizing: border-box;
 }
+
+.settings-container a.settings-inline-link {
+  min-height: 40px;
+  margin-top: 0;
+  border-color: color-mix(in oklab, var(--color-pear-green) 54%, var(--glass-border) 46%);
+  border-radius: 10px;
+  background: color-mix(in oklab, var(--color-pear-green) 18%, var(--glass-tint-strong) 82%);
+  color: var(--color-text);
+  font-size: 0.84rem;
+  font-weight: 650;
+}
+
+.settings-link-row,
+.settings-collapsible-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.settings-link-row > div {
+  min-width: 0;
+}
+
+.settings-link-row strong,
+.settings-link-row span {
+  display: block;
+}
+
+.settings-link-row span {
+  margin-top: 2px;
+  color: var(--color-text-muted);
+  font-size: 0.82rem;
+}
+
+.settings-disclosure,
+.tool-browser-disclosure {
+  margin-top: 12px;
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  background: color-mix(in oklab, var(--glass-tint) 88%, transparent);
+}
+
+.settings-disclosure > summary,
+.tool-browser-disclosure > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 42px;
+  padding: 9px 11px;
+  color: var(--color-text);
+  font-weight: 750;
+  cursor: pointer;
+  list-style: none;
+}
+
+.settings-disclosure > summary::-webkit-details-marker,
+.tool-browser-disclosure > summary::-webkit-details-marker,
+.tool-browser-card > summary::-webkit-details-marker {
+  display: none;
+}
+
+.settings-disclosure > summary::after,
+.tool-browser-disclosure > summary::after {
+  content: "+";
+  margin-left: auto;
+  color: var(--color-text-muted);
+  font-size: 1rem;
+}
+
+.settings-disclosure[open] > summary::after,
+.tool-browser-disclosure[open] > summary::after {
+  content: "−";
+}
+
+.settings-disclosure > summary .settings-info-tip {
+  margin-left: 0;
+  margin-right: auto;
+}
+
+.settings-disclosure-body,
+.settings-collapsible-body,
+.tool-browser-disclosure-body {
+  padding: 0 11px 12px;
+  border-top: 1px solid color-mix(in oklab, var(--glass-border) 62%, transparent);
+}
+
+.settings-collapsible-heading {
+  padding: 10px 0;
+}
+
+.settings-collapsible-heading h4 {
+  font-size: 0.94rem;
+}
+
+.settings-compact-actions,
+.settings-action-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.settings-container .settings-compact-actions button,
+.settings-container .settings-action-row button,
+.settings-container .settings-action-row a {
+  margin-top: 0;
+}
+
+.settings-container .settings-action-btn {
+  min-width: 170px;
+  min-height: 42px;
+  text-decoration: none;
+}
+
+.settings-instructions-field {
+  width: 100%;
+  min-height: 320px;
+  box-sizing: border-box;
+  line-height: 1.45;
+  resize: vertical;
+}
+
+.capture-privacy-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.settings-container label.capture-privacy-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  min-height: 48px;
+  margin-top: 0;
+  padding: 10px 11px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 76%, transparent);
+  border-radius: 10px;
+  background: color-mix(in oklab, var(--glass-panel-bg) 58%, transparent);
+  line-height: 1.35;
+  cursor: pointer;
+}
+
+.settings-container label.capture-privacy-option input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  margin: 1px 0 0;
+  padding: 0;
+}
 .settings-container button:disabled {
   opacity: 0.6;
   cursor: not-allowed;
@@ -649,6 +570,17 @@ body.dark-mode .settings-container {
 .secret-input-row input {
   flex: 1 1 auto;
   width: auto;
+}
+.server-preset-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.server-preset-controls select {
+  flex: 1 1 260px;
+  width: auto;
+  min-width: 0;
 }
 .secret-toggle-btn {
   margin-top: 5px;
@@ -1076,62 +1008,6 @@ body.dark-mode .settings-toolbar-card {
   overflow-wrap: anywhere;
 }
 
-.settings-sync-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 60;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
-  background: rgba(13, 18, 24, 0.62);
-  backdrop-filter: blur(10px);
-}
-
-.settings-sync-dialog {
-  width: min(720px, 100%);
-  max-height: min(80vh, 720px);
-  overflow: auto;
-  padding: 18px;
-  border: 1px solid var(--glass-border);
-  border-radius: var(--radius-md);
-  background: color-mix(in oklab, var(--glass-tint) 94%, transparent);
-  box-shadow: var(--glass-shadow);
-}
-
-.settings-sync-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.settings-sync-header h3 {
-  margin: 0 0 6px;
-}
-
-.settings-sync-grid {
-  display: grid;
-  gap: 10px;
-  margin-top: 16px;
-}
-
-.settings-sync-row {
-  display: grid;
-  grid-template-columns: auto 1fr;
-  gap: 10px;
-  align-items: flex-start;
-  padding: 12px;
-  border: 1px solid var(--glass-border);
-  border-radius: var(--radius-sm);
-  background: var(--glass-tint);
-}
-
-.settings-sync-row input {
-  width: auto;
-  margin-top: 2px;
-}
-
 /* Reuse dot styles similar to TopBar */
 .status-dot {
   width: 10px;
@@ -1154,23 +1030,44 @@ body.dark-mode .settings-toolbar-card {
 }
 .celery-header {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
+  gap: 10px 16px;
+  flex-wrap: wrap;
+}
+.celery-title-row,
+.celery-toolbar-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.celery-title-row h3 {
+  margin: 0;
+}
+.celery-toolbar-controls {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.settings-container .celery-toolbar-controls select {
+  width: 138px;
+  margin-top: 0;
+}
+.settings-container .celery-toolbar-controls button {
+  min-height: 38px;
+  margin-top: 0;
+  padding: 8px 14px;
 }
 .celery-notice {
   display: flex;
-  flex-direction: column;
-  gap: 3px;
+  align-items: center;
+  gap: 7px;
   margin-top: 10px;
-  padding: 10px 12px;
+  padding: 8px 10px;
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-sm);
   background: color-mix(in oklab, var(--glass-tint-strong) 82%, transparent);
   color: var(--color-text);
-}
-.celery-notice span {
-  color: var(--color-text-muted);
-  font-size: 0.82rem;
 }
 .celery-notice--degraded,
 .celery-notice--loading {
@@ -1667,6 +1564,8 @@ body.dark-mode .model-lane-switch {
   font-weight: 700;
   letter-spacing: 0.03em;
   text-transform: uppercase;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .runtime-inline-chip--local {
@@ -1924,6 +1823,21 @@ body.dark-mode .model-lane-switch {
   background: color-mix(in oklab, var(--glass-tint) 88%, transparent);
 }
 
+.tool-browser-summary-count {
+  margin-left: auto;
+  color: var(--color-text-muted);
+  font-size: 0.76rem;
+  font-weight: 650;
+}
+
+.tool-browser-disclosure > summary::after {
+  margin-left: 0;
+}
+
+.tool-browser-disclosure-body {
+  padding-top: 11px;
+}
+
 .tool-browser-source-grid {
   margin-top: 12px;
   display: grid;
@@ -1986,10 +1900,36 @@ body.dark-mode .model-lane-switch {
 }
 
 .tool-browser-card {
-  padding: 12px;
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-sm);
   background: color-mix(in oklab, var(--glass-tint) 90%, transparent);
+}
+
+.tool-browser-card > summary {
+  align-items: center;
+  min-height: 48px;
+  padding: 10px 12px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.tool-browser-card > summary::before {
+  content: "›";
+  flex: 0 0 auto;
+  color: var(--color-text-muted);
+  font-size: 1.1rem;
+  line-height: 1;
+  transform: rotate(0deg);
+  transition: transform 120ms ease;
+}
+
+.tool-browser-card[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.tool-browser-card-body {
+  padding: 0 12px 12px;
+  border-top: 1px solid color-mix(in oklab, var(--glass-border) 58%, transparent);
 }
 
 .tool-browser-empty-state {
@@ -2075,6 +2015,7 @@ body.dark-mode .model-lane-switch {
 @media (max-width: 760px) {
   .main-chat--settings .settings-container {
     max-height: calc(100vh - var(--topbar-total-height) - 20px);
+    max-height: calc(100dvh - var(--topbar-total-height) - 20px);
     margin: 10px auto;
     padding: 16px;
   }
@@ -2101,10 +2042,6 @@ body.dark-mode .model-lane-switch {
 
   .settings-topbar-actions {
     justify-self: end;
-  }
-
-  .workflow-profile-header {
-    flex-direction: column;
   }
 
   .settings-layout {
@@ -2136,18 +2073,48 @@ body.dark-mode .model-lane-switch {
     width: 100%;
   }
 
-  .tool-browser-limit-row,
-  .tool-browser-policy-grid,
-  .tool-browser-detail-grid,
-  .workflow-pack-grid {
-    grid-template-columns: 1fr;
+  .settings-link-row,
+  .settings-collapsible-heading {
+    align-items: stretch;
+    flex-direction: column;
   }
 
-  .workflow-pack-actions {
+  .settings-container a.settings-inline-link,
+  .settings-collapsible-heading .runtime-inline-btn {
+    width: 100%;
+  }
+
+  .celery-header,
+  .celery-toolbar-controls {
+    align-items: stretch;
+  }
+
+  .celery-toolbar-controls {
+    width: 100%;
     justify-content: flex-start;
+  }
+
+  .settings-container .celery-toolbar-controls select {
+    flex: 1 1 150px;
+    width: auto;
+  }
+
+  .settings-container .settings-action-btn {
+    flex: 1 1 100%;
+    width: 100%;
+  }
+
+  .tool-browser-limit-row,
+  .tool-browser-policy-grid,
+  .tool-browser-detail-grid {
+    grid-template-columns: 1fr;
   }
 
   .settings-subcard {
     padding: 12px;
+  }
+
+  .capture-privacy-options {
+    grid-template-columns: 1fr;
   }
 }

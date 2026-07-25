@@ -163,16 +163,21 @@ def accept_offer(
             continue
         if offer.get("accepted_at"):
             raise ValueError("Pairing offer has already been used")
-        offer["accepted_at"] = _now()
-        offer["accepted_by"] = {
-            "device_name": str(device_name or "").strip() or "device",
-            "public_key": str(public_key or "").strip(),
-            "candidate_urls": list(candidate_urls or []),
-            "relay_url": str(relay_url or "").strip() or None,
+        accepted_offer = {
+            **offer,
+            "accepted_at": _now(),
+            "accepted_by": {
+                "device_name": str(device_name or "").strip() or "device",
+                "public_key": str(public_key or "").strip(),
+                "candidate_urls": list(candidate_urls or []),
+                "relay_url": str(relay_url or "").strip() or None,
+            },
         }
-        state["offers"][offer_id] = offer
+        # Pairing codes and candidate addresses are one-time enrollment data.
+        # Remove them from persistent state as soon as the offer is consumed.
+        del state["offers"][offer_id]
         _save_state(state)
-        return offer
+        return accepted_offer
     raise ValueError("Pairing offer was not found or has expired")
 
 
@@ -200,3 +205,8 @@ def create_session(
     state["sessions"][session_id] = session
     _save_state(state)
     return session
+
+
+# Avoid retaining the last expired offer/session forever when Float restarts and
+# no later rendezvous operation happens to trigger lazy cleanup.
+_purge_expired(_load_state())

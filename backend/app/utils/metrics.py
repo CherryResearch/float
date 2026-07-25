@@ -8,10 +8,10 @@ from fastapi import FastAPI, Request, Response
 try:
     from prometheus_client import (
         CONTENT_TYPE_LATEST,
+        REGISTRY,
         Counter,
         Histogram,
         generate_latest,
-        REGISTRY,
     )
 except Exception:  # pragma: no cover - optional dependency
     CONTENT_TYPE_LATEST = "text/plain; version=0.0.4; charset=utf-8"
@@ -177,5 +177,3 @@ def init_metrics(app: FastAPI, config: Dict[str, Any]) -> None:
     async def metrics_endpoint() -> Response:  # type: ignore
         data = generate_latest(REGISTRY)
         return Response(content=data, media_type=CONTENT_TYPE_LATEST)
-
-

@@ -1,16 +1,17 @@
 # Float API Reference
 
-Updated: 2026-04-13
+Updated: 2026-07-16
 
 This is a curated reference for the current local FastAPI surface. Most routes are mounted under `/api`; root health probes also exist at `/` and `/health`.
 
-The implementation source of truth is `backend/app/routes.py` plus the app setup in `backend/app/main.py`. Keep this file high-level enough to stay readable, and check route definitions before adding exact request/response schemas.
+The implementation source of truth is the router aggregate in `backend/app/routes.py`, its included domain routers under `backend/app/routers/` plus legacy extractions such as `backend/app/routes_graph.py`, and the app setup in `backend/app/main.py`. Keep this file high-level enough to stay readable, and check route definitions before adding exact request/response schemas.
 
 ## Health And Status
 
 | Endpoint | Method | Purpose |
 | --- | --- | --- |
 | `/health`, `/api/health` | `GET` | Basic backend readiness. |
+| `/api/instance` | `GET` | Current software/build receipt and deployment/data identity as separate status dimensions, including deterministic data revision, local revision-observation time, workspace lineage/origin/upstream identity, and latest sync checkpoint. Opening Sync also refreshes this deployment in the machine-local registry. |
 | `/api/mcp/status` | `GET` | MCP bridge status. |
 | `/api/celery/status` | `GET` | Worker/broker status summary. |
 | `/api/celery/tasks` | `GET` | Current Celery task view for diagnostics. |
@@ -31,7 +32,9 @@ Chat modes are `api`, `local`, and `server`.
 
 - `api` uses the configured OpenAI-compatible API URL, defaulting to OpenAI Responses.
 - `local` uses direct local Transformers or a managed local provider marker such as LM Studio/Ollama.
-- `server` uses a user-supplied OpenAI-compatible `server_url` and does not manage that server process.
+- `server` uses a preset or user-supplied OpenAI-compatible `server_url` and does not manage that server process. Presets keep bearer tokens in named process environment variables. Tinker inventory is account-aware and includes supported base models plus the account's sampler checkpoints.
+
+The chat, continuation, and generation request models accept `thinking` as a boolean, named level, or numeric effort. Named levels are `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`; numeric efforts are clamped to `0` through `0.99`. Tinker / Inkling receives numeric effort directly, while other recognized reasoning models round it to the nearest named level. These requests also accept optional `max_output_tokens` from `1` through `2000000`. Omitting it leaves the cap to the provider; it is not inferred from reasoning effort. Float returns `metadata.reasoning` for effort details and `metadata.generation` with the explicit maximum or `provider_default`. A provider finish reason such as `length` is reported as `output_truncated` with termination category `output_token_limit`; unsupported reasoning controls, context-window failures, and output-token failures receive separate error categories and hints. Live voice keeps its own provider/session output behavior.
 
 ## Voice And Live Streaming
 
@@ -60,7 +63,7 @@ OpenAI TTS uses `/v1/audio/speech` with `gpt-4o-mini-tts`, `tts-1`, or `tts-1-hd
 | `/api/tools/decision` | `POST` | Approve, deny, or edit a proposed tool call. |
 | `/api/tools/client-resolve` | `POST` | Resolve client-side tool work such as camera capture. |
 | `/api/tools/schedule` | `POST` | Schedule a tool/action follow-up. |
-| `/api/actions` | `GET` | List tracked write actions. |
+| `/api/actions` | `GET` | List tracked write actions plus non-revertible deployment metadata events. Content-bearing undo snapshots still follow the configured Action History retention. |
 | `/api/actions/{action_id}` | `GET` | Inspect a tracked action/diff. |
 | `/api/actions/revert` | `POST` | Revert tracked write actions when conflict checks allow it. |
 | `/api/agents/console` | `GET` | Hydrate Agent Console cards after refresh/reconnect. |
@@ -96,6 +99,8 @@ Current built-in tool metadata lives in `backend/app/tool_catalog.py`; current c
 | `/api/memory/search` | `POST` | Deterministic memory text search. |
 | `/api/memory/rag/rehydrate` | `POST` | Reindex memory rows into RAG. |
 | `/api/memory/graph` | `GET` | Current memory/provenance graph projection. |
+| `/api/graph/schema` | `GET` | Durable graph node/claim schema for tools and editors. |
+| `/api/graph` | `GET` / `POST` | Read or upsert durable graph nodes and multi-role claims; `POST` returns an action-history revision when tracking is enabled. |
 | `/api/knowledge/upload` | `POST` | Upload a document into knowledge. |
 | `/api/knowledge/add` | `POST` | Add an existing allowed path or URL-like source. |
 | `/api/knowledge/text` | `POST` | Add freeform text. |
@@ -125,8 +130,8 @@ SQLite is the canonical knowledge/memory store. Chroma is the default retrieval 
 | `/api/conversations/{name:path}/rename` | `POST` | Rename/move a conversation. |
 | `/api/conversations/{name:path}/export` | `GET` | Export one conversation. |
 | `/api/conversations/export-all` | `GET` | Export all conversations. |
-| `/api/conversations/import/preview` | `POST` | Preview import payloads. |
-| `/api/conversations/import` | `POST` | Import Markdown/JSON/text/OpenAI-style export content. |
+| `/api/conversations/import/preview` | `POST` | Preview JSON/ZIP candidates or classify Markdown/text as a conversation, document, or ambiguous content without writing it. |
+| `/api/conversations/import` | `POST` | Import conversation content. Document-classified Markdown/text is rejected; ambiguous Markdown/text requires explicit conversation intent and confirmation. |
 | `/api/conversations/reveal/{name:path}` | `GET` | Reveal a saved conversation location. |
 | `/api/conversations/{name:path}/suggest-name` | `GET` | Suggest a better display name. |
 | `/api/threads/generate` | `POST` | Generate/update semantic thread summaries. Supports high-level topic inference, seeded `manual_threads`, `embedding_model`, selectable `topic_suggestion_provider`/`topic_suggestion_model`, and default-on `sensitive_mode` that blocks API topic labeling for protected/secret conversation scopes. |
@@ -165,17 +170,18 @@ Conversation sidecar metadata can exist without a matching conversation JSON fil
 | `/api/themes` | `GET` / `POST` | List or save user-created themes. |
 | `/api/themes/{theme_id}` | `DELETE` | Delete a user theme. |
 | `/api/workflows/catalog` | `GET` | Read built-in workflow profile metadata. |
-| `/api/openai/models` | `GET` | Cached model inventory for the configured OpenAI-compatible API provider. |
+| `/api/openai/models` | `GET` | Cached provider inventory plus `selectable_models`, lifecycle `catalog`, and optional persisted-selection `migration`; accepts `selected_model` and `include_non_chat`. |
 | `/api/llm/provider/status` | `GET` | Managed local provider runtime status. |
 | `/api/llm/provider/models` | `GET` | Managed local provider model inventory. |
 | `/api/llm/provider/start`, `/api/llm/provider/stop` | `POST` | Start/stop local-managed provider server when supported. |
 | `/api/llm/provider/load`, `/api/llm/provider/unload` | `POST` | Load/unload a provider-managed model when supported. |
-| `/api/llm/server/models` | `GET` | Probe a Server/LAN OpenAI-compatible endpoint for models. |
+| `/api/llm/server/models` | `GET` | Probe a Server/LAN OpenAI-compatible endpoint for models. Accepts `server_url`, optional `preset_id`, and `refresh`; returns normalized `model_details` when the provider reports context or maximum-output limits. The Tinker preset uses authenticated account inventory rather than assuming a generic `/models` response and currently reports base-model context lengths from the Tinker SDK. |
 | `/api/llm/local-status`, `/api/llm/load-local`, `/api/llm/unload-local` | `GET` / `POST` | Direct local Transformers runtime status/load/unload. |
 | `/api/models/supported` | `GET` | Current built-in supported model ids. |
 | `/api/models/downloadable` | `GET` | Downloadable model catalog entries. |
-| `/api/models/registered` | `GET` / `POST` | Local registered model aliases. |
-| `/api/models/registered/{alias}` | `DELETE` | Remove a local registered model alias. |
+| `/api/models/registered` | `GET` / `POST` | List user-registered local/Hugging Face models or register an existing local path. |
+| `/api/models/registered/huggingface` | `POST` | Normalize and persist a Hugging Face model URL or `owner/repo` in the user's model catalog. |
+| `/api/models/registered/{alias}` | `DELETE` | Remove a user-registered local or Hugging Face model alias without deleting external source files. |
 | `/api/models/jobs` | `GET` / `POST` | List/create model download jobs. |
 | `/api/models/jobs/{job_id}` | `GET` | Read one model job. |
 | `/api/models/jobs/{job_id}/pause`, `/resume`, `/cancel` | `POST` | Control a model job. |
@@ -185,7 +191,7 @@ Conversation sidecar metadata can exist without a matching conversation JSON fil
 | `/api/models/reveal/{model_name}` | `GET` | Reveal local model path. |
 | `/api/models/{model_name}` | `DELETE` | Delete a local model payload. |
 
-Current API defaults focus on `gpt-5.4`; direct-local Gemma 4 targets `gemma-4-E2B-it` plus unquantized QAT aliases, while QAT GGUF Gemma 4 aliases are provider/server-first.
+Current API defaults focus on OpenAI `chat-latest` (`GPT latest (...)` in the UI when inventory is available); direct-local Gemma 4 targets `gemma-4-E2B-it`; larger Gemma 4 checkpoints are provider/server-first.
 
 ## Trusted Devices And Sync
 
@@ -198,15 +204,16 @@ Current API defaults focus on `gpt-5.4`; direct-local Gemma 4 targets `gemma-4-E
 | `/api/devices/prune-legacy` | `POST` | Prune legacy device records. |
 | `/api/pairing/offers` | `POST` | Create a pairing offer. |
 | `/api/pairing/offers/accept` | `POST` | Accept a pairing offer. |
-| `/api/sync/overview` | `GET` | Sync visibility, pairings, workspace profiles, and review state. |
+| `/api/sync/overview` | `GET` | Sync visibility, pairings, workspace profiles, data revision/checkpoint state, recent deployment metadata events, ledger-chain health, and review state. |
+| `/api/sync/events` | `GET` | List this deployment's content-free software/data event ledger. Supports `limit` and optional `event_type`; returns hash-chain verification state. |
 | `/api/sync/pair` | `POST` | Pair with another Float instance. |
 | `/api/sync/peer/status` | `POST` | Probe paired peer reachability. |
 | `/api/sync/pair/update`, `/api/sync/pair/revoke` | `POST` | Update/revoke saved pairings. |
-| `/api/sync/manifest` | `POST` | Remote manifest endpoint for authenticated sync. |
-| `/api/sync/export` | `POST` | Remote export endpoint for authenticated sync. |
+| `/api/sync/manifest` | `POST` | Remote manifest endpoint for authenticated sync, including deterministic scoped data revision. |
+| `/api/sync/export` | `POST` | Remote export endpoint for authenticated sync, including deterministic scoped data revision. |
 | `/api/sync/ingest` | `POST` | Remote ingest endpoint, reviewable unless auto-accept is enabled. |
-| `/api/sync/plan` | `POST` | Local preview of pull/push changes. |
-| `/api/sync/apply` | `POST` | Apply selected sync changes. |
+| `/api/sync/plan` | `POST` | Local preview of pull/push changes using a peer/workspace-scoped common ancestor when available. |
+| `/api/sync/apply` | `POST` | Apply selected sync changes and record a successful data checkpoint for later creation/edit/deletion/conflict classification. |
 | `/api/sync/reviews/{review_id}/approve`, `/reject` | `POST` | Approve or reject inbound push review items. |
 
 Sync covers conversations, memories, knowledge, graph rows, attachments, calendar files, and workspace preferences. It is an alpha trusted-device flow, not a public gateway or background-sync system.

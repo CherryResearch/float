@@ -1263,30 +1263,44 @@ def summarize_clusters(
 
     clusters = base_summary.get("clusters", {})
     threads_map: Dict[str, List[Dict[str, Any]]] = {}
-    seen_conv: set[Tuple[str, str]] = set()
+    thread_items: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for i, lbl in enumerate(labels):
         tname = clusters.get(str(int(lbl)), f"cluster_{int(lbl)}")
         if not tname:
             tname = f"cluster_{int(lbl)}"
         conv = nug_conversations[i]
         key = (tname, conv)
-        if key in seen_conv:
+        message_index = nug_msg_indices[i]
+        date = str(nug_datestamps[i] or "")
+        existing = thread_items.get(key)
+        if existing is not None:
+            message_indices = existing.setdefault("message_indices", [])
+            if message_index not in message_indices:
+                message_indices.append(message_index)
+            first_date = str(existing.get("first_date") or "")
+            latest_date = str(existing.get("latest_date") or "")
+            if date and (not first_date or date < first_date):
+                existing["first_date"] = date
+            if date and (not latest_date or date > latest_date):
+                existing["latest_date"] = date
             continue
-        seen_conv.add(key)
         score = cosine(
             embeddings[i],
             centroids.get(str(int(lbl)), embeddings[i]),
         )
         excerpt = "\n".join([ln for ln in nuggets_text[i].splitlines()][:4])
-        threads_map.setdefault(tname, []).append(
-            {
-                "conversation": conv,
-                "message_index": nug_msg_indices[i],
-                "date": nug_datestamps[i],
-                "score": round(float(score), 4),
-                "excerpt": excerpt,
-            }
-        )
+        item = {
+            "conversation": conv,
+            "message_index": message_index,
+            "message_indices": [message_index],
+            "date": date,
+            "first_date": date,
+            "latest_date": date,
+            "score": round(float(score), 4),
+            "excerpt": excerpt,
+        }
+        threads_map.setdefault(tname, []).append(item)
+        thread_items[key] = item
     base_summary["threads"] = threads_map
 
     return base_summary, centroids

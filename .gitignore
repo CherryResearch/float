@@ -32,6 +32,8 @@ Thumbs.db
 # Node.js
 node_modules/
 dist/
+# The repository-root workspace lockfile is authoritative.
+frontend/package-lock.json
 
 # Project data
 /data/

@@ -32,13 +32,22 @@ const responseLabelFor = (action) => {
 };
 
 const ACTION_KIND_LABELS = {
+  data: "data",
+  deployment: "deployment",
   revert: "undo",
+  sync: "sync",
 };
 
 const ACTION_NAME_LABELS = {
   revert_actions: "undo",
   sync_ingest: "incoming sync",
   sync_pull: "sync pull",
+  data_bulk_replace: "bulk replacement",
+  data_delete: "deletion",
+  data_restore: "restore",
+  data_safety_snapshot: "safety snapshot",
+  data_sync: "sync event",
+  software_install: "software install",
 };
 
 const normalizeActionLabel = (value, fallback) => {
@@ -571,14 +580,16 @@ const ActionHistoryPanel = ({
                               </button>
                               {!isCompact ? (
                                 <>
-                                  <button
-                                    type="button"
-                                    className="agent-card-control-btn"
-                                    onClick={() => toggleDiff(actionId)}
-                                    disabled={!backendReady}
-                                  >
-                                    {isExpanded ? "Hide diff" : "Show diff"}
-                                  </button>
+                                  {!action.metadata_only ? (
+                                    <button
+                                      type="button"
+                                      className="agent-card-control-btn"
+                                      onClick={() => toggleDiff(actionId)}
+                                      disabled={!backendReady}
+                                    >
+                                      {isExpanded ? "Hide diff" : "Show diff"}
+                                    </button>
+                                  ) : null}
                                   <button
                                     type="button"
                                     className="agent-card-control-btn"

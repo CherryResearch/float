@@ -8,7 +8,7 @@ This document outlines the steps to set up the development environment for the F
 
 - **Python 3.11+**
 - **Poetry** for Python package management.
-- **Node.js 16+** with npm for frontend development.
+- **Node.js 20+** with npm for frontend development.
 - **Docker** (Optional, for containerized deployment).
 - **Redis server** (Required for Celery/background workers; optional for backend/frontend-only local runs).
 
@@ -39,14 +39,14 @@ poetry install --extras "workers"
 
 ### CUDA-enabled PyTorch (required for local GPU inference)
 
-Poetry pins the platform-agnostic `torch` package, but CUDA wheels live on
-vendor-specific indexes that cannot be encoded in `pyproject.toml`. After the
-initial install, activate the Poetry environment and replace the CPU wheel with
-the matching CUDA build, then add the MXFP4 kernels:
+Poetry pins the compatible `torch==2.10.0` / `torchvision==0.25.0` pair, but
+CUDA wheels live on vendor-specific indexes that cannot be selected dynamically
+in `pyproject.toml`. After the initial install, replace only the wheel source and
+keep those two versions aligned, then add the MXFP4 kernels:
 
 ```bash
 poetry shell
-python -m pip install --force-reinstall --index-url https://download.pytorch.org/whl/cu128 torch==2.7.1+cu128 torchvision==0.22.1+cu128 torchaudio==2.7.1+cu128
+python -m pip install --force-reinstall --index-url https://download.pytorch.org/whl/cu128 torch==2.10.0 torchvision==0.25.0
 python -m pip install --upgrade kernels
 ```
 
@@ -56,7 +56,7 @@ python -m pip install --upgrade kernels
 
 CPU-only fallback (fixes `torchvision::nms` mismatch errors):
 ```bash
-poetry run uv pip install --upgrade --force-reinstall --index-url https://download.pytorch.org/whl/cpu torch==2.7.1+cpu torchvision==0.22.1+cpu torchaudio==2.7.1+cpu
+poetry run uv pip install --upgrade --force-reinstall --index-url https://download.pytorch.org/whl/cpu torch==2.10.0 torchvision==0.25.0
 ```
 
 Verify that PyTorch now sees your GPU:
@@ -72,8 +72,9 @@ if torch.cuda.is_available():
 PY
 ```
 
-Swap `cu128`/`2.7.1` for the wheel that matches your CUDA runtime (e.g., `cu121`
-on older drivers). When the backend restarts, the Settings → Inference Device
+Swap `cu128` for the wheel index that matches your CUDA runtime. Do not mix a
+Torch release with a torchvision release from a different compatibility pair;
+`torchaudio` is not required by Float. When the backend restarts, the Settings → Inference Device
 panel will show a CUDA badge so you can confirm the runtime is ready.
 
 ### 2. Configure Environment Variables
@@ -101,11 +102,22 @@ Open the `.env` file and add your OpenAI API key and any other necessary configu
 OPENAI_API_KEY=your_openai_api_key
 
 # The default model to use for API mode
-OPENAI_MODEL=gpt-5.4
+OPENAI_MODEL=chat-latest
 
 # The URL for a local LLM (e.g., Ollama)
 LOCAL_LLM_URL=http://localhost:11434
 ```
+
+Server/LAN provider presets keep credentials in the backend process environment. Set only the keys for providers you use, then restart Float so the process can detect them:
+
+```env
+TINKER_API_KEY=your_tinker_api_key
+ANTHROPIC_API_KEY=your_anthropic_api_key
+GEMINI_API_KEY=your_gemini_api_key
+OPENROUTER_API_KEY=your_openrouter_api_key
+```
+
+The Settings UI persists `SERVER_URL`, `SERVER_PRESET_ID`, and custom preset metadata in `SERVER_PRESETS_JSON`. Custom presets may name an uppercase environment variable such as `MY_PROVIDER_API_KEY`; secret values are never written into preset JSON or returned by `/api/settings`. `OPENAI_API_KEY` and Cloud API mode remain the default path.
 
 Optional Hugging Face settings (backend defaults XET high-performance mode on):
 
@@ -187,10 +199,10 @@ The frontend is a React application built with Vite.
 
 ### 1. Install Dependencies
 
-Navigate to the `frontend` directory and install the required npm packages.
+Install from the repository root. The root workspace lockfile is the only npm
+dependency source of truth.
 
 ```bash
-cd frontend
 npm install
 ```
 If you encounter errors later about `vite` not being recognized, it means this step was not completed successfully.
@@ -200,8 +212,7 @@ If you encounter errors later about `vite` not being recognized, it means this s
 Once the dependencies are installed, you can start the Vite development server.
 
 ```bash
-# This command must be run from inside the 'frontend' directory
-npm run dev
+npm run dev --workspace frontend
 ```
 
 The frontend will be available at `http://localhost:5173` (or the next available port) and will proxy API requests to the backend.

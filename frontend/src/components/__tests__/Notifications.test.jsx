@@ -22,6 +22,32 @@ const toolNotification = {
   },
 };
 
+const installEventSourceHarness = () => {
+  const sources = [];
+
+  class FakeEventSource {
+    constructor() {
+      this.listeners = {};
+      this.onmessage = null;
+      sources.push(this);
+    }
+
+    addEventListener(type, handler) {
+      this.listeners[type] = handler;
+    }
+
+    emit(type, payload) {
+      const event = { data: JSON.stringify(payload) };
+      this.listeners[type]?.(event);
+    }
+
+    close() {}
+  }
+
+  global.EventSource = FakeEventSource;
+  return sources;
+};
+
 describe("Notifications", () => {
   const originalFetch = global.fetch;
   const originalEventSource = global.EventSource;
@@ -47,6 +73,106 @@ describe("Notifications", () => {
     } else {
       delete global.EventSource;
     }
+  });
+
+  it("minimizes notifications to a compact count and restores the tray", async () => {
+    render(<Notifications onOpenToolReview={vi.fn()} />);
+
+    const minimizeButton = await screen.findByRole("button", {
+      name: /minimize notifications/i,
+    });
+    expect(screen.getByRole("button", { name: /^accept$/i })).toBeInTheDocument();
+
+    fireEvent.click(minimizeButton);
+
+    const showButton = screen.getByRole("button", {
+      name: /show notifications: 1 tool awaiting review/i,
+    });
+    expect(showButton).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("button", { name: /^accept$/i })).not.toBeInTheDocument();
+
+    fireEvent.click(showButton);
+
+    expect(
+      screen.getByRole("button", { name: /minimize notifications/i }),
+    ).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: /^accept$/i })).toBeInTheDocument();
+  });
+
+  it("starts compact in Full Auto while keeping activity inspectable", async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          notifications: [
+            {
+              title: "Importing knowledge",
+              category: "operation_progress",
+              ts: Date.now() / 1000,
+              data: {
+                operation_id: "import:running",
+                status: "running",
+                detail: "Reading the file.",
+              },
+            },
+          ],
+        }),
+    });
+
+    const onOpenToolReview = vi.fn();
+    const { rerender } = render(
+      <Notifications onOpenToolReview={onOpenToolReview} autoMinimize />,
+    );
+
+    const showButton = await screen.findByRole("button", {
+      name: /show notifications: 1 operation running/i,
+    });
+    expect(showButton).toHaveTextContent("1");
+    expect(screen.getByText(/reading the file/i)).not.toBeVisible();
+
+    fireEvent.click(showButton);
+
+    expect(screen.getByText(/reading the file/i)).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: /minimize notifications/i }));
+    expect(screen.getByText(/reading the file/i)).not.toBeVisible();
+
+    rerender(
+      <Notifications onOpenToolReview={onOpenToolReview} autoMinimize={false} />,
+    );
+
+    await waitFor(() => expect(screen.getByText(/reading the file/i)).toBeVisible());
+  });
+
+  it("expands Full Auto notifications when an operation reports an error", async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          notifications: [
+            {
+              title: "Import failed",
+              category: "operation_progress",
+              ts: Date.now() / 1000,
+              data: {
+                operation_id: "import:failed",
+                status: "error",
+                detail: "Could not read the file.",
+              },
+            },
+          ],
+        }),
+    });
+
+    render(<Notifications autoMinimize />);
+
+    expect(
+      await screen.findByRole("button", { name: /minimize notifications/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/could not read the file/i)).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /show notifications/i }),
+    ).not.toBeInTheDocument();
   });
 
   it("adds accept, deny, and edit actions to tool review notifications", async () => {
@@ -101,7 +227,7 @@ describe("Notifications", () => {
     unmount();
   });
 
-  it("tabs through batched tool review items and can accept plus continue the whole batch", async () => {
+  it("keeps selected and whole-batch accept plus continue actions explicit", async () => {
     global.fetch = vi.fn().mockResolvedValue({
       ok: true,
       json: () =>
@@ -125,7 +251,10 @@ describe("Notifications", () => {
     });
     const onOpenToolReview = vi.fn();
     const actions = [];
-    const handler = (event) => actions.push({ ...event.detail });
+    const handler = (event) => {
+      actions.push({ ...event.detail });
+      event.detail.handled = true;
+    };
     window.addEventListener(TOOL_REVIEW_ACTION_EVENT, handler);
 
     const { unmount } = render(<Notifications onOpenToolReview={onOpenToolReview} />);
@@ -160,26 +289,35 @@ describe("Notifications", () => {
         }),
       );
     });
-    expect(screen.getByRole("button", { name: /accept all \+ continue/i })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /^accept \+ continue$/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /^accept all \+ continue$/i }),
+    ).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /accept all \+ continue/i }));
+    actions.length = 0;
+    fireEvent.click(screen.getByRole("button", { name: /^accept \+ continue$/i }));
     await waitFor(() => {
-      expect(
-        actions.some(
-          (action) =>
-            action.action === "accept" &&
-            action.toolId === "proposal-1" &&
-            action.scope === "selected",
-        ),
-      ).toBe(true);
-      expect(
-        actions.some(
-          (action) =>
-            action.action === "accept" &&
-            action.toolId === "proposal-2" &&
-            action.scope === "selected",
-        ),
-      ).toBe(true);
+      const selectedContinue = actions.find((action) => action.action === "continue");
+      expect(selectedContinue).toEqual(
+        expect.objectContaining({
+          action: "continue",
+          scope: "selected",
+          selectedToolId: "proposal-1",
+          toolIds: ["proposal-1"],
+        }),
+      );
+    });
+    expect(
+      actions
+        .filter((action) => action.action === "accept")
+        .map((action) => action.selectedToolId),
+    ).toEqual(["proposal-1"]);
+
+    actions.length = 0;
+    fireEvent.click(screen.getByRole("button", { name: /^accept all \+ continue$/i }));
+    await waitFor(() => {
       const batchAction = actions.find((action) => action.action === "continue");
       expect(batchAction).toEqual(
         expect.objectContaining({
@@ -189,6 +327,11 @@ describe("Notifications", () => {
         }),
       );
     });
+    expect(
+      actions
+        .filter((action) => action.action === "accept")
+        .map((action) => action.selectedToolId),
+    ).toEqual(["proposal-1", "proposal-2"]);
 
     window.removeEventListener(TOOL_REVIEW_ACTION_EVENT, handler);
     unmount();
@@ -263,6 +406,96 @@ describe("Notifications", () => {
       vi.advanceTimersByTime(120000);
     });
 
+    expect(screen.getByRole("button", { name: /^accept$/i })).toBeInTheDocument();
+    unmount();
+  });
+
+  it("removes a persistent tool review when its request reaches a terminal status", async () => {
+    const sources = installEventSourceHarness();
+    const { unmount } = render(<Notifications onOpenToolReview={() => {}} />);
+
+    expect(await screen.findByRole("button", { name: /^accept$/i })).toBeInTheDocument();
+    await waitFor(() => expect(sources).toHaveLength(1));
+
+    act(() => {
+      sources[0].emit("notification", {
+        title: "Tool finished",
+        category: "tool_resolution",
+        ts: Date.now() / 1000,
+        data: {
+          tool_ids: ["proposal-1"],
+          tool_names: ["search_web"],
+          status: "invoked",
+          session_id: "sess-1",
+          message_id: "msg-1",
+        },
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: /^accept$/i })).not.toBeInTheDocument();
+    });
+    expect(screen.queryByText("Tool finished")).not.toBeInTheDocument();
+
+    act(() => {
+      sources[0].emit("notification", toolNotification);
+    });
+
+    expect(screen.queryByRole("button", { name: /^accept$/i })).not.toBeInTheDocument();
+    unmount();
+  });
+
+  it("keeps only unresolved items when a mixed tool batch reports terminal statuses", async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          notifications: [
+            {
+              ...toolNotification,
+              title: "Tools need review",
+              data: {
+                ...toolNotification.data,
+                tool_ids: ["proposal-1", "proposal-2"],
+                tool_names: ["search_web", "list_dir"],
+                tool_args: [{ query: "Float privacy" }, { path: "frontend/src" }],
+                tool_statuses: ["proposed", "proposed"],
+              },
+            },
+          ],
+        }),
+    });
+    const sources = installEventSourceHarness();
+    const { unmount } = render(<Notifications onOpenToolReview={() => {}} />);
+
+    expect(
+      await screen.findByRole("button", { name: /^1\. search_web$/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^2\. list_dir$/i })).toBeInTheDocument();
+    await waitFor(() => expect(sources).toHaveLength(1));
+
+    act(() => {
+      sources[0].emit("notification", {
+        title: "Tool status update",
+        category: "tool_resolution",
+        ts: Date.now() / 1000,
+        data: {
+          tool_ids: ["proposal-1", "proposal-2"],
+          tool_names: ["search_web", "list_dir"],
+          tool_args: [{ query: "Float privacy" }, { path: "frontend/src" }],
+          tool_statuses: ["invoked", "proposed"],
+          session_id: "sess-1",
+          message_id: "msg-1",
+        },
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByText("search_web")).not.toBeInTheDocument();
+      expect(screen.getByText("list_dir")).toBeInTheDocument();
+    });
+    expect(screen.getByText("Tools need review")).toBeInTheDocument();
+    expect(screen.queryByText("Tool status update")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^accept$/i })).toBeInTheDocument();
     unmount();
   });

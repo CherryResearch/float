@@ -24,8 +24,6 @@ const safeString = (value) => {
 
 const validateArgsAgainstSchema = (schema, args) => {
   if (!schema || schema.type !== "object") return { ok: true };
-  const props =
-    schema.properties && typeof schema.properties === "object" ? schema.properties : {};
   const required = Array.isArray(schema.required) ? schema.required : [];
   const missing = required.filter((key) => {
     const value = args?.[key];

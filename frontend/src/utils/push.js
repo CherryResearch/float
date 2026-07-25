@@ -3,7 +3,7 @@ export async function ensureServiceWorker() {
 	try {
 		const reg = await navigator.serviceWorker.register('/sw.js');
 		return reg;
-	} catch (e) {
+	} catch {
 		return null;
 	}
 }

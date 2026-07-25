@@ -114,6 +114,41 @@ export const hydrateMemoryGraph = (graph) => {
   };
 };
 
+export const hydrateKnowledgeGraph = (graph) => {
+  const rawNodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
+  const rawLinks = Array.isArray(graph?.links) ? graph.links : [];
+  const maxLevel = rawNodes.reduce((max, node) => {
+    const level = Number(node?.level || 0);
+    return Number.isFinite(level) ? Math.max(max, level) : max;
+  }, 0);
+
+  return {
+    graphKey: "knowledge",
+    nodes: rawNodes.map((node) => ({
+      ...node,
+      graphKey: "knowledge",
+      level: Number(node?.level || 0),
+      weight: Number(node?.weight || 0),
+      matchKey: node?.matchKey || node?.match_key || "",
+      nodeKind: node?.nodeKind || node?.node_kind || "",
+      nodeType: node?.nodeType || node?.node_type || node?.type || "",
+      summaryText: node?.summaryText || node?.summary_text || "",
+      attributes:
+        node?.attributes && typeof node.attributes === "object" ? node.attributes : {},
+    })),
+    links: rawLinks.map((link) => ({
+      ...link,
+      graphKey: "knowledge",
+      weight: Number(link?.weight || link?.confidence || 1),
+    })),
+    claims: Array.isArray(graph?.claims) ? graph.claims : [],
+    metadata: {
+      ...(graph?.metadata || {}),
+      maxLevel,
+    },
+  };
+};
+
 const graphSlotsFor = (activeGraphs, planeOffset) => {
   if (!activeGraphs.length) return new Map();
   const slots = new Map();
@@ -134,9 +169,60 @@ const graphSlotsFor = (activeGraphs, planeOffset) => {
   return slots;
 };
 
+const knowledgeLayoutSlots = {
+  self: [0, 0],
+  close_friend: [-260, -95],
+  club_friend: [225, -105],
+  computer_club: [360, -170],
+  coworker: [205, 155],
+  job: [360, 105],
+  family: [-255, 150],
+};
+
+const knowledgeNodeAnchor = (node, index, graph, slot) => {
+  const nodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
+  const layoutSlot = String(
+    node?.attributes?.layout_slot || node?.layout_slot || node?.metadata?.layout_slot || "",
+  );
+  const layoutOffset = knowledgeLayoutSlots[layoutSlot];
+  if (layoutOffset) {
+    return {
+      anchorX: slot.anchorX + layoutOffset[0],
+      anchorY: slot.anchorY + layoutOffset[1],
+    };
+  }
+
+  const nodeId = String(node?.id || node?.node_id || "");
+  const label = String(node?.label || node?.canonical_name || "");
+  if (!nodes.length || /(^|:)self$/i.test(nodeId) || label.toLowerCase() === "self") {
+    return {
+      anchorX: slot.anchorX,
+      anchorY: slot.anchorY,
+    };
+  }
+
+  const otherNodes = nodes.filter((candidate) => {
+    const candidateId = String(candidate?.id || candidate?.node_id || "");
+    const candidateLabel = String(candidate?.label || candidate?.canonical_name || "");
+    return !/(^|:)self$/i.test(candidateId) && candidateLabel.toLowerCase() !== "self";
+  });
+  const ringIndex = Math.max(0, otherNodes.findIndex((candidate) => candidate === node));
+  const ringCount = Math.max(1, otherNodes.length);
+  const angle = -Math.PI / 2 + (2 * Math.PI * ringIndex) / ringCount;
+  const radius = ringCount <= 8 ? 310 : 235;
+  const type = String(node?.type || node?.nodeType || node?.node_type || "").toLowerCase();
+  const typeRadiusBoost = type === "organization" ? 34 : 0;
+
+  return {
+    anchorX: slot.anchorX + Math.cos(angle) * (radius + typeRadiusBoost),
+    anchorY: slot.anchorY + Math.sin(angle) * (radius * 0.68 + typeRadiusBoost * 0.4),
+  };
+};
+
 export const buildCombinedGraphData = ({
   threadGraph,
   memoryGraph,
+  knowledgeGraph,
   includeThreadProjection,
   includeMemoryProjection,
   includeKnowledgeOverlay,
@@ -151,7 +237,9 @@ export const buildCombinedGraphData = ({
     selectedGraphs.push(memoryGraph);
   }
   if (includeKnowledgeOverlay) {
-    // The knowledge-graph overlay is still a placeholder and contributes no nodes yet.
+    if (knowledgeGraph?.nodes?.length) {
+      selectedGraphs.push(knowledgeGraph);
+    }
   }
 
   const slots = graphSlotsFor(selectedGraphs, planeOffset);
@@ -164,11 +252,18 @@ export const buildCombinedGraphData = ({
       anchorY: VISUALIZATION_HEIGHT / 2,
       depth: 0,
     };
-    graph.nodes.forEach((node) => {
+    graph.nodes.forEach((node, index) => {
+      const nodeAnchor =
+        graph.graphKey === "knowledge"
+          ? knowledgeNodeAnchor(node, index, graph, slot)
+          : {
+              anchorX: slot.anchorX,
+              anchorY: slot.anchorY,
+            };
       nodes.push({
         ...cloneNode(node),
-        anchorX: slot.anchorX,
-        anchorY: slot.anchorY,
+        anchorX: nodeAnchor.anchorX,
+        anchorY: nodeAnchor.anchorY,
         depth: slot.depth,
         focusLevel: Number(levels?.[graph.graphKey] || 0),
       });
@@ -210,7 +305,7 @@ export const buildCombinedGraphData = ({
   const maxLevels = {
     threads: Number(threadGraph?.metadata?.maxLevel || 0),
     memory: Number(memoryGraph?.metadata?.maxLevel || 0),
-    knowledge: 0,
+    knowledge: Number(knowledgeGraph?.metadata?.maxLevel || 0),
   };
 
   return {
@@ -239,6 +334,53 @@ export const getNodeFocus = (node, levels, selectedNodeId) => {
 export const getBaseNodeRadius = (node) => {
   if (node?.type === "thread") return 11;
   if (node?.type === "memory") return 8.5;
+  if (node?.graphKey === "knowledge" && node?.type === "person") return 12;
+  if (node?.graphKey === "knowledge") return 10;
   if (String(node?.type || "").endsWith("_anchor")) return 6.5;
   return 7;
+};
+
+const linkEndpointId = (endpoint) => {
+  if (typeof endpoint === "string") return endpoint;
+  if (endpoint && typeof endpoint === "object") return String(endpoint.id || "");
+  return "";
+};
+
+const relationshipBoost = (link) => {
+  const metadata = link?.metadata && typeof link.metadata === "object" ? link.metadata : {};
+  const strength = String(metadata.relationship_strength || "").toLowerCase();
+  if (strength === "close") return 0.18;
+  if (strength === "family") return 0.12;
+  if (strength === "co-worker") return 0.08;
+  return 0;
+};
+
+export const rankNodeConnections = (selectedNodeId, nodes = [], links = []) => {
+  const selectedId = String(selectedNodeId || "");
+  if (!selectedId) return [];
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  return links
+    .map((link) => {
+      const sourceId = linkEndpointId(link?.source);
+      const targetId = linkEndpointId(link?.target);
+      if (sourceId !== selectedId && targetId !== selectedId) return null;
+      const otherId = sourceId === selectedId ? targetId : sourceId;
+      const otherNode = nodeById.get(otherId);
+      if (!otherNode) return null;
+      const weight = Number(link?.weight ?? link?.confidence ?? 0);
+      const score = weight + relationshipBoost(link);
+      return {
+        id: `${selectedId}:${otherId}:${link?.claim_id || link?.predicate || link?.type}`,
+        nodeId: otherId,
+        label: otherNode.label || otherId,
+        type: otherNode.type || "",
+        predicate: link?.predicate || link?.category || link?.type || "connected",
+        relation: link?.metadata?.relationship || "",
+        context: link?.metadata?.context || "",
+        score,
+        weight,
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => right.score - left.score || left.label.localeCompare(right.label));
 };

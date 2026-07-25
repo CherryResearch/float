@@ -1,0 +1,216 @@
+{
+  "nodes": [
+    {
+      "ref": "self",
+      "node_id": "person:self",
+      "node_kind": "entity",
+      "node_type": "person",
+      "canonical_name": "Self",
+      "summary_text": "Primary person whose local social graph is being edited.",
+      "attributes": {
+        "relation_to_self": "self",
+        "city": "Vancouver",
+        "role": "Float user",
+        "interests": ["graph workflows", "tool traces"],
+        "privacy": "personal",
+        "layout_slot": "self"
+      }
+    },
+    {
+      "ref": "friend-maya",
+      "node_id": "person:friend-maya",
+      "node_kind": "entity",
+      "node_type": "person",
+      "canonical_name": "Maya Stone",
+      "summary_text": "Friend in the local creative and planning circle.",
+      "attributes": {
+        "relation_to_self": "friend",
+        "relationship_strength": "close",
+        "city": "Portland",
+        "role": "artist",
+        "interests": ["ceramics", "gallery walks"],
+        "privacy": "personal",
+        "layout_slot": "close_friend"
+      }
+    },
+    {
+      "ref": "friend-jules",
+      "node_id": "person:friend-jules",
+      "node_kind": "entity",
+      "node_type": "person",
+      "canonical_name": "Jules Park",
+      "summary_text": "Friend who trades notes about games and analysis projects.",
+      "attributes": {
+        "relation_to_self": "friend",
+        "city": "Seattle",
+        "role": "analyst",
+        "interests": ["strategy games", "data notebooks"],
+        "privacy": "personal",
+        "layout_slot": "club_friend"
+      }
+    },
+    {
+      "ref": "coworker-ren",
+      "node_id": "person:coworker-ren",
+      "node_kind": "entity",
+      "node_type": "person",
+      "canonical_name": "Ren Ortiz",
+      "summary_text": "Co-worker who pairs on backend and workflow systems.",
+      "attributes": {
+        "relation_to_self": "co-worker",
+        "city": "Vancouver",
+        "role": "backend engineer",
+        "interests": ["sqlite", "agent workflows"],
+        "privacy": "personal",
+        "layout_slot": "coworker"
+      }
+    },
+    {
+      "ref": "family-lena",
+      "node_id": "person:family-lena",
+      "node_kind": "entity",
+      "node_type": "person",
+      "canonical_name": "Lena Rivera",
+      "summary_text": "Family member connected to the primary person.",
+      "attributes": {
+        "relation_to_self": "family",
+        "city": "Victoria",
+        "role": "family member",
+        "interests": ["gardening", "photos"],
+        "privacy": "personal",
+        "layout_slot": "family"
+      }
+    },
+    {
+      "ref": "computer-club",
+      "node_id": "org:computer-club",
+      "node_kind": "entity",
+      "node_type": "organization",
+      "canonical_name": "Vancouver Computer Club",
+      "summary_text": "Community computer club associated with Jules.",
+      "attributes": {
+        "organization_type": "club",
+        "city": "Vancouver",
+        "topics": ["computers", "games", "hardware"],
+        "privacy": "personal",
+        "layout_slot": "computer_club"
+      }
+    },
+    {
+      "ref": "job",
+      "node_id": "org:job",
+      "node_kind": "entity",
+      "node_type": "organization",
+      "canonical_name": "Float Systems Lab",
+      "summary_text": "Workplace context connecting self and Ren.",
+      "attributes": {
+        "organization_type": "job",
+        "city": "Vancouver",
+        "domain": "agent workflow software",
+        "privacy": "personal",
+        "layout_slot": "job"
+      }
+    }
+  ],
+  "claims": [
+    {
+      "claim_id": "claim:self-maya-friend",
+      "claim_type": "relationship",
+      "predicate": "friend_of",
+      "confidence": 0.95,
+      "roles": [
+        { "role_name": "subject", "node_ref": "self" },
+        { "role_name": "object", "node_ref": "friend-maya" }
+      ],
+      "metadata": {
+        "relationship": "friend",
+        "relationship_strength": "close",
+        "context": "creative planning"
+      }
+    },
+    {
+      "claim_id": "claim:self-jules-friend",
+      "claim_type": "relationship",
+      "predicate": "friend_of",
+      "confidence": 0.92,
+      "roles": [
+        { "role_name": "subject", "node_ref": "self" },
+        { "role_name": "object", "node_ref": "friend-jules" }
+      ],
+      "metadata": {
+        "relationship": "friend",
+        "context": "games and analysis notes"
+      }
+    },
+    {
+      "claim_id": "claim:self-ren-coworker",
+      "claim_type": "relationship",
+      "predicate": "works_with",
+      "confidence": 0.9,
+      "roles": [
+        { "role_name": "subject", "node_ref": "self" },
+        { "role_name": "object", "node_ref": "coworker-ren" }
+      ],
+      "metadata": {
+        "relationship": "co-worker",
+        "context": "backend and workflow systems"
+      }
+    },
+    {
+      "claim_id": "claim:self-lena-family",
+      "claim_type": "relationship",
+      "predicate": "family_of",
+      "confidence": 0.96,
+      "roles": [
+        { "role_name": "subject", "node_ref": "self" },
+        { "role_name": "object", "node_ref": "family-lena" }
+      ],
+      "metadata": {
+        "relationship": "family",
+        "context": "family member"
+      }
+    },
+    {
+      "claim_id": "claim:jules-computer-club-member",
+      "claim_type": "affiliation",
+      "predicate": "member_of",
+      "confidence": 0.88,
+      "roles": [
+        { "role_name": "subject", "node_ref": "friend-jules" },
+        { "role_name": "object", "node_ref": "computer-club" }
+      ],
+      "metadata": {
+        "relationship": "club affiliation",
+        "context": "friend from computer club"
+      }
+    },
+    {
+      "claim_id": "claim:self-job-affiliation",
+      "claim_type": "affiliation",
+      "predicate": "works_at",
+      "confidence": 0.9,
+      "roles": [
+        { "role_name": "subject", "node_ref": "self" },
+        { "role_name": "object", "node_ref": "job" }
+      ],
+      "metadata": {
+        "relationship": "job",
+        "context": "current workplace"
+      }
+    },
+    {
+      "claim_id": "claim:ren-job-affiliation",
+      "claim_type": "affiliation",
+      "predicate": "works_at",
+      "confidence": 0.9,
+      "roles": [
+        { "role_name": "subject", "node_ref": "coworker-ren" },
+        { "role_name": "object", "node_ref": "job" }
+      ],
+      "metadata": {
+        "relationship": "job",
+        "context": "co-worker workplace"
+      }
+    }
+  ]
+}

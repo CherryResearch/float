@@ -22,13 +22,17 @@ def use_temp_dotenv(monkeypatch, tmp_path):
 
 
 @pytest.fixture
-def client(add_backend_to_sys_path):
+def client(add_backend_to_sys_path, monkeypatch):
     from app import routes
+    from app.config import DEFAULT_MODELS_DIR
     from app.main import app
 
-    app.state.config["mode"] = "api"
-    routes.llm_service.mode = "api"
-    routes.llm_service.config = app.state.config
+    test_config = dict(app.state.config)
+    test_config["mode"] = "api"
+    test_config["models_folder"] = str(DEFAULT_MODELS_DIR)
+    monkeypatch.setattr(app.state, "config", test_config)
+    monkeypatch.setattr(routes.llm_service, "mode", "api")
+    monkeypatch.setattr(routes.llm_service, "config", test_config)
     return TestClient(app)
 
 
@@ -109,6 +113,42 @@ def test_local_provider_settings(client, tmp_path):
     assert "LOCAL_PROVIDER_API_TOKEN" in content and "provider-secret" in content
 
 
+def test_server_presets_persist_metadata_without_secrets(client, tmp_path, monkeypatch):
+    monkeypatch.setenv("CUSTOM_INFERENCE_KEY", "environment-secret")
+    env_path = tmp_path / ".env"
+    response = client.post(
+        "/settings",
+        json={
+            "server_preset_id": "custom-lab",
+            "server_url": "https://models.example.test/v1",
+            "server_presets": [
+                {
+                    "id": "custom-lab",
+                    "name": "Lab endpoint",
+                    "provider": "openai-compatible",
+                    "base_url": "https://models.example.test/v1",
+                    "api_key_env": "CUSTOM_INFERENCE_KEY",
+                    "api_key": "should-be-ignored",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    settings = response.json().get("settings") or {}
+    assert settings["server_preset_id"] == "custom-lab"
+    presets = {item["id"]: item for item in settings["server_presets"]}
+    assert "tinker" in presets
+    assert presets["custom-lab"]["api_key_set"] is True
+    assert "api_key" not in presets["custom-lab"]
+    content = env_path.read_text()
+    assert "SERVER_PRESET_ID" in content and "custom-lab" in content
+    assert "SERVER_PRESETS_JSON" in content
+    assert "CUSTOM_INFERENCE_KEY" in content
+    assert "environment-secret" not in content
+    assert "should-be-ignored" not in content
+
+
 def test_mode_setting_persists_to_env_and_settings(client, tmp_path):
     env_path = tmp_path / ".env"
     resp = client.post("/settings", json={"mode": "local"})
@@ -171,7 +211,7 @@ def test_realtime_voice_settings_refresh_service(client, tmp_path):
         json={
             "stream_backend": "api",
             "stt_model": "gpt-realtime-whisper",
-            "realtime_model": "gpt-realtime-2",
+            "realtime_model": "gpt-realtime-2.1",
             "realtime_voice": "marin",
             "live_agent_mode": "server",
             "live_agent_model": "gemma-4-E4B-it",
@@ -184,7 +224,7 @@ def test_realtime_voice_settings_refresh_service(client, tmp_path):
     settings = resp.json().get("settings") or {}
     assert settings.get("stream_backend") == "api"
     assert settings.get("stt_model") == "gpt-realtime-whisper"
-    assert settings.get("realtime_model") == "gpt-realtime-2"
+    assert settings.get("realtime_model") == "gpt-realtime-2.1"
     assert settings.get("realtime_voice") == "marin"
     assert settings.get("live_agent_mode") == "server"
     assert settings.get("live_agent_model") == "gemma-4-E4B-it"
@@ -200,7 +240,7 @@ def test_realtime_voice_settings_refresh_service(client, tmp_path):
     content = env_path.read_text()
     assert "FLOAT_STREAM_BACKEND" in content and "api" in content
     assert "STT_MODEL" in content and "gpt-realtime-whisper" in content
-    assert "OPENAI_REALTIME_MODEL" in content and "gpt-realtime-2" in content
+    assert "OPENAI_REALTIME_MODEL" in content and "gpt-realtime-2.1" in content
     assert "OPENAI_REALTIME_VOICE" in content and "marin" in content
     assert "OPENAI_REALTIME_TRANSCRIPTION_MODEL" not in content
     assert "FLOAT_LIVE_AGENT_MODE" in content and "server" in content
@@ -208,7 +248,7 @@ def test_realtime_voice_settings_refresh_service(client, tmp_path):
     assert "FLOAT_LIVE_MULTIMODAL_MODEL" in content and "gemma-4-26B-A4B-it" in content
     livekit_service = client.app.state.livekit_service
     assert livekit_service.mode == "api"
-    assert livekit_service.realtime_model == "gpt-realtime-2"
+    assert livekit_service.realtime_model == "gpt-realtime-2.1"
     assert livekit_service.realtime_voice == "marin"
     assert livekit_service.realtime_transcription_model == "gpt-realtime-whisper"
     assert livekit_service.live_agent_mode == "server"
@@ -245,12 +285,14 @@ def test_local_live_settings_refresh_service(client, tmp_path):
     assert livekit_service.live_multimodal_model == "gemma-4-E4B-it"
 
 
-def test_voice_connect_forwards_chat_thinking_to_realtime_reasoning(client):
+def test_voice_connect_forwards_chat_thinking_to_realtime_reasoning(
+    client, monkeypatch
+):
     captured = {}
 
     class DummyLiveKitService:
         mode = "api"
-        realtime_model = "gpt-realtime-2"
+        realtime_model = "gpt-realtime-2.1"
 
         def connect(self, identity, room, *, reasoning_effort=None):
             captured["identity"] = identity
@@ -258,7 +300,7 @@ def test_voice_connect_forwards_chat_thinking_to_realtime_reasoning(client):
             captured["reasoning_effort"] = reasoning_effort
             return {"provider": "openai-realtime", "client_secret": "test-secret"}
 
-    client.app.state.livekit_service = DummyLiveKitService()
+    monkeypatch.setattr(client.app.state, "livekit_service", DummyLiveKitService())
 
     resp = client.post(
         "/voice/connect",
@@ -273,18 +315,20 @@ def test_voice_connect_forwards_chat_thinking_to_realtime_reasoning(client):
     }
 
 
-def test_voice_connect_uses_workflow_reasoning_when_thinking_is_auto(client):
+def test_voice_connect_uses_workflow_reasoning_when_thinking_is_auto(
+    client, monkeypatch
+):
     captured = {}
 
     class DummyLiveKitService:
         mode = "api"
-        realtime_model = "gpt-realtime-2"
+        realtime_model = "gpt-realtime-2.1"
 
         def connect(self, identity, room, *, reasoning_effort=None):
             captured["reasoning_effort"] = reasoning_effort
             return {"provider": "openai-realtime", "client_secret": "test-secret"}
 
-    client.app.state.livekit_service = DummyLiveKitService()
+    monkeypatch.setattr(client.app.state, "livekit_service", DummyLiveKitService())
 
     resp = client.post(
         "/voice/connect",

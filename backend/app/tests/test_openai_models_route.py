@@ -26,8 +26,14 @@ def _make_client():
     return TestClient(app)
 
 
+def _clear_model_inventory_cache():
+    from app.services import model_inventory_service
+
+    model_inventory_service.openai_models_cache.clear()
+
+
 def test_openai_models_route_uses_ttl_cache(monkeypatch):
-    from app import routes
+    from app.routers import model_catalog
 
     class DummyResponse:
         status_code = 200
@@ -63,8 +69,8 @@ def test_openai_models_route_uses_ttl_cache(monkeypatch):
         call_urls.append(url)
         return DummyResponse()
 
-    routes._openai_models_cache.clear()
-    monkeypatch.setattr(routes.http_session, "get", fake_get)
+    _clear_model_inventory_cache()
+    monkeypatch.setattr(model_catalog.http_session, "get", fake_get)
     client = _make_client()
 
     first = client.get("/api/openai/models")
@@ -74,35 +80,34 @@ def test_openai_models_route_uses_ttl_cache(monkeypatch):
     assert first.status_code == 200
     assert second.status_code == 200
     assert full.status_code == 200
-    assert first.json() == {
-        "models": ["gpt-5.4", "gpt-5.4-pro", "gpt-4.1-mini", "deepseek-chat"]
-    }
-    assert second.json() == {
-        "models": ["gpt-5.4", "gpt-5.4-pro", "gpt-4.1-mini", "deepseek-chat"]
-    }
-    assert full.json() == {
-        "models": [
-            "gpt-5.4",
-            "gpt-5.4-pro",
-            "gpt-4.1-mini",
-            "gpt-4o-mini-transcribe",
-            "gpt-4o-mini-tts",
-            "gpt-3.5-turbo-instruct",
-            "computer-use-preview",
-            "davinci-002",
-            "deepseek-chat",
-            "gpt-image-1",
-            "omni-moderation-latest",
-            "sora-2",
-            "text-davinci-003",
-            "text-embedding-3-large",
-        ]
-    }
+    assert first.json()["models"] == [
+        "gpt-5.4",
+        "gpt-5.4-pro",
+        "gpt-4.1-mini",
+        "deepseek-chat",
+    ]
+    assert second.json()["models"] == first.json()["models"]
+    assert full.json()["models"] == [
+        "gpt-5.4",
+        "gpt-5.4-pro",
+        "gpt-4.1-mini",
+        "gpt-4o-mini-transcribe",
+        "gpt-4o-mini-tts",
+        "gpt-3.5-turbo-instruct",
+        "computer-use-preview",
+        "davinci-002",
+        "deepseek-chat",
+        "gpt-image-1",
+        "omni-moderation-latest",
+        "sora-2",
+        "text-davinci-003",
+        "text-embedding-3-large",
+    ]
     assert call_urls == ["https://api.openai.com/v1/models"]
 
 
 def test_openai_models_cache_is_keyed_by_provider_config(monkeypatch):
-    from app import routes
+    from app.routers import model_catalog
 
     class DummyResponse:
         status_code = 200
@@ -125,8 +130,8 @@ def test_openai_models_cache_is_keyed_by_provider_config(monkeypatch):
             return DummyResponse("gpt-5.4")
         return DummyResponse("other-model")
 
-    routes._openai_models_cache.clear()
-    monkeypatch.setattr(routes.http_session, "get", fake_get)
+    _clear_model_inventory_cache()
+    monkeypatch.setattr(model_catalog.http_session, "get", fake_get)
     client = _make_client()
 
     first = client.get("/api/openai/models")
@@ -135,9 +140,101 @@ def test_openai_models_cache_is_keyed_by_provider_config(monkeypatch):
 
     assert first.status_code == 200
     assert second.status_code == 200
-    assert first.json() == {"models": ["gpt-5.4"]}
-    assert second.json() == {"models": ["other-model"]}
+    assert first.json()["models"] == ["gpt-5.4"]
+    assert second.json()["models"] == ["other-model"]
     assert call_urls == [
         ("https://api.openai.com/v1/models", "Bearer test-key"),
         ("https://api.openai.com/v1/models", "Bearer other-key"),
     ]
+
+
+def test_openai_models_route_reports_latest_alias_metadata(monkeypatch):
+    from app.routers import model_catalog
+
+    class DummyResponse:
+        status_code = 200
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "data": [
+                    {"id": "chat-latest"},
+                    {"id": "gpt-5.5-2026-07-01"},
+                    {"id": "gpt-5.5-pro"},
+                    {"id": "gpt-5.5"},
+                    {"id": "gpt-5.4-mini"},
+                ]
+            }
+
+    _clear_model_inventory_cache()
+    monkeypatch.setattr(
+        model_catalog.http_session, "get", lambda *args, **kwargs: DummyResponse()
+    )
+    client = _make_client()
+
+    resp = client.get("/api/openai/models")
+
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["models"][:4] == [
+        "chat-latest",
+        "gpt-5.5",
+        "gpt-5.5-pro",
+        "gpt-5.5-2026-07-01",
+    ]
+    assert payload["model_aliases"]["chat-latest"] == {
+        "label": "GPT latest",
+        "display_label": "GPT latest (gpt-5.5)",
+        "target_model": "gpt-5.5",
+    }
+
+
+def test_openai_models_route_hides_deprecated_models_from_new_selection(monkeypatch):
+    from app.routers import model_catalog
+
+    class DummyResponse:
+        status_code = 200
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "data": [
+                    {"id": "chat-latest"},
+                    {"id": "gpt-5-chat-latest"},
+                    {"id": "gpt-5.4-mini"},
+                ]
+            }
+
+    _clear_model_inventory_cache()
+    monkeypatch.setattr(
+        model_catalog.http_session, "get", lambda *args, **kwargs: DummyResponse()
+    )
+    client = _make_client()
+
+    response = client.get(
+        "/api/openai/models",
+        params={"selected_model": "gpt-5-chat-latest"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["models"] == [
+        "chat-latest",
+        "gpt-5.4-mini",
+        "gpt-5-chat-latest",
+    ]
+    assert payload["selectable_models"] == ["chat-latest", "gpt-5.4-mini"]
+    assert payload["selection"]["status"] == "deprecated"
+    assert payload["migration"] == {
+        "from": "gpt-5-chat-latest",
+        "to": "gpt-5.5",
+        "kind": "required",
+        "required": True,
+        "shutdown_at": "2026-07-23",
+    }

@@ -102,6 +102,13 @@ def test_tool_catalog_endpoint_returns_builtin_metadata(tmp_path, monkeypatch):
     assert revert_actions["category"] == "history"
     assert revert_actions["persistence"]["writes_state"] is True
     assert revert_actions["safety"]["default_approval"] == "confirm"
+    graph_update = next(
+        (tool for tool in tools if tool.get("id") == "graph.update"), None
+    )
+    assert graph_update is not None
+    assert graph_update["category"] == "memory"
+    assert graph_update["persistence"]["writes_state"] is True
+    assert graph_update["safety"]["default_approval"] == "confirm"
     list_tasks = next((tool for tool in tools if tool.get("id") == "list_tasks"), None)
     assert list_tasks is not None
     assert list_tasks["category"] == "calendar"

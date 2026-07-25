@@ -129,6 +129,7 @@ def test_chat_marks_resolved_inline_read_tools_for_continuation(monkeypatch, tmp
     payload = resp.json()
     assert payload["message"].startswith("Tool results:")
     metadata = payload.get("metadata") or {}
+    assert metadata.get("status") == "pending"
     assert metadata.get("tool_response_pending") is True
     assert metadata.get("inline_tool_continuation_pending") is True
 
@@ -136,6 +137,7 @@ def test_chat_marks_resolved_inline_read_tools_for_continuation(monkeypatch, tmp
     ai = next(m for m in messages if m.get("id") == "m1")
     assert ai.get("text", "").startswith("Tool results:")
     saved_meta = ai.get("metadata") or {}
+    assert saved_meta.get("status") == "pending"
     assert saved_meta.get("tool_response_pending") is True
     assert saved_meta.get("inline_tool_continuation_pending") is True
 
@@ -885,6 +887,7 @@ def test_chat_persists_tool_proposals(monkeypatch, tmp_path):
     tool = tools[0]
     assert tool.get("name") == "search_web"
     assert tool.get("status") == "proposed"
+    assert (ai.get("metadata") or {}).get("status") == "pending"
 
 
 def test_chat_tool_proposals_emit_review_notification(monkeypatch, tmp_path):
@@ -1133,6 +1136,7 @@ def test_chat_masks_completion_text_when_tools_are_only_proposed(monkeypatch, tm
     payload = resp.json()
     assert payload["message"].startswith("Requested tool")
     assert "Awaiting approval." in payload["message"]
+    assert payload.get("metadata", {}).get("status") == "pending"
     assert payload.get("metadata", {}).get("tool_response_pending") is True
 
 
@@ -1393,11 +1397,14 @@ def test_chat_passes_vision_workflow_to_generate_and_persists_user_metadata(
                 {
                     "name": "camera.png",
                     "type": "image/png",
-                    "url": "/api/attachments/hash-two/camera.png",
+                    "url": "/api/captures/capture-1/content",
                     "content_hash": "hash-two",
                     "origin": "captured",
-                    "relative_path": "captured/hash-two/camera.png",
+                    "relative_path": "captures/transient/capture-1/camera.png",
                     "capture_source": "chat_camera",
+                    "capture_id": "capture-1",
+                    "transient": True,
+                    "expires_at": "2026-07-25T12:00:00Z",
                 }
             ],
         },
@@ -1405,6 +1412,9 @@ def test_chat_passes_vision_workflow_to_generate_and_persists_user_metadata(
     assert resp.status_code == 200
     assert captured["vision_workflow"] == "caption"
     assert captured["attachments"][0]["origin"] == "captured"
+    assert captured["attachments"][0]["capture_id"] == "capture-1"
+    assert captured["attachments"][0]["transient"] is True
+    assert captured["attachments"][0]["expires_at"] == "2026-07-25T12:00:00Z"
     assert any(
         ((entry.get("metadata") or {}).get("vision", {}).get("workflow") == "caption")
         for entry in captured["context"].messages
@@ -1422,6 +1432,9 @@ def test_chat_passes_vision_workflow_to_generate_and_persists_user_metadata(
         "caption"
     )
     assert user_entry.get("attachments")[0]["origin"] == "captured"
+    assert user_entry.get("attachments")[0]["capture_id"] == "capture-1"
+    assert user_entry.get("attachments")[0]["transient"] is True
+    assert user_entry.get("attachments")[0]["expires_at"] == ("2026-07-25T12:00:00Z")
     live_context = routes.llm_service.get_context("sess")
     assert [
         entry.get("content")
@@ -1828,7 +1841,7 @@ def test_chat_rag_prefers_exact_memory_reference_and_penalizes_recent_repeats(
 
     app = importlib.import_module("app.main").app
     app.state.pending_tools = {}
-    app.state.memory_manager = DummyMemoryManager()
+    monkeypatch.setattr(app.state, "memory_manager", DummyMemoryManager())
     conv_store.save_conversation(
         "sess",
         [
@@ -1946,7 +1959,7 @@ def test_chat_rag_uses_memory_title_terms_as_secondary_signal(monkeypatch, tmp_p
 
     app = importlib.import_module("app.main").app
     app.state.pending_tools = {}
-    app.state.memory_manager = DummyMemoryManager()
+    monkeypatch.setattr(app.state, "memory_manager", DummyMemoryManager())
     app.state.config["rag_chat_min_similarity"] = 0.45
     client = TestClient(app)
     resp = client.post(

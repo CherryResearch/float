@@ -25,7 +25,9 @@ def can_send_push() -> bool:
     return bool(vapid.get("publicKey") and vapid.get("privateKey") and webpush)
 
 
-def send_web_push(subscription: Dict[str, Any], payload: Dict[str, Any]) -> Optional[str]:
+def send_web_push(
+    subscription: Dict[str, Any], payload: Dict[str, Any]
+) -> Optional[str]:
     """Send a web push. Returns error message string on failure or None on success."""
     if not can_send_push():
         return "push_not_configured"
@@ -41,6 +43,3 @@ def send_web_push(subscription: Dict[str, Any], payload: Dict[str, Any]) -> Opti
         return None
     except WebPushException as e:  # pragma: no cover - network dependent
         return str(e)
-
-
-

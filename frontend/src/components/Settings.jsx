@@ -22,6 +22,7 @@ import {
   DEFAULT_VISUAL_THEME,
   getVisualTheme,
   getVisualThemeOptions,
+  isBuiltInVisualTheme,
   normalizeVisualTheme,
   THEME_SLOT_KEYS,
 } from "../theme";
@@ -33,6 +34,7 @@ import { filterAvailableModelsForField } from "../utils/modelFiltering";
 import {
   buildModelGroups,
   DEFAULT_API_MODELS,
+  formatApiModelLabel,
   formatLocalRuntimeLabel,
   isDirectLocalGemmaModel,
   isGemmaFamilyModel,
@@ -53,6 +55,10 @@ import {
   isChatCapableProviderModelName,
 } from "../utils/providerRuntime";
 import {
+  RUNTIME_PANEL_LANES,
+  resolveRuntimePanelContract,
+} from "../utils/runtimePanelContract";
+import {
   buildModelDeleteLockInspectorRows,
   buildProviderRuntimeInspectorRows,
   extractStateExplanationMessage,
@@ -63,6 +69,12 @@ import {
   CAPTURE_SENSITIVITY_OPTIONS,
   getSensitivityTooltip,
 } from "../utils/privacyLevels";
+import {
+  makeCustomServerPreset,
+  normalizeServerPresets,
+  selectedServerPreset,
+  serverTrustWarning,
+} from "../utils/serverPresets";
 
 const FLOAT_SETTING_FIELDS = new Set([
   "gpu_memory_fraction",
@@ -117,6 +129,13 @@ const MANAGED_LOCAL_PROVIDERS = new Set([
 
 const PROVIDER_RUNTIME_STATUS_POLL_MS = 60000;
 
+const LANGUAGE_RUNTIME_LANE_LABELS = Object.freeze({
+  [RUNTIME_PANEL_LANES.CLOUD_API]: "Cloud API",
+  [RUNTIME_PANEL_LANES.SERVER_LAN]: "Server/LAN",
+  [RUNTIME_PANEL_LANES.LOCAL_PROVIDER]: "Local provider",
+  [RUNTIME_PANEL_LANES.DIRECT_LOCAL]: "Direct local",
+});
+
 const expandSettingsSearchTerm = (value) => {
   const term = String(value || "").trim().toLowerCase();
   if (!term) return [];
@@ -134,7 +153,7 @@ const SETTINGS_SECTIONS = [
   {
     id: "connections",
     label: "Connections",
-    description: "API secrets, endpoints, and knowledge base access.",
+    description: "Provider access, runtime endpoints, and device sync.",
     searchText: [
       "connections",
       "access",
@@ -147,19 +166,10 @@ const SETTINGS_SECTIONS = [
       "weaviate",
       "knowledge base",
       "server url",
-    ].join(" "),
-  },
-  {
-    id: "runtime",
-    label: "Runtime",
-    description: "Mode, provider, device, and request behavior.",
-    searchText: [
       "runtime",
       "server",
-      "server url",
       "server lan",
       "server lan url",
-      "llm server",
       "mode",
       "provider",
       "local runtime",
@@ -172,6 +182,14 @@ const SETTINGS_SECTIONS = [
       "stream idle timeout",
       "token",
       "context length",
+      "sharing",
+      "sync",
+      "instance sync",
+      "pairing",
+      "trusted device",
+      "private transport",
+      "tailnet",
+      "vpn",
     ].join(" "),
   },
   {
@@ -256,29 +274,21 @@ const SETTINGS_SECTIONS = [
   },
   {
     id: "workflows",
-    label: "Workflows",
-    description: "Prompt stacks, model posture, and module / permission defaults.",
+    label: "Visual data",
+    description: "Camera and screen capture retention, image access, and privacy routing.",
     searchText: [
+      "capture",
+      "capture privacy",
       "workflow",
       "workflows",
-      "workflow editor",
+      "skills workflows knowledge",
       "default workflow",
-      "workflow profile",
-      "workflow module",
       "capture retention",
       "capture sensitivity",
       "privacy filter",
       "automatic privacy",
       "memory sensitivity",
-      "prompt stack",
-      "restrictions",
-      "permissions",
-      "followup hooks",
-      "continue defaults",
-      "conditional workflow",
       "camera capture",
-      "computer use",
-      "host shell",
     ].join(" "),
   },
   {
@@ -298,24 +308,6 @@ const SETTINGS_SECTIONS = [
       "orchestration",
       "queued tests",
       "reflection",
-    ].join(" "),
-  },
-  {
-    id: "sharing",
-    label: "Sharing",
-    description: "Trusted-device sync and private live transport.",
-    searchText: [
-      "sharing",
-      "sync",
-      "instance sync",
-      "pairing",
-      "trusted device",
-      "private transport",
-      "streaming",
-      "live voice",
-      "realtime",
-      "tailnet",
-      "vpn",
     ].join(" "),
   },
   {
@@ -355,9 +347,8 @@ const CAPTURE_RETENTION_OPTIONS = [
 const PRIVACY_FILTER_MODE_OPTIONS = [
   {
     value: "off",
-    label: "Off",
-    description:
-      "Do not run the local text privacy classifier for writes, rerouting, or API embedding preflight.",
+    label: "Never use it",
+    description: "Do not run the automatic text privacy classifier on writes.",
   },
   {
     value: "auto",
@@ -426,39 +417,6 @@ const normalizeToolApproval = (value, fallback = "high") => {
     : fallback;
 };
 
-const moduleSourceClass = (value) => {
-  const source = String(value || "base").trim().toLowerCase();
-  if (source === "custom" || source === "local") return "custom";
-  if (source === "base" || source === "repo") return "base";
-  return source || "base";
-};
-
-const formatModuleSource = (value) => {
-  const source = String(value || "base").trim().toLowerCase();
-  if (source === "base" || source === "repo") return "shipped repo";
-  if (source === "custom") return "imported local pack";
-  if (source === "local") return "local override";
-  return source || "unknown source";
-};
-
-const summarizePackTransfer = (payload, fallback = "") => {
-  if (!payload || typeof payload !== "object") return fallback;
-  const status = String(payload.status || "preview");
-  if (payload.type === "skill") {
-    const skillId = payload.skill_id || "skill";
-    const destination = payload.destination_path || "";
-    const prefix = status === "preview" ? "Preview" : status;
-    return `${prefix}: ${skillId} -> ${destination}`;
-  }
-  const addon = payload.addon || {};
-  const addonId = addon.id || "module pack";
-  const fileCount = Number(payload.file_count || 0);
-  const skillCount = Number(payload.skill_doc_count || 0);
-  const destination = payload.destination_path || "";
-  const prefix = status === "preview" ? "Preview" : status;
-  return `${prefix}: ${addonId}, ${fileCount} file${fileCount === 1 ? "" : "s"}, ${skillCount} skill doc${skillCount === 1 ? "" : "s"} -> ${destination}`;
-};
-
 const BACKGROUND_AUTONOMY_MODE_OPTIONS = [
   {
     value: "manual",
@@ -514,70 +472,6 @@ const normalizeToolPolicy = (policy) => ({
 const toolPolicyControlId = (toolId, field) =>
   `tool-policy-${field}-${String(toolId || "tool").replace(/[^a-z0-9_-]+/gi, "-")}`;
 
-const DEFAULT_WORKFLOW_CATALOG = {
-  workflows: [
-    {
-      id: "default",
-      label: "Default",
-      description: "Balanced reasoning with normal tool access and moderate latency.",
-      thinking_default: "auto",
-      preferred_continue: "mini_execution",
-      allow_continue_to: ["default", "mini_execution"],
-      enabled_modules: ["computer_use"],
-    },
-    {
-      id: "architect_planner",
-      label: "Architect / Planner",
-      description: "Higher-reasoning planning workflow that prefers decomposition and explicit handoff.",
-      thinking_default: "high",
-      preferred_continue: "mini_execution",
-      allow_continue_to: ["architect_planner", "default", "mini_execution"],
-      enabled_modules: ["computer_use"],
-    },
-    {
-      id: "mini_execution",
-      label: "Mini Execution",
-      description: "Short, low-latency execution bursts for in-between tool steps and recursive continue loops.",
-      thinking_default: "low",
-      preferred_continue: "mini_execution",
-      allow_continue_to: ["mini_execution"],
-      enabled_modules: ["computer_use"],
-    },
-  ],
-  modules: [
-    {
-      id: "computer_use",
-      label: "Computer Use",
-      description:
-        "Browser and desktop observation, camera capture, capture promotion, and approval-gated host actions.",
-      status: "live",
-      source: "base",
-      enabled: false,
-      skill_id: "computer_use",
-      doc_id: "skills:computer_use",
-      tool_names: [
-        "computer.session.start",
-        "computer.session.stop",
-        "computer.observe",
-        "computer.act",
-        "computer.navigate",
-        "computer.windows.list",
-        "computer.windows.focus",
-        "computer.app.launch",
-        "camera.capture",
-        "capture.list",
-        "capture.promote",
-        "capture.delete",
-        "shell.exec",
-        "patch.apply",
-        "mcp.call",
-      ],
-    },
-  ],
-  addons: [],
-  addons_root: "data/modules/addons",
-};
-
 const THEME_SLOT_LABELS = {
   c1Light: "C1 light",
   c1Med: "C1 medium",
@@ -600,6 +494,20 @@ const buildThemeDraftFromTheme = (themeSource, label = "Custom Theme") => {
   }, {});
   return { label, slots };
 };
+
+const SettingsInfoTip = ({ text, label = "More information" }) => (
+  <span
+    className="settings-info-tip"
+    tabIndex={0}
+    role="note"
+    aria-label={`${label}: ${text}`}
+  >
+    <span aria-hidden="true">?</span>
+    <span className="settings-info-tip-content" role="tooltip">
+      {text}
+    </span>
+  </span>
+);
 
 const Settings = () => {
 
@@ -1349,6 +1257,8 @@ const Settings = () => {
   harmony_format_mode: normalizeHarmonyFormatMode(state.harmonyFormatMode),
 
   server_url: state.serverUrl,
+  server_preset_id: "",
+  server_presets: [],
 
     stt_model: state.sttModel,
 
@@ -1356,7 +1266,7 @@ const Settings = () => {
 
     voice_model: state.voiceModel,
     stream_backend: "api",
-    realtime_model: "gpt-realtime-2",
+    realtime_model: "gpt-realtime-2.1",
     realtime_voice: "alloy",
     live_agent_mode: "local",
     live_agent_model: "",
@@ -1467,35 +1377,8 @@ const Settings = () => {
   const [privacyFilterMode, setPrivacyFilterMode] = useState("off");
   const [privacyFilterModel, setPrivacyFilterModel] = useState("openai/privacy-filter");
   const [privacyRouteMode, setPrivacyRouteMode] = useState("off");
-  const privacyDetectorDisabled = normalizePrivacyFilterMode(privacyFilterMode) === "off";
-  const [defaultWorkflow, setDefaultWorkflow] = useState(state.workflowProfile || "default");
-  const [enabledWorkflowModules, setEnabledWorkflowModules] = useState(
-    Array.isArray(state.enabledWorkflowModules) ? state.enabledWorkflowModules : [],
-  );
-  const [workflowCatalog, setWorkflowCatalog] = useState(DEFAULT_WORKFLOW_CATALOG);
-  const [workflowCatalogLoading, setWorkflowCatalogLoading] = useState(false);
-  const [workflowInspectorOpen, setWorkflowInspectorOpen] = useState(false);
-  const [moduleDetailsId, setModuleDetailsId] = useState("");
-  const [skillDocSelectedId, setSkillDocSelectedId] = useState("");
-  const [skillDoc, setSkillDoc] = useState(null);
-  const [skillDocDraft, setSkillDocDraft] = useState("");
-  const [skillDocLoading, setSkillDocLoading] = useState(false);
-  const [skillDocSaving, setSkillDocSaving] = useState(false);
-  const [skillDocMessage, setSkillDocMessage] = useState("");
-  const [modulePackImportPath, setModulePackImportPath] = useState("");
-  const [modulePackExportPath, setModulePackExportPath] = useState("");
-  const [modulePackOverwrite, setModulePackOverwrite] = useState(false);
-  const [modulePackTransferBusy, setModulePackTransferBusy] = useState("");
-  const [modulePackTransferMessage, setModulePackTransferMessage] = useState("");
-  const [modulePackTransferPreview, setModulePackTransferPreview] = useState(null);
-  const [skillImportPath, setSkillImportPath] = useState("");
-  const [skillExportPath, setSkillExportPath] = useState("");
-  const [skillTransferOverwrite, setSkillTransferOverwrite] = useState(false);
-  const [skillTransferBusy, setSkillTransferBusy] = useState("");
-  const [skillTransferMessage, setSkillTransferMessage] = useState("");
-  const [skillTransferPreview, setSkillTransferPreview] = useState(null);
-  const [captureWorkflowSaving, setCaptureWorkflowSaving] = useState(false);
-  const [captureWorkflowMessage, setCaptureWorkflowMessage] = useState("");
+  const [capturePrivacySaving, setCapturePrivacySaving] = useState(false);
+  const [capturePrivacyMessage, setCapturePrivacyMessage] = useState("");
 
   const [exportDefaults, setExportDefaults] = useState({
     format: "md",
@@ -1510,16 +1393,6 @@ const Settings = () => {
   const [exportSaving, setExportSaving] = useState(false);
   const [exportMessage, setExportMessage] = useState("");
   const [exportAllBusy, setExportAllBusy] = useState(false);
-  const [syncRemoteUrl, setSyncRemoteUrl] = useState("");
-  const [syncPreview, setSyncPreview] = useState(null);
-  const [syncSelections, setSyncSelections] = useState({});
-  const [syncBusy, setSyncBusy] = useState(false);
-  const [syncActionBusy, setSyncActionBusy] = useState("");
-  const [syncMessage, setSyncMessage] = useState("");
-  const [syncLinkToSourceDevice, setSyncLinkToSourceDevice] = useState(false);
-  const [syncSourceNamespace, setSyncSourceNamespace] = useState("");
-  const [syncDefaultsSaving, setSyncDefaultsSaving] = useState(false);
-  const [syncDialogOpen, setSyncDialogOpen] = useState(false);
   const [settingsSearch, setSettingsSearch] = useState("");
   const [toolCatalog, setToolCatalog] = useState([]);
   const [toolLimits, setToolLimits] = useState(null);
@@ -1528,6 +1401,7 @@ const Settings = () => {
   const [toolCatalogFilter, setToolCatalogFilter] = useState("");
   const [toolPolicySaving, setToolPolicySaving] = useState("");
   const [toolPolicyMessage, setToolPolicyMessage] = useState("");
+  const [hfRegisterOpen, setHfRegisterOpen] = useState(false);
 
   const [availableModels, setAvailableModels] = useState([]);
   const [providerRuntime, setProviderRuntime] = useState(null);
@@ -1541,6 +1415,9 @@ const Settings = () => {
   const [localRuntimeError, setLocalRuntimeError] = useState("");
   const [localRuntimeActionBusy, setLocalRuntimeActionBusy] = useState("");
   const [localRuntimeMessage, setLocalRuntimeMessage] = useState("");
+  const [serverRuntime, setServerRuntime] = useState(null);
+  const [serverRuntimeLoading, setServerRuntimeLoading] = useState(false);
+  const [serverRuntimeError, setServerRuntimeError] = useState("");
   const [languageRuntimeCollapsed, setLanguageRuntimeCollapsed] = useState(false);
   const [embeddingRuntimeCollapsed, setEmbeddingRuntimeCollapsed] = useState(false);
   const [embeddingRuntimeBusy, setEmbeddingRuntimeBusy] = useState("");
@@ -1555,6 +1432,12 @@ const Settings = () => {
   const [registerModelBusy, setRegisterModelBusy] = useState(false);
   const [registerModelMessage, setRegisterModelMessage] = useState("");
   const [registerModelExplanation, setRegisterModelExplanation] = useState(null);
+  const [registerHfUrl, setRegisterHfUrl] = useState("");
+  const [registerHfAlias, setRegisterHfAlias] = useState("");
+  const [registerHfType, setRegisterHfType] = useState("transformer");
+  const [registerHfRuntime, setRegisterHfRuntime] = useState("direct");
+  const [registerHfBusy, setRegisterHfBusy] = useState(false);
+  const [registerHfMessage, setRegisterHfMessage] = useState("");
   const availableModelSet = useMemo(() => {
     const set = new Set();
     (availableModels || []).forEach((model) => {
@@ -1599,6 +1482,13 @@ const Settings = () => {
   }, [providerModelOptions, settings.local_provider_preferred_model]);
 
   const apiModelsAvailable = Array.isArray(state.apiModels) ? state.apiModels : [];
+  const apiModelAliases =
+    state.apiModelAliases && typeof state.apiModelAliases === "object"
+      ? state.apiModelAliases
+      : {};
+  const apiModelCatalog = Array.isArray(state.apiModelCatalog)
+    ? state.apiModelCatalog
+    : [];
   const apiModelsAvailableSet = useMemo(
     () => new Set(apiModelsAvailable),
     [apiModelsAvailable],
@@ -1682,12 +1572,8 @@ const Settings = () => {
         id: "custom",
         label: "Custom tools",
         badge: "planned",
-        description:
-          "Settings does not yet create saved HTTP or MCP-backed custom tools.",
-        details: [
-          "Read-only for now",
-          "Planned follow-up: custom HTTP/MCP tool management",
-        ],
+        description: "Saved HTTP or MCP tools will appear here when custom creation is available.",
+        details: ["None configured", "Creation is not available yet"],
       },
     ];
   }, [
@@ -1969,29 +1855,6 @@ const Settings = () => {
     },
     [scrollToSettingsSection, settingsSearchTerms.length, visibleSettingsSectionIds],
   );
-  const workflowProfiles = useMemo(
-    () =>
-      workflowCatalog.workflows.length
-        ? workflowCatalog.workflows
-        : DEFAULT_WORKFLOW_CATALOG.workflows,
-    [workflowCatalog.workflows],
-  );
-  const workflowModules = useMemo(
-    () =>
-      workflowCatalog.modules.length
-        ? workflowCatalog.modules
-        : DEFAULT_WORKFLOW_CATALOG.modules,
-    [workflowCatalog.modules],
-  );
-  const workflowProfileMap = useMemo(
-    () => new Map(workflowProfiles.map((workflow) => [workflow.id, workflow])),
-    [workflowProfiles],
-  );
-  const workflowModuleMap = useMemo(
-    () => new Map(workflowModules.map((module) => [module.id, module])),
-    [workflowModules],
-  );
-
   const suggestedLangModels = Array.from(
     new Set([
       ...(Array.isArray(SUGGESTED_LOCAL_MODELS) ? SUGGESTED_LOCAL_MODELS : []),
@@ -2000,11 +1863,14 @@ const Settings = () => {
   );
   const serverRuntimeModelOptions = Array.from(
     new Set([
+      ...(Array.isArray(serverRuntime?.models) ? serverRuntime.models : []),
       ...(Array.isArray(providerModelOptions) ? providerModelOptions : []),
       ...(Array.isArray(SUGGESTED_SERVER_MODELS) ? SUGGESTED_SERVER_MODELS : []),
       settings.transformer_model,
     ].filter((model) => typeof model === "string" && model.trim())),
   );
+  const activeServerPreset = selectedServerPreset(settings);
+  const activeServerTrustWarning = serverTrustWarning(settings);
   const suggestedApiLangModels = apiModelGroups.all;
 
   const suggestedSttModels = [
@@ -2379,6 +2245,8 @@ const Settings = () => {
     "shimmer",
   ];
   const realtimeModelOptions = [
+    "gpt-realtime-2.1",
+    "gpt-realtime-2.1-mini",
     "gpt-realtime-2",
     "gpt-realtime-mini",
     "gpt-realtime-1.5",
@@ -2948,6 +2816,8 @@ const Settings = () => {
           ),
 
           server_url: data.server_url || "",
+          server_preset_id: data.server_preset_id || "",
+          server_presets: normalizeServerPresets(data.server_presets),
 
           stt_model: data.stt_model || "whisper-1",
 
@@ -2957,7 +2827,7 @@ const Settings = () => {
 
           voice_model: data.voice_model || "alloy",
           stream_backend: data.stream_backend || "api",
-          realtime_model: data.realtime_model || "gpt-realtime-2",
+          realtime_model: data.realtime_model || "gpt-realtime-2.1",
           realtime_voice: data.realtime_voice || "alloy",
           live_agent_mode: data.live_agent_mode || "local",
           live_agent_model: data.live_agent_model || "",
@@ -3368,6 +3238,37 @@ const Settings = () => {
       }
     }
   };
+
+  const refreshServerRuntime = useCallback(async ({ refresh = false } = {}) => {
+    const serverUrl =
+      typeof settings.server_url === "string" ? settings.server_url.trim() : "";
+    if (settings.mode !== "server" || !serverUrl) {
+      setServerRuntime(null);
+      setServerRuntimeError("");
+      setServerRuntimeLoading(false);
+      return;
+    }
+    setServerRuntimeLoading(true);
+    setServerRuntimeError("");
+    try {
+      const response = await axios.get("/api/llm/server/models", {
+        params: {
+          server_url: serverUrl,
+          ...(settings.server_preset_id
+            ? { preset_id: settings.server_preset_id }
+            : {}),
+          ...(refresh ? { refresh: true } : {}),
+        },
+      });
+      setServerRuntime(response?.data || { reachable: false, models: [] });
+    } catch (err) {
+      void err;
+      setServerRuntime({ reachable: false, models: [] });
+      setServerRuntimeError("Server/LAN endpoint is not reachable right now.");
+    } finally {
+      setServerRuntimeLoading(false);
+    }
+  }, [settings.mode, settings.server_preset_id, settings.server_url]);
 
   const refreshLocalRuntime = async (quiet = false) => {
     const shouldInspect =
@@ -4020,46 +3921,28 @@ const Settings = () => {
 
         <div className="celery-panel">
 
-          <div
-            className="celery-header"
-            style={{ display: 'flex', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap' }}
-          >
+          <div className="celery-header">
 
             <div
-              className="inline-flex"
-              style={{ alignItems: 'center', gap: 8 }}
+              className="celery-title-row"
             >
 
               {renderStatusDot(svcCelery)}
 
-              <h3 style={{ margin: 0 }}>Celery tasks</h3>
+              <h3>Background jobs</h3>
 
               {renderStatusBadge(svcCelery)}
 
-              <span
-                className="hint-badge"
-                title="Celery runs optional background workers, scheduled tasks, and multi-step queues. It can stay offline during normal chat."
-              >
-                ?
-              </span>
-
-              {svcCeleryNote && (
-
-                <span
-                  className={`status-note ${
-                    celeryStatusNormalized === 'degraded' ? 'warn' : ''
-                  }`}
-                >
-
-                  {svcCeleryNote}
-
-                </span>
-
-              )}
+              <SettingsInfoTip
+                label="About background jobs"
+                text={`Optional workers handle scheduled and long-running jobs; normal chat still works while they are offline.${
+                  svcCeleryNote ? ` Current status: ${svcCeleryNote}.` : ""
+                }`}
+              />
 
             </div>
 
-            <div className="inline-flex">
+            <div className="celery-toolbar-controls">
 
               <select
 
@@ -4089,7 +3972,7 @@ const Settings = () => {
 
               </select>
 
-              <label className="inline-flex" style={{ gap: 6 }} title="Auto-refresh every ~8s">
+              <label className="settings-toggle-row settings-toggle-row--compact">
 
                 <input
 
@@ -4101,7 +3984,7 @@ const Settings = () => {
 
                 />
 
-                Auto-refresh
+                <span>Auto-refresh</span>
 
               </label>
 
@@ -4121,13 +4004,7 @@ const Settings = () => {
                 role="status"
               >
                 <strong>{celeryNoticeTitle}</strong>
-                <span>{celeryNoticeBody}</span>
-              </div>
-            )}
-
-            {!showCeleryOperations && (
-              <div className="celery-empty-state" role="status">
-                Worker controls appear when the queue is reachable or tasks exist.
+                <SettingsInfoTip label={celeryNoticeTitle} text={celeryNoticeBody} />
               </div>
             )}
 
@@ -4621,6 +4498,11 @@ const Settings = () => {
   }, [loading, settings.mode, settings.local_provider]);
 
   useEffect(() => {
+    if (loading) return;
+    refreshServerRuntime();
+  }, [loading, refreshServerRuntime]);
+
+  useEffect(() => {
     const providerKey = normalizeModelId(settings.local_provider) || "lmstudio";
     if (!(settings.mode === "local" && MANAGED_LOCAL_PROVIDERS.has(providerKey))) {
       return undefined;
@@ -4812,296 +4694,12 @@ const Settings = () => {
     setCaptureDefaultSensitivity(state.captureDefaultSensitivity || "personal");
     setCaptureAllowModelRawImageAccess(state.captureAllowModelRawImageAccess !== false);
     setCaptureAllowSummaryFallback(state.captureAllowSummaryFallback !== false);
-    setDefaultWorkflow(state.workflowProfile || "default");
-    setEnabledWorkflowModules(
-      Array.isArray(state.enabledWorkflowModules) ? state.enabledWorkflowModules : [],
-    );
   }, [
     state.captureAllowModelRawImageAccess,
     state.captureAllowSummaryFallback,
     state.captureDefaultSensitivity,
     state.captureRetentionDays,
-    state.enabledWorkflowModules,
-    state.workflowProfile,
   ]);
-
-  const refreshWorkflowCatalog = async () => {
-    setWorkflowCatalogLoading(true);
-    try {
-      const res = await axios.get("/api/workflows/catalog");
-      const payload = res?.data || {};
-      setWorkflowCatalog({
-        workflows: Array.isArray(payload.workflows)
-          ? payload.workflows
-          : DEFAULT_WORKFLOW_CATALOG.workflows,
-        modules: Array.isArray(payload.modules)
-          ? payload.modules
-          : DEFAULT_WORKFLOW_CATALOG.modules,
-        addons: Array.isArray(payload.addons) ? payload.addons : [],
-        addons_root:
-          typeof payload.addons_root === "string" && payload.addons_root.trim()
-            ? payload.addons_root.trim()
-            : DEFAULT_WORKFLOW_CATALOG.addons_root,
-      });
-    } catch {
-      setWorkflowCatalog(DEFAULT_WORKFLOW_CATALOG);
-    } finally {
-      setWorkflowCatalogLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    refreshWorkflowCatalog();
-  }, []);
-
-  useEffect(() => {
-    if (!workflowModules.length) {
-      return;
-    }
-    const moduleIds = workflowModules
-      .map((module) => String(module.id || "").trim())
-      .filter(Boolean);
-    if (moduleIds.length && (!moduleDetailsId || !moduleIds.includes(moduleDetailsId))) {
-      setModuleDetailsId(moduleIds[0]);
-    }
-    const knownSkillIds = workflowModules
-      .map((module) => String(module.skill_id || module.id || "").trim())
-      .filter(Boolean);
-    if (!knownSkillIds.length) {
-      return;
-    }
-    if (!skillDocSelectedId || !knownSkillIds.includes(skillDocSelectedId)) {
-      setSkillDocSelectedId(knownSkillIds[0]);
-    }
-  }, [moduleDetailsId, skillDocSelectedId, workflowModules]);
-
-  const fetchSkillDoc = async (skillId) => {
-    const normalized = String(skillId || "").trim();
-    if (!normalized) {
-      setSkillDoc(null);
-      setSkillDocDraft("");
-      return;
-    }
-    setSkillDocLoading(true);
-    setSkillDocMessage("");
-    try {
-      const res = await axios.get(`/api/workflows/skills/${encodeURIComponent(normalized)}`);
-      const payload = res?.data || null;
-      setSkillDoc(payload);
-      setSkillDocDraft(String(payload?.active?.body || ""));
-    } catch {
-      setSkillDoc(null);
-      setSkillDocDraft("");
-      setSkillDocMessage("Could not load that skill doc.");
-    } finally {
-      setSkillDocLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    fetchSkillDoc(skillDocSelectedId);
-  }, [skillDocSelectedId]);
-
-  const handleSkillDocSave = async () => {
-    const normalized = String(skillDocSelectedId || "").trim();
-    if (!normalized) {
-      return;
-    }
-    setSkillDocSaving(true);
-    setSkillDocMessage("");
-    try {
-      const res = await axios.put(`/api/workflows/skills/${encodeURIComponent(normalized)}`, {
-        body: skillDocDraft,
-      });
-      const payload = res?.data || null;
-      setSkillDoc(payload);
-      setSkillDocDraft(String(payload?.active?.body || ""));
-      setSkillDocMessage("Local skill override saved.");
-      refreshWorkflowCatalog();
-    } catch {
-      setSkillDocMessage("Failed to save local skill override.");
-    } finally {
-      setSkillDocSaving(false);
-    }
-  };
-
-  const handleSkillDocDelete = async () => {
-    const normalized = String(skillDocSelectedId || "").trim();
-    if (!normalized) {
-      return;
-    }
-    setSkillDocSaving(true);
-    setSkillDocMessage("");
-    try {
-      const res = await axios.delete(`/api/workflows/skills/${encodeURIComponent(normalized)}`);
-      const payload = res?.data || null;
-      setSkillDoc(payload);
-      setSkillDocDraft(String(payload?.active?.body || ""));
-      setSkillDocMessage("Local skill override removed; base doc is active again.");
-      refreshWorkflowCatalog();
-    } catch {
-      setSkillDocMessage("Failed to remove local skill override.");
-    } finally {
-      setSkillDocSaving(false);
-    }
-  };
-
-  const handleModulePackImport = async (dryRun = true) => {
-    const sourcePath = modulePackImportPath.trim();
-    if (!sourcePath) {
-      setModulePackTransferMessage("Choose a module pack folder first.");
-      return;
-    }
-    setModulePackTransferBusy(dryRun ? "import-preview" : "import");
-    setModulePackTransferMessage("");
-    try {
-      const res = await axios.post("/api/workflows/module-packs/import", {
-        source_path: sourcePath,
-        dry_run: dryRun,
-        overwrite: modulePackOverwrite,
-      });
-      const payload = res?.data || null;
-      setModulePackTransferPreview(payload);
-      setModulePackTransferMessage(
-        summarizePackTransfer(
-          payload,
-          dryRun ? "Module pack preview ready." : "Module pack imported.",
-        ),
-      );
-      if (!dryRun) {
-        const moduleId = payload?.addon?.module_ids?.[0];
-        if (moduleId) {
-          setModuleDetailsId(moduleId);
-        }
-        await refreshWorkflowCatalog();
-      }
-    } catch (error) {
-      setModulePackTransferMessage(
-        error?.response?.data?.detail || "Module pack import failed.",
-      );
-    } finally {
-      setModulePackTransferBusy("");
-    }
-  };
-
-  const handleModulePackExport = async (dryRun = true) => {
-    const destinationPath = modulePackExportPath.trim();
-    if (!destinationPath) {
-      setModulePackTransferMessage("Choose an export folder first.");
-      return;
-    }
-    const selectedModule =
-      workflowModuleMap.get(moduleDetailsId) || workflowModules[0] || {};
-    const source = String(selectedModule.source || "").toLowerCase();
-    const addonId = String(selectedModule.addon_id || "").trim();
-    if (!addonId || (source !== "custom" && source !== "local")) {
-      setModulePackTransferMessage("Only imported local packs can be exported here.");
-      return;
-    }
-    setModulePackTransferBusy(dryRun ? "export-preview" : "export");
-    setModulePackTransferMessage("");
-    try {
-      const res = await axios.post(
-        `/api/workflows/module-packs/${encodeURIComponent(addonId)}/export`,
-        {
-          destination_path: destinationPath,
-          dry_run: dryRun,
-          overwrite: modulePackOverwrite,
-        },
-      );
-      const payload = res?.data || null;
-      setModulePackTransferPreview(payload);
-      setModulePackTransferMessage(
-        summarizePackTransfer(
-          payload,
-          dryRun ? "Module pack export preview ready." : "Module pack exported.",
-        ),
-      );
-    } catch (error) {
-      setModulePackTransferMessage(
-        error?.response?.data?.detail || "Module pack export failed.",
-      );
-    } finally {
-      setModulePackTransferBusy("");
-    }
-  };
-
-  const handleSkillImport = async (dryRun = true) => {
-    const sourcePath = skillImportPath.trim();
-    if (!sourcePath) {
-      setSkillTransferMessage("Choose a skill markdown file first.");
-      return;
-    }
-    setSkillTransferBusy(dryRun ? "import-preview" : "import");
-    setSkillTransferMessage("");
-    try {
-      const res = await axios.post("/api/workflows/skills/import", {
-        source_path: sourcePath,
-        dry_run: dryRun,
-        overwrite: skillTransferOverwrite,
-      });
-      const payload = res?.data || null;
-      setSkillTransferPreview(payload);
-      setSkillTransferMessage(
-        summarizePackTransfer(
-          payload,
-          dryRun ? "Skill import preview ready." : "Skill imported.",
-        ),
-      );
-      if (!dryRun) {
-        await refreshWorkflowCatalog();
-        if (payload?.skill_id) {
-          setSkillDocSelectedId(payload.skill_id);
-          fetchSkillDoc(payload.skill_id);
-        }
-      }
-    } catch (error) {
-      setSkillTransferMessage(
-        error?.response?.data?.detail || "Skill markdown import failed.",
-      );
-    } finally {
-      setSkillTransferBusy("");
-    }
-  };
-
-  const handleSkillExport = async (dryRun = true) => {
-    const destinationPath = skillExportPath.trim();
-    const normalized = String(skillDocSelectedId || "").trim();
-    if (!normalized) {
-      setSkillTransferMessage("Choose a skill doc first.");
-      return;
-    }
-    if (!destinationPath) {
-      setSkillTransferMessage("Choose a skill export folder first.");
-      return;
-    }
-    setSkillTransferBusy(dryRun ? "export-preview" : "export");
-    setSkillTransferMessage("");
-    try {
-      const res = await axios.post(
-        `/api/workflows/skills/${encodeURIComponent(normalized)}/export`,
-        {
-          destination_path: destinationPath,
-          dry_run: dryRun,
-          overwrite: skillTransferOverwrite,
-        },
-      );
-      const payload = res?.data || null;
-      setSkillTransferPreview(payload);
-      setSkillTransferMessage(
-        summarizePackTransfer(
-          payload,
-          dryRun ? "Skill export preview ready." : "Skill exported.",
-        ),
-      );
-    } catch (error) {
-      setSkillTransferMessage(
-        error?.response?.data?.detail || "Skill markdown export failed.",
-      );
-    } finally {
-      setSkillTransferBusy("");
-    }
-  };
 
 
 
@@ -5160,12 +4758,6 @@ const Settings = () => {
             normalizePrivacyRouteMode(s.privacy_filter_route_private_mode),
           );
         }
-        if (typeof s.default_workflow === "string" && s.default_workflow.trim()) {
-          setDefaultWorkflow(s.default_workflow.trim());
-        }
-        if (Array.isArray(s.enabled_workflow_modules)) {
-          setEnabledWorkflowModules(s.enabled_workflow_modules);
-        }
         const nextDefaults = {
           format: normalizeExportFormat(s.export_default_format),
           includeChat:
@@ -5188,11 +4780,6 @@ const Settings = () => {
         setSystemPromptCustom(
           typeof s.system_prompt_custom === "string" ? s.system_prompt_custom : "",
         );
-        setSyncLinkToSourceDevice(!!s.sync_link_to_source_device);
-        setSyncSourceNamespace(
-          typeof s.sync_source_namespace === "string" ? s.sync_source_namespace : "",
-        );
-
       })
 
       .catch(() => {});
@@ -5838,6 +5425,79 @@ const Settings = () => {
     providerRuntime?.last_operation,
     runtimeNow,
   );
+  const languageProviderRuntime = providerRuntime
+    ? {
+        ...providerRuntime,
+        ...(providerRuntime.loaded_model &&
+        typeof providerRuntime.server_running !== "boolean"
+          ? { server_running: true }
+          : {}),
+        ...(providerRuntime.loaded_model &&
+        typeof providerRuntime.model_loaded !== "boolean"
+          ? { model_loaded: true }
+          : {}),
+      }
+    : null;
+  const languageRuntimeContract = resolveRuntimePanelContract(
+    {
+      mode: settings.mode,
+      apiStatus: svcApi,
+      apiProviderStatus: state.apiProviderStatus,
+      apiModel: settings.model || state.apiModel,
+      apiEndpoint: settings.api_url,
+      serverUrl: settings.server_url,
+      serverModel: settings.transformer_model || state.transformerModel,
+      serverRuntime,
+      serverStatus:
+        serverRuntime?.reachable === false
+          ? "unavailable"
+          : serverRuntime?.reachable === true
+            ? "online"
+            : "",
+      serverLoading: serverRuntimeLoading,
+      serverError: serverRuntimeError,
+      localRuntimeKind: managedLocalRuntimeSelected ? "provider" : "direct",
+      localModel: settings.transformer_model,
+      providerMode: settings.local_provider_mode,
+      localProviderBaseUrl: settings.local_provider_base_url,
+      providerPreferredModel: settings.local_provider_preferred_model,
+      providerRuntime: languageProviderRuntime,
+      providerModels: providerModelOptions,
+      providerLoading: providerRuntimeLoading || !!providerActionBusy,
+      providerError: providerRuntimeDisplayError,
+      runtime: localRuntime,
+      localLoading: localRuntimeLoading || !!localRuntimeActionBusy,
+      localError: localRuntimeError,
+    },
+    runtimeNow,
+  );
+  const languageRuntimeLaneLabel =
+    LANGUAGE_RUNTIME_LANE_LABELS[languageRuntimeContract.lane] ||
+    languageRuntimeContract.lane;
+  const languageRuntimePanelClass =
+    languageRuntimeContract.lane === RUNTIME_PANEL_LANES.CLOUD_API
+      ? "runtime-inline-panel--api"
+      : languageRuntimeContract.lane === RUNTIME_PANEL_LANES.LOCAL_PROVIDER
+        ? "runtime-inline-panel--provider"
+        : languageRuntimeContract.lane === RUNTIME_PANEL_LANES.DIRECT_LOCAL
+          ? "runtime-inline-panel--local"
+          : "";
+  const languageRuntimeDescription =
+    languageRuntimeContract.lane === RUNTIME_PANEL_LANES.CLOUD_API
+      ? "Cloud API runtime for the selected provider model."
+      : languageRuntimeContract.lane === RUNTIME_PANEL_LANES.SERVER_LAN
+        ? "OpenAI-compatible Server/LAN runtime for the configured endpoint."
+        : languageRuntimeContract.lane === RUNTIME_PANEL_LANES.LOCAL_PROVIDER
+          ? "Provider-backed local runtime status for the selected bridge."
+          : "Direct local Transformers runtime for the selected language model.";
+  const languageRuntimeBusy =
+    languageRuntimeContract.lane === RUNTIME_PANEL_LANES.SERVER_LAN
+      ? serverRuntimeLoading
+      : languageRuntimeContract.lane === RUNTIME_PANEL_LANES.LOCAL_PROVIDER
+        ? providerRuntimeLoading || !!providerActionBusy
+        : languageRuntimeContract.lane === RUNTIME_PANEL_LANES.DIRECT_LOCAL
+          ? localRuntimeLoading || !!localRuntimeActionBusy
+          : svcApi === "loading";
   const providerRuntimeInspectorRows = buildProviderRuntimeInspectorRows({
     providerKey: selectedProviderKey,
     providerLabel: providerLabelText,
@@ -5920,6 +5580,10 @@ const Settings = () => {
       <div className="model-inline voice-inline model-inline--stacked">
         <label className="model-inline-label" htmlFor="settings-voice-model">
           TTS voice preset
+          <SettingsInfoTip
+            label="About TTS voice presets"
+            text="OpenAI voice presets depend on the selected TTS model. Kitten and Kokoro use local presets, while live-streaming voice is configured separately."
+          />
         </label>
         <input
           id="settings-voice-model"
@@ -5944,14 +5608,6 @@ const Settings = () => {
             : "Voice preset doesn’t match the selected TTS model. Choose a preset or leave blank for provider defaults."}
         </div>
       )}
-      <div className="status-note form-note">
-        <em>
-          OpenAI API voices are model-specific: `tts-1` and `tts-1-hd` use the
-          legacy preset set, while `gpt-4o-mini-tts` can use the expanded OpenAI
-          voice list. `kitten` and `kokoro` use local voice presets. Live
-          streaming voice stays in the section below.
-        </em>
-      </div>
     </div>
   );
 
@@ -6257,6 +5913,142 @@ const Settings = () => {
     }
   };
 
+  const handleServerPresetChange = (event) => {
+    const presetId = event.target.value;
+    setSettings((prev) => {
+      const presets = normalizeServerPresets(prev.server_presets);
+      const preset = presets.find((item) => item.id === presetId);
+      return {
+        ...prev,
+        server_preset_id: preset?.id || "",
+        server_url: preset?.base_url || prev.server_url,
+      };
+    });
+    setServerRuntime(null);
+    setServerRuntimeError("");
+  };
+
+  const updateActiveServerPreset = (field, value) => {
+    setSettings((prev) => {
+      const presetId = prev.server_preset_id;
+      const presets = normalizeServerPresets(prev.server_presets).map((preset) =>
+        preset.id === presetId && !preset.builtin
+          ? { ...preset, [field]: value }
+          : preset,
+      );
+      return {
+        ...prev,
+        server_presets: presets,
+        ...(field === "base_url" ? { server_url: value } : {}),
+      };
+    });
+  };
+
+  const handleServerUrlChange = (event) => {
+    const value = event.target.value;
+    setSettings((prev) => {
+      const presets = normalizeServerPresets(prev.server_presets);
+      const current = presets.find((preset) => preset.id === prev.server_preset_id);
+      if (current && !current.builtin) {
+        return {
+          ...prev,
+          server_url: value,
+          server_presets: presets.map((preset) =>
+            preset.id === current.id ? { ...preset, base_url: value } : preset,
+          ),
+        };
+      }
+      if (current && current.base_url !== value) {
+        return { ...prev, server_url: value, server_preset_id: "" };
+      }
+      return { ...prev, server_url: value };
+    });
+  };
+
+  const addCustomServerPreset = () => {
+    const preset = makeCustomServerPreset(Date.now());
+    setSettings((prev) => ({
+      ...prev,
+      server_preset_id: preset.id,
+      server_url: "",
+      server_presets: [...normalizeServerPresets(prev.server_presets), preset],
+    }));
+    setServerRuntime(null);
+    setServerRuntimeError("");
+  };
+
+  const removeActiveServerPreset = () => {
+    setSettings((prev) => {
+      const presets = normalizeServerPresets(prev.server_presets);
+      const current = presets.find((preset) => preset.id === prev.server_preset_id);
+      if (!current || current.builtin) return prev;
+      const remaining = presets.filter((preset) => preset.id !== current.id);
+      const fallback = remaining.find((preset) => preset.id === "lm-studio-local");
+      return {
+        ...prev,
+        server_presets: remaining,
+        server_preset_id: fallback?.id || "",
+        server_url: fallback?.base_url || "",
+      };
+    });
+    setServerRuntime(null);
+    setServerRuntimeError("");
+  };
+
+  const handleRegisterHfModel = async () => {
+    const url = String(registerHfUrl || "").trim();
+    if (!url) {
+      setRegisterHfMessage("Hugging Face model URL or owner/repo is required.");
+      return;
+    }
+    const payload = {
+      url,
+      model_type: registerHfType || "transformer",
+      runtime: registerHfRuntime || "direct",
+    };
+    const alias = String(registerHfAlias || "").trim();
+    if (alias) payload.alias = alias;
+    setRegisterHfBusy(true);
+    setRegisterHfMessage("");
+    try {
+      const response = await axios.post(
+        "/api/models/registered/huggingface",
+        payload,
+      );
+      const model = response?.data?.model || {};
+      await fetchRegisteredLocalModels();
+      setRegisterHfUrl("");
+      setRegisterHfAlias("");
+      setRegisterHfMessage(
+        `Added '${model.alias || alias || model.repo_id}' from ${model.repo_id || url}.`,
+      );
+    } catch (err) {
+      const detail =
+        err?.response?.data?.detail || "Failed to add Hugging Face model.";
+      setRegisterHfMessage(String(detail));
+    } finally {
+      setRegisterHfBusy(false);
+    }
+  };
+
+  const handleUnregisterHfModel = async (alias) => {
+    const modelAlias = String(alias || "").trim();
+    if (!modelAlias) return;
+    setRegisterHfBusy(true);
+    setRegisterHfMessage("");
+    try {
+      await axios.delete(`/api/models/registered/${encodeURIComponent(modelAlias)}`);
+      await fetchRegisteredLocalModels();
+      setRegisterHfMessage(`Removed Hugging Face model '${modelAlias}'.`);
+    } catch (err) {
+      const detail =
+        err?.response?.data?.detail || "Failed to remove Hugging Face model.";
+      setRegisterHfMessage(String(detail));
+    } finally {
+      setRegisterHfBusy(false);
+    }
+  };
+
   const handleUnregisterLocalModel = async (alias) => {
     const modelAlias = String(alias || "").trim();
     if (!modelAlias) return;
@@ -6361,6 +6153,10 @@ const Settings = () => {
       harmony_format_mode: normalizeHarmonyFormatMode(s.harmony_format_mode),
 
       server_url: s.server_url,
+      server_preset_id: s.server_preset_id || "",
+      server_presets: normalizeServerPresets(s.server_presets).filter(
+        (preset) => !preset.builtin,
+      ),
 
       stt_model: s.stt_model,
 
@@ -6654,8 +6450,13 @@ const Settings = () => {
               ? "model-option-suggested"
               : "model-option-unknown"
       }`;
+      const apiLabel = formatApiModelLabel(value, {
+        aliases: apiModelAliases,
+        availableModels: apiModelsAvailable,
+        catalog: apiModelCatalog,
+      });
       const labelText = isApiOnly
-        ? `${value} (API)`
+        ? `${apiLabel || value} (API)`
         : isProviderInventory
           ? `✓ ${value}`
         : isAvailable
@@ -6950,6 +6751,17 @@ const Settings = () => {
 
   const handleSave = () => {
 
+    const incompleteServerPreset = normalizeServerPresets(
+      settings.server_presets,
+    ).find(
+      (preset) =>
+        !preset.builtin && (!preset.name.trim() || !preset.base_url.trim()),
+    );
+    if (incompleteServerPreset) {
+      setMessage("Give each custom server preset a name and base URL before saving.");
+      return;
+    }
+
     setSaving(true);
 
     setMessage("");
@@ -7021,6 +6833,10 @@ const Settings = () => {
       harmony_format_mode: normalizeHarmonyFormatMode(settings.harmony_format_mode),
 
       server_url: settings.server_url,
+      server_preset_id: settings.server_preset_id || "",
+      server_presets: normalizeServerPresets(settings.server_presets).filter(
+        (preset) => !preset.builtin,
+      ),
 
       stt_model: settings.stt_model,
 
@@ -7164,7 +6980,7 @@ const Settings = () => {
           nextSettings = {
             ...nextSettings,
             stream_backend: nextSettings.stream_backend || "api",
-            realtime_model: nextSettings.realtime_model || "gpt-realtime-2",
+            realtime_model: nextSettings.realtime_model || "gpt-realtime-2.1",
             realtime_voice: nextSettings.realtime_voice || "alloy",
             live_agent_mode: nextSettings.live_agent_mode || "local",
             live_agent_model: nextSettings.live_agent_model || "",
@@ -7331,22 +7147,6 @@ const Settings = () => {
     }
   };
 
-  const handleSyncDefaultsSave = async () => {
-    setSyncDefaultsSaving(true);
-    setSyncMessage("");
-    try {
-      await axios.post("/api/user-settings", {
-        sync_link_to_source_device: !!syncLinkToSourceDevice,
-        sync_source_namespace: syncSourceNamespace.trim(),
-      });
-      setSyncMessage("Sync defaults saved.");
-    } catch {
-      setSyncMessage("Failed to save sync defaults.");
-    } finally {
-      setSyncDefaultsSaving(false);
-    }
-  };
-
   const handleSystemPromptSave = async () => {
     setSystemPromptSaving(true);
     setSystemPromptMessage("");
@@ -7393,23 +7193,14 @@ const Settings = () => {
     }
   };
 
-  const handleCaptureWorkflowSave = async () => {
-    const nextModules = Array.from(
-      new Set(
-        (Array.isArray(enabledWorkflowModules) ? enabledWorkflowModules : [])
-          .map((item) => String(item || "").trim())
-          .filter(Boolean),
-      ),
-    );
-    const nextWorkflow = String(defaultWorkflow || "default").trim() || "default";
+  const handleCapturePrivacySave = async () => {
     const nextRetentionDays = Math.max(1, Number(captureRetentionDays) || 7);
     const nextPrivacyFilterMode = normalizePrivacyFilterMode(privacyFilterMode);
     const nextPrivacyFilterModel =
       String(privacyFilterModel || "").trim() || "openai/privacy-filter";
-    const nextPrivacyRouteMode =
-      nextPrivacyFilterMode === "off" ? "off" : normalizePrivacyRouteMode(privacyRouteMode);
-    setCaptureWorkflowSaving(true);
-    setCaptureWorkflowMessage("");
+    const nextPrivacyRouteMode = normalizePrivacyRouteMode(privacyRouteMode);
+    setCapturePrivacySaving(true);
+    setCapturePrivacyMessage("");
     try {
       await axios.post("/api/user-settings", {
         capture_retention_days: nextRetentionDays,
@@ -7419,8 +7210,6 @@ const Settings = () => {
         privacy_filter_mode: nextPrivacyFilterMode,
         privacy_filter_model: nextPrivacyFilterModel,
         privacy_filter_route_private_mode: nextPrivacyRouteMode,
-        default_workflow: nextWorkflow,
-        enabled_workflow_modules: nextModules,
       });
       setPrivacyFilterMode(nextPrivacyFilterMode);
       setPrivacyFilterModel(nextPrivacyFilterModel);
@@ -7431,14 +7220,12 @@ const Settings = () => {
         captureDefaultSensitivity: captureDefaultSensitivity || "personal",
         captureAllowModelRawImageAccess: captureAllowModelRawImageAccess !== false,
         captureAllowSummaryFallback: captureAllowSummaryFallback !== false,
-        workflowProfile: nextWorkflow,
-        enabledWorkflowModules: nextModules,
       }));
-      setCaptureWorkflowMessage("Capture, privacy, and workflow defaults saved.");
+      setCapturePrivacyMessage("Capture and privacy settings saved.");
     } catch {
-      setCaptureWorkflowMessage("Failed to save capture and workflow defaults.");
+      setCapturePrivacyMessage("Failed to save capture and privacy settings.");
     } finally {
-      setCaptureWorkflowSaving(false);
+      setCapturePrivacySaving(false);
     }
   };
 
@@ -7486,201 +7273,6 @@ const Settings = () => {
       setExportAllBusy(false);
     }
   };
-
-  const extractSyncError = (err, fallback) => {
-    const detail = err?.response?.data?.detail;
-    if (typeof detail === "string" && detail.trim()) {
-      return detail.trim();
-    }
-    return fallback;
-  };
-
-  const summarizeSyncSections = (sectionMap) => {
-    if (!sectionMap || typeof sectionMap !== "object") return "Sync complete.";
-    const parts = Object.entries(sectionMap)
-      .map(([key, value]) => {
-        if (!value || typeof value !== "object") return null;
-        const applied = Number(value.applied || 0);
-        const skipped = Number(value.skipped || 0);
-        if (!applied && !skipped) return null;
-        const label = key.replace(/_/g, " ");
-        if (applied && skipped) return `${label}: ${applied} applied, ${skipped} skipped`;
-        if (applied) return `${label}: ${applied} applied`;
-        return `${label}: ${skipped} skipped`;
-      })
-      .filter(Boolean);
-    return parts.length ? parts.join(" | ") : "Sync complete.";
-  };
-
-  const syncPreviewStatusLabel = (status) => {
-    const key = String(status || "").trim().toLowerCase();
-    if (key === "only_remote") return "Only remote";
-    if (key === "only_local") return "Only local";
-    if (key === "remote_newer") return "Remote newer";
-    if (key === "local_newer") return "Local newer";
-    if (key === "identical") return "Identical";
-    return key || "Changed";
-  };
-
-  const syncPreviewStatusTone = (status) => {
-    const key = String(status || "").trim().toLowerCase();
-    if (key === "remote_newer" || key === "only_remote") {
-      return "color-mix(in oklab, var(--color-mint-green) 18%, transparent)";
-    }
-    if (key === "local_newer" || key === "only_local") {
-      return "color-mix(in oklab, var(--color-lavender) 22%, transparent)";
-    }
-    return "color-mix(in oklab, var(--color-neutral) 12%, transparent)";
-  };
-
-  const renderSyncPreviewItems = (title, items) => {
-    const list = Array.isArray(items) ? items : [];
-    if (!list.length) return null;
-    return (
-      <div style={{ marginTop: 8 }}>
-        <div className="status-note">{title}</div>
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 6 }}>
-          {list.map((item) => (
-            <span
-              key={`${title}-${item.resource_id}-${item.status}`}
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 6,
-                padding: "4px 8px",
-                borderRadius: 999,
-                border: "1px solid var(--glass-border)",
-                background: syncPreviewStatusTone(item.status),
-                fontSize: "0.75rem",
-                lineHeight: 1.2,
-              }}
-            >
-              <strong>{item.label || item.resource_id}</strong>
-              <span>{syncPreviewStatusLabel(item.status)}</span>
-            </span>
-          ))}
-        </div>
-      </div>
-    );
-  };
-
-  const getSyncOptionsPayload = () => {
-    const payload = {
-      link_to_source: !!syncLinkToSourceDevice,
-    };
-    const namespace = syncSourceNamespace.trim();
-    if (namespace) {
-      payload.source_namespace = namespace;
-    }
-    return payload;
-  };
-
-  const previewSync = async () => {
-    const remoteUrl = syncRemoteUrl.trim();
-    if (!remoteUrl) {
-      setSyncMessage("Enter the other Float instance URL first.");
-      return;
-    }
-    setSyncBusy(true);
-    setSyncMessage("");
-    try {
-      const res = await axios.post("/api/sync/plan", {
-        remote_url: remoteUrl,
-        ...getSyncOptionsPayload(),
-      });
-      const sections = Array.isArray(res?.data?.pull_sections)
-        ? res.data.pull_sections
-        : Array.isArray(res?.data?.sections)
-          ? res.data.sections
-          : [];
-      setSyncPreview(res.data || null);
-      setSyncSelections(
-        sections.reduce((acc, section) => {
-          if (section?.key) acc[section.key] = !!section.selected_by_default;
-          return acc;
-        }, {}),
-      );
-      setSyncDialogOpen(true);
-    } catch (err) {
-      setSyncMessage(extractSyncError(err, "Failed to preview instance sync."));
-    } finally {
-      setSyncBusy(false);
-    }
-  };
-
-  const applySync = async (direction) => {
-    const sections = Object.entries(syncSelections)
-      .filter(([, selected]) => !!selected)
-      .map(([key]) => key);
-    if (!sections.length) {
-      setSyncMessage("Choose at least one section to sync.");
-      return;
-    }
-    setSyncActionBusy(direction);
-    setSyncMessage("");
-    try {
-      const res = await axios.post("/api/sync/apply", {
-        remote_url: syncRemoteUrl.trim(),
-        direction,
-        sections,
-        ...getSyncOptionsPayload(),
-      });
-      const sectionMap =
-        direction === "push"
-          ? res?.data?.result?.sections
-          : res?.data?.result?.sections;
-      const effectiveNamespace =
-        res?.data?.effective_namespace || res?.data?.result?.effective_namespace;
-      setSyncMessage(
-        direction === "push"
-          ? `Push complete. ${summarizeSyncSections(sectionMap)}${
-              effectiveNamespace
-                ? ` Remote copy linked under ${effectiveNamespace}/.`
-                : ""
-            }`
-          : `Pull complete. ${summarizeSyncSections(sectionMap)}${
-              effectiveNamespace ? ` Stored under ${effectiveNamespace}/.` : ""
-            }`
-      );
-      setSyncDialogOpen(false);
-    } catch (err) {
-      setSyncMessage(
-        extractSyncError(
-          err,
-          direction === "push"
-            ? "Failed to push data to the remote Float instance."
-            : "Failed to pull data from the remote Float instance."
-        )
-      );
-    } finally {
-      setSyncActionBusy("");
-    }
-  };
-
-  const syncPullSections = Array.isArray(syncPreview?.pull_sections)
-    ? syncPreview.pull_sections
-    : Array.isArray(syncPreview?.sections)
-      ? syncPreview.sections
-      : [];
-  const syncPushSections = Array.isArray(syncPreview?.push_sections)
-    ? syncPreview.push_sections
-    : syncPullSections;
-  const syncPushSectionMap = syncPushSections.reduce((acc, section) => {
-    if (section?.key) {
-      acc[section.key] = section;
-    }
-    return acc;
-  }, {});
-  const syncPullNamespace =
-    typeof syncPreview?.effective_namespaces?.pull === "string"
-      ? syncPreview.effective_namespaces.pull
-      : "";
-  const syncPushNamespace =
-    typeof syncPreview?.effective_namespaces?.push === "string"
-      ? syncPreview.effective_namespaces.push
-      : "";
-
-
 
   return (
 
@@ -7785,90 +7377,6 @@ const Settings = () => {
                   </p>
                 </div>
               </div>
-
-          <div className="settings-section" style={{ marginBottom: 12 }}>
-
-            <h3>Knowledge Base (Weaviate)</h3>
-
-            <label title="Weaviate base URL (http/https)">Weaviate URL</label>
-
-            <input
-
-              name="weaviate_url"
-
-              type="text"
-
-              value={settings.weaviate_url}
-
-              onChange={handleChange}
-
-              placeholder="http://localhost:8080"
-
-              title="Weaviate base URL (http/https)"
-
-            />
-
-            <div className="inline-flex" style={{ alignItems: 'center', gap: 8, marginTop: 6 }}>
-
-              <button type="button" onClick={refreshWeaviateStatus} disabled={wvLoading}>
-
-                {wvLoading ? 'Checking…' : 'Check Status'}
-
-              </button>
-
-              <span>
-
-                {weaviateStatus.reachable == null ? (
-
-                  <span className="status-badge status-badge--loading">checking</span>
-
-                ) : weaviateStatus.reachable ? (
-
-                  <span className="status-badge status-badge--online">reachable</span>
-
-                ) : (
-
-                  <span className="status-badge status-badge--offline">unreachable</span>
-
-                )}
-
-              </span>
-
-              <button type="button" onClick={handleWeaviateStart} disabled={wvStarting}>
-
-                {wvStarting ? 'Starting…' : 'Start Weaviate'}
-
-              </button>
-
-            </div>
-
-            {wvMessage && (
-
-              <div className="settings-message" role="status" style={{ marginTop: 4 }}>
-
-                {wvMessage}
-
-              </div>
-
-            )}
-
-            <label title="Try to auto‑start Weaviate via Docker when needed">Auto‑start Weaviate</label>
-
-            <input
-
-              name="weaviate_auto_start"
-
-              type="checkbox"
-
-              checked={!!settings.weaviate_auto_start}
-
-              onChange={(e) => setSettings((prev) => ({ ...prev, weaviate_auto_start: !!e.target.checked }))}
-
-              title="Try to auto‑start Weaviate via Docker when needed"
-
-            />
-
-          </div>
 
           <label title="Secret token for provider APIs (e.g., OpenAI)">API Key</label>
 
@@ -8003,21 +7511,96 @@ const Settings = () => {
 
           />
 
+          <div className="settings-link-row">
+            <div>
+              <strong>Device sync</strong>
+              <span>Pair devices, review changes, and manage trust in Knowledge Sync.</span>
+            </div>
+            <Link to="/knowledge?tab=sync" className="icon-btn settings-inline-link">
+              Open Knowledge Sync
+            </Link>
+          </div>
+
+          <details className="settings-disclosure settings-disclosure--advanced">
+            <summary>
+              <span>Optional Weaviate connection</span>
+              <SettingsInfoTip
+                label="About Weaviate"
+                text="Float uses SQLite for canonical knowledge and Chroma for retrieval by default. Configure Weaviate only for a deliberate external backend or import workflow."
+              />
+            </summary>
+            <div className="settings-disclosure-body">
+              <label title="Weaviate base URL (http/https)">Weaviate URL</label>
+              <input
+                name="weaviate_url"
+                type="text"
+                value={settings.weaviate_url}
+                onChange={handleChange}
+                placeholder="http://localhost:8080"
+                title="Weaviate base URL (http/https)"
+              />
+              <div className="settings-compact-actions">
+                <button
+                  type="button"
+                  className="runtime-inline-btn"
+                  onClick={refreshWeaviateStatus}
+                  disabled={wvLoading}
+                >
+                  {wvLoading ? "Checking…" : "Check status"}
+                </button>
+                {weaviateStatus.reachable == null ? (
+                  <span className="status-badge status-badge--loading">checking</span>
+                ) : weaviateStatus.reachable ? (
+                  <span className="status-badge status-badge--online">reachable</span>
+                ) : (
+                  <span className="status-badge status-badge--offline">unreachable</span>
+                )}
+                <button
+                  type="button"
+                  className="runtime-inline-btn"
+                  onClick={handleWeaviateStart}
+                  disabled={wvStarting}
+                >
+                  {wvStarting ? "Starting…" : "Start Weaviate"}
+                </button>
+              </div>
+              {wvMessage && (
+                <div className="settings-message" role="status">
+                  {wvMessage}
+                </div>
+              )}
+              <label className="settings-toggle-row">
+                <input
+                  name="weaviate_auto_start"
+                  type="checkbox"
+                  checked={!!settings.weaviate_auto_start}
+                  onChange={(event) =>
+                    setSettings((prev) => ({
+                      ...prev,
+                      weaviate_auto_start: !!event.target.checked,
+                    }))
+                  }
+                />
+                <span>Auto-start Weaviate through Docker when needed</span>
+              </label>
+            </div>
+          </details>
+
             </section>
           )}
 
-          {showSettingsSection("runtime") && (
+          {showSettingsSection("connections") && (
             <section
               id="settings-runtime"
               className="settings-card settings-section"
-              aria-label="Runtime and provider"
+              aria-label="Language runtime connections"
             >
               <div className="settings-card-header">
                 <div>
-                  <h2>Runtime &amp; Provider</h2>
+                  <h2>Language Runtime Connections</h2>
                   <p className="settings-card-copy">
-                    Choose the active runtime, with direct Transformers as the
-                    primary local path and provider bridges kept separate.
+                    Choose cloud API, on-device Transformers, or a compatible
+                    server connection.
                   </p>
                 </div>
               </div>
@@ -8039,23 +7622,120 @@ const Settings = () => {
             Local means direct Transformers or a configured provider bridge.
           </div>
 
-        <label title="URL for an OpenAI-compatible LLM server, such as LM Studio or Ollama. Used when Mode is Server/LAN.">
-          Server/LAN URL
-        </label>
-        <input
-          name="server_url"
-          type="text"
-          value={settings.server_url}
-          onChange={handleChange}
-          placeholder="http://127.0.0.1:1234/v1"
-          title="URL for an OpenAI-compatible LLM server, such as LM Studio or Ollama. Used when Mode is Server/LAN."
-        />
-        <div className="status-note form-note">
-          Used by Server/LAN mode. Local provider bridges keep their own base URL below.
-        </div>
-
         {settings.mode === "server" && (
           <>
+            <label title="Choose a built-in server connection or a saved custom endpoint.">
+              Server connection preset
+            </label>
+            <div className="server-preset-controls">
+              <select
+                aria-label="Server connection preset"
+                value={settings.server_preset_id || ""}
+                onChange={handleServerPresetChange}
+              >
+                <option value="">Manual URL</option>
+                {normalizeServerPresets(settings.server_presets).map((preset) => (
+                  <option key={preset.id} value={preset.id}>
+                    {preset.name}
+                  </option>
+                ))}
+              </select>
+              <button type="button" className="runtime-inline-btn" onClick={addCustomServerPreset}>
+                New custom
+              </button>
+              {!activeServerPreset?.builtin && activeServerPreset && (
+                <button
+                  type="button"
+                  className="runtime-inline-btn"
+                  onClick={removeActiveServerPreset}
+                >
+                  Remove
+                </button>
+              )}
+            </div>
+            {activeServerPreset?.description && (
+              <div className="status-note form-note">{activeServerPreset.description}</div>
+            )}
+
+            {activeServerPreset && !activeServerPreset.builtin && (
+              <>
+                <label title="Friendly name shown in the preset list.">Preset name</label>
+                <input
+                  type="text"
+                  aria-label="Preset name"
+                  value={activeServerPreset.name}
+                  onChange={(event) =>
+                    updateActiveServerPreset("name", event.target.value)
+                  }
+                  placeholder="My inference endpoint"
+                />
+                <label title="Provider hint used for account-aware inventory and warnings.">
+                  Provider type
+                </label>
+                <input
+                  type="text"
+                  aria-label="Provider type"
+                  value={activeServerPreset.provider}
+                  onChange={(event) =>
+                    updateActiveServerPreset("provider", event.target.value)
+                  }
+                  placeholder="openai-compatible"
+                />
+              </>
+            )}
+
+            <label title="URL for an OpenAI-compatible LLM server or hosted provider.">
+              Server/LAN URL
+            </label>
+            <input
+              name="server_url"
+              type="text"
+              value={settings.server_url}
+              onChange={handleServerUrlChange}
+              placeholder="http://127.0.0.1:1234/v1"
+              title="URL for an OpenAI-compatible LLM server or hosted provider."
+            />
+            <SettingsInfoTip
+              label="Server connection details"
+              text="Provider keys are read server-side from environment variables."
+            />
+
+            {activeServerPreset && !activeServerPreset.builtin && (
+              <>
+                <label title="Environment variable containing this provider's bearer token.">
+                  API key environment variable
+                </label>
+                <input
+                  type="text"
+                  aria-label="API key environment variable"
+                  value={activeServerPreset.api_key_env}
+                  onChange={(event) =>
+                    updateActiveServerPreset("api_key_env", event.target.value.toUpperCase())
+                  }
+                  placeholder="MY_PROVIDER_API_KEY"
+                  autoCapitalize="characters"
+                />
+              </>
+            )}
+
+            {activeServerPreset?.api_key_env && (
+              <div
+                className={`status-note form-note${
+                  activeServerPreset.api_key_set ? "" : " warn"
+                }`}
+              >
+                {activeServerPreset.api_key_set
+                  ? `${activeServerPreset.api_key_env} detected (hidden).`
+                  : `${activeServerPreset.api_key_env} is not set in the Float process environment.`}
+              </div>
+            )}
+
+            {activeServerTrustWarning && (
+              <div className="status-note warn form-note" role="alert">
+                {activeServerTrustWarning}
+              </div>
+            )}
+
             <label title="Model id sent to the Server/LAN endpoint. Leave blank only when the server should choose its loaded model.">
               Server model
             </label>
@@ -8161,7 +7841,14 @@ const Settings = () => {
                     const disabled =
                       apiModelsAvailableSet.size > 0 &&
                       !apiModelsAvailableSet.has(m);
-                    const label = disabled ? `${m} (unavailable)` : m;
+                    const displayLabel = formatApiModelLabel(m, {
+                      aliases: apiModelAliases,
+                      availableModels: apiModelsAvailable,
+                      catalog: apiModelCatalog,
+                    });
+                    const label = disabled
+                      ? `${displayLabel || m} (unavailable)`
+                      : displayLabel || m;
                     return (
                       <option key={m} value={m} disabled={disabled}>
                         {label}
@@ -8175,7 +7862,11 @@ const Settings = () => {
                   >
                     {apiModelGroups.extras.map((m) => (
                       <option key={m} value={m}>
-                        {m}
+                        {formatApiModelLabel(m, {
+                          aliases: apiModelAliases,
+                          availableModels: apiModelsAvailable,
+                          catalog: apiModelCatalog,
+                        }) || m}
                       </option>
                     ))}
                   </optgroup>
@@ -8626,12 +8317,12 @@ const Settings = () => {
               </div>
 
           <div className="model-library-header">
-            <div>
+            <div className="settings-heading-with-help">
               <h3 className="settings-subsection-title">Model library</h3>
-              <p className="status-note form-note">
-                Downloads land in the configured models folder, normally <code>data/models</code>.
-                Direct Transformers expects Hugging Face checkpoint folders; GGUF models run through LM Studio or Ollama.
-              </p>
+              <SettingsInfoTip
+                label="About model downloads"
+                text="Downloads use the configured models folder, normally data/models. Direct Transformers expects Hugging Face checkpoint folders; GGUF models run through LM Studio, Ollama, or another provider."
+              />
             </div>
             <button type="button" className="icon-btn" onClick={openDownloadsTray}>
               Downloads
@@ -8664,6 +8355,122 @@ const Settings = () => {
               <span>Include noisy HF cache entries</span>
             </label>
           </div>
+          <div className="settings-collapsible-heading">
+            <div className="settings-heading-with-help">
+              <h4>Add Hugging Face model</h4>
+              <SettingsInfoTip
+                label="About Hugging Face registration"
+                text="Accepts a huggingface.co model URL or owner/repo. Registration saves catalog metadata; use Downloads separately to fetch weights."
+              />
+            </div>
+            <button
+              type="button"
+              className="runtime-inline-btn"
+              aria-expanded={hfRegisterOpen}
+              onClick={() => setHfRegisterOpen((open) => !open)}
+            >
+              {hfRegisterOpen ? "Close form" : "Add model"}
+            </button>
+          </div>
+          {hfRegisterOpen && (
+            <div className="settings-collapsible-body">
+              <div className="model-register-row">
+                <input
+                  type="text"
+                  value={registerHfAlias}
+                  onChange={(event) => setRegisterHfAlias(event.target.value)}
+                  placeholder="Alias (optional)"
+                  title="Name shown in Float model selectors. Defaults to the Hugging Face repository name."
+                />
+                <input
+                  type="url"
+                  value={registerHfUrl}
+                  onChange={(event) => setRegisterHfUrl(event.target.value)}
+                  placeholder="https://huggingface.co/owner/model or owner/model"
+                  title="Hugging Face model page URL or owner/repo identifier."
+                />
+                <select
+                  value={registerHfType}
+                  onChange={(event) => setRegisterHfType(event.target.value)}
+                  title="Model type for type-aware dropdown placement."
+                >
+                  <option value="transformer">Language</option>
+                  <option value="stt">Speech-to-text</option>
+                  <option value="tts">Text-to-speech</option>
+                  <option value="vision">Vision</option>
+                  <option value="voice">Voice</option>
+                  <option value="other">Other</option>
+                </select>
+                <select
+                  value={registerHfRuntime}
+                  onChange={(event) => setRegisterHfRuntime(event.target.value)}
+                  title="Direct Transformers loads a checkpoint in Float. Provider/GGUF downloads weights for LM Studio, Ollama, or another compatible runtime."
+                >
+                  <option value="direct">Direct Transformers</option>
+                  <option value="provider">Provider / GGUF</option>
+                </select>
+                <button
+                  type="button"
+                  className="icon-btn"
+                  onClick={handleRegisterHfModel}
+                  disabled={registerHfBusy}
+                  title="Add Hugging Face model to personal catalog"
+                >
+                  + Add
+                </button>
+              </div>
+              {registerHfMessage && (
+                <div className="settings-message model-register-message" role="status">
+                  {registerHfMessage}
+                </div>
+              )}
+            </div>
+          )}
+          {registeredLocalModels.some(
+            (entry) => entry?.source_type === "huggingface",
+          ) && (
+            <div className="model-register-list">
+              {registeredLocalModels
+                .filter((entry) => entry?.source_type === "huggingface")
+                .map((entry) => {
+                  const alias = String(entry?.alias || "").trim();
+                  const repoId = String(entry?.repo_id || "").trim();
+                  const modelType = String(entry?.model_type || "other").trim();
+                  const runtime = String(entry?.runtime || "direct").trim();
+                  if (!alias || !repoId) return null;
+                  const modelUrl = `https://huggingface.co/${repoId}`;
+                  return (
+                    <div
+                      key={`huggingface:${alias}:${repoId}`}
+                      className="model-register-item"
+                    >
+                      <span className="model-register-item-main">{alias}</span>
+                      <span className="model-register-item-type">
+                        {modelType} / {runtime}
+                      </span>
+                      <a
+                        className="model-register-item-path"
+                        href={modelUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        title={modelUrl}
+                      >
+                        {repoId}
+                      </a>
+                      <button
+                        type="button"
+                        className="icon-btn"
+                        onClick={() => handleUnregisterHfModel(alias)}
+                        disabled={registerHfBusy}
+                        title="Remove Hugging Face model from personal catalog"
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  );
+                })}
+            </div>
+          )}
           {useCustomModelsFolder ? (
             <>
               <label title="Register a local model file/folder by alias so it appears in model pickers.">
@@ -8773,12 +8580,6 @@ const Settings = () => {
             </div>
           )}
 
-          <p className="status-note settings-models-intro">
-            Gemma 4 belongs in the language lane. Speech settings stay on
-            dedicated transcription and synthesis models, while live voice
-            remains the OpenAI Realtime path.
-          </p>
-
           <div className="settings-models-grid">
             <div className="settings-subcard">
               <div className="settings-subcard-header">
@@ -8795,25 +8596,28 @@ const Settings = () => {
                 "transformer_model",
                 suggestedLangModels,
               )}
-              {settings.mode === "local" && (
-                <div
-                  className={`model-inline-panel runtime-inline-panel ${
-                    managedLocalRuntimeSelected
-                      ? "runtime-inline-panel--provider"
-                      : "runtime-inline-panel--local"
-                  }`}
-                >
+              <div
+                className={`model-inline-panel runtime-inline-panel ${languageRuntimePanelClass}`.trim()}
+              >
                   <div className="runtime-inline-header">
                     <div>
                       <h4>Runtime</h4>
                       <p className="status-note form-note">
-                        {managedLocalRuntimeSelected
-                          ? "Provider-backed local runtime status for the selected bridge."
-                          : "Direct local Transformers runtime for the selected language model."}
+                        {languageRuntimeDescription}
                       </p>
                     </div>
-                    <div className="runtime-inline-actions">
-                      {managedLocalRuntimeSelected ? (
+                    {(settings.mode === "server" || settings.mode === "local") && (
+                      <div className="runtime-inline-actions">
+                      {settings.mode === "server" ? (
+                        <button
+                          type="button"
+                          className="runtime-inline-btn"
+                          onClick={() => refreshServerRuntime({ refresh: true })}
+                          disabled={serverRuntimeLoading || !settings.server_url}
+                        >
+                          {serverRuntimeLoading ? "Refreshing..." : "Refresh"}
+                        </button>
+                      ) : managedLocalRuntimeSelected ? (
                         <button
                           type="button"
                           className="runtime-inline-btn"
@@ -8851,48 +8655,82 @@ const Settings = () => {
                           </button>
                         </>
                       )}
-                      <button
-                        type="button"
-                        className="runtime-inline-btn"
-                        onClick={() => setLanguageRuntimeCollapsed((prev) => !prev)}
-                        aria-expanded={!languageRuntimeCollapsed}
-                      >
-                        {languageRuntimeCollapsed ? "Expand" : "Collapse"}
-                      </button>
-                    </div>
+                      {settings.mode === "local" && (
+                        <button
+                          type="button"
+                          className="runtime-inline-btn"
+                          onClick={() => setLanguageRuntimeCollapsed((prev) => !prev)}
+                          aria-controls="settings-language-runtime-details"
+                          aria-expanded={!languageRuntimeCollapsed}
+                        >
+                          {languageRuntimeCollapsed ? "Expand" : "Collapse"}
+                        </button>
+                      )}
+                      </div>
+                    )}
                   </div>
-                  {!languageRuntimeCollapsed && (
+                  {(settings.mode !== "local" || languageRuntimeCollapsed) && (
+                    <>
                     <div
+                    className="runtime-inline-summary"
+                    role="group"
+                    aria-label="Language runtime summary"
+                    aria-busy={languageRuntimeBusy}
+                    aria-live="polite"
+                  >
+                    <span
+                      className={`runtime-inline-chip runtime-inline-chip--${languageRuntimeContract.lane}`}
+                      aria-label={`Runtime lane: ${languageRuntimeLaneLabel}`}
+                    >
+                      Lane: {languageRuntimeLaneLabel}
+                    </span>
+                    <span
+                      className="runtime-inline-chip"
+                      aria-label={`Runtime model: ${languageRuntimeContract.model || "none selected"}`}
+                    >
+                      Model: {languageRuntimeContract.model || "none selected"}
+                    </span>
+                    {(languageRuntimeContract.endpoint ||
+                      languageRuntimeContract.lane === RUNTIME_PANEL_LANES.SERVER_LAN ||
+                      languageRuntimeContract.lane === RUNTIME_PANEL_LANES.LOCAL_PROVIDER) && (
+                      <span
+                        className="runtime-inline-chip"
+                        aria-label={`Runtime endpoint: ${languageRuntimeContract.endpoint || "not configured"}`}
+                        title={languageRuntimeContract.endpoint || undefined}
+                      >
+                        Endpoint: {languageRuntimeContract.endpoint || "not configured"}
+                      </span>
+                    )}
+                    <span
+                      className={`runtime-inline-chip runtime-inline-chip--${languageRuntimeContract.availability}`}
+                      aria-label={`Runtime availability: ${languageRuntimeContract.availability}`}
+                    >
+                      Availability: {languageRuntimeContract.availability}
+                    </span>
+                    </div>
+                  {languageRuntimeContract.lastOperation ? (
+                    <p
+                      className={`status-note form-note${
+                        languageRuntimeContract.lastOperation.status === "failed"
+                          ? " warn"
+                          : ""
+                      }`}
+                      title={languageRuntimeContract.lastOperation.title}
+                      aria-label="Latest runtime operation"
+                    >
+                      {languageRuntimeContract.lastOperation.label}
+                    </p>
+                  ) : null}
+                    </>
+                  )}
+                  {settings.mode === "local" && !languageRuntimeCollapsed && (
+                    <div
+                      id="settings-language-runtime-details"
                       className="runtime-inline-body"
-                      aria-busy={
-                        managedLocalRuntimeSelected
-                          ? providerRuntimeLoading || !!providerActionBusy
-                          : localRuntimeLoading || !!localRuntimeActionBusy
-                      }
+                      aria-busy={languageRuntimeBusy}
                     >
                       {managedLocalRuntimeSelected ? (
                         <>
-                          <div className="runtime-inline-summary">
-                            <span className="runtime-inline-chip runtime-inline-chip--provider">
-                              {formatLocalRuntimeLabel(settings.transformer_model || selectedProviderKey)}
-                            </span>
-                            <span className="runtime-inline-chip">
-                              {providerRuntime?.model_loaded
-                                ? providerExternalManagedLoadedModel
-                                  ? "external loaded"
-                                  : "loaded"
-                                : providerExternalManagedServer
-                                  ? "external server"
-                                  : providerRuntime?.server_running
-                                    ? "ready"
-                                    : "idle"}
-                            </span>
-                            {(providerRuntimeLoading || providerActionBusy) && (
-                              <span className="runtime-inline-chip runtime-inline-chip--busy">
-                                updating
-                              </span>
-                            )}
-                          </div>
                           <p className="status-note form-note">
                             Loaded model: {providerRuntime?.loaded_model || "none"}
                           </p>
@@ -8919,22 +8757,9 @@ const Settings = () => {
                         </>
                       ) : (
                         <>
-                          <div className="runtime-inline-summary">
-                            <span className="runtime-inline-chip runtime-inline-chip--local">
-                              {settings.transformer_model || "local model"}
-                            </span>
-                            <span className="runtime-inline-chip">
-                              {localRuntime?.load_state || "idle"}
-                            </span>
-                            {(localRuntimeLoading || localRuntimeActionBusy) && (
-                              <span className="runtime-inline-chip runtime-inline-chip--busy">
-                                updating
-                              </span>
-                            )}
-                            {localRuntime?.supports_images ? (
-                              <span className="runtime-inline-chip">vision</span>
-                            ) : null}
-                          </div>
+                          {localRuntime?.supports_images ? (
+                            <p className="status-note form-note">Capabilities: vision.</p>
+                          ) : null}
                           {localRuntime?.effective_model_id &&
                           normalizeModelId(localRuntime.effective_model_id) !==
                             normalizeModelId(settings.transformer_model) ? (
@@ -8988,8 +8813,7 @@ const Settings = () => {
                       )}
                     </div>
                   )}
-                </div>
-              )}
+              </div>
 
               <div className={`settings-toggle-card${harmonyWarning ? " settings-toggle-card--warn" : ""}`}>
                 <div className="settings-toggle-copy">
@@ -9036,11 +8860,12 @@ const Settings = () => {
 
             <div className="settings-subcard">
               <div className="settings-subcard-header">
-                <div>
+                <div className="settings-heading-with-help">
                   <h3>Speech</h3>
-                  <p className="settings-subcard-copy">
-                    Chat mic transcription, synthesis, and TTS voice presets. API STT can use the selected OpenAI transcription model; local STT waits for a finished recording.
-                  </p>
+                  <SettingsInfoTip
+                    label="About speech models"
+                    text="Chat microphone transcription, synthesis, and TTS voices are configured here. API transcription can use the selected OpenAI model; local transcription begins after recording stops."
+                  />
                 </div>
               </div>
 
@@ -9060,11 +8885,12 @@ const Settings = () => {
 
             <div className="settings-subcard settings-subcard--wide">
               <div className="settings-subcard-header">
-                <div>
+                <div className="settings-heading-with-help">
                   <h3>Live streaming</h3>
-                  <p className="settings-subcard-copy">
-                    OpenAI Realtime is the shipped live voice lane. Transport and live runtime models are kept separate so future local or provider-backed live sessions can use their own response and visual models.
-                  </p>
+                  <SettingsInfoTip
+                    label="About live streaming"
+                    text="The API lane uses OpenAI Realtime. The local lane defaults to the configured Gemma 4 response and multimodal models. Transport, response, and visual models remain separate."
+                  />
                 </div>
                 <div className="settings-model-heading-meta">
                   {renderLaneSelector(
@@ -9094,7 +8920,7 @@ const Settings = () => {
                     value={settings.realtime_model || ""}
                     onChange={handleChange}
                     list="realtime-model-options"
-                    placeholder="gpt-realtime-2"
+                    placeholder="gpt-realtime-2.1"
                     title={fieldTooltips.realtime_model}
                   />
                   <datalist id="realtime-model-options">
@@ -9155,18 +8981,10 @@ const Settings = () => {
                     title="Endpoint the browser uses for the OpenAI Realtime WebRTC SDP exchange."
                   />
 
-                  <p className="status-note form-note">
-                    OpenAI Realtime uses a short-lived client secret from the
-                    backend and connects from the browser over WebRTC. Realtime
-                    STT inherits the compatible API STT model when one is selected;
-                    the normal chat mic still uses the STT model after recording
-                    stops.
-                  </p>
-                  <p className="status-note form-note">
-                    Keep the local lane configured as well if you want a
-                    persistent voice shell to hand camera or tool-heavy turns
-                    off to a separate non-Realtime runtime.
-                  </p>
+                  <SettingsInfoTip
+                    label="Realtime connection details"
+                    text="The backend mints a short-lived client secret and the browser connects over WebRTC. Realtime may inherit a compatible API transcription model; normal chat microphone recordings still use the speech model after recording stops."
+                  />
                 </>
               ) : (
                 <>
@@ -9239,23 +9057,10 @@ const Settings = () => {
                     ))}
                   </datalist>
 
-                  <p className="status-note form-note">
-                    Live agent model is the response model for the Local lane.
-                    Live multimodal model is the visual model for camera or
-                    screen context when that response model is text-only.
-                  </p>
-                  <p className="status-note form-note">
-                    For Gemma 4 on LM Studio or another provider-backed lane,
-                    keep the voice transport separate and set both the response
-                    and multimodal checkpoints explicitly instead of relying on
-                    the generic caption fallback.
-                  </p>
-                  <p className="status-note form-note">
-                    Float local bridge is the intended path for persistent local
-                    live sessions. LiveKit remains available as a legacy room
-                    transport when you are intentionally running a LiveKit
-                    server.
-                  </p>
+                  <SettingsInfoTip
+                    label="Local live connection details"
+                    text="The agent model generates responses; the multimodal model handles camera or screen context when needed. Float local bridge is the default persistent transport, while LiveKit remains available for an intentional legacy room server."
+                  />
                   {settings.stream_backend === "livekit" && (
                     <p className="status-note form-note">
                       LiveKit is currently selected inside the Local lane. The
@@ -9266,55 +9071,53 @@ const Settings = () => {
                 </>
               )}
 
-            <label title="Show the current live transcript inside chat while live streaming mode is active.">
-              Show live transcript
-            </label>
-            <input
-              type="checkbox"
-              checked={state.liveTranscriptEnabled !== false}
-              onChange={(event) =>
-                setState((prev) => ({
-                  ...prev,
-                  liveTranscriptEnabled: event.target.checked,
-                }))
-              }
-              title="Show the current live transcript inside chat while live streaming mode is active."
-            />
-
-            <label title="Start the camera automatically when live streaming mode begins.">
-              Start camera automatically
-            </label>
-            <input
-              type="checkbox"
-              checked={state.liveCameraDefaultEnabled === true}
-              onChange={(event) =>
-                setState((prev) => ({
-                  ...prev,
-                  liveCameraDefaultEnabled: event.target.checked,
-                }))
-              }
-              title="Start the camera automatically when live streaming mode begins."
-            />
-
-            <p className="status-note form-note">
-              The transcript and camera-start toggles are UI preferences and save
-              automatically; backend and model changes still use the main Save button.
-            </p>
+            <div className="settings-toggle-stack">
+              <label className="settings-toggle-row">
+                <input
+                  type="checkbox"
+                  checked={state.liveTranscriptEnabled !== false}
+                  onChange={(event) =>
+                    setState((prev) => ({
+                      ...prev,
+                      liveTranscriptEnabled: event.target.checked,
+                    }))
+                  }
+                />
+                <span>Show live transcript</span>
+              </label>
+              <label className="settings-toggle-row">
+                <input
+                  type="checkbox"
+                  checked={state.liveCameraDefaultEnabled === true}
+                  onChange={(event) =>
+                    setState((prev) => ({
+                      ...prev,
+                      liveCameraDefaultEnabled: event.target.checked,
+                    }))
+                  }
+                />
+                <span>Start camera automatically</span>
+              </label>
+              <SettingsInfoTip
+                label="About live preferences"
+                text="Transcript and camera-start preferences save automatically. Backend and model changes still use the main Save button."
+              />
+            </div>
           </div>
 
             <div className="settings-subcard settings-subcard--wide">
               <div className="settings-subcard-header">
-                <div>
+                <div className="settings-heading-with-help">
                   <h3>Retrieval &amp; vision</h3>
-                  <p className="settings-subcard-copy">
-                    Vision fallback, text embeddings, and image retrieval. EmbeddingGemma
-                    is text-only and does not replace CLIP.
-                  </p>
+                  <SettingsInfoTip
+                    label="About retrieval and vision"
+                    text="Image understanding can use a cloud or local vision model. CLIP is a separate local similarity model for finding related images; text embeddings do not replace it."
+                  />
                 </div>
               </div>
 
               {renderModelField(
-                "Vision Fallback Model",
+                "Image understanding fallback",
                 "vision_model",
                 suggestedVisionModels,
               )}
@@ -9489,8 +9292,12 @@ const Settings = () => {
                     htmlFor="rag-clip-model"
                     title="CLIP model used for image-aware RAG retrieval."
                   >
-                    RAG CLIP model
+                    Image retrieval model (CLIP)
                   </label>
+                  <SettingsInfoTip
+                    label="About CLIP retrieval"
+                    text="CLIP compares images for retrieval. It is local and distinct from the cloud or local model that interprets an image for chat."
+                  />
                   <div className="settings-model-heading-meta">
                     <span className="model-lane-pill model-lane-pill--local">Local</span>
                   </div>
@@ -9519,15 +9326,15 @@ const Settings = () => {
                 </div>
               </div>
 
-              <p className="status-note">
-                Keep this on an OpenCLIP variant; Vision model selection is separate.
-              </p>
-
               <label
                 htmlFor="rag-chat-min-similarity"
                 title="Minimum similarity (0-1) for automatic RAG injection."
               >
                 RAG min similarity
+                <SettingsInfoTip
+                  label="About similarity filtering"
+                  text="Lower values include more matches. Set this to 0 to disable similarity filtering."
+                />
               </label>
 
               <input
@@ -9540,10 +9347,6 @@ const Settings = () => {
                 value={settings.rag_chat_min_similarity}
                 onChange={handleChange}
               />
-
-              <p className="status-note">
-                Lower values include more matches; set to 0 to disable similarity filtering.
-              </p>
 
               <details className="advanced-block mt-sm">
             <summary>Experimental SAE steering (stub)</summary>
@@ -9716,45 +9519,25 @@ const Settings = () => {
 
           <div className="mb-sm">VRAM Estimate: {vramEstimate.toFixed(1)} MB</div>
 
-          <label title="Cache attention keys/values to speed up generation">
-
-            Enable K/V Cache
-
+          <label className="settings-toggle-row" title="Cache attention keys/values to speed up generation">
+            <input
+              name="kv_cache"
+              type="checkbox"
+              checked={settings.kv_cache}
+              onChange={handleChange}
+            />
+            <span>Enable K/V cache</span>
           </label>
 
-          <input
-
-            name="kv_cache"
-
-            type="checkbox"
-
-            checked={settings.kv_cache}
-
-            onChange={handleChange}
-
-            title="Cache attention keys/values to speed up generation"
-
-          />
-
-          <label title="Allow model to spill to system RAM when VRAM is low">
-
-            Enable RAM Swap
-
+          <label className="settings-toggle-row" title="Allow model to spill to system RAM when VRAM is low">
+            <input
+              name="ram_swap"
+              type="checkbox"
+              checked={settings.ram_swap}
+              onChange={handleChange}
+            />
+            <span>Enable RAM swap</span>
           </label>
-
-          <input
-
-            name="ram_swap"
-
-            type="checkbox"
-
-            checked={settings.ram_swap}
-
-            onChange={handleChange}
-
-            title="Allow model to spill to system RAM when VRAM is low"
-
-          />
 
           <details className="advanced-block mt-sm">
             <summary>Advanced Local Inference</summary>
@@ -9851,15 +9634,18 @@ const Settings = () => {
                 onChange={handleChange}
               />
 
-              <label title="Attempt to enable Flash Attention when dependencies exist">
-                Enable Flash Attention
+              <label
+                className="settings-toggle-row advanced-grid-span"
+                title="Attempt to enable Flash Attention when dependencies exist"
+              >
+                <input
+                  name="flash_attention"
+                  type="checkbox"
+                  checked={!!settings.flash_attention}
+                  onChange={handleChange}
+                />
+                <span>Enable Flash Attention</span>
               </label>
-              <input
-                name="flash_attention"
-                type="checkbox"
-                checked={!!settings.flash_attention}
-                onChange={handleChange}
-              />
 
               <label title="Override the attention backend used during inference">
                 Attention Implementation Override
@@ -9964,36 +9750,21 @@ const Settings = () => {
           </details>
 
           <label
-            className="field-label"
+            className="settings-toggle-row"
             title="Add a custom models directory to the search path. Default storage is data/models; repo-root models is treated as a legacy search location."
           >
-
-            Use Custom Models Folder
-            <span
-              className="hint-badge"
-              title="When enabled, Float scans this folder and shows the local-path registration tool in Model library."
-            >
-              ?
-            </span>
-
+            <input
+              name="use_custom_models_folder"
+              type="checkbox"
+              checked={useCustomModelsFolder}
+              onChange={(e) => setUseCustomModelsFolder(!!e.target.checked)}
+            />
+            <span>Use custom models folder</span>
+            <SettingsInfoTip
+              label="About model folders"
+              text="Default downloads use data/models. The repo-root models folder is scanned only as a legacy or bundled location."
+            />
           </label>
-
-          <input
-
-            name="use_custom_models_folder"
-
-            type="checkbox"
-
-            checked={useCustomModelsFolder}
-
-            onChange={(e) => setUseCustomModelsFolder(!!e.target.checked)}
-
-            title="Add a custom models directory to the search path. Default storage is data/models; repo-root models is treated as a legacy search location."
-
-          />
-          <div className="status-note form-note">
-            Default model downloads use <code>data/models</code>. The repo-root <code>models</code> folder is scanned as a legacy/bundled location, not the primary download target.
-          </div>
 
           {useCustomModelsFolder && (
 
@@ -10035,25 +9806,15 @@ const Settings = () => {
 
           )}
 
-          <label title="Use an explicit conversations directory instead of default (Default: ./data/conversations)">
-
-            Use Custom Conversations Folder
-
+          <label className="settings-toggle-row" title="Use an explicit conversations directory instead of default (Default: ./data/conversations)">
+            <input
+              name="use_custom_conv_folder"
+              type="checkbox"
+              checked={useCustomConvFolder}
+              onChange={(e) => setUseCustomConvFolder(!!e.target.checked)}
+            />
+            <span>Use custom conversations folder</span>
           </label>
-
-          <input
-
-            name="use_custom_conv_folder"
-
-            type="checkbox"
-
-            checked={useCustomConvFolder}
-
-            onChange={(e) => setUseCustomConvFolder(!!e.target.checked)}
-
-            title="Use an explicit conversations directory instead of default (Default: ./data/conversations)"
-
-          />
 
           {useCustomConvFolder && (
 
@@ -10270,7 +10031,13 @@ const Settings = () => {
           </div>
 
           <div className="settings-section">
-            <h3>Appearance</h3>
+            <div className="settings-heading-with-help">
+              <h3>Appearance</h3>
+              <SettingsInfoTip
+                label="About themes"
+                text="The top bar controls dark or light mode; this setting selects the color family beneath it. Built-in themes ship with Float, while custom themes are stored in the data folder."
+              />
+            </div>
             <label
               className="field-label"
               htmlFor="visual-theme"
@@ -10290,15 +10057,11 @@ const Settings = () => {
             >
               {visualThemeOptions.map((option) => (
                 <option key={option.value} value={option.value}>
-                  {option.label}
+                  {`${option.label} (${isBuiltInVisualTheme(option.value) ? "built-in" : "custom"})`}
                 </option>
               ))}
             </select>
-            <p className="status-note" style={{ marginTop: 6 }}>
-              Dark and light mode still toggle from the top bar; this picker changes the color family
-              underneath them.
-            </p>
-            <div className="inline-flex" style={{ gap: 10, marginTop: 10, flexWrap: "wrap" }}>
+            <div className="settings-action-row">
               <button
                 type="button"
                 className="icon-btn"
@@ -10318,10 +10081,6 @@ const Settings = () => {
                 </button>
               )}
             </div>
-            <p className="status-note" style={{ marginTop: 8 }}>
-              Built-in themes stay in source control. Custom themes can be created here, edited later,
-              renamed, or deleted, and are stored in the data folder.
-            </p>
             {showThemeEditor && (
               <div className="theme-editor-card">
                 <label className="field-label" htmlFor="theme-draft-label">
@@ -10486,27 +10245,18 @@ const Settings = () => {
               Tracks reversible snapshots for file edits, memory changes, calendar writes, and
               similar state updates. Older copies are discarded after this window.
             </p>
-            <div className="inline-flex" style={{ gap: 10, marginTop: 10, flexWrap: "wrap" }}>
+            <div className="settings-action-row">
               <button
                 type="button"
-                className="icon-btn"
+                className="icon-btn settings-action-btn"
                 onClick={handleActionHistorySave}
                 disabled={actionHistorySaving}
-                style={{ marginTop: 0 }}
               >
                 {actionHistorySaving ? "Saving..." : "Save work history"}
               </button>
               <Link
                 to="/work-history"
-                className="icon-btn"
-                style={{
-                  marginTop: 0,
-                  display: "inline-flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  textDecoration: "none",
-                  color: "var(--color-black)",
-                }}
+                className="icon-btn settings-action-btn"
               >
                 Open work history
               </Link>
@@ -10516,7 +10266,13 @@ const Settings = () => {
 
           <div className="settings-section">
             <div className="settings-header">
-              <h3>Tools</h3>
+              <div className="settings-heading-with-help">
+                <h3>Tools</h3>
+                <SettingsInfoTip
+                  label="About tool access"
+                  text="Workflow availability controls where a tool appears. Approval controls whether it can run automatically. Expand the catalog only when you need per-tool overrides."
+                />
+              </div>
               <button
                 type="button"
                 className="icon-btn"
@@ -10527,9 +10283,14 @@ const Settings = () => {
                 {toolCatalogLoading ? "Refreshing..." : "Refresh tools"}
               </button>
             </div>
-            <p className="status-note">
-              Set which workflow can see each tool and how much approval it needs before auto use.
-            </p>
+            <details className="tool-browser-disclosure">
+              <summary>
+                <span>Sources &amp; runtime limits</span>
+                <span className="tool-browser-summary-count">
+                  {toolSourceCards.length + 1} sources
+                </span>
+              </summary>
+              <div className="tool-browser-disclosure-body">
             <div className="tool-browser-source-card" style={{ marginBottom: 12 }}>
               <div className="status-header">
                 <strong>Computer use</strong>
@@ -10603,6 +10364,18 @@ const Settings = () => {
                 </div>
               </div>
             )}
+              </div>
+            </details>
+            <details className="tool-browser-disclosure">
+              <summary>
+                <span>Tool catalog</span>
+                <span className="tool-browser-summary-count">
+                  {toolCatalogLoading
+                    ? "loading"
+                    : `${filteredToolCatalog.length} shown · ${toolStatusSummary.live} live`}
+                </span>
+              </summary>
+              <div className="tool-browser-disclosure-body">
             <label htmlFor="tool-catalog-filter" title="Filter tools by name, category, or description.">
               Filter tools
             </label>
@@ -10649,8 +10422,8 @@ const Settings = () => {
                     toolPolicySaving === `${String(entry?.id || "")}:workflow` ||
                     toolPolicySaving === `${String(entry?.id || "")}:approval`;
                   return (
-                    <article key={entry.id} className="tool-browser-card">
-                      <div className="status-header">
+                    <details key={entry.id} className="tool-browser-card">
+                      <summary className="status-header">
                         <div>
                           <div className="tool-browser-title-row">
                             <strong>{entry.display_name || entry.id}</strong>
@@ -10663,7 +10436,8 @@ const Settings = () => {
                           </div>
                         </div>
                         {renderToolStatusBadge(entry.status)}
-                      </div>
+                      </summary>
+                      <div className="tool-browser-card-body">
                       <p className="tool-browser-summary">
                         {entry.summary || entry.description || "No summary available."}
                       </p>
@@ -10752,11 +10526,14 @@ const Settings = () => {
                           </p>
                         </div>
                       </div>
-                    </article>
+                      </div>
+                    </details>
                   );
                 })}
               </div>
             )}
+              </div>
+            </details>
           </div>
 
             </section>
@@ -10766,34 +10543,38 @@ const Settings = () => {
             <section
               id="settings-workflows"
               className="settings-card settings-section"
-              aria-label="Capture and workflows"
+              aria-label="Visual data and privacy"
             >
               <div className="settings-card-header">
                 <div>
-                  <h2>Capture &amp; Workflows</h2>
+                  <h2>Visual Data &amp; Privacy</h2>
                   <p className="settings-card-copy">
-                    Capture retention plus reusable workflow defaults for prompts, model posture,
-                    permissions, and follow-up hooks.
+                    Control temporary camera and screen images produced by Live mode and
+                    computer-use tools, plus privacy checks before model access.
                   </p>
                 </div>
-                <button
-                  type="button"
-                  className="icon-btn"
-                  onClick={refreshWorkflowCatalog}
-                  disabled={workflowCatalogLoading}
-                  style={{ marginTop: 0 }}
-                >
-                  {workflowCatalogLoading ? "Refreshing..." : "Refresh profiles"}
-                </button>
+              </div>
+
+              <div className="settings-subcard settings-subcard--wide">
+                <div className="settings-subcard-header">
+                  <div>
+                    <h3>Skills &amp; workflows live in Knowledge</h3>
+                    <p className="settings-subcard-copy">
+                      Manage workflow defaults, capability modules, and local markdown skill
+                      documents in their dedicated workspace.
+                    </p>
+                  </div>
+                  <Link
+                    className="icon-btn settings-inline-link"
+                    to="/knowledge?tab=skills"
+                    title="Open Skills and workflows in Knowledge"
+                  >
+                    Open Skills &amp; workflows
+                  </Link>
+                </div>
               </div>
 
               <div className="settings-section">
-                <p className="status-note">
-                  A workflow is the reusable response profile for a run: prompt stack, default
-                  model posture, enabled modules, and the restrictions or permissions that shape
-                  which hooks can execute. The current UI saves defaults now and leaves richer
-                  conditional editing for the next workflow pass.
-                </p>
                 <label
                   className="field-label"
                   htmlFor="capture-retention"
@@ -10831,11 +10612,8 @@ const Settings = () => {
                     </option>
                   ))}
                 </select>
-                <div className="inline-flex" style={{ gap: 12, marginTop: 10, flexWrap: "wrap" }}>
-                  <label
-                    className="checkbox-row"
-                    style={{ display: "inline-flex", gap: 8, alignItems: "center" }}
-                  >
+                <div className="capture-privacy-options">
+                  <label className="capture-privacy-option">
                     <input
                       type="checkbox"
                       checked={captureAllowModelRawImageAccess}
@@ -10845,10 +10623,7 @@ const Settings = () => {
                     />
                     <span>Allow raw image access for supported models</span>
                   </label>
-                  <label
-                    className="checkbox-row"
-                    style={{ display: "inline-flex", gap: 8, alignItems: "center" }}
-                  >
+                  <label className="capture-privacy-option">
                     <input
                       type="checkbox"
                       checked={captureAllowSummaryFallback}
@@ -10860,25 +10635,22 @@ const Settings = () => {
                 <p className="status-note" style={{ marginTop: 6 }}>
                   Computer observations, camera captures, and screen stills stay transient for
                   this window unless promoted. Promoted captures remain accessible as durable
-                  attachments for later memory workflows.
+                  attachments.
                 </p>
+
                 <label
                   className="field-label"
                   htmlFor="privacy-filter-mode"
-                  title="Local text privacy classification for saved writes, rerouting prompts, and API embedding preflight."
+                  title="Automatic first-pass text privacy classification for saved memories, conversations, knowledge, and file writes."
                 >
-                  Text privacy detector
+                  Text privacy filter on writes
                 </label>
                 <select
                   id="privacy-filter-mode"
                   value={privacyFilterMode}
-                  onChange={(event) => {
-                    const nextMode = normalizePrivacyFilterMode(event.target.value);
-                    setPrivacyFilterMode(nextMode);
-                    if (nextMode === "off") {
-                      setPrivacyRouteMode("off");
-                    }
-                  }}
+                  onChange={(event) =>
+                    setPrivacyFilterMode(normalizePrivacyFilterMode(event.target.value))
+                  }
                 >
                   {PRIVACY_FILTER_MODE_OPTIONS.map((option) => (
                     <option key={option.value} value={option.value}>
@@ -10892,9 +10664,9 @@ const Settings = () => {
                       (option) => option.value === normalizePrivacyFilterMode(privacyFilterMode),
                     )?.description
                   }{" "}
-                  Uses a local text classifier. When off, private-message rerouting and
-                  API embedding preflight are disabled too.
+                  Uses a local text classifier. Image access stays controlled separately above.
                 </p>
+
                 <label
                   className="field-label"
                   htmlFor="privacy-filter-model"
@@ -10918,10 +10690,10 @@ const Settings = () => {
                   ))}
                 </datalist>
                 <p className="status-note" style={{ marginTop: 6 }}>
-                  This is not a RAG embedding model. Use Downloads in Models to fetch
-                  {" "}
+                  This is not a RAG embedding model. Use Downloads in Models to fetch{" "}
                   <code>privacy-filter</code> locally before enabling always-on checks.
                 </p>
+
                 <label
                   className="field-label"
                   htmlFor="privacy-route-mode"
@@ -10931,8 +10703,7 @@ const Settings = () => {
                 </label>
                 <select
                   id="privacy-route-mode"
-                  value={privacyDetectorDisabled ? "off" : privacyRouteMode}
-                  disabled={privacyDetectorDisabled}
+                  value={privacyRouteMode}
                   onChange={(event) =>
                     setPrivacyRouteMode(normalizePrivacyRouteMode(event.target.value))
                   }
@@ -10944,611 +10715,32 @@ const Settings = () => {
                   ))}
                 </select>
                 <p className="status-note" style={{ marginTop: 6 }}>
-                  {privacyDetectorDisabled
-                    ? "Enable the text privacy detector before using private-message rerouting."
-                    : PRIVACY_ROUTE_MODE_OPTIONS.find(
-                        (option) => option.value === normalizePrivacyRouteMode(privacyRouteMode),
-                      )?.description}{" "}
+                  {
+                    PRIVACY_ROUTE_MODE_OPTIONS.find(
+                      (option) => option.value === normalizePrivacyRouteMode(privacyRouteMode),
+                    )?.description
+                  }{" "}
                   The route is never automatic; it uses the same accept, edit, or deny review card.
                 </p>
-                <label
-                  className="field-label"
-                  htmlFor="default-workflow"
-                  title="Default workflow profile for new messages and auto-continues."
-                >
-                  Default workflow profile
-                </label>
-                <select
-                  id="default-workflow"
-                  value={defaultWorkflow}
-                  onChange={(event) => setDefaultWorkflow(event.target.value)}
-                >
-                  {workflowProfiles.map((workflow) => (
-                    <option key={workflow.id} value={workflow.id}>
-                      {workflow.label}
-                    </option>
-                  ))}
-                </select>
-                <p className="status-note" style={{ marginTop: 6 }}>
-                  {(() => {
-                    const selected =
-                      workflowProfiles.find((workflow) => workflow.id === defaultWorkflow) ||
-                      workflowProfiles[0];
-                    if (!selected) {
-                      return "Workflow profiles control reasoning depth, recursion, and tool posture.";
-                    }
-                    const preferredContinueLabel =
-                      workflowProfileMap.get(selected.preferred_continue)?.label ||
-                      selected.preferred_continue ||
-                      "the active workflow";
-                    const preferredContinue =
-                      preferredContinueLabel || "the active workflow";
-                    return `${selected.description} Continue defaults prefer ${preferredContinue}.`;
-                  })()}
-                </p>
-                <div className="inline-flex" style={{ gap: 10, marginTop: 10, flexWrap: "wrap" }}>
+
+                <div className="inline-flex" style={{ gap: 10, marginTop: 12, flexWrap: "wrap" }}>
                   <button
                     type="button"
                     className="icon-btn"
-                    onClick={() => setWorkflowInspectorOpen((current) => !current)}
-                    aria-expanded={workflowInspectorOpen}
-                    aria-controls="workflow-profile-inspector"
+                    onClick={handleCapturePrivacySave}
+                    disabled={capturePrivacySaving}
                     style={{ marginTop: 0 }}
                   >
-                    {workflowInspectorOpen
-                      ? "Hide workflow profiles"
-                      : "Inspect workflow profiles"}
+                    {capturePrivacySaving ? "Saving..." : "Save capture & privacy settings"}
                   </button>
                 </div>
-                {workflowInspectorOpen && (
-                  <div id="workflow-profile-inspector" className="workflow-profile-grid">
-                    {workflowProfiles.map((workflow) => {
-                      const continueTargets = Array.isArray(workflow.allow_continue_to)
-                        ? workflow.allow_continue_to.filter(
-                            (value) => typeof value === "string" && value.trim(),
-                          )
-                        : [];
-                      const workflowEnabledModules = Array.isArray(workflow.enabled_modules)
-                        ? workflow.enabled_modules.filter(
-                            (value) => typeof value === "string" && value.trim(),
-                          )
-                        : [];
-                      return (
-                        <article
-                          key={workflow.id}
-                          className={`workflow-profile-card${
-                            defaultWorkflow === workflow.id ? " is-selected" : ""
-                          }`}
-                        >
-                          <div className="workflow-profile-header">
-                            <div>
-                              <h3>{workflow.label}</h3>
-                              <p className="status-note">{workflow.description}</p>
-                            </div>
-                            {defaultWorkflow === workflow.id && (
-                              <span className="workflow-profile-badge">Current default</span>
-                            )}
-                          </div>
-                          <div className="workflow-profile-meta">
-                            <span>
-                              Thinking: <strong>{workflow.thinking_default || "auto"}</strong>
-                            </span>
-                            <span>
-                              Continue default:{" "}
-                              <strong>
-                                {workflowProfileMap.get(workflow.preferred_continue)?.label ||
-                                  workflow.preferred_continue ||
-                                  "active workflow"}
-                              </strong>
-                            </span>
-                          </div>
-                          <p className="status-note">
-                            {continueTargets.length
-                              ? `Can continue into ${continueTargets
-                                  .map(
-                                    (target) =>
-                                      workflowProfileMap.get(target)?.label || target,
-                                  )
-                                  .join(", ")}.`
-                              : "Continue targets stay on the active workflow."}
-                          </p>
-                          <div className="workflow-profile-tags">
-                            {workflowEnabledModules.length ? (
-                              workflowEnabledModules.map((moduleId) => {
-                                const moduleMeta = workflowModuleMap.get(moduleId);
-                                return (
-                                  <span
-                                    key={`${workflow.id}-${moduleId}`}
-                                    className="workflow-profile-tag"
-                                    title={moduleMeta?.description || moduleId}
-                                  >
-                                    {moduleMeta?.label || moduleId}
-                                  </span>
-                                );
-                              })
-                            ) : (
-                              <span className="workflow-profile-tag workflow-profile-tag--muted">
-                                No modules listed
-                              </span>
-                            )}
-                          </div>
-                        </article>
-                      );
-                    })}
-                  </div>
-                )}
-                <p className="status-note" style={{ marginTop: 10 }}>
-                  Inspect shows the current built-in profile definitions. Editing the conditional
-                  routing, prompt layers, and permission gates themselves is still the next
-                  workflow pass.
-                </p>
-                <div className="workflow-modules-card">
-                  <div className="workflow-modules-heading">
-                    <div>
-                      <div className="field-label">
-                        Modules{" "}
-                        <span
-                          className="settings-help-dot"
-                          title="Disabled modules stay visible as capability docs, but their tools are not listed as callable."
-                        >
-                          ?
-                        </span>
-                      </div>
-                      <p className="status-note workflow-module-location">
-                        Custom add-ons live in{" "}
-                        <code>
-                          {workflowCatalog.addons_root || DEFAULT_WORKFLOW_CATALOG.addons_root}
-                        </code>.
-                      </p>
-                    </div>
-                    <div className="workflow-module-heading-actions">
-                      <select
-                        aria-label="Module details"
-                        value={moduleDetailsId}
-                        onChange={(event) => setModuleDetailsId(event.target.value)}
-                      >
-                        {workflowModules.map((module) => (
-                          <option key={module.id} value={module.id}>
-                            {module.label || module.id}
-                          </option>
-                        ))}
-                      </select>
-                      <span className="workflow-module-count">
-                        {enabledWorkflowModules.length}/{workflowModules.length} enabled
-                      </span>
-                    </div>
-                  </div>
-                  <div className="workflow-module-list">
-                    {workflowModules.map((module) => {
-                      const source = String(module.source || "base").toLowerCase();
-                      const sourceLabelClass = moduleSourceClass(source);
-                      const sourceLabel = formatModuleSource(source);
-                      const linkedDocId = String(module.doc_id || "").trim();
-                      const linkedSkillId = String(
-                        module.skill_id || module.id || "",
-                      ).trim();
-                      const activeSkillSource = String(
-                        module.skill_source || module.source || "",
-                      ).trim();
-                      const activeSkillSourceLabel = activeSkillSource
-                        ? formatModuleSource(activeSkillSource)
-                        : "";
-                      const toolCount = Array.isArray(module.tool_names)
-                        ? module.tool_names.length
-                        : 0;
-                      return (
-                        <label key={module.id} className="workflow-module-row">
-                          <span className="workflow-module-main">
-                            <span className="workflow-module-title">
-                              <strong>{module.label || module.id}</strong>
-                              <span
-                                className={`workflow-module-source workflow-module-source--${sourceLabelClass}`}
-                              >
-                                {sourceLabel}
-                              </span>
-                              <span className="workflow-module-status">
-                                {module.status || "live"}
-                              </span>
-                              {toolCount > 0 && (
-                                <span className="workflow-module-tools">
-                                  {toolCount} tool{toolCount === 1 ? "" : "s"}
-                                </span>
-                              )}
-                            </span>
-                            <span className="status-note workflow-module-description">
-                              {module.description || "No module description supplied."}
-                            </span>
-                            <span className="status-note workflow-module-description">
-                              {`Docs: ${linkedDocId || "unlinked"} | Skill: ${
-                                linkedSkillId || "unlisted"
-                              }`}
-                              {activeSkillSourceLabel
-                                ? ` | Doc source: ${activeSkillSourceLabel}`
-                                : ""}
-                            </span>
-                          </span>
-                          <input
-                            type="checkbox"
-                            aria-label={`${module.label || module.id} enabled`}
-                            checked={enabledWorkflowModules.includes(module.id)}
-                            onChange={(event) => {
-                              setEnabledWorkflowModules((prev) => {
-                                const current = Array.isArray(prev) ? prev : [];
-                                if (event.target.checked) {
-                                  return Array.from(new Set([...current, module.id]));
-                                }
-                                return current.filter((item) => item !== module.id);
-                              });
-                            }}
-                          />
-                        </label>
-                      );
-                    })}
-                  </div>
-                  {(() => {
-                    const selectedModule =
-                      workflowModuleMap.get(moduleDetailsId) || workflowModules[0] || {};
-                    const selectedTools = Array.isArray(selectedModule.tool_names)
-                      ? selectedModule.tool_names
-                      : [];
-                    const selectedAssets = Array.isArray(selectedModule.assets)
-                      ? selectedModule.assets
-                      : [];
-                    const selectedConfig =
-                      selectedModule.config && typeof selectedModule.config === "object"
-                        ? selectedModule.config
-                        : {};
-                    const configKeys = Object.keys(selectedConfig);
-                    return (
-                      <div className="workflow-module-details">
-                        <div>
-                          <strong>{selectedModule.label || selectedModule.id || "Module"}</strong>
-                          <span className="status-note">
-                            {" "}
-                            {selectedModule.doc_id || "No skill doc linked"}
-                          </span>
-                        </div>
-                        <div className="workflow-module-detail-grid">
-                          <div>
-                            <span className="workflow-detail-label">skills</span>
-                            <p>{selectedModule.skill_id || "No skill listed"}</p>
-                          </div>
-                          <div>
-                            <span className="workflow-detail-label">tools</span>
-                            <p>
-                              {selectedTools.length
-                                ? selectedTools.join(", ")
-                                : "No tools listed"}
-                            </p>
-                          </div>
-                          <div>
-                            <span className="workflow-detail-label">assets</span>
-                            <p>
-                              {selectedAssets.length
-                                ? selectedAssets
-                                    .map((asset) =>
-                                      typeof asset === "string"
-                                        ? asset
-                                        : asset?.label || asset?.path || "asset",
-                                    )
-                                    .join(", ")
-                                : "No assets listed"}
-                            </p>
-                          </div>
-                          <div>
-                            <span className="workflow-detail-label">config</span>
-                            {configKeys.length ? (
-                              <textarea
-                                className="workflow-config-editor"
-                                aria-label={`${selectedModule.label || selectedModule.id} config`}
-                                value={JSON.stringify(selectedConfig, null, 2)}
-                                readOnly
-                              />
-                            ) : (
-                              <p>No editable config for this module.</p>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                    );
-                  })()}
-                <div className="workflow-pack-manager workflow-skill-manager--subcard" aria-label="Module pack import and export">
-                  <div className="workflow-modules-heading">
-                    <div>
-                      <div className="field-label">Module packs</div>
-                    </div>
-                    <label className="inline-flex workflow-pack-overwrite">
-                      <input
-                        type="checkbox"
-                        checked={modulePackOverwrite}
-                        onChange={(event) => setModulePackOverwrite(event.target.checked)}
-                      />
-                      <span>Overwrite</span>
-                    </label>
-                  </div>
-                  <div className="workflow-pack-grid">
-                    <label className="field-label" htmlFor="workflow-module-pack-import">
-                      Import folder
-                    </label>
-                    <input
-                      id="workflow-module-pack-import"
-                      type="text"
-                      value={modulePackImportPath}
-                      onChange={(event) => setModulePackImportPath(event.target.value)}
-                      placeholder="data/workspace/hermes-pack"
-                    />
-                    <div className="workflow-pack-actions">
-                      <button
-                        type="button"
-                        className="icon-btn"
-                        onClick={() => handleModulePackImport(true)}
-                        disabled={!!modulePackTransferBusy}
-                        style={{ marginTop: 0 }}
-                      >
-                        {modulePackTransferBusy === "import-preview" ? "Checking..." : "Preview import"}
-                      </button>
-                      <button
-                        type="button"
-                        className="icon-btn"
-                        onClick={() => handleModulePackImport(false)}
-                        disabled={!!modulePackTransferBusy}
-                        style={{ marginTop: 0 }}
-                      >
-                        {modulePackTransferBusy === "import" ? "Importing..." : "Import pack"}
-                      </button>
-                    </div>
-                    <label className="field-label" htmlFor="workflow-module-pack-export">
-                      Module export folder
-                    </label>
-                    <input
-                      id="workflow-module-pack-export"
-                      type="text"
-                      value={modulePackExportPath}
-                      onChange={(event) => setModulePackExportPath(event.target.value)}
-                      placeholder="data/workspace/module-exports"
-                    />
-                    <div className="workflow-pack-actions">
-                      <button
-                        type="button"
-                        className="icon-btn"
-                        onClick={() => handleModulePackExport(true)}
-                        disabled={!!modulePackTransferBusy}
-                        style={{ marginTop: 0 }}
-                      >
-                        {modulePackTransferBusy === "export-preview" ? "Checking..." : "Preview export"}
-                      </button>
-                      <button
-                        type="button"
-                        className="icon-btn"
-                        onClick={() => handleModulePackExport(false)}
-                        disabled={!!modulePackTransferBusy}
-                        style={{ marginTop: 0 }}
-                      >
-                        {modulePackTransferBusy === "export" ? "Exporting..." : "Export selected"}
-                      </button>
-                    </div>
-                  </div>
-                  {modulePackTransferPreview?.warnings?.length > 0 && (
-                    <p className="status-note warn">
-                      {modulePackTransferPreview.warnings.join(" ")}
-                    </p>
-                  )}
-                  {modulePackTransferMessage && (
-                    <p className="status-note">{modulePackTransferMessage}</p>
-                  )}
-                </div>
-                <div className="workflow-skill-manager workflow-skill-manager--subcard" aria-label="Module skill docs">
-                  <div className="workflow-modules-heading">
-                    <div>
-                      <div className="field-label">Module skill docs</div>
-                      <p className="status-note">
-                        Edit local markdown overrides in <code>data/modules/skills/</code>. Base
-                        docs stay read-only and can be restored by deleting the local override.
-                      </p>
-                    </div>
-                    {skillDoc?.active?.source && (
-                      <span className="workflow-module-count">
-                        active: {formatModuleSource(skillDoc.active.source)}
-                      </span>
-                    )}
-                  </div>
-                  <label className="field-label" htmlFor="workflow-skill-doc-select">
-                    Skill doc
-                  </label>
-                  <select
-                    id="workflow-skill-doc-select"
-                    value={skillDocSelectedId}
-                    onChange={(event) => setSkillDocSelectedId(event.target.value)}
-                    disabled={skillDocLoading || skillDocSaving}
-                  >
-                    {Array.from(
-                      new Map(
-                        workflowModules
-                          .map((module) => {
-                            const skillId = String(module.skill_id || module.id || "").trim();
-                            if (!skillId) {
-                              return null;
-                            }
-                            return [
-                              skillId,
-                              `${module.label || module.id || skillId} (${skillId})`,
-                            ];
-                          })
-                          .filter(Boolean),
-                      ).entries(),
-                    ).map(([skillId, label]) => (
-                      <option key={skillId} value={skillId}>
-                        {label}
-                      </option>
-                    ))}
-                  </select>
-                  <div className="workflow-skill-meta">
-                    <span>
-                      Local override: <strong>{skillDoc?.local_exists ? "yes" : "no"}</strong>
-                    </span>
-                    <span>
-                      Base doc: <strong>{skillDoc?.repo_exists ? "available" : "missing"}</strong>
-                    </span>
-                    {skillDoc?.local_path && (
-                      <span title={skillDoc.local_path}>
-                        Save path: <code>{skillDoc.local_path}</code>
-                      </span>
-                    )}
-                  </div>
-                  <textarea
-                    className="workflow-skill-editor"
-                    aria-label="Skill markdown editor"
-                    value={skillDocDraft}
-                    onChange={(event) => setSkillDocDraft(event.target.value)}
-                    disabled={skillDocLoading || skillDocSaving || !skillDocSelectedId}
-                    spellCheck={false}
-                  />
-                  <div className="inline-flex" style={{ gap: 10, marginTop: 10, flexWrap: "wrap" }}>
-                    <button
-                      type="button"
-                      className="icon-btn"
-                      onClick={handleSkillDocSave}
-                      disabled={skillDocLoading || skillDocSaving || !skillDocSelectedId}
-                      style={{ marginTop: 0 }}
-                    >
-                      {skillDocSaving ? "Saving..." : "Save local override"}
-                    </button>
-                    <button
-                      type="button"
-                      className="icon-btn"
-                      onClick={handleSkillDocDelete}
-                      disabled={
-                        skillDocLoading ||
-                        skillDocSaving ||
-                        !skillDocSelectedId ||
-                        !skillDoc?.local_exists
-                      }
-                      style={{ marginTop: 0 }}
-                    >
-                      Delete local override
-                    </button>
-                    <button
-                      type="button"
-                      className="icon-btn"
-                      onClick={() => fetchSkillDoc(skillDocSelectedId)}
-                      disabled={skillDocLoading || skillDocSaving || !skillDocSelectedId}
-                      style={{ marginTop: 0 }}
-                    >
-                      Reload doc
-                    </button>
-                  </div>
-                  <div className="workflow-pack-manager workflow-pack-manager--flat" aria-label="Skill markdown import and export">
-                    <div className="workflow-modules-heading">
-                      <div className="field-label">Skill packs</div>
-                      <label className="inline-flex workflow-pack-overwrite">
-                        <input
-                          type="checkbox"
-                          checked={skillTransferOverwrite}
-                          onChange={(event) =>
-                            setSkillTransferOverwrite(event.target.checked)
-                          }
-                        />
-                        <span>Overwrite</span>
-                      </label>
-                    </div>
-                    <div className="workflow-pack-grid">
-                      <label className="field-label" htmlFor="workflow-skill-import">
-                        Import markdown
-                      </label>
-                      <input
-                        id="workflow-skill-import"
-                        type="text"
-                        value={skillImportPath}
-                        onChange={(event) => setSkillImportPath(event.target.value)}
-                        placeholder="data/workspace/generic_skill.md"
-                      />
-                      <div className="workflow-pack-actions">
-                        <button
-                          type="button"
-                          className="icon-btn"
-                          onClick={() => handleSkillImport(true)}
-                          disabled={!!skillTransferBusy}
-                          style={{ marginTop: 0 }}
-                        >
-                          {skillTransferBusy === "import-preview" ? "Checking..." : "Preview import"}
-                        </button>
-                        <button
-                          type="button"
-                          className="icon-btn"
-                          onClick={() => handleSkillImport(false)}
-                          disabled={!!skillTransferBusy}
-                          style={{ marginTop: 0 }}
-                        >
-                          {skillTransferBusy === "import" ? "Importing..." : "Import skill"}
-                        </button>
-                      </div>
-                      <label className="field-label" htmlFor="workflow-skill-export">
-                        Skill export folder
-                      </label>
-                      <input
-                        id="workflow-skill-export"
-                        type="text"
-                        value={skillExportPath}
-                        onChange={(event) => setSkillExportPath(event.target.value)}
-                        placeholder="data/workspace/skill-exports"
-                      />
-                      <div className="workflow-pack-actions">
-                        <button
-                          type="button"
-                          className="icon-btn"
-                          onClick={() => handleSkillExport(true)}
-                          disabled={!!skillTransferBusy || !skillDocSelectedId}
-                          style={{ marginTop: 0 }}
-                        >
-                          {skillTransferBusy === "export-preview" ? "Checking..." : "Preview export"}
-                        </button>
-                        <button
-                          type="button"
-                          className="icon-btn"
-                          onClick={() => handleSkillExport(false)}
-                          disabled={!!skillTransferBusy || !skillDocSelectedId}
-                          style={{ marginTop: 0 }}
-                        >
-                          {skillTransferBusy === "export" ? "Exporting..." : "Export selected"}
-                        </button>
-                      </div>
-                    </div>
-                    {skillTransferPreview?.warnings?.length > 0 && (
-                      <p className="status-note warn">
-                        {skillTransferPreview.warnings.join(" ")}
-                      </p>
-                    )}
-                    {skillTransferMessage && (
-                      <p className="status-note">{skillTransferMessage}</p>
-                    )}
-                  </div>
-                  {skillDocMessage && <p className="status-note">{skillDocMessage}</p>}
-                </div>
-                </div>
-                <p className="status-note" style={{ marginTop: 10 }}>
-                  {Array.isArray(workflowCatalog.addons) && workflowCatalog.addons.length > 0
-                    ? ` ${workflowCatalog.addons.length} add-on${
-                        workflowCatalog.addons.length === 1 ? "" : "s"
-                      } currently registered.`
-                    : "Drop sanctioned workflow/module packs there to surface them here later."}
-                </p>
-                <div className="inline-flex" style={{ gap: 10, marginTop: 10, flexWrap: "wrap" }}>
-                  <button
-                    type="button"
-                    className="icon-btn"
-                    onClick={handleCaptureWorkflowSave}
-                    disabled={captureWorkflowSaving}
-                    style={{ marginTop: 0 }}
-                  >
-                    {captureWorkflowSaving ? "Saving..." : "Save capture & workflow settings"}
-                  </button>
-                </div>
-                {captureWorkflowMessage && (
-                  <p className="status-note">{captureWorkflowMessage}</p>
+                {capturePrivacyMessage && (
+                  <p className="status-note" role="status">{capturePrivacyMessage}</p>
                 )}
               </div>
             </section>
           )}
+
 
           {showSettingsSection("background") && (
             <section
@@ -11880,102 +11072,6 @@ const Settings = () => {
             </section>
           )}
 
-          {showSettingsSection("sharing") && (
-            <section
-              id="settings-sharing"
-              className="settings-card settings-section"
-              aria-label="Sharing and sync"
-            >
-              <div className="settings-card-header">
-                <div>
-                  <h2>Sharing &amp; Sync</h2>
-                  <p className="settings-card-copy">
-                    Trusted-device sync and private live transport. This is the
-                    visible entry point for the preview flow, not a public
-                    account layer.
-                  </p>
-                </div>
-              </div>
-
-              <div className="settings-section">
-                <p className="status-note">
-                  Recommended use is a private LAN, VPN, or user-operated
-                  tunnel. The current sync preview still expects a trusted
-                  remote Float API and does not replace a real pairing wizard.
-                </p>
-                <h3>Instance sync</h3>
-                <p className="status-note">
-                  Preview a section-by-section merge against another Float instance,
-                  then pull its state here or push this instance there.
-                </p>
-                <label className="field-label" htmlFor="sync-remote-url">
-                  <span>Remote Float URL</span>
-                </label>
-                <input
-                  id="sync-remote-url"
-                  type="text"
-                  value={syncRemoteUrl}
-                  onChange={(event) => setSyncRemoteUrl(event.target.value)}
-                  placeholder="http://192.168.1.25:5000"
-                />
-                <label
-                  className="inline-flex"
-                  style={{ gap: 8, marginTop: 10, alignItems: "center", flexWrap: "wrap" }}
-                >
-                  <input
-                    type="checkbox"
-                    checked={syncLinkToSourceDevice}
-                    onChange={(event) => setSyncLinkToSourceDevice(event.target.checked)}
-                  />
-                  Link synced data to its source device/workspace
-                </label>
-                <label className="field-label" htmlFor="sync-source-namespace">
-                  <span>This device label / namespace</span>
-                </label>
-                <input
-                  id="sync-source-namespace"
-                  type="text"
-                  value={syncSourceNamespace}
-                  onChange={(event) => setSyncSourceNamespace(event.target.value)}
-                  placeholder="desktop"
-                />
-                <p className="status-note">
-                  The remote instance must already be reachable over a private
-                  transport such as a LAN, VPN, or user-operated tunnel. This
-                  preview flow registers a temporary sync device automatically, but
-                  it is not a public discovery or login layer.
-                </p>
-                <p className="status-note">
-                  When source-linking is enabled, receivers keep synced
-                  conversations, attachments, memories, graph state, calendar
-                  events, and knowledge rows under a source namespace so nested
-                  device or workspace deployments can coexist.
-                </p>
-                <div className="inline-flex" style={{ gap: 10, marginTop: 10, flexWrap: "wrap" }}>
-                  <button
-                    type="button"
-                    className="icon-btn"
-                    onClick={handleSyncDefaultsSave}
-                    disabled={syncDefaultsSaving}
-                    style={{ marginTop: 0 }}
-                  >
-                    {syncDefaultsSaving ? "Saving..." : "Save sync defaults"}
-                  </button>
-                  <button
-                    type="button"
-                    className="icon-btn"
-                    onClick={previewSync}
-                    disabled={syncBusy || syncActionBusy}
-                    style={{ marginTop: 0 }}
-                  >
-                    {syncBusy ? "Checking..." : "Preview sync"}
-                  </button>
-                </div>
-                {syncMessage && <p className="status-note">{syncMessage}</p>}
-              </div>
-            </section>
-          )}
-
           {showSettingsSection("output") && (
             <section
               id="settings-output"
@@ -12085,8 +11181,8 @@ const Settings = () => {
               Default instructions (read-only)
             </label>
             <textarea
-              className="message-field"
-              rows="8"
+              className="message-field settings-instructions-field"
+              rows="16"
               value={systemPromptBase}
               readOnly
             />
@@ -12097,8 +11193,8 @@ const Settings = () => {
               Custom instructions
             </label>
             <textarea
-              className="message-field"
-              rows="8"
+              className="message-field settings-instructions-field"
+              rows="16"
               value={systemPromptCustom}
               onChange={(e) => setSystemPromptCustom(e.target.value)}
               placeholder="Add your custom behavior overrides here."
@@ -12118,118 +11214,6 @@ const Settings = () => {
           </div>
 
             </section>
-          )}
-
-          {syncDialogOpen && syncPreview && (
-            <div
-              className="settings-sync-overlay"
-              role="presentation"
-              onClick={(event) => {
-                if (event.target === event.currentTarget && !syncActionBusy) {
-                  setSyncDialogOpen(false);
-                }
-              }}
-            >
-              <div
-                className="settings-sync-dialog"
-                role="dialog"
-                aria-modal="true"
-                aria-labelledby="sync-dialog-title"
-                onClick={(event) => event.stopPropagation()}
-              >
-                <div className="settings-sync-header">
-                  <div>
-                    <h3 id="sync-dialog-title">Sync preview</h3>
-                    <p className="status-note">
-                      Compare this Float instance with{" "}
-                      {syncPreview?.remote?.base_url || syncRemoteUrl.trim()} and
-                      choose which sections to merge.
-                    </p>
-                    {syncPreview?.link_to_source && (
-                      <>
-                        <p className="status-note">
-                          Pull here will link remote data under{" "}
-                          <code>{syncPullNamespace || "remote"}/</code>.
-                        </p>
-                        <p className="status-note">
-                          Push there will link this instance under{" "}
-                          <code>{syncPushNamespace || "this-device"}/</code> on the receiver.
-                        </p>
-                      </>
-                    )}
-                  </div>
-                  <button
-                    type="button"
-                    className="icon-btn"
-                    onClick={() => setSyncDialogOpen(false)}
-                    disabled={!!syncActionBusy}
-                    style={{ marginTop: 0 }}
-                  >
-                    Close
-                  </button>
-                </div>
-                <div className="settings-sync-grid">
-                  {syncPullSections.map((section) => {
-                    const pushSection = syncPushSectionMap[section.key] || section;
-                    return (
-                    <label key={section.key} className="settings-sync-row">
-                      <input
-                        type="checkbox"
-                        checked={!!syncSelections[section.key]}
-                        onChange={(event) =>
-                          setSyncSelections((prev) => ({
-                            ...prev,
-                            [section.key]: event.target.checked,
-                          }))
-                        }
-                      />
-                      <div>
-                        <strong>{section.label}</strong>
-                        <div className="status-note">
-                          Pull here: Remote newer: {section.remote_newer} |
-                          Local newer: {section.local_newer}
-                        </div>
-                        <div className="status-note">
-                          Only remote: {section.only_remote} | Only local:{" "}
-                          {section.only_local} | Identical: {section.identical}
-                        </div>
-                        <div className="status-note">
-                          Push there: Remote newer: {pushSection.remote_newer}
-                          {" | "}Local newer: {pushSection.local_newer}
-                        </div>
-                        <div className="status-note">
-                          Only remote: {pushSection.only_remote} | Only local:{" "}
-                          {pushSection.only_local} | Identical: {pushSection.identical}
-                        </div>
-                        {renderSyncPreviewItems("Pull item preview", section.items)}
-                        {renderSyncPreviewItems("Push item preview", pushSection.items)}
-                      </div>
-                    </label>
-                    );
-                  })}
-                </div>
-                <div className="inline-flex" style={{ gap: 10, marginTop: 16, flexWrap: "wrap" }}>
-                  <button
-                    type="button"
-                    className="icon-btn"
-                    onClick={() => applySync("pull")}
-                    disabled={!!syncActionBusy}
-                    style={{ marginTop: 0 }}
-                  >
-                    {syncActionBusy === "pull" ? "Pulling..." : "Pull here"}
-                  </button>
-                  <button
-                    type="button"
-                    className="icon-btn"
-                    onClick={() => applySync("push")}
-                    disabled={!!syncActionBusy}
-                    style={{ marginTop: 0 }}
-                  >
-                    {syncActionBusy === "push" ? "Pushing..." : "Push there"}
-                  </button>
-                </div>
-              </div>
-            </div>
           )}
 
           {message && <p className="settings-message">{message}</p>}

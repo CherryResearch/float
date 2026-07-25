@@ -23,6 +23,7 @@ import time
 from typing import Any, Dict, Optional
 
 from app.services import privacy_filter_service
+from app.services.graph_payload_service import apply_graph_payload
 from app.services.rag_provider import (
     get_clip_rag_service,
     get_rag_service,
@@ -305,6 +306,25 @@ def _maybe_queue_reflection_after_save(
         return {"status": "error", "reason": str(exc)}
 
 
+def _persist_graph_updates(
+    *,
+    memory_key: str,
+    graph_nodes: Any = None,
+    graph_claims: Any = None,
+) -> Optional[Dict[str, Any]]:
+    if not graph_nodes and not graph_claims:
+        return None
+    graph_store = getattr(_MANAGER, "_graph_store", None)
+    return apply_graph_payload(
+        graph_store,
+        graph_nodes=graph_nodes,
+        graph_claims=graph_claims,
+        default_source_kind="memory",
+        default_source_ref=memory_key,
+        memory_key=memory_key,
+    )
+
+
 def legacy_memory_save(*, user: str, signature: str, **payload: Any) -> Dict[str, Any]:
     """Compatibility tool that accepts the older `memory.save` schema."""
 
@@ -324,6 +344,12 @@ def legacy_memory_save(*, user: str, signature: str, **payload: Any) -> Dict[str
         args.get("graph_triples")
         if isinstance(args.get("graph_triples"), list)
         else None
+    )
+    graph_nodes = (
+        args.get("graph_nodes") if isinstance(args.get("graph_nodes"), list) else None
+    )
+    graph_claims = (
+        args.get("graph_claims") if isinstance(args.get("graph_claims"), list) else None
     )
     privacy = _normalize_optional_str(args.get("privacy"))
     source = _normalize_optional_str(args.get("source"))
@@ -355,6 +381,10 @@ def legacy_memory_save(*, user: str, signature: str, **payload: Any) -> Dict[str
         record["vectorize"] = bool(vectorize)
     if graph_triples:
         record["graph_triples"] = graph_triples
+    if graph_nodes:
+        record["graph_nodes"] = graph_nodes
+    if graph_claims:
+        record["graph_claims"] = graph_claims
     if privacy:
         record["privacy"] = privacy
     if source:
@@ -400,6 +430,13 @@ def legacy_memory_save(*, user: str, signature: str, **payload: Any) -> Dict[str
             run_now=reflection_run_now,
             source_tool="memory.save",
         )
+    graph_update = _persist_graph_updates(
+        memory_key=key,
+        graph_nodes=graph_nodes,
+        graph_claims=graph_claims,
+    )
+    if graph_update:
+        result["graph_update"] = graph_update
     return result
 
 
@@ -420,6 +457,8 @@ def remember(
     occurs_at: Optional[float] | object = _DEFAULT,
     review_at: Optional[float] | object = _DEFAULT,
     decay_at: Optional[float] | object = _DEFAULT,
+    graph_nodes: Optional[list] | object = _DEFAULT,
+    graph_claims: Optional[list] | object = _DEFAULT,
     reflect_after_save: bool | object = _DEFAULT,
     reflection_prompt: Optional[str] | object = _DEFAULT,
     reflection_run_now: bool | object = _DEFAULT,
@@ -455,6 +494,10 @@ def remember(
         payload["review_at"] = review_at
     if decay_at is not _DEFAULT:
         payload["decay_at"] = decay_at
+    if graph_nodes is not _DEFAULT:
+        payload["graph_nodes"] = graph_nodes
+    if graph_claims is not _DEFAULT:
+        payload["graph_claims"] = graph_claims
     if reflect_after_save is not _DEFAULT:
         payload["reflect_after_save"] = reflect_after_save
     if reflection_prompt is not _DEFAULT:
@@ -554,6 +597,18 @@ def remember(
         )
     privacy_notice = privacy_filter_service.notice(privacy_decision)
     status_text = f"ok ({privacy_notice})" if privacy_notice else "ok"
+    graph_update = _persist_graph_updates(
+        memory_key=key,
+        graph_nodes=None if graph_nodes is _DEFAULT else graph_nodes,
+        graph_claims=None if graph_claims is _DEFAULT else graph_claims,
+    )
+    if graph_update:
+        status_text = (
+            f"{status_text}; graph {graph_update.get('node_count', 0)} nodes/"
+            f"{graph_update.get('claim_count', 0)} claims"
+        )
+        if graph_update.get("errors"):
+            status_text = f"{status_text} ({len(graph_update['errors'])} errors)"
     if reflect_after_save is not _DEFAULT and bool(reflect_after_save):
         reflection = _maybe_queue_reflection_after_save(
             key=key,

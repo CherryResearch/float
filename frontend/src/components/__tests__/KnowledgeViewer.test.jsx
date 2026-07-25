@@ -25,6 +25,10 @@ vi.mock("../KnowledgeVisualizationsTab", () => ({
   default: () => <div>visualizations tab body</div>,
 }));
 
+vi.mock("../KnowledgeSkillsTab", () => ({
+  default: () => <div>skills tab body</div>,
+}));
+
 vi.mock("../KnowledgeSyncTab", () => ({
   default: () => <div>sync tab body</div>,
 }));
@@ -87,5 +91,21 @@ describe("KnowledgeViewer", () => {
       );
       expect(screen.getByTestId("location-search")).toHaveTextContent("tab=documents");
     });
+  });
+
+  it("opens the skills workspace from a direct Knowledge link", async () => {
+    render(
+      <MemoryRouter initialEntries={["/knowledge?tab=skills"]}>
+        <Routes>
+          <Route path="/knowledge" element={<KnowledgeViewer />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole("button", { name: /skills/i })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+    expect(screen.getByText("skills tab body")).toBeInTheDocument();
   });
 });

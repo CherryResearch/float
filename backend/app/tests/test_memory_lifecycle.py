@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -14,6 +15,8 @@ _MEMORY_SPEC = importlib.util.spec_from_file_location(
 memory_tools = importlib.util.module_from_spec(_MEMORY_SPEC)
 assert _MEMORY_SPEC and _MEMORY_SPEC.loader
 _MEMORY_SPEC.loader.exec_module(memory_tools)  # type: ignore[arg-type]
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
 @pytest.fixture
@@ -218,6 +221,29 @@ def test_remember_uses_shared_relative_weekday_resolution(memory_manager, monkey
     assert expected_date in stored["value"]
     assert stored["occurs_at"] == pytest.approx(expected_ts)
     assert stored["review_at"] == pytest.approx(stored["occurs_at"])
+
+
+def test_remember_can_persist_structured_graph_updates(tmp_path, monkeypatch):
+    manager = MemoryManager({"memory_store_path": str(tmp_path / "memory.sqlite3")})
+    monkeypatch.setattr(memory_tools, "_MANAGER", manager)
+    monkeypatch.setattr(memory_tools, "get_rag_service", lambda raise_http=False: None)
+    fixture = json.loads((FIXTURES / "basic_social_graph.json").read_text())
+    user = "alice"
+    args = {
+        "key": "social_graph_seed",
+        "value": "seed a small social graph",
+        "graph_nodes": fixture["nodes"],
+        "graph_claims": fixture["claims"],
+    }
+    sig = generate_signature(user, "remember", args)
+
+    result = memory_tools.remember(user=user, signature=sig, **args)
+
+    assert result == "ok; graph 7 nodes/7 claims"
+    assert manager._graph_store is not None
+    projection = manager._graph_store.projection()
+    assert projection["metadata"]["node_count"] == 7
+    assert any(link["predicate"] == "friend_of" for link in projection["links"])
 
 
 def test_evergreen_memories_do_not_receive_review_or_decay_by_default(memory_manager):

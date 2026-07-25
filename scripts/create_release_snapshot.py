@@ -5,12 +5,23 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import hashlib
+import json
+import os
+import re
 import shutil
+import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+
+import tomllib
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = REPO_ROOT / "data" / "workspace" / "release-public-alpha"
+BUILD_RECEIPT_NAME = ".float-build.json"
+DEPLOYMENT_MANIFEST_NAME = ".float-deployment-manifest.json"
+BUILD_CODE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 INCLUDE_PATHS = [
     ".flake8",
@@ -36,7 +47,6 @@ INCLUDE_PATHS = [
     "docs/resources",
     "docs/ui-snapshot-2026-04-12.png",
     "frontend",
-    "jwt.py",
     "main.py",
     "makefile",
     "modules",
@@ -67,6 +77,8 @@ EXCLUDED_PARTS = {
 
 EXCLUDED_PREFIXES = (
     "AGENTS.md",
+    BUILD_RECEIPT_NAME,
+    DEPLOYMENT_MANIFEST_NAME,
     ".dev_state.json",
     ".env",
     ".env.example",
@@ -148,6 +160,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Remove an existing output directory before copying.",
     )
+    parser.add_argument(
+        "--build-code",
+        default=os.getenv("FLOAT_BUILD_CODE", ""),
+        help=(
+            "Human build checkpoint to store separately from the release version. "
+            "Leave empty for an unassigned development snapshot."
+        ),
+    )
+    parser.add_argument(
+        "--require-build-code",
+        action="store_true",
+        help="Fail unless --build-code supplies an intentional build checkpoint.",
+    )
     return parser.parse_args()
 
 
@@ -155,8 +180,8 @@ def rel_path(path: Path) -> str:
     return path.relative_to(REPO_ROOT).as_posix()
 
 
-def is_excluded(path: Path) -> bool:
-    relative = rel_path(path)
+def is_relative_excluded(relative: str) -> bool:
+    relative = str(relative or "").replace("\\", "/").strip().strip("/")
     if any(
         relative == prefix.rstrip("/") or relative.startswith(prefix)
         for prefix in EXCLUDED_PREFIXES
@@ -164,7 +189,22 @@ def is_excluded(path: Path) -> bool:
         return True
     if any(fnmatch.fnmatchcase(relative, pattern) for pattern in EXCLUDED_GLOBS):
         return True
-    return any(part in EXCLUDED_PARTS for part in path.parts)
+    return any(part in EXCLUDED_PARTS for part in Path(relative).parts)
+
+
+def is_excluded(path: Path) -> bool:
+    return is_relative_excluded(rel_path(path))
+
+
+def is_manifest_relative_path(relative: str) -> bool:
+    normalized = str(relative or "").replace("\\", "/").strip().strip("/")
+    if not normalized or is_relative_excluded(normalized):
+        return False
+    for item in INCLUDE_PATHS:
+        prefix = item.rstrip("/")
+        if normalized == prefix or normalized.startswith(f"{prefix}/"):
+            return True
+    return normalized in OPTIONAL_PATHS
 
 
 def iter_dir_files(src: Path) -> list[Path]:
@@ -218,6 +258,89 @@ def copy_snapshot(files: list[Path], output_dir: Path, force: bool) -> None:
         shutil.copy2(src, dest)
 
 
+def release_version() -> str:
+    payload = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    return str(payload["tool"]["poetry"]["version"]).strip()
+
+
+def source_revision() -> str:
+    override = str(os.getenv("FLOAT_SOURCE_REVISION") or "").strip()
+    if override:
+        return override
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            check=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout.strip()
+
+
+def _is_manifest_scope(relative: str) -> bool:
+    normalized = relative.replace("\\", "/").strip().strip('"')
+    return is_manifest_relative_path(normalized)
+
+
+def snapshot_source_dirty() -> bool:
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            check=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    for raw in result.stdout.split(b"\0"):
+        if len(raw) < 4:
+            continue
+        relative = raw[3:].decode("utf-8", errors="replace")
+        if _is_manifest_scope(relative):
+            return True
+    return False
+
+
+def snapshot_digest(files: list[Path]) -> str:
+    manifest = hashlib.sha256()
+    for path in sorted(files, key=rel_path):
+        content_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        manifest.update(f"{rel_path(path)}\t{content_hash}\n".encode("utf-8"))
+    return manifest.hexdigest()
+
+
+def write_build_receipt(
+    output_dir: Path,
+    files: list[Path],
+    build_code: str,
+) -> dict[str, object]:
+    code = str(build_code or "").strip()
+    if code and not BUILD_CODE_PATTERN.fullmatch(code):
+        raise ValueError(
+            "Build code must start with a letter or number and use only letters, "
+            "numbers, dots, underscores, or hyphens (maximum 64 characters)."
+        )
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "release_version": release_version(),
+        "build_code": code,
+        "source_revision": source_revision(),
+        "source_dirty": snapshot_source_dirty(),
+        "snapshot_digest": snapshot_digest(files),
+        "built_at": datetime.now(tz=timezone.utc).isoformat(),
+    }
+    (output_dir / BUILD_RECEIPT_NAME).write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return payload
+
+
 def scan_text_files(files: list[Path], root: Path) -> list[str]:
     errors: list[str] = []
     for path in files:
@@ -258,6 +381,7 @@ def validate_snapshot(output_dir: Path) -> list[str]:
     snapshot_files = [path for path in output_dir.rglob("*") if path.is_file()]
     errors = scan_text_files(snapshot_files, output_dir)
     for required in (
+        BUILD_RECEIPT_NAME,
         "LICENSE",
         "CLA.md",
         "CONTRIBUTOR_ASSIGNMENT_AGREEMENT.md",
@@ -270,6 +394,13 @@ def validate_snapshot(output_dir: Path) -> list[str]:
 
 def main() -> int:
     args = parse_args()
+    build_code = str(args.build_code or "").strip()
+    if args.require_build_code and not build_code:
+        print("Release snapshot requires an intentional --build-code.", file=sys.stderr)
+        return 1
+    if build_code and not BUILD_CODE_PATTERN.fullmatch(build_code):
+        print("Release snapshot build code is invalid.", file=sys.stderr)
+        return 1
     files, missing = iter_manifest_files()
     source_errors = validate_source(files, missing)
     if source_errors:
@@ -281,6 +412,7 @@ def main() -> int:
         print(f"Release snapshot check passed for {len(files)} files.")
         return 0
     copy_snapshot(files, args.output.resolve(), args.force)
+    receipt = write_build_receipt(args.output.resolve(), files, build_code)
     snapshot_errors = validate_snapshot(args.output.resolve())
     if snapshot_errors:
         print("Copied snapshot failed validation:", file=sys.stderr)
@@ -288,7 +420,9 @@ def main() -> int:
             print(f"- {error}", file=sys.stderr)
         return 1
     print(
-        f"Release snapshot copied to {args.output.resolve()} " f"({len(files)} files)."
+        f"Release snapshot copied to {args.output.resolve()} "
+        f"({len(files)} files, build={receipt['build_code'] or 'unassigned'}, "
+        f"digest={receipt['snapshot_digest']})."
     )
     return 0
 

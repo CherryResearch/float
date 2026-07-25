@@ -156,6 +156,13 @@ def _apply_aliases(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
                     break
         for alias in ("content", "text", "note", "body"):
             args.pop(alias, None)
+    elif tool_name == "graph.update":
+        if "nodes" not in args and "graph_nodes" in args:
+            args["nodes"] = args.get("graph_nodes")
+        if "claims" not in args and "graph_claims" in args:
+            args["claims"] = args.get("graph_claims")
+        args.pop("graph_nodes", None)
+        args.pop("graph_claims", None)
     elif tool_name == "recall":
         if "key" not in args or not str(args.get("key") or "").strip():
             for alias in ("query", "search", "text", "content"):

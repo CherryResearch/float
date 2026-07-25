@@ -21,11 +21,9 @@ def _sign(tool_name: str, payload: dict) -> str:
         or (
             "search"
             if str(payload.get("query") or "").strip()
-            else (
-                "read"
-                if str(payload.get("doc_id") or payload.get("path") or "").strip()
-                else "list"
-            )
+            else "read"
+            if str(payload.get("doc_id") or payload.get("path") or "").strip()
+            else "list"
         ),
         "scope": _normalize_scope(payload.get("scope")),
         "doc_id": str(payload.get("doc_id") or ""),
@@ -58,10 +56,6 @@ def test_read_capability_docs_lists_curated_docs(tmp_path, monkeypatch):
         "Skill summary\n\n# Computer Use\n- Observe first.\n",
         encoding="utf-8",
     )
-    (skill_root / "float_self_knowledge.md").write_text(
-        "Float summary\n\n# Float Self Knowledge\n- Runtime map.\n",
-        encoding="utf-8",
-    )
     (docs_root / "memory.md").write_text(
         "Memory summary\n\n# Memory\n- Durable notes.\n",
         encoding="utf-8",
@@ -77,7 +71,6 @@ def test_read_capability_docs_lists_curated_docs(tmp_path, monkeypatch):
     assert result["action"] == "list"
     doc_ids = [item["id"] for item in result["docs"]]
     assert "skills:computer_use" in doc_ids
-    assert "skills:float_self_knowledge" in doc_ids
     assert "function_descriptions:memory" in doc_ids
     computer_doc = next(
         item for item in result["docs"] if item["id"] == "skills:computer_use"
@@ -86,34 +79,6 @@ def test_read_capability_docs_lists_curated_docs(tmp_path, monkeypatch):
     assert computer_doc["module_source"] == "base"
     assert computer_doc["module_enabled"] is False
     assert "computer.observe" in computer_doc["module_tool_names"]
-
-
-def test_read_capability_docs_searches_float_self_knowledge(tmp_path, monkeypatch):
-    from app import workflow_profiles
-    from app.tools.capability_docs import read_capability_docs
-
-    monkeypatch.setattr(workflow_profiles.app_config, "REPO_ROOT", tmp_path)
-    skill_root = tmp_path / "modules" / "skills"
-    skill_root.mkdir(parents=True, exist_ok=True)
-    (skill_root / "float_self_knowledge.md").write_text(
-        "Float summary\n\n# Float Self Knowledge\nRuntime lanes and Settings surfaces.\n",
-        encoding="utf-8",
-    )
-
-    args = {
-        "action": "search",
-        "scope": "skills",
-        "query": "Runtime lanes",
-        "limit": 10,
-    }
-    result = read_capability_docs(
-        user="tester",
-        signature=_sign("read_capability_docs", args),
-        **args,
-    )
-
-    assert result["count"] == 1
-    assert result["docs"][0]["id"] == "skills:float_self_knowledge"
 
 
 def test_read_capability_docs_marks_enabled_module(tmp_path, monkeypatch):

@@ -12,7 +12,7 @@ import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ..utils import conversation_store
 from .semantic_tags_service import (
@@ -53,7 +53,7 @@ DEFAULT_MAX_K = 16
 DEFAULT_THREAD_SIGNAL_BLEND = 0.7
 DEFAULT_SAE_PROXY_TOPK = 20
 THREADS_SUMMARY_SCHEMA_VERSION = 2
-THREAD_OVERVIEW_SCHEMA_VERSION = 1
+THREAD_OVERVIEW_SCHEMA_VERSION = 2
 API_SENSITIVE_PRIVACY_MODES = {"protected", "secret"}
 API_SENSITIVE_LEVELS = {"protected", "secret"}
 
@@ -133,6 +133,32 @@ def _normalize_conversation_reference(value: Any) -> str:
     if raw.lower().endswith(".json"):
         raw = raw[:-5]
     return raw
+
+
+def _compact_message_ranges(values: Iterable[Any]) -> list[dict[str, int]]:
+    indices: set[int] = set()
+    for value in values:
+        try:
+            parsed = int(value)
+        except Exception:
+            continue
+        if parsed >= 0:
+            indices.add(parsed)
+    if not indices:
+        return []
+
+    ordered = sorted(indices)
+    ranges: list[dict[str, int]] = []
+    start = ordered[0]
+    end = start
+    for index in ordered[1:]:
+        if index == end + 1:
+            end = index
+            continue
+        ranges.append({"start": start, "end": end})
+        start = end = index
+    ranges.append({"start": start, "end": end})
+    return ranges
 
 
 def _as_score(value: Any) -> Optional[float]:
@@ -237,13 +263,30 @@ def _build_thread_overview(summary: Dict[str, Any]) -> Dict[str, Any]:
                 parsed_message_index = int(raw_item.get("message_index"))
             except Exception:
                 parsed_message_index = None
+            message_refs: set[int] = set()
+            raw_message_indices = raw_item.get("message_indices")
+            if isinstance(raw_message_indices, (list, tuple, set)):
+                for value in raw_message_indices:
+                    try:
+                        candidate = int(value)
+                    except Exception:
+                        continue
+                    if candidate >= 0:
+                        message_refs.add(candidate)
+            if parsed_message_index is not None and parsed_message_index >= 0:
+                message_refs.add(parsed_message_index)
             date = str(raw_item.get("date") or "").strip()
+            first_date = str(raw_item.get("first_date") or date).strip()
+            latest_date = str(raw_item.get("latest_date") or date).strip()
             score = _as_score(raw_item.get("score"))
             excerpt = str(raw_item.get("excerpt") or "").strip()
             item = {
                 "conversation": conversation,
                 "message_index": parsed_message_index,
+                "message_indices": sorted(message_refs),
                 "date": date,
+                "first_date": first_date,
+                "latest_date": latest_date,
                 "score": round(score, 4) if score is not None else None,
                 "excerpt": excerpt,
             }
@@ -255,6 +298,7 @@ def _build_thread_overview(summary: Dict[str, Any]) -> Dict[str, Any]:
                     "conversation": conversation,
                     "item_count": 0,
                     "message_refs": set(),
+                    "first_date": "",
                     "latest_date": "",
                     "score_total": 0.0,
                     "score_count": 0,
@@ -262,11 +306,15 @@ def _build_thread_overview(summary: Dict[str, Any]) -> Dict[str, Any]:
                 },
             )
             row["item_count"] += 1
-            if parsed_message_index is not None:
-                row["message_refs"].add(parsed_message_index)
-                message_pairs.add((conversation, parsed_message_index))
-            if date and (not row["latest_date"] or date > row["latest_date"]):
-                row["latest_date"] = date
+            for message_ref in message_refs:
+                row["message_refs"].add(message_ref)
+                message_pairs.add((conversation, message_ref))
+            if first_date and (not row["first_date"] or first_date < row["first_date"]):
+                row["first_date"] = first_date
+            if latest_date and (
+                not row["latest_date"] or latest_date > row["latest_date"]
+            ):
+                row["latest_date"] = latest_date
             if score is not None:
                 row["score_total"] += float(score)
                 row["score_count"] += 1
@@ -304,6 +352,10 @@ def _build_thread_overview(summary: Dict[str, Any]) -> Dict[str, Any]:
                     "conversation": row.get("conversation") or "(unknown)",
                     "item_count": int(row.get("item_count", 0) or 0),
                     "message_count": len(row.get("message_refs", set())),
+                    "message_ranges": _compact_message_ranges(
+                        row.get("message_refs", set())
+                    ),
+                    "first_date": row.get("first_date") or "",
                     "latest_date": row.get("latest_date") or "",
                     "avg_score": avg_score,
                     "preview_excerpt": row.get("preview_excerpt") or "",
@@ -1097,12 +1149,27 @@ def _generate_threads_via_float(
                 continue
             msgs = conversation_store.load_conversation(name)
             for idx, m in enumerate(msgs):
-                if scope_pairs is not None and (name, idx) not in scope_pairs:
+                source_message_index = idx
+                if isinstance(m, dict):
+                    try:
+                        candidate_index = int(m.get("source_message_index", idx))
+                    except Exception:
+                        candidate_index = idx
+                    if candidate_index >= 0:
+                        source_message_index = candidate_index
+                if (
+                    scope_pairs is not None
+                    and (
+                        name,
+                        source_message_index,
+                    )
+                    not in scope_pairs
+                ):
                     continue
                 if isinstance(m, dict):
                     text = m.get("content") or m.get("text") or ""
                     role = m.get("role") or m.get("speaker") or None
-                    ts = m.get("timestamp")
+                    ts = m.get("timestamp") or m.get("created_at")
                 elif isinstance(m, str):
                     text = m
                     role = None
@@ -1119,7 +1186,7 @@ def _generate_threads_via_float(
                     # per-conversation aggregation in the UI.
                     nug_sources.append(Path(f"{name}.json"))
                     nug_conversations.append(name)
-                    nug_msg_indices.append(idx)
+                    nug_msg_indices.append(source_message_index)
                     if isinstance(ts, str) and len(ts) >= 10:
                         date_only = str(ts)[:10]
                     else:
@@ -1396,7 +1463,7 @@ def generate_threads(
             threads_map: Dict[str, List[Dict[str, Any]]] = {
                 t: [] for t in manual_threads
             }
-            seen: set[Tuple[str, str]] = set()
+            thread_items: Dict[Tuple[str, str], Dict[str, Any]] = {}
             embeddings: List[List[float]] = _CACHE.get("embeddings") or []
             nuggets: List[Dict[str, Any]] = _CACHE.get("nuggets") or []
             sae_proxy_topk = (
@@ -1443,15 +1510,29 @@ def generate_threads(
                 if best_t is None:
                     continue
                 key = (best_t, meta["conversation"])
-                if key in seen:
+                message_index = meta["message_index"]
+                date = str(meta.get("date") or "")
+                existing = thread_items.get(key)
+                if existing is not None:
+                    message_indices = existing.setdefault("message_indices", [])
+                    if message_index not in message_indices:
+                        message_indices.append(message_index)
+                    first_date = str(existing.get("first_date") or "")
+                    latest_date = str(existing.get("latest_date") or "")
+                    if date and (not first_date or date < first_date):
+                        existing["first_date"] = date
+                    if date and (not latest_date or date > latest_date):
+                        existing["latest_date"] = date
                     continue
-                seen.add(key)
                 lines = meta["text"].splitlines()
                 excerpt = "\n".join(lines[:4])
                 item: Dict[str, Any] = {
                     "conversation": meta["conversation"],
-                    "message_index": meta["message_index"],
-                    "date": meta["date"],
+                    "message_index": message_index,
+                    "message_indices": [message_index],
+                    "date": date,
+                    "first_date": date,
+                    "latest_date": date,
                     "score": round(float(best_s), 4),
                     "excerpt": excerpt,
                 }
@@ -1460,6 +1541,7 @@ def generate_threads(
                 if best_sae_score is not None:
                     item["sae_score"] = round(float(best_sae_score), 4)
                 threads_map[best_t].append(item)
+                thread_items[key] = item
             float_summary["threads"] = threads_map
         except Exception:
             pass

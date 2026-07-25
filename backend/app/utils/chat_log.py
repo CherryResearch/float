@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable
@@ -35,7 +34,9 @@ def _truncate(value: object, limit: int = 160) -> str:
     """Return a shortened, single-line representation for console output."""
 
     try:
-        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        text = (
+            value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        )
     except Exception:
         text = str(value)
     text = (text or "").replace("\n", " ").strip()
@@ -137,12 +138,17 @@ def log_chat_request(session_id: str, prompt_snippet: str, model: str | None) ->
     )
 
 
-def log_chat_response(session_id: str, text_snippet: str, meta: Dict[str, Any] | None) -> None:
+def log_chat_response(
+    session_id: str, text_snippet: str, meta: Dict[str, Any] | None
+) -> None:
     # Trim overly large metadata; keep a shallow copy
     safe_meta: Dict[str, Any] | None = None
     if isinstance(meta, dict):
         try:
-            safe_meta = {k: (v if isinstance(v, (str, int, float, bool)) else str(v)) for k, v in meta.items()}
+            safe_meta = {
+                k: (v if isinstance(v, (str, int, float, bool)) else str(v))
+                for k, v in meta.items()
+            }
         except Exception:
             safe_meta = None
     log_event(
@@ -203,7 +209,9 @@ def log_tool_event(
     if args is not None:
         payload["args"] = args
     if result is not None:
-        payload["result"] = result if isinstance(result, (str, int, float, bool)) else str(result)
+        payload["result"] = (
+            result if isinstance(result, (str, int, float, bool)) else str(result)
+        )
     log_event("tool_event", payload)
     try:
         from app.utils import conversation_timeline
@@ -220,4 +228,3 @@ def log_tool_event(
         )
     except Exception:
         pass
-

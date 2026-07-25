@@ -128,7 +128,6 @@ body.dark-mode .collapse-btn {
   left: calc(var(--space-sm) + 6px);
   --sidebar-light-angle: 196deg;
   width: var(--sidebar-width-left, var(--sidebar-width));
-  container: history-sidebar / inline-size;
 }
 
 .left-sidebar.collapsed {
@@ -1177,34 +1176,6 @@ body.dark-mode .conversation-item.is-active {
   z-index: 1;
 }
 
-@container history-sidebar (max-width: 260px) {
-  .folder-conversation {
-    flex-direction: column;
-    gap: 4px;
-  }
-
-  .folder-conversation .conversation-main {
-    width: 100%;
-    align-items: flex-start;
-    flex-wrap: nowrap;
-  }
-
-  .folder-conversation .conversation-link {
-    line-height: 1.22;
-  }
-
-  .folder-conversation .conv-actions {
-    width: 100%;
-    justify-content: space-between;
-    padding-left: 14px;
-  }
-
-  .folder-conversation .conversation-date-tag {
-    align-items: flex-start;
-    padding-left: 0;
-  }
-}
-
 .conv-menu-wrapper {
   position: relative;
 }
@@ -1442,20 +1413,27 @@ body.dark-mode .conversation-item.is-active {
 .history-modal-overlay {
   position: fixed;
   inset: 0;
+  box-sizing: border-box;
+  padding: 8px;
   background: rgba(0, 0, 0, 0.45);
   display: flex;
   align-items: center;
   justify-content: center;
+  overflow-y: auto;
   z-index: 10000;
 }
 
 .history-modal {
+  box-sizing: border-box;
   background: var(--color-surface);
   border-radius: var(--radius-md);
   padding: 16px;
-  min-width: 320px;
+  min-width: min(320px, 100%);
   max-width: 520px;
   width: 90%;
+  max-height: calc(100vh - 16px);
+  max-height: calc(100dvh - 16px);
+  overflow: hidden;
   box-shadow: var(--shadow-lg);
   display: flex;
   flex-direction: column;
@@ -1469,8 +1447,28 @@ body.dark-mode .conversation-item.is-active {
 
 .history-modal-body {
   display: flex;
+  flex: 1 1 auto;
   flex-direction: column;
   gap: 10px;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 2px;
+}
+
+.history-import-status {
+  border: 1px solid color-mix(in oklab, var(--color-primary) 34%, var(--glass-border));
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  background: color-mix(in oklab, var(--color-primary) 10%, transparent);
+  color: var(--color-text);
+  font-size: 0.82rem;
+  overflow-wrap: anywhere;
+}
+
+.history-import-status.is-error {
+  border-color: color-mix(in oklab, #f28482 58%, var(--glass-border));
+  background: color-mix(in oklab, #f28482 12%, transparent);
 }
 
 .history-modal-field {
@@ -1734,6 +1732,8 @@ body.dark-mode .conversation-item.is-active {
 
 .history-modal-actions {
   display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
   justify-content: flex-end;
   gap: 8px;
 }
@@ -1861,13 +1861,13 @@ body.dark-mode .conversation-item.is-active {
   }
 }
 
-@media (max-width: 900px) {
+@media (max-width: 900px), (orientation: landscape) and (max-width: 1000px) and (max-height: 600px) {
   .sidebar-resizer {
     display: none;
   }
 }
 
-@media (max-width: 600px) {
+@media (max-width: 600px), (orientation: landscape) and (max-width: 1000px) and (max-height: 600px) {
   .sidebar {
     /* Overlay style, but keep narrower so it doesn't cover center completely */
     width: clamp(240px, 64vw, 360px);
@@ -4176,6 +4176,38 @@ body.dark-mode .agent-card {
 
 .runtime-provider-actions > .runtime-action-btn {
   flex: 0 0 auto;
+}
+
+@media (max-width: 600px), (orientation: landscape) and (max-width: 1000px) and (max-height: 600px) {
+  .runtime-provider-select-wrap.has-meta {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .runtime-provider-select-wrap.has-meta .runtime-provider-model-select {
+    padding-right: 2rem;
+  }
+
+  .runtime-provider-model-meta {
+    position: static;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    transform: none;
+    white-space: normal;
+  }
+
+  .runtime-action-btn,
+  .runtime-provider-context-input {
+    min-height: 36px;
+  }
+
+  .runtime-action-symbol {
+    width: 2.25rem;
+    height: 2.25rem;
+    min-width: 2.25rem;
+    min-height: 2.25rem;
+  }
 }
 
 .runtime-model-name {

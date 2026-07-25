@@ -42,11 +42,15 @@ from app.provider_transports.openai_responses_ws import (
     OpenAIResponsesWebSocketTransport,
 )
 from app.provider_transports.openai_responses_ws import (
+    extract_response_function_calls as _extract_responses_function_calls,
+)
+from app.provider_transports.openai_responses_ws import (
     extract_response_text as _extract_responses_visible_text,
 )
 from app.provider_transports.openai_responses_ws import (
     extract_response_tool_text as _extract_responses_tool_text,
 )
+from app.server_presets import resolve_server_auth_token, server_trust_warning
 from app.utils import blob_store
 from app.utils.blob_store import get_blob as load_blob
 from app.utils.graph_store import GraphStore
@@ -444,17 +448,18 @@ def _float_local_torch_install_guidance() -> str:
     cuda_example = (
         "poetry run uv pip install --upgrade --force-reinstall --index-url "
         "https://download.pytorch.org/whl/cu128 "
-        "torch==2.7.1+cu128 torchvision==0.22.1+cu128 torchaudio==2.7.1+cu128"
+        "torch==2.10.0 torchvision==0.25.0"
     )
     cpu_example = (
         "poetry run uv pip install --upgrade --force-reinstall --index-url "
         "https://download.pytorch.org/whl/cpu "
-        "torch==2.7.1+cpu torchvision==0.22.1+cpu torchaudio==2.7.1+cpu"
+        "torch==2.10.0 torchvision==0.25.0"
     )
     return (
         "See README.md or docs/environment setup.md for the Float-specific install "
-        "steps. Install matching torch/torchvision/torchaudio wheels into the Poetry "
-        f"environment, for example CUDA: `{cuda_example}` or CPU fallback: "
+        "steps. Keep the torch/torchvision versions declared in pyproject.toml paired, "
+        "and change only their wheel index for CPU or CUDA. For example, CUDA: "
+        f"`{cuda_example}` or CPU fallback: "
         f"`{cpu_example}`. Restart Float after installation."
     )
 
@@ -485,6 +490,7 @@ _OPENAI_ROLE_ALIASES = {
     "human": "user",
 }
 _VISION_NATIVE_MODEL_HINTS = (
+    "chat-latest",
     "gpt-4o",
     "gpt-4.1",
     "gpt-5",
@@ -2546,6 +2552,7 @@ class LLMService:
             nonlocal previous_response_id
             nonlocal output_ids
             nonlocal final_response_payload
+            nonlocal finish_reason
 
             if not isinstance(candidate, dict):
                 return
@@ -2582,6 +2589,15 @@ class LLMService:
                 model_value = source.get("model")
                 if isinstance(model_value, str) and model_value.strip():
                     response_model = model_value.strip()
+                if str(source.get("status") or "").strip().lower() == "incomplete":
+                    incomplete_details = source.get("incomplete_details")
+                    if isinstance(incomplete_details, dict):
+                        incomplete_reason = str(
+                            incomplete_details.get("reason") or ""
+                        ).strip()
+                        if incomplete_reason:
+                            finish_reason = incomplete_reason
+                    finish_reason = finish_reason or "incomplete"
                 extracted_output_ids = _extract_output_ids(source.get("output"))
                 if extracted_output_ids:
                     output_ids = extracted_output_ids
@@ -2974,6 +2990,17 @@ class LLMService:
                                     _emit_thought(text)
                         elif isinstance(reasoning, str):
                             _emit_thought(reasoning)
+                        reasoning_content = delta.get("reasoning_content")
+                        if isinstance(reasoning_content, str):
+                            _emit_thought(reasoning_content)
+                        elif isinstance(reasoning_content, list):
+                            for item in reasoning_content:
+                                if isinstance(item, dict):
+                                    text = str(item.get("text", "") or "")
+                                else:
+                                    text = str(item or "")
+                                if text:
+                                    _emit_thought(text)
                         tool_deltas = delta.get("tool_calls") or []
                         if isinstance(tool_deltas, list):
                             for call in tool_deltas:
@@ -3443,6 +3470,7 @@ class LLMService:
         Generate text via an OpenAI-style Chat Completion API.
         """
         tool_executor = kwargs.pop("tool_executor", None)
+        native_tool_definitions = kwargs.pop("native_tool_definitions", None)
         attachments_param = kwargs.pop("attachments", None) or []
         if isinstance(attachments_param, dict):
             attachments_param = [attachments_param]
@@ -3453,6 +3481,18 @@ class LLMService:
             1 for att in attachment_queue if _is_image_attachment(att)
         )
         reasoning = kwargs.pop("reasoning", None)
+        output_token_limit = kwargs.pop(
+            "output_token_limit",
+            kwargs.pop("reasoning_output_tokens", None),
+        )
+        try:
+            output_token_limit = (
+                max(1, int(output_token_limit))
+                if output_token_limit is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            output_token_limit = None
         vision_workflow = _normalize_vision_workflow(
             kwargs.pop("vision_workflow", None)
         )
@@ -3653,12 +3693,20 @@ class LLMService:
                         "caption_model": caption_model,
                     }
                 )
-            prefix = {
-                "ocr": "Local vision fallback summary. Read visible text cautiously:",
-                "compare": "Local vision fallback summary for comparison:",
-                "caption": "Local vision fallback caption:",
-            }.get(vision_workflow, "Local vision fallback summary:")
-            text = f"{prefix} Image {entry_index} ({label}): {caption}"
+            if placeholder:
+                text = (
+                    "Image delivery notice: The selected model did not receive visual "
+                    f"content for Image {entry_index} ({label}). Float could not generate "
+                    "a usable local image description. Do not infer visual details; tell "
+                    "the user that visual input was unavailable."
+                )
+            else:
+                prefix = {
+                    "ocr": "Local vision fallback summary. Read visible text cautiously:",
+                    "compare": "Local vision fallback summary for comparison:",
+                    "caption": "Local vision fallback caption:",
+                }.get(vision_workflow, "Local vision fallback summary:")
+                text = f"{prefix} Image {entry_index} ({label}): {caption}"
             if ref:
                 text = f"{text} [{ref}]"
             return {"type": "text", "text": text}
@@ -3764,11 +3812,16 @@ class LLMService:
             configured_url = self._normalize_server_url(server_url)
         else:
             configured_url = api_url
-        api_key = (
-            api_key_override
-            if isinstance(api_key_override, str)
-            else self.config.get("api_key")
-        )
+        if isinstance(api_key_override, str):
+            api_key = api_key_override
+        elif use_server:
+            api_key = resolve_server_auth_token(
+                self.config,
+                raw_server_url,
+                preset_id=self.config.get("server_preset_id"),
+            )
+        else:
+            api_key = self.config.get("api_key")
         if not configured_url:
             return {
                 "text": "",
@@ -4042,8 +4095,13 @@ class LLMService:
         use_responses = configured_url.endswith(suffix_resp) or lower_model.startswith(
             "gpt-5"
         )
+        tool_source = (
+            native_tool_definitions
+            if isinstance(native_tool_definitions, list)
+            else ctx.tools
+        )
         tool_definitions = _convert_tools_for_openai(
-            ctx.tools, responses_api=use_responses
+            tool_source, responses_api=use_responses
         )
         # Derive final URL if switching from chat to responses
         url = configured_url
@@ -4170,8 +4228,12 @@ class LLMService:
                 payload = {"input": transcript}
             if model:
                 payload["model"] = model
-            if reasoning is not None:
-                payload["reasoning"] = reasoning
+            if isinstance(reasoning, dict):
+                reasoning_effort = reasoning.get("effort")
+                if reasoning_effort is not None and str(reasoning_effort).strip():
+                    payload["reasoning"] = {"effort": reasoning_effort}
+            if output_token_limit is not None:
+                payload["max_output_tokens"] = output_token_limit
             if send_response_format:
                 payload["response_format"] = {"type": send_response_format}
             if tool_definitions:
@@ -4199,6 +4261,16 @@ class LLMService:
             }
             if model:
                 payload["model"] = model
+            if isinstance(reasoning, dict):
+                reasoning_effort = reasoning.get("effort")
+                if reasoning_effort is not None and str(reasoning_effort).strip():
+                    # Tinker and several OpenAI-compatible Chat Completions
+                    # providers use this flat field instead of Responses' object.
+                    payload["reasoning_effort"] = reasoning_effort
+            if output_token_limit is not None:
+                # `max_tokens` remains the broadest compatible output cap across
+                # Tinker and self-hosted OpenAI-style Chat Completions servers.
+                payload["max_tokens"] = output_token_limit
             if send_response_format:
                 payload["response_format"] = {"type": send_response_format}
             if tool_definitions and "tools" not in payload:
@@ -4355,6 +4427,19 @@ class LLMService:
                 )
                 if streamed is not None:
                     if use_server:
+                        if isinstance(streamed, dict):
+                            streamed_meta = streamed.get("metadata")
+                            if not isinstance(streamed_meta, dict):
+                                streamed_meta = {}
+                                streamed["metadata"] = streamed_meta
+                            trust_warning = server_trust_warning(
+                                self.config,
+                                preset_id=self.config.get("server_preset_id"),
+                                base_url=raw_server_url,
+                                model=model,
+                            )
+                            if trust_warning:
+                                streamed_meta["trust_warning"] = trust_warning
                         try:
                             streamed_meta = (
                                 streamed.get("metadata")
@@ -4567,6 +4652,58 @@ class LLMService:
                             truncated = truncated.rstrip() + "..."
                         meta["provider_message"] = truncated
                         fallback_text = f"Provider error: {truncated}"
+                    failure_text = " ".join(
+                        str(value or "")
+                        for value in (
+                            meta.get("error"),
+                            meta.get("provider_message"),
+                            meta.get("provider_error_text"),
+                        )
+                    ).lower()
+                    if (
+                        "reasoning_effort" in failure_text
+                        or "output_config.effort" in failure_text
+                        or (
+                            "reasoning" in failure_text
+                            and any(
+                                token in failure_text
+                                for token in ("unsupported", "not support", "invalid")
+                            )
+                        )
+                    ):
+                        meta["category"] = "reasoning_control_unsupported"
+                        meta["hint"] = (
+                            "This model or endpoint rejected the requested reasoning effort. "
+                            "Use auto or a named preset supported by the provider."
+                        )
+                    elif any(
+                        token in failure_text
+                        for token in (
+                            "maximum context length",
+                            "context length exceeded",
+                            "context window",
+                            "too many input tokens",
+                        )
+                    ):
+                        meta["category"] = "context_token_limit"
+                        meta["hint"] = (
+                            "The prompt and loaded context exceeded the model context window. "
+                            "Compact the conversation, reduce retrieval, or choose a larger-context model."
+                        )
+                    elif any(
+                        token in failure_text
+                        for token in (
+                            "max_tokens",
+                            "max completion tokens",
+                            "max output tokens",
+                            "output token limit",
+                        )
+                    ):
+                        meta["category"] = "output_token_limit"
+                        meta["hint"] = (
+                            "The provider rejected or exhausted the output-token budget. "
+                            "Lower reasoning effort or increase the allowed output budget."
+                        )
                     if use_server:
                         try:
                             log_llm_server_event(
@@ -4577,7 +4714,7 @@ class LLMService:
                                     "endpoint": url,
                                     "model": model,
                                     "status_code": status_code,
-                                    "category": category,
+                                    "category": meta.get("category", category),
                                     "request_id": request_id,
                                     "stream_requested": streaming_enabled,
                                     "response_format_requested": requested_response_format,
@@ -4673,10 +4810,16 @@ class LLMService:
         thought = ""
         message: Dict[str, Any] = {}
         response_tool_text = ""
+        finish_reason: Optional[str] = None
         if url.endswith(suffix_resp):
             # OpenAI Responses API style payload
             text = _extract_responses_visible_text(data)
             response_tool_text = _extract_responses_tool_text(data)
+            if str(data.get("status") or "").strip().lower() == "incomplete":
+                incomplete_details = data.get("incomplete_details")
+                if isinstance(incomplete_details, dict):
+                    finish_reason = str(incomplete_details.get("reason") or "").strip()
+                finish_reason = finish_reason or "incomplete"
         else:
             # Chat Completions style payload
             choice = (
@@ -4685,6 +4828,9 @@ class LLMService:
                 else {}
             )
             message = choice.get("message", {}) if isinstance(choice, dict) else {}
+            finish_reason = (
+                choice.get("finish_reason") if isinstance(choice, dict) else None
+            )
             content = message.get("content", "") if isinstance(message, dict) else ""
             text = ""
             if isinstance(content, list):
@@ -4714,10 +4860,20 @@ class LLMService:
                     part.get("text", "") if isinstance(part, dict) else str(part)
                     for part in reasoning
                 )
+        if not thought and isinstance(message, dict):
+            reasoning_content = message.get("reasoning_content")
+            if isinstance(reasoning_content, str):
+                thought = reasoning_content
+            elif isinstance(reasoning_content, list):
+                thought = "".join(
+                    part.get("text", "") if isinstance(part, dict) else str(part)
+                    for part in reasoning_content
+                )
 
         tools_used: List[Dict[str, Any]] = []
 
         if url.endswith(suffix_resp):
+            tools_used.extend(_extract_responses_function_calls(data))
             tools_used.extend(_extract_native_responses_tool_calls(data))
 
         # Safely parse tool calls if present in chat-completions style responses
@@ -4835,6 +4991,17 @@ class LLMService:
             result["metadata"]["output_ids"] = output_ids
         if capture_path:
             result["metadata"]["oai_api_log_path"] = capture_path
+        if finish_reason:
+            result["metadata"]["finish_reason"] = finish_reason
+        if use_server:
+            trust_warning = server_trust_warning(
+                self.config,
+                preset_id=self.config.get("server_preset_id"),
+                base_url=raw_server_url,
+                model=requested_model,
+            )
+            if trust_warning:
+                result["metadata"]["trust_warning"] = trust_warning
         if requested_model and response_model and response_model != requested_model:
             result["metadata"]["model_mismatch"] = True
             result["metadata"].setdefault(
@@ -5378,9 +5545,15 @@ class LLMService:
                     "Failed to move local inference inputs to model device",
                     exc_info=True,
                 )
-        generate_kwargs: Dict[str, Any] = {
-            "max_new_tokens": kwargs.get("max_new_tokens", 128)
-        }
+        requested_output_tokens = kwargs.get(
+            "output_token_limit",
+            kwargs.get("max_new_tokens", 128),
+        )
+        try:
+            requested_output_tokens = max(1, int(requested_output_tokens))
+        except (TypeError, ValueError):
+            requested_output_tokens = 128
+        generate_kwargs: Dict[str, Any] = {"max_new_tokens": requested_output_tokens}
         if self.use_kv_cache:
             generate_kwargs["use_cache"] = True
             generate_kwargs["return_dict_in_generate"] = True

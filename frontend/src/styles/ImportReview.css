@@ -1,0 +1,356 @@
+.import-review-shell {
+  border: 1px solid color-mix(in oklab, var(--theme-c1-med) 18%, var(--glass-border) 82%);
+  border-radius: 18px;
+  background:
+    linear-gradient(
+      145deg,
+      color-mix(in oklab, var(--theme-c1-light) 14%, transparent),
+      transparent 68%
+    ),
+    color-mix(in oklab, var(--glass-tint-strong) 92%, var(--color-surface) 8%);
+  box-shadow: var(--shadow-sm);
+}
+
+.knowledge-sync-import-review.import-review-shell {
+  gap: 14px;
+  padding: 16px;
+  border: 1px solid color-mix(in oklab, var(--theme-c1-med) 18%, var(--glass-border) 82%);
+  border-radius: 18px;
+  background:
+    linear-gradient(
+      145deg,
+      color-mix(in oklab, var(--theme-c1-light) 14%, transparent),
+      transparent 68%
+    ),
+    color-mix(in oklab, var(--glass-tint-strong) 92%, var(--color-surface) 8%);
+  box-shadow: var(--shadow-sm);
+}
+
+.import-review-card {
+  --import-review-accent: var(--theme-c1-med);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid
+    color-mix(in oklab, var(--import-review-accent) 24%, var(--glass-border) 76%);
+  border-radius: 16px;
+  background:
+    linear-gradient(
+      140deg,
+      color-mix(in oklab, var(--import-review-accent) 10%, transparent),
+      transparent 72%
+    ),
+    color-mix(in oklab, var(--theme-c1-light) 14%, var(--glass-tint-strong) 86%);
+  box-shadow: var(--shadow-sm);
+}
+
+.import-review-card--conversation {
+  --import-review-accent: var(--theme-c2-med);
+}
+
+.import-review-card--ambiguous {
+  --import-review-accent: color-mix(
+    in oklab,
+    var(--theme-c1-med) 58%,
+    var(--theme-c2-med) 42%
+  );
+}
+
+.import-review-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.import-review-title {
+  color: var(--color-text);
+  font-size: 0.96rem;
+  line-height: 1.3;
+}
+
+.import-review-detail {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: 0.84rem;
+  line-height: 1.5;
+  text-align: left;
+}
+
+.import-review-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.import-review-filename,
+.import-review-count {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 3px 9px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 72%, transparent);
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--glass-tint-strong) 88%, transparent);
+  font-size: 0.74rem;
+  line-height: 1.25;
+}
+
+.import-review-filename {
+  max-width: 100%;
+  color: var(--color-text);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.import-review-count {
+  color: var(--color-text-muted);
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.import-review-warning {
+  display: block;
+  margin: 0;
+  padding: 9px 11px;
+  border: 1px solid
+    color-mix(in oklab, var(--color-warning, #b7791f) 34%, var(--glass-border) 66%);
+  border-radius: 12px;
+  background: color-mix(
+    in oklab,
+    var(--color-warning, #b7791f) 10%,
+    var(--glass-tint-strong) 90%
+  );
+  color: color-mix(in oklab, var(--color-warning, #8a5a12) 72%, var(--color-text) 28%);
+  font-size: 0.8rem;
+  line-height: 1.45;
+  text-align: left;
+}
+
+.import-review-preview {
+  box-sizing: border-box;
+  width: 100%;
+  max-height: 180px;
+  margin: 0;
+  padding: 12px 14px;
+  overflow: auto;
+  border: 1px solid color-mix(in oklab, var(--theme-c1-med) 20%, var(--glass-border) 80%);
+  border-radius: 14px;
+  background: color-mix(in oklab, var(--color-surface) 74%, var(--theme-c1-light) 26%);
+  box-shadow: inset 0 1px 0 color-mix(in oklab, var(--theme-very-light) 34%, transparent);
+  color: var(--color-text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    monospace;
+  font-size: 0.78rem;
+  line-height: 1.55;
+  opacity: 1;
+  overflow-wrap: anywhere;
+  text-align: left;
+  white-space: pre-wrap;
+}
+
+.import-review-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.history-import-modal .import-review-button,
+.knowledge-sync-import-review .import-review-button {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  min-height: 40px;
+  margin: 0;
+  padding: 8px 14px;
+  border: 1px solid color-mix(in oklab, var(--theme-c1-med) 18%, var(--glass-border) 82%);
+  border-radius: 12px;
+  background: color-mix(in oklab, var(--glass-tint-strong) 94%, transparent);
+  box-shadow: var(--shadow-sm);
+  color: var(--color-text);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 650;
+  line-height: 1.2;
+  text-align: center;
+  transition:
+    transform 120ms ease,
+    border-color 120ms ease,
+    background 120ms ease,
+    box-shadow 120ms ease;
+}
+
+.history-import-modal .import-review-button:hover:not(:disabled),
+.knowledge-sync-import-review .import-review-button:hover:not(:disabled) {
+  border-color: color-mix(in oklab, var(--color-primary) 42%, var(--glass-border) 58%);
+  background: color-mix(in oklab, var(--theme-c1-light) 16%, var(--glass-tint-strong) 84%);
+  box-shadow: var(--shadow-md);
+  transform: translateY(-1px);
+}
+
+.history-import-modal .import-review-button:focus-visible,
+.knowledge-sync-import-review .import-review-button:focus-visible,
+.history-import-modal input:focus-visible,
+.knowledge-sync-import-review input:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+.history-import-modal .import-review-button--primary,
+.knowledge-sync-import-review .import-review-button--primary {
+  border-color: color-mix(in oklab, var(--color-primary) 72%, var(--glass-border) 28%);
+  background: linear-gradient(
+    180deg,
+    color-mix(in oklab, var(--color-primary) 64%, var(--theme-very-dark) 36%),
+    color-mix(in oklab, var(--color-primary) 54%, var(--theme-very-dark) 46%)
+  );
+  box-shadow:
+    0 6px 14px color-mix(in oklab, var(--color-primary) 24%, transparent),
+    var(--shadow-sm);
+  color: var(--theme-very-light);
+}
+
+.history-import-modal .import-review-button--primary:hover:not(:disabled),
+.knowledge-sync-import-review .import-review-button--primary:hover:not(:disabled) {
+  border-color: color-mix(in oklab, var(--color-primary-dark) 78%, var(--glass-border) 22%);
+  background: linear-gradient(
+    180deg,
+    color-mix(in oklab, var(--color-primary) 70%, var(--theme-very-dark) 30%),
+    color-mix(in oklab, var(--color-primary) 60%, var(--theme-very-dark) 40%)
+  );
+}
+
+.history-import-modal .import-review-button--secondary,
+.knowledge-sync-import-review .import-review-button--secondary {
+  border-color: color-mix(in oklab, var(--theme-c1-med) 30%, var(--glass-border) 70%);
+  background: color-mix(in oklab, var(--theme-c1-light) 18%, var(--glass-tint-strong) 82%);
+}
+
+.history-import-modal .import-review-button--quiet,
+.knowledge-sync-import-review .import-review-button--quiet {
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+  color: var(--color-text-muted);
+}
+
+.history-import-modal .import-review-button:disabled,
+.knowledge-sync-import-review .import-review-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+  transform: none;
+}
+
+.history-import-modal.import-review-shell {
+  border-radius: 20px;
+  background:
+    linear-gradient(
+      150deg,
+      color-mix(in oklab, var(--theme-c1-light) 10%, transparent),
+      transparent 62%
+    ),
+    var(--color-surface);
+}
+
+.history-import-modal .history-modal-field input,
+.knowledge-sync-import-review input[type="text"] {
+  box-sizing: border-box;
+  min-height: 40px;
+  margin-top: 0;
+  border: 1px solid color-mix(in oklab, var(--theme-c1-med) 20%, var(--glass-border) 80%);
+  border-radius: 11px;
+  background: color-mix(in oklab, var(--glass-tint-strong) 92%, var(--color-surface) 8%);
+  color: var(--color-text);
+}
+
+.knowledge-sync-import-review label.field-label {
+  margin-top: 0;
+  color: var(--color-text-muted);
+  font-size: 0.82rem;
+}
+
+.history-import-modal .history-chip {
+  min-height: 36px;
+}
+
+body.dark-mode .history-import-modal .import-review-button--primary,
+body.dark-mode .knowledge-sync-import-review .import-review-button--primary {
+  background: linear-gradient(
+    180deg,
+    color-mix(in oklab, var(--color-primary) 88%, var(--theme-very-light) 12%),
+    var(--color-primary)
+  );
+  color: var(--theme-very-dark);
+}
+
+body.dark-mode .history-import-modal .import-review-button--primary:hover:not(:disabled),
+body.dark-mode .knowledge-sync-import-review .import-review-button--primary:hover:not(:disabled) {
+  background: linear-gradient(
+    180deg,
+    color-mix(in oklab, var(--color-primary) 94%, var(--theme-very-light) 6%),
+    color-mix(in oklab, var(--color-primary) 92%, var(--theme-very-light) 8%)
+  );
+}
+
+body.dark-mode .import-review-warning {
+  color: var(--color-text);
+}
+
+body.dark-mode .import-review-detail,
+body.dark-mode .import-review-count,
+body.dark-mode .history-import-modal .history-modal-field,
+body.dark-mode .knowledge-sync-import-review label.field-label,
+body.dark-mode .history-import-modal .import-review-button--quiet,
+body.dark-mode .knowledge-sync-import-review .import-review-button--quiet {
+  color: var(--color-text);
+}
+
+@media (max-width: 520px) {
+  .history-import-modal.import-review-shell {
+    padding: 16px;
+  }
+
+  .history-import-modal .import-review-card {
+    padding: 12px;
+  }
+
+  .history-import-modal .history-modal-actions.import-review-actions {
+    display: grid;
+    grid-template-columns: minmax(0, 0.72fr) minmax(0, 1.28fr);
+    width: 100%;
+  }
+
+  .history-import-modal .history-modal-actions .import-review-button {
+    width: 100%;
+    min-height: 42px;
+  }
+
+  .history-import-modal .history-modal-actions .import-review-button--primary {
+    grid-column: 1 / -1;
+  }
+
+  .knowledge-sync-import-review .import-review-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .knowledge-sync-import-review .import-review-actions .import-review-button {
+    width: 100%;
+    min-height: 44px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .history-import-modal .import-review-button,
+  .knowledge-sync-import-review .import-review-button {
+    transition: none;
+  }
+}

@@ -73,4 +73,3 @@ def test_llm_generate_publishes_content_events_with_message_id(client, monkeypat
             lambda m: m.get("type") == "content" and m.get("message_id") == message_id,
         )
         assert ev["session_id"] == session_id
-

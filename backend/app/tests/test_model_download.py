@@ -1,17 +1,17 @@
-import asyncio
 import time
-from fastapi.testclient import TestClient
+
 from app.main import app
+from fastapi.testclient import TestClient
 
 client = TestClient(app)
+
 
 def test_model_download_and_verify():
     # Use a small model for testing
     model_name = "kokoro"
-    filename_to_check = "config.json"
 
     # 1. Start the download
-    response = client.post(f"/api/models/jobs", json={"model": model_name})
+    response = client.post("/api/models/jobs", json={"model": model_name})
     assert response.status_code == 200
     job = response.json().get("job")
     assert job is not None
@@ -28,7 +28,9 @@ def test_model_download_and_verify():
         if job_status == "completed":
             break
         elif job_status == "error":
-            assert False, f"Download job failed: {response.json().get('job', {}).get('error')}"
+            assert (
+                False
+            ), f"Download job failed: {response.json().get('job', {}).get('error')}"
         time.sleep(1)
     else:
         assert False, "Download job timed out"

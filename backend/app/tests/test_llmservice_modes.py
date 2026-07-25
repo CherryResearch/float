@@ -3,6 +3,7 @@ import os
 from types import SimpleNamespace
 
 import pytest
+import requests
 from app.base_services import LLMService, ModelContext, _model_supports_native_images
 
 
@@ -79,16 +80,16 @@ class DummyProcess:
         self.terminated = False
         self.waited = False
 
-
-def test_gemma4_server_models_are_native_image_capable():
-    assert _model_supports_native_images("google/gemma-4-12b")
-    assert _model_supports_native_images("google/gemma4-31b-qat")
-
     def terminate(self):
         self.terminated = True
 
     def wait(self, timeout=None):
         self.waited = True
+
+
+def test_gemma4_server_models_are_native_image_capable():
+    assert _model_supports_native_images("google/gemma-4-12b")
+    assert _model_supports_native_images("google/gemma4-31b-qat")
 
 
 class DummyApiResponse:
@@ -103,6 +104,18 @@ class DummyApiResponse:
 
     def json(self):
         return self._payload
+
+
+class DummyErrorApiResponse(DummyApiResponse):
+    def __init__(self, payload, status_code=400):
+        super().__init__(payload)
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        raise requests.exceptions.HTTPError(
+            f"{self.status_code} provider error",
+            response=self,
+        )
 
 
 class DummyStreamingApiResponse:
@@ -398,6 +411,193 @@ def test_normalize_server_url_adds_http_scheme_for_bare_host():
     )
 
 
+def test_tinker_server_uses_tinker_key_and_reasoning_content(monkeypatch):
+    from app.server_presets import TINKER_OPENAI_BASE_URL
+
+    captured = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None, **kwargs):
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["payload"] = json
+        return DummyApiResponse(
+            {
+                "model": "tinker://run:train:0/sampler_weights/inkling-custom",
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Inkling answer",
+                            "reasoning_content": "Inkling thought",
+                        }
+                    }
+                ],
+            }
+        )
+
+    monkeypatch.setenv("TINKER_API_KEY", "tinker-secret")
+    monkeypatch.setattr("app.base_services.http_session.post", fake_post)
+    service = LLMService(
+        mode="server",
+        config={
+            "server_url": TINKER_OPENAI_BASE_URL,
+            "server_preset_id": "tinker",
+            "server_presets": [],
+            "api_key": "openai-secret",
+        },
+    )
+    model = "tinker://run:train:0/sampler_weights/inkling-custom"
+
+    result = service.generate(
+        "hello",
+        model=model,
+        reasoning={"effort": "high"},
+        output_token_limit=65536,
+        native_tool_definitions=[
+            {
+                "name": "tool_info",
+                "description": "Look up one available tool.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"tool_name": {"type": "string"}},
+                    "required": ["tool_name"],
+                },
+            }
+        ],
+    )
+
+    assert captured["url"].endswith("/oai/api/v1/chat/completions")
+    assert captured["headers"]["Authorization"] == "Bearer tinker-secret"
+    assert captured["payload"]["model"] == model
+    assert captured["payload"]["reasoning_effort"] == "high"
+    assert captured["payload"]["max_tokens"] == 65536
+    assert captured["payload"]["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "tool_info",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"tool_name": {"type": "string"}},
+                    "required": ["tool_name"],
+                },
+                "description": "Look up one available tool.",
+            },
+        }
+    ]
+    assert result["text"] == "Inkling answer"
+    assert result["thought"] == "Inkling thought"
+
+
+def test_tinker_models_receive_chat_reasoning_controls():
+    from app.routes import (
+        _apply_reasoning_response_metadata,
+        _reasoning_generation_kwargs,
+        _reasoning_payload_for_model,
+        _runtime_model_identity_note,
+    )
+
+    high = _reasoning_payload_for_model(
+        "high",
+        model="tinker://run:train:0/sampler_weights/inkling-custom",
+    )
+    assert high["effort"] == "high"
+    assert "output_token_budget" not in high
+
+    continuous = _reasoning_payload_for_model("0.83", model="tml/Inkling")
+    assert continuous["effort"] == 0.83
+    assert continuous["preset"] == "high"
+    assert continuous["rounded"] is False
+
+    rounded = _reasoning_payload_for_model(0.83, model="gpt-5.4")
+    assert rounded["effort"] == "high"
+    assert rounded["preset"] == "high"
+    assert rounded["rounded"] is True
+
+    low = _reasoning_payload_for_model("low", model="tml/Inkling")
+    assert low["effort"] == "low"
+    assert "output_token_budget" not in low
+
+    automatic = _reasoning_generation_kwargs(
+        "high",
+        model="tml/Inkling",
+    )
+    assert "output_token_limit" not in automatic
+    explicit = _reasoning_generation_kwargs(
+        "high",
+        model="tml/Inkling",
+        max_output_tokens=65536,
+    )
+    assert explicit["output_token_limit"] == 65536
+
+    response = {"metadata": {"finish_reason": "length"}}
+    _apply_reasoning_response_metadata(response, continuous, 65536)
+    assert response["metadata"]["output_truncated"] is True
+    assert response["metadata"]["termination_category"] == "output_token_limit"
+    assert response["metadata"]["reasoning"]["effective_effort"] == 0.83
+    assert response["metadata"]["generation"] == {
+        "max_output_tokens": 65536,
+        "output_limit_source": "user",
+    }
+
+    provider_default = {"metadata": {}}
+    _apply_reasoning_response_metadata(provider_default, high)
+    assert provider_default["metadata"]["generation"] == {
+        "max_output_tokens": None,
+        "output_limit_source": "provider_default",
+    }
+
+    identity_note = _runtime_model_identity_note(
+        model="thinkingmachines/Inkling",
+        mode="server",
+        provider="tinker",
+    )
+    assert "You are Float" in identity_note
+    assert "thinkingmachines/Inkling" in identity_note
+
+
+@pytest.mark.parametrize(
+    ("provider_message", "expected_category"),
+    [
+        (
+            "reasoning_effort is not supported by this model",
+            "reasoning_control_unsupported",
+        ),
+        (
+            "max_tokens exceeds the output token limit",
+            "output_token_limit",
+        ),
+    ],
+)
+def test_server_provider_errors_classify_reasoning_and_output_limits(
+    monkeypatch,
+    provider_message,
+    expected_category,
+):
+    def fake_post(*args, **kwargs):
+        return DummyErrorApiResponse({"error": {"message": provider_message}})
+
+    monkeypatch.setattr("app.base_services.http_session.post", fake_post)
+    service = LLMService(
+        mode="server",
+        config={
+            "server_url": "https://example.test/v1",
+            "server_presets": [],
+        },
+    )
+
+    result = service.generate(
+        "hello",
+        model="thinkingmachines/Inkling",
+        reasoning={"effort": 0.83},
+        output_token_limit=8192,
+        retries=0,
+    )
+
+    assert result["metadata"]["category"] == expected_category
+    assert provider_message in result["metadata"]["provider_message"]
+    assert "hint" in result["metadata"]
+
+
 def test_dynamic_server_start_stop(monkeypatch):
     proc = DummyProcess()
 
@@ -640,7 +840,7 @@ def test_local_runtime_preflight_blocks_gemma4_without_torchvision(
             if name == "torchvision"
             else "5.5.0"
             if name == "transformers"
-            else "2.7.1"
+            else "2.10.0"
             if name == "torch"
             else "1.0.0"
         ),
@@ -664,7 +864,7 @@ def test_local_runtime_preflight_blocks_gemma4_without_torchvision(
     assert preflight["missing_packages"] == ["torchvision"]
     assert "README.md" in (preflight["hint"] or "")
     assert "docs/environment setup.md" in (preflight["hint"] or "")
-    assert "torchvision==0.22.1+cpu" in (preflight["hint"] or "")
+    assert "torchvision==0.25.0" in (preflight["hint"] or "")
 
 
 def test_local_runtime_preflight_reloads_transformers_components_when_stale(
@@ -802,7 +1002,7 @@ def test_generate_local_gemma4_reports_torchvision_install_guidance(
             if name == "torchvision"
             else "5.5.0"
             if name == "transformers"
-            else "2.7.1"
+            else "2.10.0"
             if name == "torch"
             else "1.0.0"
         ),
@@ -1244,12 +1444,16 @@ def test_generate_api_uses_placeholder_caption_without_hashlib_crash(monkeypatch
             str(part.get("text", ""))
             for part in content
             if isinstance(part, dict)
-            and "Local vision fallback caption" in str(part.get("text", ""))
+            and "Image delivery notice" in str(part.get("text", ""))
         ),
         "",
     )
-    assert "Unable to generate caption" in fallback_text
-    assert result["metadata"]["vision"]["fallback_used"] is True
+    assert "selected model did not receive visual content" in fallback_text
+    assert "Do not infer visual details" in fallback_text
+    vision_meta = result["metadata"]["vision"]
+    assert vision_meta["native_image_input"] is False
+    assert vision_meta["fallback_used"] is True
+    assert vision_meta["fallback_attachments"][0]["placeholder"] is True
 
 
 def test_generate_api_merges_attachments_when_prompt_is_sequence(monkeypatch):

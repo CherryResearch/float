@@ -16,6 +16,7 @@ data/
   threads/                     # generated thread summaries (threads_summary.json)
   databases/
     memory.sqlite3             # memory store backing /memory endpoints
+    deployment_events.sqlite3 # content-free local software/data event ledger
     calendar_events/           # JSON payloads for upcoming/past events
     chroma/                    # Chroma vector store used by the RAG backend
   files/
@@ -25,9 +26,7 @@ data/
     workspace/                 # root workspace plus named workspace roots / nested sync copies
   models/                      # default download/cache target for local models
   modules/
-    addons/{addon}/            # imported/local add-on package folders
-      config.json              # local add-on manifest/config
-      ...                      # package assets copied from import source
+    addons/{addon}/config.json # local add-on manifest/config overrides
     skills/{skill_id}.md       # local skill markdown overrides
   themes/                      # user-created visual themes saved from Settings
   workspace/                   # tool-writable scratch space for general workflows
@@ -61,9 +60,6 @@ Conversation history lives under `data/conversations/` (legacy `conversations/` 
 - `data/modules/skills/` is optional and is for local or user-written skill markdown that should override or extend the repo-shipped `modules/skills/` guidance.
 - If an add-on id exists in both places, the local `data/` copy should override the tracked repo copy.
 - If a skill markdown id exists in both places, the local `data/` copy should override the tracked repo copy.
-- Module-pack imports preview their copy plan before writing, require `config.json`, normalize ids, reject traversal/symlinks, and write only into `data/modules/addons/{addon}/` plus any mirrored active skill docs under `data/modules/skills/`.
-- Module-pack exports and skill exports are user-directed copies from local `data/modules/` content back into a chosen workspace folder. They do not edit repo-shipped `modules/` content.
-- `modules/skills/float_self_knowledge.md` is the shipped synthesized guide for model self-research. Local overrides still belong in `data/modules/skills/`.
 - Legacy `models/` at the repo root is documentation-only. Keep placeholder README files there, but store actual checkpoints in `data/models/`.
 
 ## Recent Migrations

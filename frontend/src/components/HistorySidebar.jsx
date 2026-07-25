@@ -8,6 +8,7 @@ import { GlobalContext } from "../main";
 import { getConversationTrimMeta } from "../utils/proxy";
 import { buildHistoryFromConversation } from "../utils/conversationHistory";
 import "../styles/Sidebar.css";
+import "../styles/ImportReview.css";
 import {
   handleUnifiedPress,
   supportsHoverInteractions,
@@ -17,6 +18,11 @@ import {
   getConversationPrivacyTooltip,
   normalizeConversationPrivacyMode,
 } from "../utils/privacyLevels";
+import {
+  describeClassifiedImport,
+  isMarkdownOrTextImport,
+  normalizeClassifiedImportPreview,
+} from "../utils/importClassification";
 
 const EMPTY_GLOBAL_STATE = Object.freeze({});
 const NOOP_SET_STATE = () => {};
@@ -163,9 +169,12 @@ const splitFolderPath = (path) => {
     .filter(Boolean);
 };
 
+const CONTROL_CHARS_RANGE = `${String.fromCharCode(0)}-${String.fromCharCode(31)}`;
+const UNSAFE_PATH_CHARS_RE = new RegExp(`[<>:"/\\\\|?*${CONTROL_CHARS_RANGE}]`, "g");
+
 const sanitizeFilename = (value) => {
   const base = ensureString(value).trim() || "conversation";
-  const cleaned = base.replace(/[<>:"/\\|?*\x00-\x1F]/g, "-").trim();
+  const cleaned = base.replace(UNSAFE_PATH_CHARS_RE, "-").trim();
   const collapsed = cleaned.replace(/\s+/g, "_");
   return collapsed || "conversation";
 };
@@ -175,7 +184,7 @@ const sanitizeFolderPath = (value) => {
   if (!raw) return "";
   const segments = raw
     .split("/")
-    .map((segment) => segment.replace(/[<>:"/\\|?*\x00-\x1F]/g, "-").trim())
+    .map((segment) => segment.replace(UNSAFE_PATH_CHARS_RE, "-").trim())
     .filter(Boolean);
   return segments.join("/");
 };
@@ -183,7 +192,7 @@ const sanitizeFolderPath = (value) => {
 const sanitizeBaseName = (value) => {
   const raw = ensureString(value).trim();
   if (!raw) return "";
-  return raw.replace(/[<>:"/\\|?*\x00-\x1F]/g, "-").trim();
+  return raw.replace(UNSAFE_PATH_CHARS_RE, "-").trim();
 };
 
 const ensureExtension = (filename, ext) => {
@@ -254,7 +263,9 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
     try {
       const raw = String(localStorage.getItem(HISTORY_SORT_MODE_STORAGE_KEY) || "");
       if (HISTORY_SORT_MODE_ORDER.includes(raw)) return raw;
-    } catch {}
+    } catch (err) {
+      void err;
+    }
     return HISTORY_SORT_MODES.UPDATED;
   });
   const [customOrder, setCustomOrder] = React.useState(() => {
@@ -309,6 +320,7 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
   const [dragOverConversation, setDragOverConversation] = React.useState(null);
   const [exportTarget, setExportTarget] = React.useState(null);
   const [importStatus, setImportStatus] = React.useState("");
+  const [importStatusKind, setImportStatusKind] = React.useState("");
   const [importBusy, setImportBusy] = React.useState(false);
   const [importReview, setImportReview] = React.useState({
     open: false,
@@ -317,6 +329,13 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
     selectedFiles: {},
     destinationFolder: "",
     summary: null,
+    classification: "",
+    messageCount: 0,
+    roleCounts: {},
+    preview: "",
+    warnings: [],
+    suggestedAction: "",
+    allowedActions: [],
   });
   const [exportOptions, setExportOptions] = React.useState({
     format: "md",
@@ -342,6 +361,9 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
   });
   const ephemeralSortRef = React.useRef(new Map());
   const importFileInputRef = React.useRef(null);
+  const importTriggerRef = React.useRef(null);
+  const importDialogRef = React.useRef(null);
+  const importReturnFocusRef = React.useRef(null);
   const historyControlsScrollRef = React.useRef(null);
   const historyControlsContentRef = React.useRef(null);
   const apiUnavailable = state.backendMode === "api" && state.apiStatus !== "online";
@@ -397,7 +419,9 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
       if (!persist) return;
       try {
         localStorage.setItem("sidebarWidthLeft", String(width));
-      } catch {}
+      } catch (err) {
+        void err;
+      }
     },
     [],
   );
@@ -408,7 +432,9 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
     root.style.removeProperty("--sidebar-width-left");
     try {
       localStorage.removeItem("sidebarWidthLeft");
-    } catch {}
+    } catch (err) {
+      void err;
+    }
   }, []);
 
   const nudgeSidebarWidth = React.useCallback(
@@ -682,7 +708,9 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
             `float:conv-loaded:${id}`,
             JSON.stringify(loadedMessages),
           );
-        } catch {}
+        } catch (err) {
+          void err;
+        }
       }
       setState((prev) => ({
         ...prev,
@@ -730,7 +758,9 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
   React.useEffect(() => {
     try {
       localStorage.setItem(HISTORY_SORT_MODE_STORAGE_KEY, sortMode);
-    } catch {}
+    } catch (err) {
+      void err;
+    }
   }, [sortMode]);
 
   const syncHistoryControlsIndicator = React.useCallback(() => {
@@ -780,7 +810,9 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
         HISTORY_CUSTOM_ORDER_STORAGE_KEY,
         JSON.stringify(customOrder || {}),
       );
-    } catch {}
+    } catch (err) {
+      void err;
+    }
   }, [customOrder]);
 
   React.useEffect(() => {
@@ -789,7 +821,9 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
         HISTORY_THREAD_GROUP_COLLAPSE_STORAGE_KEY,
         JSON.stringify(Array.from(collapsedThreadGroups || [])),
       );
-    } catch {}
+    } catch (err) {
+      void err;
+    }
   }, [collapsedThreadGroups]);
 
   const compareConversations = React.useCallback(
@@ -1848,7 +1882,9 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
     try {
       event.dataTransfer.effectAllowed = "move";
       event.dataTransfer.setData("text/plain", conv.storageKey);
-    } catch {}
+    } catch (err) {
+      void err;
+    }
   };
 
   const handleConversationDragEnd = () => {
@@ -1874,7 +1910,9 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
       event.dataTransfer.effectAllowed = "move";
       event.dataTransfer.setData("application/x-float-folder", path);
       event.dataTransfer.setData("text/plain", path);
-    } catch {}
+    } catch (err) {
+      void err;
+    }
   };
 
   const handleFolderDragEnd = () => {
@@ -1896,7 +1934,9 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
     autoScrollHistoryBody(event.clientY);
     try {
       event.dataTransfer.dropEffect = "move";
-    } catch {}
+    } catch (err) {
+      void err;
+    }
     setDragOverFolder(folderKey);
     setDragOverConversation(null);
   };
@@ -1942,7 +1982,9 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
     autoScrollHistoryBody(event.clientY);
     try {
       event.dataTransfer.dropEffect = "move";
-    } catch {}
+    } catch (err) {
+      void err;
+    }
     setDragOverConversation(conv.storageKey);
     setDragOverFolder(null);
   };
@@ -1980,7 +2022,9 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
     autoScrollHistoryBody(event.clientY);
     try {
       event.dataTransfer.dropEffect = "move";
-    } catch {}
+    } catch (err) {
+      void err;
+    }
   };
 
   const handleHistoryBodyDrop = async (event) => {
@@ -2035,15 +2079,67 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
     setExportTarget(null);
   };
 
-  const closeImportReviewModal = () => {
+  const closeImportReviewModal = React.useCallback(() => {
     setImportReview({
       open: false,
       file: null,
       detectedFiles: [],
       selectedFiles: {},
       destinationFolder: "",
+      summary: null,
+      classification: "",
+      messageCount: 0,
+      roleCounts: {},
+      preview: "",
+      warnings: [],
+      suggestedAction: "",
+      allowedActions: [],
     });
-  };
+  }, []);
+
+  React.useEffect(() => {
+    if (!importReview.open) return undefined;
+    const dialog = importDialogRef.current;
+    if (!dialog) return undefined;
+    dialog.focus();
+
+    const handleImportDialogKeyDown = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeImportReviewModal();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = Array.from(
+        dialog.querySelectorAll(
+          'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], [tabindex]:not([tabindex="-1"])',
+        ),
+      );
+      if (!focusable.length) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && (document.activeElement === first || document.activeElement === dialog)) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener("keydown", handleImportDialogKeyDown);
+    return () => {
+      document.removeEventListener("keydown", handleImportDialogKeyDown);
+      const returnFocus = importReturnFocusRef.current;
+      if (returnFocus && returnFocus.isConnected && typeof returnFocus.focus === "function") {
+        returnFocus.focus();
+      }
+    };
+  }, [closeImportReviewModal, importReview.open]);
 
   const openConversationInOs = async (conv) => {
     if (!conv) return;
@@ -2103,7 +2199,12 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
 
   const triggerImportPicker = () => {
     if (apiUnavailable) return;
+    importReturnFocusRef.current =
+      typeof HTMLElement !== "undefined" && document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : importTriggerRef.current;
     setImportStatus("");
+    setImportStatusKind("");
     setImportReview((prev) => ({ ...prev, open: false, summary: null }));
     if (importFileInputRef.current) {
       importFileInputRef.current.value = "";
@@ -2121,6 +2222,7 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
     });
     if (!normalized.length) {
       setImportStatus("No importable files detected in this archive.");
+      setImportStatusKind("error");
       return;
     }
     setImportReview({
@@ -2130,20 +2232,51 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
       selectedFiles,
       destinationFolder: "",
       summary,
+      classification: "",
+      messageCount: 0,
+      roleCounts: {},
+      preview: "",
+      warnings: [],
+      suggestedAction: "",
+      allowedActions: [],
     });
+    setImportStatus("");
+    setImportStatusKind("");
+  };
+
+  const openClassifiedImportReview = (file, payload) => {
+    const classification = normalizeClassifiedImportPreview(payload, file);
+    setImportReview({
+      open: true,
+      file,
+      detectedFiles: [],
+      selectedFiles: {},
+      destinationFolder: "",
+      summary: payload || null,
+      ...classification,
+    });
+    setImportStatus("");
+    setImportStatusKind("");
   };
 
   const previewImportCandidates = async (file) => {
     if (!file) return;
+    const format = inferImportFormatFromFilename(file.name);
+    const classifiedTextImport = isMarkdownOrTextImport(format);
     const formData = new FormData();
     formData.append("file", file);
     setImportBusy(true);
     setImportStatus("Detecting import candidates...");
+    setImportStatusKind("progress");
     try {
       const response = await axios.post(
         "/api/conversations/import/preview",
         formData,
       );
+      if (classifiedTextImport) {
+        openClassifiedImportReview(file, response.data || {});
+        return;
+      }
       const detectedFiles = response.data?.detected_files || [];
       if (Array.isArray(detectedFiles) && detectedFiles.length > 0) {
         openImportReview(file, detectedFiles, response.data || null);
@@ -2153,6 +2286,7 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
     } catch (err) {
       const detail = err?.response?.data?.detail || "Import preview failed";
       setImportStatus(String(detail));
+      setImportStatusKind("error");
       console.error("Import preview failed", err);
     } finally {
       setImportBusy(false);
@@ -2163,6 +2297,8 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
     file,
     selectedFiles = null,
     destinationFolder = "",
+    intent = "",
+    confirmAmbiguous = false,
   }) => {
     if (!file) return;
     const formData = new FormData();
@@ -2174,8 +2310,11 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
     if (destinationFolder) {
       formData.append("destination_folder", destinationFolder);
     }
+    if (intent) formData.append("intent", intent);
+    if (confirmAmbiguous) formData.append("confirm_ambiguous", "true");
     setImportBusy(true);
     setImportStatus("Importing...");
+    setImportStatusKind("progress");
     let didImport = false;
     try {
       const res = await axios.post("/api/conversations/import", formData);
@@ -2184,6 +2323,7 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
         setImportStatus(
           `Imported ${imported.length} conversations (${res.data?.message_count || 0} messages).`,
         );
+        setImportStatusKind("success");
       } else {
         const importedName = String(
           imported?.[0]?.name || res.data?.name || "",
@@ -2193,6 +2333,7 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
             ? `Imported ${importedName} (${res.data?.message_count || 0} messages).`
             : "Import complete.",
         );
+        setImportStatusKind("success");
         if (importedName) {
           await loadConversation(importedName);
         }
@@ -2202,6 +2343,7 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
     } catch (err) {
       const detail = err?.response?.data?.detail || "Import failed";
       setImportStatus(String(detail));
+      setImportStatusKind("error");
       console.error("Import failed", err);
     } finally {
       setImportBusy(false);
@@ -2211,11 +2353,35 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
     }
   };
 
+  const uploadDocumentImport = async ({ file }) => {
+    if (!file) return;
+    const formData = new FormData();
+    formData.append("file", file);
+    setImportBusy(true);
+    setImportStatus("Saving document...");
+    setImportStatusKind("progress");
+    try {
+      await axios.post("/api/knowledge/upload", formData);
+      setImportStatus(
+        `Saved ${file.name || "file"} to Documents and knowledge search.`,
+      );
+      setImportStatusKind("success");
+      closeImportReviewModal();
+    } catch (err) {
+      const detail = err?.response?.data?.detail || "Document save failed";
+      setImportStatus(String(detail));
+      setImportStatusKind("error");
+      console.error("Document save failed", err);
+    } finally {
+      setImportBusy(false);
+    }
+  };
+
   const handleImportFileChange = (event) => {
     const file = event?.target?.files?.[0];
     if (!file) return;
     const format = inferImportFormatFromFilename(file.name);
-    if (format === "zip" || format === "json") {
+    if (format === "zip" || format === "json" || isMarkdownOrTextImport(format)) {
       previewImportCandidates(file);
       return;
     }
@@ -2264,6 +2430,7 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
     );
     if (!selected.length) {
       setImportStatus("Select at least one file before importing.");
+      setImportStatusKind("error");
       return;
     }
     await uploadConversationImport({
@@ -2287,6 +2454,23 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
   );
   const importReviewIgnoredJsonLabel =
     importReview.summary?.ignored_json_entry_count != null ? "entries" : "files";
+  const classifiedImport = Boolean(importReview.classification);
+  const classifiedImportDescription = classifiedImport
+    ? describeClassifiedImport(importReview)
+    : null;
+  const classifiedImportActions = new Set(importReview.allowedActions || []);
+  const canImportRecognizedConversation =
+    classifiedImport &&
+    Number(importReview.messageCount || 0) > 0 &&
+    classifiedImportActions.has("conversation");
+  const canSaveClassifiedDocument =
+    classifiedImport && classifiedImportActions.has("document");
+  const conversationImportIsPrimary =
+    importReview.classification === "conversation" && importReview.suggestedAction !== "document";
+  const classifiedRoleSummary = Object.entries(importReview.roleCounts || {})
+    .filter(([, count]) => Number(count) > 0)
+    .map(([role, count]) => `${role}: ${count}`)
+    .join(" | ");
 
   const handleDelete = async (conv) => {
     if (!conv) return;
@@ -2945,9 +3129,10 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
                     accept=".md,.markdown,.txt,.json,.zip"
                   />
                   <button
+                    ref={importTriggerRef}
                     className="new-chat-btn history-action-btn"
                     onClick={triggerImportPicker}
-                    title="Import markdown, json, or OpenAI export zip"
+                    title="Review and import conversations or documents"
                     disabled={apiUnavailable || importBusy}
                   >
                     {importBusy ? "importing..." : "import"}
@@ -2994,8 +3179,12 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
             </button>
           </div>
         </div>
-        {importStatus ? (
-          <div className="history-empty" style={{ paddingTop: "4px", marginTop: "4px" }}>
+        {importStatus && !importReview.open ? (
+          <div
+            className="history-empty"
+            role={importStatusKind === "error" ? "alert" : "status"}
+            style={{ paddingTop: "4px", marginTop: "4px" }}
+          >
             {importStatus}
           </div>
         ) : null}
@@ -3003,99 +3192,256 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
       {importReview.open &&
         renderInBodyPortal(
         <div className="history-modal-overlay" onClick={closeImportReviewModal}>
-          <div className="history-modal" onClick={(event) => event.stopPropagation()}>
-            <h3>Import conversations</h3>
+          <div
+            ref={importDialogRef}
+            className="history-modal history-import-modal import-review-shell"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="history-import-dialog-title"
+            aria-busy={importBusy}
+            tabIndex={-1}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h3 id="history-import-dialog-title">
+              {classifiedImport ? "Review file import" : "Import conversations"}
+            </h3>
             <div className="history-modal-body">
-              <label className="history-modal-field">
-                <span>Destination folder</span>
-                <input
-                  type="text"
-                  value={importReview.destinationFolder}
-                  onChange={(event) => setImportDestinationFolder(event.target.value)}
-                  placeholder="Leave blank for root"
-                />
-              </label>
-              <div className="history-chip-row">
-                <button
-                  type="button"
-                  className={`history-chip${!importReview.destinationFolder ? " active" : ""}`}
-                  onClick={() => setImportDestinationFolder("")}
-                  title="Import into root folder"
+              {importStatus ? (
+                <div
+                  className={`history-import-status${
+                    importStatusKind === "error" ? " is-error" : ""
+                  }`}
+                  role={importStatusKind === "error" ? "alert" : "status"}
                 >
-                  Root
-                </button>
-                {folderOptions.map((path) => (
-                  <button
-                    key={`import-destination-${path}`}
-                    type="button"
-                    className={`history-chip${
-                      importReview.destinationFolder === path ? " active" : ""
-                    }`}
-                    onClick={() => setImportDestinationFolder(path)}
-                    title={path}
+                  {importStatus}
+                </div>
+              ) : null}
+              {classifiedImport ? (
+                <>
+                  <div
+                    className={`import-review-card import-review-card--${importReview.classification}`}
                   >
-                    {getFolderDisplayLabel(path, path)}
-                  </button>
-                ))}
-              </div>
-              <div className="history-modal-field">
-                <div className="history-import-toolbar">
-                  <span>
-                    Detected files ({importReviewSelectedCount}/{importReviewTotalCount})
-                  </span>
-                  <button type="button" onClick={selectAllImportFiles}>
-                    {importReviewAllSelected ? "Deselect all" : "Select all"}
-                  </button>
-                </div>
-                {importReviewIgnoredJsonCount > 0 ? (
-                  <div className="history-empty" style={{ paddingTop: "2px" }}>
-                    Ignored {importReviewIgnoredJsonCount} metadata-only JSON
-                    {importReviewIgnoredJsonCount === 1
-                      ? ` ${importReviewIgnoredJsonLabel.slice(0, -1)}`
-                      : ` ${importReviewIgnoredJsonLabel}`}
-                    .
+                    <div className="import-review-summary">
+                      <strong className="import-review-title">
+                        {classifiedImportDescription?.title}
+                      </strong>
+                      <span className="import-review-detail" role="status">
+                        {classifiedImportDescription?.detail}
+                      </span>
+                      <div className="import-review-meta">
+                        <span className="import-review-filename">
+                          {importReview.file?.name || importReview.sourceName || "Selected file"}
+                        </span>
+                        {classifiedRoleSummary ? (
+                          <span className="import-review-count">{classifiedRoleSummary}</span>
+                        ) : null}
+                      </div>
+                    </div>
+                    {(importReview.warnings || []).map((warning, index) => (
+                      <div
+                        key={`classified-import-warning-${index}`}
+                        className="import-review-warning"
+                        role="alert"
+                      >
+                        <strong>Warning:</strong> {warning}
+                      </div>
+                    ))}
+                    {importReview.preview ? (
+                      <pre className="import-review-preview" aria-label="File import preview">
+                        {importReview.preview}
+                      </pre>
+                    ) : null}
                   </div>
-                ) : null}
-                <div className="history-import-list">
-                  {importReview.detectedFiles.length === 0 ? (
-                    <div className="history-empty">No files detected.</div>
-                  ) : (
-                    importReview.detectedFiles.map((item) => {
-                      const path = String(item?.path || item?.name || "").trim();
-                      if (!path) return null;
-                      const checked = Boolean(importReview.selectedFiles[path]);
-                      return (
-                        <label key={`import-file-${path}`} className="history-import-item">
-                          <input
-                            type="checkbox"
-                            checked={checked}
-                            onChange={() => toggleImportFileSelection(path)}
-                          />
-                          <div className="history-import-item-meta">
-                            <span className="history-import-item-path">{path}</span>
-                            <span className="history-import-item-count">
-                              {item.message_count ?? 0} messages
-                            </span>
-                          </div>
-                        </label>
-                      );
-                    })
-                  )}
-                </div>
-              </div>
+                  {canImportRecognizedConversation ? (
+                    <>
+                      <label className="history-modal-field">
+                        <span>Conversation destination folder</span>
+                        <input
+                          type="text"
+                          value={importReview.destinationFolder}
+                          onChange={(event) => setImportDestinationFolder(event.target.value)}
+                          placeholder="Leave blank for root"
+                        />
+                      </label>
+                      <div className="history-chip-row">
+                        <button
+                          type="button"
+                          className={`history-chip${!importReview.destinationFolder ? " active" : ""}`}
+                          onClick={() => setImportDestinationFolder("")}
+                          title="Import conversation into root folder"
+                        >
+                          Root
+                        </button>
+                        {folderOptions.map((path) => (
+                          <button
+                            key={`classified-import-destination-${path}`}
+                            type="button"
+                            className={`history-chip${
+                              importReview.destinationFolder === path ? " active" : ""
+                            }`}
+                            onClick={() => setImportDestinationFolder(path)}
+                            title={path}
+                          >
+                            {getFolderDisplayLabel(path, path)}
+                          </button>
+                        ))}
+                      </div>
+                    </>
+                  ) : null}
+                </>
+              ) : (
+                <>
+                  <label className="history-modal-field">
+                    <span>Destination folder</span>
+                    <input
+                      type="text"
+                      value={importReview.destinationFolder}
+                      onChange={(event) => setImportDestinationFolder(event.target.value)}
+                      placeholder="Leave blank for root"
+                    />
+                  </label>
+                  <div className="history-chip-row">
+                    <button
+                      type="button"
+                      className={`history-chip${!importReview.destinationFolder ? " active" : ""}`}
+                      onClick={() => setImportDestinationFolder("")}
+                      title="Import into root folder"
+                    >
+                      Root
+                    </button>
+                    {folderOptions.map((path) => (
+                      <button
+                        key={`import-destination-${path}`}
+                        type="button"
+                        className={`history-chip${
+                          importReview.destinationFolder === path ? " active" : ""
+                        }`}
+                        onClick={() => setImportDestinationFolder(path)}
+                        title={path}
+                      >
+                        {getFolderDisplayLabel(path, path)}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="history-modal-field">
+                    <div className="history-import-toolbar">
+                      <span>
+                        Detected files ({importReviewSelectedCount}/{importReviewTotalCount})
+                      </span>
+                      <button type="button" onClick={selectAllImportFiles}>
+                        {importReviewAllSelected ? "Deselect all" : "Select all"}
+                      </button>
+                    </div>
+                    {importReviewIgnoredJsonCount > 0 ? (
+                      <div className="history-empty" style={{ paddingTop: "2px" }}>
+                        Ignored {importReviewIgnoredJsonCount} metadata-only JSON
+                        {importReviewIgnoredJsonCount === 1
+                          ? ` ${importReviewIgnoredJsonLabel.slice(0, -1)}`
+                          : ` ${importReviewIgnoredJsonLabel}`}
+                        .
+                      </div>
+                    ) : null}
+                    <div className="history-import-list">
+                      {importReview.detectedFiles.length === 0 ? (
+                        <div className="history-empty">No files detected.</div>
+                      ) : (
+                        importReview.detectedFiles.map((item) => {
+                          const path = String(item?.path || item?.name || "").trim();
+                          if (!path) return null;
+                          const checked = Boolean(importReview.selectedFiles[path]);
+                          return (
+                            <label key={`import-file-${path}`} className="history-import-item">
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={() => toggleImportFileSelection(path)}
+                              />
+                              <div className="history-import-item-meta">
+                                <span className="history-import-item-path">{path}</span>
+                                <span className="history-import-item-count">
+                                  {item.message_count ?? 0} messages
+                                </span>
+                              </div>
+                            </label>
+                          );
+                        })
+                      )}
+                    </div>
+                  </div>
+                </>
+              )}
             </div>
-            <div className="history-modal-actions">
-              <button type="button" onClick={closeImportReviewModal}>
-                Cancel
-              </button>
+            <div className="history-modal-actions import-review-actions">
               <button
                 type="button"
-                className="btn-primary"
-                onClick={confirmImportReview}
-                disabled={importReviewSelectedCount === 0 || importBusy}
+                className="import-review-button import-review-button--quiet"
+                onClick={closeImportReviewModal}
               >
-                OK
+                Cancel
               </button>
+              {classifiedImport ? (
+                <>
+                  {canImportRecognizedConversation && !conversationImportIsPrimary ? (
+                    <button
+                      type="button"
+                      className="import-review-button import-review-button--secondary"
+                      onClick={() =>
+                        uploadConversationImport({
+                          file: importReview.file,
+                          destinationFolder: importReview.destinationFolder,
+                          intent: "conversation",
+                          confirmAmbiguous: importReview.classification === "ambiguous",
+                        })
+                      }
+                      disabled={importBusy}
+                    >
+                      {importReview.classification === "ambiguous"
+                        ? "Import recognized messages"
+                        : "Import conversation"}
+                    </button>
+                  ) : null}
+                  {canSaveClassifiedDocument ? (
+                    <button
+                      type="button"
+                      className={`import-review-button ${
+                        conversationImportIsPrimary
+                          ? "import-review-button--secondary"
+                          : "import-review-button--primary"
+                      }`}
+                      onClick={() => uploadDocumentImport({ file: importReview.file })}
+                      disabled={importBusy}
+                    >
+                      Save as document
+                    </button>
+                  ) : null}
+                  {canImportRecognizedConversation && conversationImportIsPrimary ? (
+                    <button
+                      type="button"
+                      className="import-review-button import-review-button--primary"
+                      onClick={() =>
+                        uploadConversationImport({
+                          file: importReview.file,
+                          destinationFolder: importReview.destinationFolder,
+                          intent: "conversation",
+                          confirmAmbiguous: false,
+                        })
+                      }
+                      disabled={importBusy}
+                    >
+                      Import conversation
+                    </button>
+                  ) : null}
+                </>
+              ) : (
+                <button
+                  type="button"
+                  className="import-review-button import-review-button--primary"
+                  onClick={confirmImportReview}
+                  disabled={importReviewSelectedCount === 0 || importBusy}
+                >
+                  OK
+                </button>
+              )}
             </div>
           </div>
         </div>,

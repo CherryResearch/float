@@ -45,6 +45,8 @@ import {
   CHAT_WINDOW_STORAGE_KEY,
   parseStoredChatWindowWidth,
 } from "../utils/chatWindowSizing";
+import { thinkingPayloadForMode } from "../utils/reasoningEffort";
+import { outputTokenPayload } from "../utils/generationLimits";
 
 const MAX_AGENT_EVENTS = 20;
 const EMPTY_GLOBAL_STATE = Object.freeze({});
@@ -734,6 +736,19 @@ const buildSyncReviewsFromSnapshot = (payload) => {
   };
 };
 
+const isCompactMobileViewport = (width, height) => {
+  const viewportWidth = Number(width);
+  const viewportHeight = Number(height);
+  if (!Number.isFinite(viewportWidth) || !Number.isFinite(viewportHeight)) {
+    return false;
+  }
+  return (
+    viewportWidth <= 600 ||
+    viewportHeight > viewportWidth ||
+    (viewportWidth <= 1000 && viewportHeight <= 600)
+  );
+};
+
 const AppContent = () => {
   const globalContext = useContext(GlobalContext);
   const state = globalContext?.state || EMPTY_GLOBAL_STATE;
@@ -754,7 +769,7 @@ const AppContent = () => {
   const [consoleFocus, setConsoleFocus] = useState(null);
   const isMobileLayout = useCallback(() => {
     if (typeof window === "undefined") return false;
-    return window.innerWidth < 600 || window.innerHeight > window.innerWidth;
+    return isCompactMobileViewport(window.innerWidth, window.innerHeight);
   }, []);
   const [leftOpen, setLeftOpen] = useState(!isMobileLayout());
   const [rightOpen, setRightOpen] = useState(!isMobileLayout());
@@ -771,6 +786,8 @@ const AppContent = () => {
   const localModelRef = useRef(state.localModel);
   const transformerModelRef = useRef(state.transformerModel);
   const thinkingModeRef = useRef(state.thinkingMode);
+  const outputTokenModeRef = useRef(state.outputTokenMode);
+  const customOutputTokensRef = useRef(state.customOutputTokens);
   const unloadLocalRef = useRef(false);
   const skipFirstBackendModeUnloadRef = useRef(true);
   const skipFirstLocalModelUnloadRef = useRef(true);
@@ -793,7 +810,9 @@ const AppContent = () => {
         const maxWidth = Math.max(220, Math.min(520, window.innerWidth - 160));
         const next = clamp(parsed, 220, maxWidth);
         root.style.setProperty(cssVar, `${next}px`);
-      } catch {}
+      } catch (err) {
+        void err;
+      }
     };
     loadWidth("sidebarWidthLeft", "--sidebar-width-left");
     loadWidth("sidebarWidthRight", "--sidebar-width-right");
@@ -805,7 +824,9 @@ const AppContent = () => {
       if (parsed !== null) {
         root.style.setProperty("--center-rail-width", `${parsed}px`);
       }
-    } catch {}
+    } catch (err) {
+      void err;
+    }
   }, []);
 
   useEffect(() => {
@@ -839,6 +860,14 @@ const AppContent = () => {
   useEffect(() => {
     thinkingModeRef.current = state.thinkingMode;
   }, [state.thinkingMode]);
+
+  useEffect(() => {
+    outputTokenModeRef.current = state.outputTokenMode;
+  }, [state.outputTokenMode]);
+
+  useEffect(() => {
+    customOutputTokensRef.current = state.customOutputTokens;
+  }, [state.customOutputTokens]);
 
   useEffect(() => {
     if (skipFirstBackendModeUnloadRef.current) {
@@ -975,7 +1004,9 @@ const AppContent = () => {
               `float:conv-loaded:${id}`,
               JSON.stringify(loadedMessages),
             );
-          } catch {}
+          } catch (err) {
+            void err;
+          }
         }
         setState((prev) => ({
           ...prev,
@@ -1286,6 +1317,7 @@ const AppContent = () => {
             const messageId = event.message_id || event.chain_id || null;
             const chainId = event.chain_id || event.message_id || messageId || null;
             const sessionId = event.session_id || stateRef.current?.sessionId || null;
+            const serverOwnsAutoDecision = event.server_auto_decide === true;
 
             const rememberAcceptedTool = (msgId, id) => {
               if (!msgId || !id) return;
@@ -1342,21 +1374,23 @@ const AppContent = () => {
               if (!autoAcceptedToolIdsRef.current.has(toolId)) {
                 autoAcceptedToolIdsRef.current.add(toolId);
                 if (messageId) rememberAcceptedTool(messageId, toolId);
-                axios
-                  .post("/api/tools/decision", {
-                    request_id: toolId,
-                    decision: "accept",
-                    name: (event.name || "").trim() || event.name,
-                    args: event.args || {},
-                    session_id: sessionId || undefined,
-                    message_id: messageId || undefined,
-                    chain_id: chainId || undefined,
-                  })
-                  .catch((err) => {
-                    console.error("Auto-accept failed", err);
-                    autoAcceptedToolIdsRef.current.delete(toolId);
-                    if (messageId) forgetAcceptedTool(messageId, toolId);
-                  });
+                if (!serverOwnsAutoDecision) {
+                  axios
+                    .post("/api/tools/decision", {
+                      request_id: toolId,
+                      decision: "accept",
+                      name: (event.name || "").trim() || event.name,
+                      args: event.args || {},
+                      session_id: sessionId || undefined,
+                      message_id: messageId || undefined,
+                      chain_id: chainId || undefined,
+                    })
+                    .catch((err) => {
+                      console.error("Auto-accept failed", err);
+                      autoAcceptedToolIdsRef.current.delete(toolId);
+                      if (messageId) forgetAcceptedTool(messageId, toolId);
+                    });
+                }
               }
             }
 
@@ -1471,9 +1505,13 @@ const AppContent = () => {
                   priorSignatures,
                 );
               }
-              const thinkingValue = thinkingModeRef.current || "auto";
-              const thinkingPayload =
-                thinkingValue === "auto" ? {} : { thinking: thinkingValue };
+              const thinkingPayload = thinkingPayloadForMode(
+                thinkingModeRef.current,
+              );
+              const outputTokensPayload = outputTokenPayload(
+                outputTokenModeRef.current,
+                customOutputTokensRef.current,
+              );
               const mode = (backendModeRef.current || "api").toLowerCase();
               const model = resolveRequestModelForMode({
                 backendMode: mode,
@@ -1490,6 +1528,7 @@ const AppContent = () => {
                   mode,
                   tools: toolPayload,
                   ...thinkingPayload,
+                  ...outputTokensPayload,
                 })
                 .then((res) => {
                   const aiContinuation = res.data?.message || "";
@@ -1629,9 +1668,11 @@ const AppContent = () => {
                             sessionId: prev.sessionId,
                             history: hist,
                           })
-                          .catch(() => {});
+                          .catch((err) => void err);
                       }
-                    } catch {}
+                    } catch (err) {
+                      void err;
+                    }
                     return { ...prev, conversation: updated, history: hist };
                   });
 
@@ -1678,7 +1719,9 @@ const AppContent = () => {
         }
         try {
           sock.close();
-        } catch {}
+        } catch (err) {
+          void err;
+        }
       };
       sock.onclose = (event) => {
         if (cancelled) return;
@@ -1728,20 +1771,24 @@ const AppContent = () => {
     return () => {
       cancelled = true;
       if (timer) clearTimeout(timer);
-      try { if (ws) ws.close(); } catch {}
+      try {
+        if (ws) ws.close();
+      } catch (err) {
+        void err;
+      }
     };
   }, [streamThoughts, setState, pushAgentEvent, state.sessionId]);
 
   useEffect(() => {
     const handleResize = () => {
-      if (window.innerWidth < 600 || window.innerHeight > window.innerWidth) {
+      if (isMobileLayout()) {
         setLeftOpen(false);
         setRightOpen(false);
       }
     };
     window.addEventListener("resize", handleResize);
     return () => window.removeEventListener("resize", handleResize);
-  }, []);
+  }, [isMobileLayout]);
 
   useEffect(() => {
     return () => {
@@ -1754,6 +1801,16 @@ const AppContent = () => {
 
   const isCalendarView = location.pathname.startsWith("/knowledge");
   const isSettingsView = location.pathname === "/settings";
+  const isKnowledgeVisualizationsView =
+    location.pathname === "/knowledge" &&
+    new URLSearchParams(location.search).get("tab") === "visualizations";
+  const mainChatClassName = [
+    "main-chat",
+    isSettingsView ? "main-chat--settings" : "",
+    isKnowledgeVisualizationsView ? "main-chat--knowledge-visualizations" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   const filteredCalendarEvents = useMemo(() => {
     if (!isCalendarView) return [];
@@ -1844,10 +1901,8 @@ const AppContent = () => {
       }
     };
     document.addEventListener("pointerdown", handleDocumentPress);
-    document.addEventListener("click", handleDocumentPress);
     return () => {
       document.removeEventListener("pointerdown", handleDocumentPress);
-      document.removeEventListener("click", handleDocumentPress);
     };
   }, [isMobileLayout, leftOpen, rightOpen]);
 
@@ -1886,7 +1941,7 @@ const AppContent = () => {
           {">"}
         </button>
       )}
-      <div className={`main-chat${isSettingsView ? " main-chat--settings" : ""}`}>
+      <div className={mainChatClassName}>
         <div className="center-rail">
           <ErrorBoundary fallback={<div><Link to="/">Back to chat</Link></div>}>
             <Routes>
@@ -1998,7 +2053,10 @@ const AppContent = () => {
         </button>
       )}
       <DownloadTray />
-      <Notifications onOpenToolReview={openToolReviewFromNotification} />
+      <Notifications
+        onOpenToolReview={openToolReviewFromNotification}
+        autoMinimize={state.approvalLevel === "auto"}
+      />
     </div>
   );
 };
@@ -2019,4 +2077,5 @@ export {
   toolLooseSignature,
   mergeToolEvent,
   reduceAgentState,
+  isCompactMobileViewport,
 };

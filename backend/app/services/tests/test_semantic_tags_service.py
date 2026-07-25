@@ -8,6 +8,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[4]
 SERVICES = ROOT / "backend" / "app" / "services"
 UTILS = ROOT / "backend" / "app" / "utils"
+_original_services_pkg = sys.modules.get("app.services")
 
 app_pkg = types.ModuleType("app")
 app_pkg.__path__ = [str(ROOT / "backend" / "app")]
@@ -15,12 +16,24 @@ sys.modules.setdefault("app", app_pkg)
 
 services_pkg = types.ModuleType("app.services")
 services_pkg.__path__ = [str(SERVICES)]
-services_pkg.RAG_IMPORT_ERROR = RuntimeError("stub services init for isolated test loading")
+services_pkg.RAG_IMPORT_ERROR = RuntimeError(
+    "stub services init for isolated test loading"
+)
 sys.modules.setdefault("app.services", services_pkg)
 
 utils_pkg = types.ModuleType("app.utils")
 utils_pkg.__path__ = [str(UTILS)]
 sys.modules.setdefault("app.utils", utils_pkg)
+
+existing_utils = sys.modules.get("app.utils")
+if existing_utils is None or not hasattr(existing_utils, "verify_signature"):
+    spec_utils_init = importlib.util.spec_from_file_location(
+        "app.utils", UTILS / "__init__.py"
+    )
+    loaded_utils = importlib.util.module_from_spec(spec_utils_init)
+    loaded_utils.__path__ = [str(UTILS)]
+    sys.modules["app.utils"] = loaded_utils
+    spec_utils_init.loader.exec_module(loaded_utils)
 
 module_path = SERVICES / "semantic_tags_service.py"
 spec = importlib.util.spec_from_file_location(
@@ -30,6 +43,10 @@ spec = importlib.util.spec_from_file_location(
 sts = importlib.util.module_from_spec(spec)
 sys.modules["semantic_tags_service"] = sts
 spec.loader.exec_module(sts)
+if _original_services_pkg is None:
+    sys.modules.pop("app.services", None)
+else:
+    sys.modules["app.services"] = _original_services_pkg
 SemanticTagsService = sts.SemanticTagsService
 
 
@@ -88,6 +105,26 @@ def test_infer_topics_without_key_uses_local_fallback():
     assert summary.get("cluster_count") == 1
     assert isinstance(summary.get("clusters"), dict)
     assert summary.get("clusters", {}).get("0")
+
+
+def test_summarize_clusters_preserves_all_source_message_evidence():
+    summary, _ = sts.summarize_clusters(
+        ["one", "two", "three", "four"],
+        [0, 0, 0, 0],
+        [[1.0], [1.0], [1.0], [1.0]],
+        object(),
+        1,
+        tags=["topic"],
+        nug_conversations=["conversation"] * 4,
+        nug_msg_indices=[2, 3, 3, 7],
+        nug_datestamps=["2026-05-03", "", "2026-05-03", "2026-05-01"],
+    )
+
+    items = next(iter(summary["threads"].values()))
+    assert len(items) == 1
+    assert items[0]["message_indices"] == [2, 3, 7]
+    assert items[0]["first_date"] == "2026-05-01"
+    assert items[0]["latest_date"] == "2026-05-03"
 
 
 def test_cluster_texts_single_vector_returns_single_cluster():

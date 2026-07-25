@@ -1,5 +1,5 @@
 import React from "react";
-import { vi } from "vitest";
+import { afterEach, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import "@testing-library/jest-dom/vitest";
@@ -57,6 +57,10 @@ const renderWithGlobalState = (
 };
 
 describe("HistorySidebar", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   beforeEach(() => {
     axiosMocks.get.mockReset();
     axiosMocks.post.mockReset();
@@ -329,6 +333,373 @@ describe("HistorySidebar", () => {
         },
       );
     });
+  });
+
+  it("previews ordinary text and saves it as a document without importing a conversation", async () => {
+    axiosMocks.post.mockImplementation((url) => {
+      if (url === "/api/conversations/import/preview") {
+        return Promise.resolve({
+          data: {
+            classification: "document",
+            message_count: 0,
+            suggested_action: "document",
+            allowed_actions: ["document"],
+            preview: "# Project notes",
+            warnings: [],
+          },
+        });
+      }
+      if (url === "/api/knowledge/upload") {
+        return Promise.resolve({ data: { id: "doc-project-notes" } });
+      }
+      return Promise.resolve({ data: { status: "ok" } });
+    });
+    const { container } = renderWithGlobalState(
+      <HistorySidebar collapsed={false} onToggle={() => {}} />,
+    );
+    const input = container.querySelector('.history-actions input[type="file"]');
+    const file = new File(["# Project notes"], "project-notes.txt", {
+      type: "text/plain",
+    });
+
+    fireEvent.change(input, { target: { files: [file] } });
+
+    expect(await screen.findByText("Document detected")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /save as document/i })).toBeInTheDocument();
+    expect(axiosMocks.post).toHaveBeenCalledWith(
+      "/api/conversations/import/preview",
+      expect.any(FormData),
+    );
+    expect(
+      axiosMocks.post.mock.calls.filter(([url]) =>
+        ["/api/conversations/import", "/api/knowledge/upload"].includes(url),
+      ),
+    ).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole("button", { name: /save as document/i }));
+
+    await waitFor(() => {
+      expect(axiosMocks.post).toHaveBeenCalledWith(
+        "/api/knowledge/upload",
+        expect.any(FormData),
+      );
+    });
+    const documentCall = axiosMocks.post.mock.calls.find(
+      ([url]) => url === "/api/knowledge/upload",
+    );
+    expect(documentCall[1].get("file")).toBe(file);
+    expect(axiosMocks.post).not.toHaveBeenCalledWith(
+      "/api/conversations/import",
+      expect.anything(),
+    );
+    expect(await screen.findByText(/Documents and knowledge search/i)).toBeInTheDocument();
+  });
+
+  it("previews a valid Float Markdown transcript before explicitly importing it", async () => {
+    axiosMocks.post.mockImplementation((url) => {
+      if (url === "/api/conversations/import/preview") {
+        return Promise.resolve({
+          data: {
+            classification: "conversation",
+            message_count: 2,
+            role_counts: { user: 1, ai: 1 },
+            suggested_action: "conversation",
+            allowed_actions: ["conversation", "document"],
+            preview: "### [user] Hello",
+          },
+        });
+      }
+      if (url === "/api/conversations/import") {
+        return Promise.resolve({
+          data: { status: "imported", name: "imported-transcript", message_count: 2 },
+        });
+      }
+      return Promise.resolve({ data: { status: "ok" } });
+    });
+    const { container } = renderWithGlobalState(
+      <HistorySidebar collapsed={false} onToggle={() => {}} />,
+    );
+    const input = container.querySelector('.history-actions input[type="file"]');
+    const file = new File(["### [user]\nHello\n\n### [ai]\nHi"], "chat.md", {
+      type: "text/markdown",
+    });
+
+    fireEvent.change(input, { target: { files: [file] } });
+
+    expect(await screen.findByText("Conversation transcript detected")).toBeInTheDocument();
+    expect(axiosMocks.post).not.toHaveBeenCalledWith(
+      "/api/conversations/import",
+      expect.anything(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /^import conversation$/i }));
+
+    await waitFor(() => {
+      expect(axiosMocks.post).toHaveBeenCalledWith(
+        "/api/conversations/import",
+        expect.any(FormData),
+      );
+    });
+    const conversationCall = axiosMocks.post.mock.calls.find(
+      ([url]) => url === "/api/conversations/import",
+    );
+    expect(conversationCall[1].get("intent")).toBe("conversation");
+    expect(axiosMocks.post).not.toHaveBeenCalledWith(
+      "/api/knowledge/upload",
+      expect.anything(),
+    );
+  });
+
+  it("keeps ambiguous Markdown read-only until recognized messages are confirmed", async () => {
+    axiosMocks.post.mockImplementation((url) => {
+      if (url === "/api/conversations/import/preview") {
+        return Promise.resolve({
+          data: {
+            detected_files: [
+              {
+                path: "mixed.md",
+                classification: "ambiguous",
+                message_count: 1,
+                role_counts: { user: 1 },
+                suggested_action: "review",
+                allowed_actions: ["conversation", "document"],
+                warnings: ["Some Markdown is outside recognized messages."],
+              },
+            ],
+          },
+        });
+      }
+      if (url === "/api/conversations/import") {
+        return Promise.resolve({
+          data: { status: "imported", name: "mixed-import", message_count: 1 },
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    const { container } = renderWithGlobalState(
+      <HistorySidebar collapsed={false} onToggle={() => {}} />,
+    );
+    const input = container.querySelector('.history-actions input[type="file"]');
+    const file = new File(["# Notes\n### [user]\nHello"], "mixed.md", {
+      type: "text/markdown",
+    });
+
+    fireEvent.change(input, { target: { files: [file] } });
+
+    expect(await screen.findByText("Mixed or ambiguous Markdown")).toBeInTheDocument();
+    expect(screen.getByText(/outside recognized messages/i)).toBeInTheDocument();
+    expect(axiosMocks.post).toHaveBeenCalledWith(
+      "/api/conversations/import/preview",
+      expect.any(FormData),
+    );
+    expect(
+      axiosMocks.post.mock.calls.filter(([url]) =>
+        ["/api/conversations/import", "/api/knowledge/upload"].includes(url),
+      ),
+    ).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole("button", { name: /import recognized messages/i }));
+
+    await waitFor(() => {
+      expect(axiosMocks.post).toHaveBeenCalledWith(
+        "/api/conversations/import",
+        expect.any(FormData),
+      );
+    });
+    const conversationCall = axiosMocks.post.mock.calls.find(
+      ([url]) => url === "/api/conversations/import",
+    );
+    expect(conversationCall[1].get("intent")).toBe("conversation");
+    expect(conversationCall[1].get("confirm_ambiguous")).toBe("true");
+    expect(axiosMocks.post).not.toHaveBeenCalledWith(
+      "/api/knowledge/upload",
+      expect.anything(),
+    );
+  });
+
+  it("keeps document upload errors visible inside the open import dialog", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    axiosMocks.post.mockImplementation((url) => {
+      if (url === "/api/conversations/import/preview") {
+        return Promise.resolve({
+          data: {
+            classification: "document",
+            message_count: 0,
+            suggested_action: "document",
+            allowed_actions: ["document"],
+            warnings: [],
+          },
+        });
+      }
+      if (url === "/api/knowledge/upload") {
+        return Promise.reject({ response: { data: { detail: "Document storage unavailable" } } });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    const { container } = renderWithGlobalState(
+      <HistorySidebar collapsed={false} onToggle={() => {}} />,
+    );
+    const input = container.querySelector('.history-actions input[type="file"]');
+    fireEvent.change(input, {
+      target: {
+        files: [new File(["# Notes"], "notes.md", { type: "text/markdown" })],
+      },
+    });
+    const dialog = await screen.findByRole("dialog", { name: /review file import/i });
+
+    fireEvent.click(within(dialog).getByRole("button", { name: /save as document/i }));
+
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+      "Document storage unavailable",
+    );
+    expect(dialog).toBeInTheDocument();
+  });
+
+  it("keeps conversation import errors visible inside the open import dialog", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    axiosMocks.post.mockImplementation((url) => {
+      if (url === "/api/conversations/import/preview") {
+        return Promise.resolve({
+          data: {
+            classification: "conversation",
+            message_count: 2,
+            role_counts: { user: 1, ai: 1 },
+            suggested_action: "conversation",
+            allowed_actions: ["conversation", "document"],
+            warnings: [],
+          },
+        });
+      }
+      if (url === "/api/conversations/import") {
+        return Promise.reject({ response: { data: { detail: "Conversation import rejected" } } });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    const { container } = renderWithGlobalState(
+      <HistorySidebar collapsed={false} onToggle={() => {}} />,
+    );
+    const input = container.querySelector('.history-actions input[type="file"]');
+    fireEvent.change(input, {
+      target: {
+        files: [
+          new File(["### [user]\nHello\n### [ai]\nHi"], "chat.md", {
+            type: "text/markdown",
+          }),
+        ],
+      },
+    });
+    const dialog = await screen.findByRole("dialog", { name: /review file import/i });
+
+    fireEvent.click(within(dialog).getByRole("button", { name: /^import conversation$/i }));
+
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+      "Conversation import rejected",
+    );
+    expect(dialog).toBeInTheDocument();
+  });
+
+  it("opens a bounded accessible import dialog and restores trigger focus on Escape", async () => {
+    const originalWidth = window.innerWidth;
+    const originalHeight = window.innerHeight;
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 320 });
+    Object.defineProperty(window, "innerHeight", { configurable: true, value: 568 });
+    try {
+      axiosMocks.post.mockImplementation((url) => {
+        if (url === "/api/conversations/import/preview") {
+          return Promise.resolve({
+            data: {
+              classification: "document",
+              message_count: 0,
+              suggested_action: "document",
+              allowed_actions: ["document"],
+              warnings: [],
+            },
+          });
+        }
+        return Promise.resolve({ data: {} });
+      });
+      const { container } = renderWithGlobalState(
+        <HistorySidebar collapsed={false} onToggle={() => {}} />,
+      );
+      const trigger = screen.getByRole("button", { name: /^import$/i });
+      trigger.focus();
+      fireEvent.click(trigger);
+      const input = container.querySelector('.history-actions input[type="file"]');
+      fireEvent.change(input, {
+        target: {
+          files: [new File(["# Mobile notes"], "mobile.md", { type: "text/markdown" })],
+        },
+      });
+
+      const dialog = await screen.findByRole("dialog", { name: /review file import/i });
+      expect(dialog).toHaveAttribute("aria-modal", "true");
+      expect(dialog).toHaveClass("history-import-modal");
+      await waitFor(() => expect(dialog).toHaveFocus());
+      expect(within(dialog).getByRole("button", { name: /save as document/i })).toBeVisible();
+      const modalBody = dialog.querySelector(".history-modal-body");
+      expect(modalBody).not.toBeNull();
+
+      fireEvent.keyDown(document, { key: "Escape" });
+
+      await waitFor(() => {
+        expect(screen.queryByRole("dialog", { name: /review file import/i })).not.toBeInTheDocument();
+        expect(trigger).toHaveFocus();
+      });
+    } finally {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: originalWidth });
+      Object.defineProperty(window, "innerHeight", { configurable: true, value: originalHeight });
+    }
+  });
+
+  it("preserves reviewed JSON selection as a conversation-only import", async () => {
+    axiosMocks.post.mockImplementation((url) => {
+      if (url === "/api/conversations/import/preview") {
+        return Promise.resolve({
+          data: {
+            detected_files: [{ path: "exports/chat-a.json", message_count: 3 }],
+          },
+        });
+      }
+      if (url === "/api/conversations/import") {
+        return Promise.resolve({
+          data: {
+            status: "imported",
+            imports: [{ name: "imports/chat-a" }],
+            message_count: 3,
+          },
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    const { container } = renderWithGlobalState(
+      <HistorySidebar collapsed={false} onToggle={() => {}} />,
+    );
+    const input = container.querySelector('.history-actions input[type="file"]');
+    fireEvent.change(input, {
+      target: {
+        files: [new File(["{}"], "export.json", { type: "application/json" })],
+      },
+    });
+    const dialog = await screen.findByRole("dialog", { name: /import conversations/i });
+
+    fireEvent.click(within(dialog).getByRole("button", { name: /^ok$/i }));
+
+    await waitFor(() => {
+      expect(axiosMocks.post).toHaveBeenCalledWith(
+        "/api/conversations/import",
+        expect.any(FormData),
+      );
+    });
+    const conversationCall = axiosMocks.post.mock.calls.find(
+      ([url]) => url === "/api/conversations/import",
+    );
+    expect(JSON.parse(conversationCall[1].get("selected_files"))).toEqual([
+      "exports/chat-a.json",
+    ]);
+    expect(conversationCall[1].get("format")).toBe("json");
+    expect(axiosMocks.post).not.toHaveBeenCalledWith(
+      "/api/knowledge/upload",
+      expect.anything(),
+    );
   });
 });
 

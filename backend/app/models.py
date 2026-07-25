@@ -34,6 +34,9 @@ class Attachment(BaseModel):
     origin: Optional[str] = None
     relative_path: Optional[str] = None
     capture_source: Optional[str] = None
+    capture_id: Optional[str] = None
+    transient: Optional[bool] = None
+    expires_at: Optional[Union[str, float]] = None
 
 
 class ComputerDisplayConfig(BaseModel):
@@ -104,7 +107,8 @@ class ChatRequest(BaseModel):
     use_text_rag: Optional[bool] = True
     use_vision_rag: Optional[bool] = True
     patience: Optional[int] = 1
-    thinking: Optional[Union[bool, str]] = None
+    thinking: Optional[Union[bool, str, float]] = None
+    max_output_tokens: Optional[int] = Field(default=None, ge=1, le=2_000_000)
     workflow: Optional[str] = None
     modules: List[str] = Field(default_factory=list)
     context: Optional[ModelContext] = None

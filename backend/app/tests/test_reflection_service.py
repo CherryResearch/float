@@ -278,3 +278,86 @@ def test_memory_remember_can_queue_reflection(tmp_path, monkeypatch):
     tasks = service.list_tasks(status="open")
     assert len(tasks) == 1
     assert tasks[0]["memory_keys"] == ["idea"]
+
+
+def test_skill_markdown_proposal_preserves_format_and_marks_model_context(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(reflection_module, "try_ingest_text", lambda *a, **k: None)
+    monkeypatch.setattr(reflection_module, "get_rag_service", lambda *a, **k: None)
+    calls = []
+
+    def fake_generate(prompt, **kwargs):
+        calls.append({"prompt": prompt, **kwargs})
+        if kwargs.get("response_format") == "json_object":
+            return {
+                "text": (
+                    '{"novelty": 0.8, "usefulness": 0.8, '
+                    '"uncertainty_delta": 0.5, "repetition": 0.1, '
+                    '"continue": false, "should_surface_to_user": false, '
+                    '"cooldown_seconds": 0}'
+                )
+            }
+        return {
+            "text": "# Incident Triage\n\n## Core loop\n\n- Inspect impact first.",
+            "thought": "Plan the operational sections.",
+            "thought_trace": [{"index": 0, "text": "Plan the operational sections."}],
+            "metadata": {
+                "provider": "tinker",
+                "model_requested": "thinkingmachines/Inkling",
+                "model_received": "thinkingmachines/Inkling",
+            },
+        }
+
+    service = ReflectionService(
+        {"reflection_store_path": str(tmp_path / "reflections.sqlite3")},
+        llm_generate=fake_generate,
+    )
+    task = service.create_task(
+        title="Skill proposal: incident_triage",
+        question="Draft skill markdown.",
+        source="user",
+        metadata={
+            "proposal_kind": "skill_markdown",
+            "skill_id": "incident_triage",
+            "requires_user_save": True,
+            "requested_model": "thinkingmachines/Inkling",
+        },
+        utility=0.8,
+        uncertainty=0.6,
+    )
+
+    result = service.run_task(task["id"], force=True)
+
+    assert result["run"]["output"] == (
+        "# Incident Triage\n\n## Core loop\n\n- Inspect impact first."
+    )
+    assert result["run"]["thought_trace"] == [
+        {"index": 0, "text": "Plan the operational sections."}
+    ]
+    assert result["run"]["thought_trace_count"] == 1
+    assert result["run"]["generation"]["provider"] == "tinker"
+    assert result["run"]["generation"]["requested_model"] == (
+        "thinkingmachines/Inkling"
+    )
+    draft_call = next(call for call in calls if call.get("response_format") is None)
+    assert "Return markdown only" in draft_call["context"].system_prompt
+    assert draft_call["context"].metadata["proposal_kind"] == "skill_markdown"
+    assert draft_call["context"].metadata["proposal_target"] == "incident_triage"
+    assert draft_call["model"] == "thinkingmachines/Inkling"
+
+
+def test_skill_markdown_proposal_rejects_prompt_echo_and_unwraps_code_fence():
+    assert (
+        reflection_module._skill_markdown_proposal(
+            "You said: Thought task: draft this. # Incident Triage"
+        )
+        == ""
+    )
+    assert reflection_module._skill_markdown_proposal("plain prose only") == ""
+    assert (
+        reflection_module._skill_markdown_proposal(
+            "```markdown\n# Incident Triage\n\n- Inspect impact first.\n```"
+        )
+        == "# Incident Triage\n\n- Inspect impact first."
+    )

@@ -1,8 +1,8 @@
 import sys
 from pathlib import Path
-import yaml
 
 import pytest
+import yaml
 
 
 @pytest.fixture(autouse=True)
@@ -12,8 +12,6 @@ def add_backend_to_sys_path():
     if backend_dir not in sys.path:
         sys.path.insert(0, backend_dir)
 
-from config import load_model_catalog
-
 
 def write_yaml(path: Path, data: dict) -> Path:
     path.write_text(yaml.safe_dump(data))
@@ -21,11 +19,16 @@ def write_yaml(path: Path, data: dict) -> Path:
 
 
 def test_select_endpoint_with_defaults_and_fallback(tmp_path: Path, monkeypatch):
+    from config import load_model_catalog
+
     # Minimal catalog mirroring the example structure
     catalog_yaml = {
         "provider": "pipecat",
         "models": {
-            "llm": {"server": "http://lmstudio.local:1234/v1", "api": "https://api.llm/v1"},
+            "llm": {
+                "server": "http://lmstudio.local:1234/v1",
+                "api": "https://api.llm/v1",
+            },
         },
         "defaults": {
             "chat": {"llm": "local", "fallback": "server"},
@@ -44,6 +47,8 @@ def test_select_endpoint_with_defaults_and_fallback(tmp_path: Path, monkeypatch)
 
 
 def test_readiness_aggregate(tmp_path: Path, monkeypatch):
+    from config import load_model_catalog
+
     catalog_yaml = {
         "provider": "pipecat",
         "models": {

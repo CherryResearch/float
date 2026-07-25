@@ -474,6 +474,346 @@ def test_import_route_not_shadowed_by_conversation_save(client):
     assert get_resp.json()["messages"][0]["content"] == "from import"
 
 
+def test_markdown_preview_classifies_without_writing(client, monkeypatch):
+    from app import routes
+    from app.utils import conversation_store
+
+    save_calls = []
+    monkeypatch.setattr(
+        conversation_store,
+        "save_conversation",
+        lambda *args, **kwargs: save_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        routes,
+        "_get_rag_service",
+        lambda: pytest.fail("Markdown preview must not touch knowledge storage"),
+    )
+
+    preview_resp = client.post(
+        "/conversations/import/preview",
+        files={
+            "file": (
+                "profile.md",
+                b"# Profile\n\nKai likes local-first software.",
+                "text/markdown",
+            )
+        },
+    )
+
+    assert preview_resp.status_code == 200
+    payload = preview_resp.json()
+    assert payload["classification"] == "document"
+    assert payload["message_count"] == 0
+    assert payload["role_counts"] == {}
+    assert payload["preview"].startswith("# Profile")
+    assert payload["warnings"] == []
+    assert payload["suggested_action"] == "document"
+    assert payload["allowed_actions"] == ["document"]
+    assert payload["detected_files"][0]["classification"] == "document"
+
+    text_preview = client.post(
+        "/conversations/import/preview",
+        files={"file": ("profile.txt", b"Plain profile notes.", "text/plain")},
+    )
+    assert text_preview.status_code == 200
+    assert text_preview.json()["classification"] == "document"
+
+    ambiguous_preview = client.post(
+        "/conversations/import/preview",
+        files={
+            "file": (
+                "mixed.md",
+                b"Profile preamble.\n### [user]\nExample\n### [ai]\nReply",
+                "text/markdown",
+            )
+        },
+    )
+    assert ambiguous_preview.status_code == 200
+    assert ambiguous_preview.json()["classification"] == "ambiguous"
+    assert ambiguous_preview.json()["message_count"] == 2
+    assert save_calls == []
+
+
+def test_float_text_export_previews_and_reimports_as_conversation(client):
+    from app.utils import conversation_io
+
+    source_messages = [
+        {
+            "role": "user",
+            "text": (
+                "Example line:\n```text\n[assistant] This is literal content "
+                "inside an unclosed fence."
+            ),
+        },
+        {
+            "role": "ai",
+            "text": "Understood.",
+            "thought_trace": [
+                {"text": "internal detail", "timestamp": 1.0},
+            ],
+            "tools": [
+                {
+                    "name": "lookup",
+                    "status": "complete",
+                    "args": {"key": "value"},
+                    "result": {"ok": True},
+                }
+            ],
+        },
+    ]
+    exported = conversation_io.export_conversation_text(
+        name="project (draft)",
+        messages=source_messages,
+        metadata={
+            "display_name": "Project (draft)",
+            "created_at": "2026-07-22T00:00:00Z",
+        },
+    )
+
+    preview = client.post(
+        "/conversations/import/preview",
+        files={"file": ("text-round-trip.txt", exported, "text/plain")},
+    )
+
+    assert preview.status_code == 200
+    assert preview.json()["classification"] == "conversation"
+    assert preview.json()["message_count"] == 2
+
+    imported = client.post(
+        "/conversations/import",
+        files={"file": ("text-round-trip.txt", exported, "text/plain")},
+        data={"name": "imports/text-round-trip"},
+    )
+
+    assert imported.status_code == 200
+    assert imported.json()["message_count"] == 2
+    fetched = client.get("/conversations/imports%2Ftext-round-trip")
+    assert fetched.status_code == 200
+    assert [
+        (message["role"], message.get("text")) for message in fetched.json()["messages"]
+    ] == [
+        ("user", source_messages[0]["text"]),
+        ("ai", source_messages[1]["text"]),
+    ]
+
+
+def test_legacy_text_unterminated_metadata_fence_requires_confirmation(client):
+    legacy = """Legacy notes (legacy-notes)
+created_at: 2026-07-22T00:00:00Z
+
+[ai] Answer before an uncertain fence
+```text
+thoughts: 4 tokens, 1s, 1 responses: derived or literal
+- lookup (complete) args={"query": "value"} result={"ok": true}
+"""
+
+    preview = client.post(
+        "/conversations/import/preview",
+        files={"file": ("legacy-notes.txt", legacy, "text/plain")},
+    )
+
+    assert preview.status_code == 200
+    payload = preview.json()
+    assert payload["classification"] == "ambiguous"
+    assert any("exporter-metadata-shaped" in warning for warning in payload["warnings"])
+
+    rejected = client.post(
+        "/conversations/import",
+        files={"file": ("legacy-notes.txt", legacy, "text/plain")},
+        data={"name": "imports/legacy-notes"},
+    )
+
+    assert rejected.status_code == 400
+    assert "confirm_ambiguous=true" in str(rejected.json().get("detail", ""))
+    assert client.get("/conversations/imports%2Flegacy-notes").json()["messages"] == []
+
+
+def test_markdown_document_import_is_actionable_and_no_write(client, monkeypatch):
+    from app.utils import conversation_store
+
+    save_calls = []
+    monkeypatch.setattr(
+        conversation_store,
+        "save_conversation",
+        lambda *args, **kwargs: save_calls.append((args, kwargs)),
+    )
+
+    import_resp = client.post(
+        "/conversations/import",
+        files={
+            "file": (
+                "profile.md",
+                b"# Profile\n\nThis belongs in knowledge.",
+                "text/markdown",
+            )
+        },
+        data={"name": "imports/profile"},
+    )
+
+    assert import_resp.status_code == 400
+    assert "knowledge document" in str(import_resp.json().get("detail", "")).lower()
+    assert save_calls == []
+
+
+def test_valid_single_message_float_export_import_remains_compatible(client):
+    markdown = """# Conversation Export
+- name: one-message
+
+## Messages
+### [user]
+Only message
+"""
+
+    import_resp = client.post(
+        "/conversations/import",
+        files={"file": ("one.md", markdown, "text/markdown")},
+        data={"name": "imports/one-message"},
+    )
+
+    assert import_resp.status_code == 200
+    assert import_resp.json()["message_count"] == 1
+    fetched = client.get("/conversations/imports%2Fone-message")
+    assert fetched.status_code == 200
+    assert fetched.json()["messages"][0]["text"] == "Only message"
+
+
+def test_bom_prefixed_markdown_import_keeps_first_message(client):
+    markdown = "\ufeff### [user]\nHello\n### [assistant]\nHi"
+
+    import_resp = client.post(
+        "/conversations/import",
+        files={"file": ("bom.md", markdown.encode("utf-8"), "text/markdown")},
+        data={"name": "imports/bom"},
+    )
+
+    assert import_resp.status_code == 200
+    assert import_resp.json()["message_count"] == 2
+    fetched = client.get("/conversations/imports%2Fbom")
+    messages = fetched.json()["messages"]
+    assert [(message["role"], message["text"]) for message in messages] == [
+        ("user", "Hello"),
+        ("ai", "Hi"),
+    ]
+
+
+def test_invalid_or_oversized_markdown_rejected_before_write(client, monkeypatch):
+    from app import routes
+    from app.utils import conversation_store
+
+    save_calls = []
+    monkeypatch.setattr(
+        conversation_store,
+        "save_conversation",
+        lambda *args, **kwargs: save_calls.append((args, kwargs)),
+    )
+
+    invalid_cases = [
+        (b"\xff### [user]\nInvalid UTF-8", "utf-8"),
+        (b"### [user]\x00Null byte", "null bytes"),
+    ]
+    for payload, expected_detail in invalid_cases:
+        preview = client.post(
+            "/conversations/import/preview",
+            files={"file": ("invalid.md", payload, "application/octet-stream")},
+        )
+        imported = client.post(
+            "/conversations/import",
+            files={"file": ("invalid.md", payload, "application/octet-stream")},
+            data={"name": "imports/invalid"},
+        )
+        assert preview.status_code == 400
+        assert imported.status_code == 400
+        assert expected_detail in str(preview.json().get("detail", "")).lower()
+        assert expected_detail in str(imported.json().get("detail", "")).lower()
+
+    oversized = b"x" * (routes.MAX_UPLOAD_SIZE + 1)
+    oversized_preview = client.post(
+        "/conversations/import/preview",
+        files={"file": ("large.md", oversized, "application/octet-stream")},
+    )
+    oversized_import = client.post(
+        "/conversations/import",
+        files={"file": ("large.md", oversized, "application/octet-stream")},
+        data={"name": "imports/large"},
+    )
+    assert oversized_preview.status_code == 413
+    assert oversized_import.status_code == 413
+    assert save_calls == []
+
+
+def test_ambiguous_markdown_requires_confirmation_and_preserves_content(client):
+    markdown = """### [user]
+Keep these notes.
+### [notes]
+This body must survive.
+### [assistant]
+Understood.
+"""
+    upload = {"file": ("ambiguous.md", markdown, "text/markdown")}
+
+    rejected = client.post(
+        "/conversations/import",
+        files=upload,
+        data={"name": "imports/ambiguous"},
+    )
+
+    assert rejected.status_code == 400
+    assert "confirm_ambiguous=true" in str(rejected.json().get("detail", ""))
+    assert client.get("/conversations/imports%2Fambiguous").json()["messages"] == []
+
+    confirmed = client.post(
+        "/conversations/import",
+        files=upload,
+        data={
+            "name": "imports/ambiguous",
+            "intent": "conversation",
+            "confirm_ambiguous": "true",
+        },
+    )
+
+    assert confirmed.status_code == 200
+    assert confirmed.json()["message_count"] == 2
+    fetched = client.get("/conversations/imports%2Fambiguous")
+    messages = fetched.json()["messages"]
+    assert "### [notes]\nThis body must survive." in messages[0]["text"]
+
+
+def test_legacy_markdown_unterminated_fence_requires_explicit_confirmation(client):
+    legacy = """# Conversation Export
+- name: legacy-fence
+
+## Messages
+### [user]
+Example starts here:
+```markdown
+### [assistant]
+This may be a real second message or a fenced example.
+"""
+
+    preview = client.post(
+        "/conversations/import/preview",
+        files={"file": ("legacy-fence.md", legacy, "text/markdown")},
+    )
+
+    assert preview.status_code == 200
+    payload = preview.json()
+    assert payload["classification"] == "ambiguous"
+    assert any(
+        "unterminated code fence" in warning.lower() for warning in payload["warnings"]
+    )
+
+    rejected = client.post(
+        "/conversations/import",
+        files={"file": ("legacy-fence.md", legacy, "text/markdown")},
+        data={"name": "imports/legacy-fence"},
+    )
+
+    assert rejected.status_code == 400
+    assert "confirm_ambiguous=true" in str(rejected.json().get("detail", ""))
+    assert client.get("/conversations/imports%2Flegacy-fence").json()["messages"] == []
+
+
 def test_import_route_zip_payload(client, monkeypatch):
     import io
     import json

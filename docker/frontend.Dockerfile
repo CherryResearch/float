@@ -4,19 +4,20 @@ FROM ${NODE_BASE} AS build
 
 WORKDIR /app
 
-# Install dependencies
-COPY frontend/package*.json ./
-RUN npm ci
+# Install from the repository-root workspace lockfile.
+COPY package.json package-lock.json ./
+COPY frontend/package.json ./frontend/package.json
+RUN npm ci --workspace frontend
 
-COPY frontend/ ./
-RUN npm run build
+COPY frontend/ ./frontend/
+RUN npm run build --workspace frontend
 
 ARG NGINX_BASE=mcr.microsoft.com/oss/nginx/nginx:1.25-alpine
 FROM ${NGINX_BASE} AS runtime
 
 RUN apk add --no-cache curl
 
-COPY --from=build /app/dist /usr/share/nginx/html
+COPY --from=build /app/frontend/dist /usr/share/nginx/html
 
 EXPOSE 80
 

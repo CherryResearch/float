@@ -94,6 +94,26 @@ def test_streaming_reasoning_channel_items(monkeypatch):
     assert out.get("thought") == "Plan"
 
 
+def test_streaming_tinker_reasoning_content(monkeypatch):
+    lines = _build_sse_lines(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "reasoning_content": "Inkling thought",
+                        "content": "Inkling answer",
+                    },
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+    )
+
+    out = _run_stream(monkeypatch, lines)
+    assert out and out.get("text") == "Inkling answer"
+    assert out.get("thought") == "Inkling thought"
+
+
 def test_streaming_prefers_first_output_source(monkeypatch):
     lines = _build_sse_lines(
         {

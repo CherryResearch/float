@@ -1,0 +1,529 @@
+.knowledge-skills-tab {
+  display: grid;
+  gap: 14px;
+  width: 100%;
+}
+
+.knowledge-skills-hero,
+.knowledge-skills-card-head,
+.knowledge-skills-actions,
+.knowledge-skills-editor-label {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.knowledge-skills-hero {
+  padding: 18px 20px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 82%, transparent);
+  border-radius: 18px;
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in oklab, var(--color-pear) 12%, transparent),
+      transparent 48%
+    ),
+    linear-gradient(
+      315deg,
+      color-mix(in oklab, var(--color-lavender) 10%, transparent),
+      transparent 54%
+    ),
+    color-mix(in oklab, var(--glass-tint) 90%, transparent);
+  box-shadow: inset 0 1px 0 color-mix(in oklab, white 24%, transparent);
+}
+
+.knowledge-skills-eyebrow,
+.knowledge-skills-step,
+.knowledge-skills-detail-list > div > span {
+  color: color-mix(in oklab, var(--color-text-muted) 76%, var(--color-pear) 24%);
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.knowledge-skills-hero h2,
+.knowledge-skills-card h3 {
+  margin: 0;
+  color: var(--color-text);
+}
+
+.knowledge-skills-hero h2 {
+  margin-top: 4px;
+  font-size: clamp(1.28rem, 2vw, 1.65rem);
+}
+
+.knowledge-skills-hero p,
+.knowledge-skills-card-head p,
+.knowledge-skills-help,
+.knowledge-skills-message,
+.knowledge-skills-path {
+  margin: 6px 0 0;
+  color: var(--color-text-muted);
+  font-size: 0.84rem;
+  line-height: 1.45;
+}
+
+.knowledge-skills-hero p {
+  max-width: 720px;
+}
+
+.knowledge-skills-refresh {
+  flex: 0 0 auto;
+  min-height: 40px;
+  margin-top: 0;
+}
+
+.knowledge-skills-summary,
+.knowledge-skills-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.knowledge-skills-summary > span,
+.knowledge-skills-meta > span,
+.knowledge-skills-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 28px;
+  padding: 4px 10px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 76%, transparent);
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--glass-tint) 86%, transparent);
+  color: var(--color-text-muted);
+  font-size: 0.74rem;
+}
+
+.knowledge-skills-summary strong,
+.knowledge-skills-meta strong {
+  color: var(--color-text);
+  font-weight: 700;
+}
+
+.knowledge-skills-message {
+  padding: 9px 11px;
+  border: 1px solid color-mix(in oklab, var(--color-warning, #d39b42) 42%, transparent);
+  border-radius: 10px;
+  background: color-mix(in oklab, var(--color-warning, #d39b42) 10%, transparent);
+}
+
+.knowledge-skills-view-tabs {
+  display: inline-flex;
+  width: fit-content;
+  max-width: 100%;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 78%, transparent);
+  border-radius: 12px;
+  background: color-mix(in oklab, var(--glass-tint) 88%, transparent);
+}
+
+.knowledge-skills-view-tabs button {
+  min-height: 38px;
+  padding: 7px 12px;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--color-text-muted);
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.knowledge-skills-view-tabs button.is-active {
+  border-color: color-mix(in oklab, var(--color-pear) 44%, var(--glass-border) 56%);
+  background: color-mix(in oklab, var(--color-pear) 13%, var(--glass-tint) 87%);
+  color: var(--color-text);
+}
+
+.knowledge-skills-view-tabs button:focus-visible {
+  outline: 2px solid color-mix(in oklab, var(--color-pear) 72%, white 28%);
+  outline-offset: 2px;
+}
+
+.knowledge-skills-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.12fr) minmax(280px, 0.88fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.knowledge-skills-card {
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 82%, transparent);
+  border-radius: 16px;
+  background: color-mix(in oklab, var(--glass-tint) 90%, transparent);
+  box-shadow: inset 0 1px 0 color-mix(in oklab, white 20%, transparent);
+}
+
+.knowledge-skills-card-head {
+  margin-bottom: 14px;
+}
+
+.knowledge-skills-card-head > div:first-child {
+  min-width: 0;
+}
+
+.knowledge-skills-card-head h3 {
+  margin-top: 3px;
+  font-size: 1rem;
+}
+
+.knowledge-skills-badge {
+  flex: 0 0 auto;
+  color: color-mix(in oklab, var(--color-text) 78%, var(--color-pear) 22%);
+  white-space: nowrap;
+}
+
+.knowledge-skills-card label,
+.knowledge-skills-modules legend {
+  display: block;
+  margin: 0 0 6px;
+  color: var(--color-text);
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.knowledge-skills-card select,
+.knowledge-skills-card input[type="text"] {
+  width: 100%;
+  min-height: 42px;
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 82%, transparent);
+  border-radius: 10px;
+  background: color-mix(in oklab, var(--glass-tint) 94%, transparent);
+  color: var(--color-text);
+}
+
+.knowledge-skills-tab .icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: auto;
+  min-height: 40px;
+  padding: 8px 13px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 82%, transparent);
+  border-radius: 10px;
+  background: color-mix(in oklab, var(--glass-tint) 92%, transparent);
+  color: var(--color-text);
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 650;
+  line-height: 1.2;
+  cursor: pointer;
+  transition:
+    border-color 140ms ease,
+    background-color 140ms ease,
+    transform 140ms ease;
+}
+
+.knowledge-skills-tab .icon-btn:hover:not(:disabled) {
+  border-color: color-mix(in oklab, var(--color-pear) 48%, var(--glass-border) 52%);
+  background: color-mix(in oklab, var(--color-pear) 12%, var(--glass-tint) 88%);
+}
+
+.knowledge-skills-tab .icon-btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.knowledge-skills-tab .icon-btn:focus-visible,
+.knowledge-skills-card select:focus-visible,
+.knowledge-skills-card input:focus-visible,
+.knowledge-skills-card textarea:focus-visible,
+.knowledge-skills-disclosure summary:focus-visible {
+  outline: 2px solid color-mix(in oklab, var(--color-pear) 72%, white 28%);
+  outline-offset: 2px;
+}
+
+.knowledge-skills-tab .icon-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.knowledge-skills-disclosure {
+  margin-top: 12px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 72%, transparent);
+  border-radius: 12px;
+  background: color-mix(in oklab, var(--glass-tint) 78%, transparent);
+}
+
+.knowledge-skills-disclosure summary {
+  min-height: 40px;
+  padding: 10px 12px;
+  color: var(--color-text);
+  font-size: 0.8rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.knowledge-skills-profile-list {
+  display: grid;
+  gap: 8px;
+  padding: 0 10px 10px;
+}
+
+.knowledge-skills-profile-list article {
+  display: grid;
+  gap: 5px;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 68%, transparent);
+  border-radius: 9px;
+  background: color-mix(in oklab, var(--glass-tint) 86%, transparent);
+}
+
+.knowledge-skills-profile-list article.is-selected {
+  border-color: color-mix(in oklab, var(--color-pear) 44%, var(--glass-border) 56%);
+  background: color-mix(in oklab, var(--color-pear) 9%, var(--glass-tint) 91%);
+}
+
+.knowledge-skills-profile-list article > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.knowledge-skills-profile-list p,
+.knowledge-skills-profile-list small {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: 0.76rem;
+  line-height: 1.4;
+}
+
+.knowledge-skills-profile-list article > div span {
+  color: var(--color-pear);
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.knowledge-skills-modules {
+  display: grid;
+  gap: 7px;
+  margin: 14px 0 0;
+  padding: 0;
+  border: 0;
+}
+
+.knowledge-skills-module-row {
+  display: grid !important;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: start;
+  min-height: 54px;
+  margin: 0 !important;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 70%, transparent);
+  border-radius: 10px;
+  background: color-mix(in oklab, var(--glass-tint) 82%, transparent);
+  cursor: pointer;
+}
+
+.knowledge-skills-module-row > span > span:last-child {
+  display: block;
+  margin-top: 3px;
+  color: var(--color-text-muted);
+  font-size: 0.76rem;
+  font-weight: 400;
+  line-height: 1.4;
+}
+
+.knowledge-skills-module-title {
+  display: flex !important;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.knowledge-skills-module-title em,
+.knowledge-skills-module-title small {
+  padding: 2px 6px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 72%, transparent);
+  border-radius: 999px;
+  color: var(--color-text-muted);
+  font-size: 0.67rem;
+  font-style: normal;
+  font-weight: 600;
+}
+
+.knowledge-skills-module-row input {
+  width: 18px;
+  height: 18px;
+  margin: 2px 0 0;
+}
+
+.knowledge-skills-actions {
+  align-items: center;
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+.knowledge-skills-actions .icon-btn {
+  min-height: 40px;
+  margin: 0;
+}
+
+.knowledge-skills-actions > span {
+  color: var(--color-text-muted);
+  font-size: 0.78rem;
+}
+
+.knowledge-skills-detail-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.knowledge-skills-detail-list > div {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 66%, transparent);
+  border-radius: 10px;
+  background: color-mix(in oklab, var(--glass-tint) 80%, transparent);
+}
+
+.knowledge-skills-detail-list p,
+.knowledge-skills-detail-list pre {
+  margin: 4px 0 0;
+  color: var(--color-text-muted);
+  font-size: 0.78rem;
+  line-height: 1.42;
+  overflow-wrap: anywhere;
+}
+
+.knowledge-skills-detail-list pre {
+  max-height: 160px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+.knowledge-skills-editor {
+  padding: 18px;
+}
+
+.knowledge-skills-editor-layout {
+  display: grid;
+  grid-template-columns: minmax(230px, 0.35fr) minmax(0, 0.65fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.knowledge-skills-editor-controls,
+.knowledge-skills-editor-body,
+.knowledge-skills-new {
+  display: grid;
+  gap: 8px;
+}
+
+.knowledge-skills-meta {
+  margin: 4px 0 8px;
+}
+
+.knowledge-skills-new {
+  margin-top: 6px;
+  padding: 11px;
+  border: 1px dashed color-mix(in oklab, var(--glass-border) 82%, transparent);
+  border-radius: 12px;
+  background: color-mix(in oklab, var(--glass-tint) 78%, transparent);
+}
+
+.knowledge-skills-new .icon-btn {
+  min-height: 40px;
+  margin: 0;
+}
+
+.knowledge-skills-new small {
+  color: var(--color-text-muted);
+  line-height: 1.35;
+}
+
+.knowledge-skills-new .knowledge-skills-inline-error {
+  color: var(--color-danger, #c85757);
+  font-weight: 650;
+}
+
+.knowledge-skills-editor-label {
+  align-items: center;
+}
+
+.knowledge-skills-editor-label label {
+  margin: 0;
+}
+
+.knowledge-skills-editor-label span {
+  color: var(--color-text-muted);
+  font-size: 0.72rem;
+}
+
+.knowledge-skills-editor textarea {
+  width: 100%;
+  min-height: 300px;
+  max-height: 58vh;
+  resize: vertical;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 82%, transparent);
+  border-radius: 12px;
+  background: color-mix(in oklab, var(--glass-tint) 94%, transparent);
+  color: var(--color-text);
+  font-family: "Cascadia Code", "Fira Code", Consolas, monospace;
+  font-size: 0.84rem;
+  line-height: 1.5;
+}
+
+.knowledge-skills-path {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.knowledge-skills-path code,
+.knowledge-skills-help code {
+  font-size: 0.76rem;
+}
+
+@media (max-width: 900px) {
+  .knowledge-skills-grid,
+  .knowledge-skills-editor-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .knowledge-skills-editor textarea {
+    min-height: 260px;
+  }
+}
+
+@media (max-width: 640px) {
+  .knowledge-skills-hero,
+  .knowledge-skills-card-head {
+    flex-direction: column;
+  }
+
+  .knowledge-skills-hero,
+  .knowledge-skills-card,
+  .knowledge-skills-editor {
+    padding: 14px;
+  }
+
+  .knowledge-skills-refresh,
+  .knowledge-skills-actions .icon-btn,
+  .knowledge-skills-new .icon-btn {
+    width: 100%;
+    min-height: 44px;
+  }
+
+  .knowledge-skills-actions {
+    align-items: stretch;
+  }
+
+  .knowledge-skills-editor textarea {
+    min-height: 240px;
+  }
+}

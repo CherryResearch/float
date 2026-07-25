@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from fnmatch import fnmatch
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from uuid import NAMESPACE_URL, uuid5
 
 from app.utils import user_settings
 from app.utils.sync_paths import (
@@ -19,6 +20,14 @@ DEFAULT_WORKSPACE_NAME = "Main workspace"
 DEFAULT_WORKSPACE_SLUG = "main"
 DEFAULT_WORKSPACE_ROOT = "data/files/workspace"
 WORKSPACE_PRIVACY_MODES = {"default", "protected", "secret"}
+
+
+def workspace_lineage_id(deployment_id: Any, workspace_id: Any) -> str:
+    deployment = str(deployment_id or "").strip()
+    workspace = str(workspace_id or "").strip()
+    if not deployment or not workspace:
+        return ""
+    return str(uuid5(NAMESPACE_URL, f"float-workspace:{deployment}:{workspace}"))
 
 
 def normalize_workspace_privacy_mode(value: Any) -> str:
@@ -124,6 +133,11 @@ def normalize_workspace_profile(entry: Any, index: int = 0) -> Dict[str, Any]:
         "source_device_name": source_device_name,
         "source_workspace_id": str(entry.get("source_workspace_id") or "").strip(),
         "source_workspace_name": source_workspace_name,
+        "lineage_id": str(entry.get("lineage_id") or "").strip(),
+        "origin_deployment_id": str(entry.get("origin_deployment_id") or "").strip(),
+        "upstream_deployment_id": str(
+            entry.get("upstream_deployment_id") or ""
+        ).strip(),
         "privacy_mode": normalize_workspace_privacy_mode(entry.get("privacy_mode")),
         "private_patterns": normalize_workspace_private_patterns(
             entry.get("private_patterns")
@@ -214,8 +228,22 @@ def workspace_profile_map(
     }
 
 
-def summarize_workspace_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
+def summarize_workspace_profile(
+    profile: Dict[str, Any],
+    *,
+    deployment_id: str = "",
+) -> Dict[str, Any]:
     workspace_id = str(profile.get("id") or "").strip()
+    imported = bool(profile.get("imported")) or profile.get("kind") == "synced"
+    lineage_id = str(profile.get("lineage_id") or "").strip()
+    if not lineage_id and not imported:
+        lineage_id = workspace_lineage_id(deployment_id, workspace_id)
+    upstream_deployment_id = str(profile.get("upstream_deployment_id") or "").strip()
+    origin_deployment_id = str(profile.get("origin_deployment_id") or "").strip()
+    if not origin_deployment_id and not imported:
+        origin_deployment_id = str(deployment_id or "").strip()
+    source_peer_id = str(profile.get("source_peer_id") or "").strip()
+    source_workspace_id = str(profile.get("source_workspace_id") or "").strip()
     return {
         "id": workspace_id,
         "name": str(profile.get("name") or "").strip() or workspace_id or "workspace",
@@ -224,13 +252,26 @@ def summarize_workspace_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
         "root_path": str(profile.get("root_path") or "").strip()
         or DEFAULT_WORKSPACE_ROOT,
         "kind": str(profile.get("kind") or "").strip() or "local",
-        "imported": bool(profile.get("imported")),
-        "source_peer_id": str(profile.get("source_peer_id") or "").strip(),
+        "imported": imported,
+        "source_peer_id": source_peer_id,
         "source_device_name": str(profile.get("source_device_name") or "").strip(),
-        "source_workspace_id": str(profile.get("source_workspace_id") or "").strip(),
+        "source_workspace_id": source_workspace_id,
         "source_workspace_name": str(
             profile.get("source_workspace_name") or ""
         ).strip(),
+        "lineage_id": lineage_id,
+        "origin_deployment_id": origin_deployment_id,
+        "upstream_deployment_id": upstream_deployment_id,
+        "sync_back": (
+            {
+                "direction": "push",
+                "peer_id": source_peer_id,
+                "deployment_id": upstream_deployment_id,
+                "workspace_id": source_workspace_id,
+            }
+            if imported and (source_peer_id or upstream_deployment_id)
+            else {}
+        ),
         "is_root": workspace_id == DEFAULT_WORKSPACE_ID,
         "privacy_mode": normalize_workspace_privacy_mode(profile.get("privacy_mode")),
         "private_patterns": normalize_workspace_private_patterns(
@@ -413,6 +454,9 @@ def build_synced_workspace_profile(
     source_workspace_id: str,
     source_workspace_name: str,
     source_workspace_slug: str = "",
+    source_deployment_id: str = "",
+    source_lineage_id: str = "",
+    source_origin_deployment_id: str = "",
 ) -> Dict[str, Any]:
     location = resolve_synced_workspace_location(
         parent_profile=parent_profile,
@@ -442,5 +486,14 @@ def build_synced_workspace_profile(
             "source_device_name": source_device_name,
             "source_workspace_id": source_workspace_id,
             "source_workspace_name": source_workspace_name,
+            "lineage_id": (
+                str(source_lineage_id or "").strip()
+                or workspace_lineage_id(source_deployment_id, source_workspace_id)
+            ),
+            "origin_deployment_id": (
+                str(source_origin_deployment_id or "").strip()
+                or str(source_deployment_id or "").strip()
+            ),
+            "upstream_deployment_id": str(source_deployment_id or "").strip(),
         }
     )

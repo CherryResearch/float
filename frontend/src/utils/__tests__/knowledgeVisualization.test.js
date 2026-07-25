@@ -1,9 +1,13 @@
 import {
+  VISUALIZATION_HEIGHT,
+  VISUALIZATION_WIDTH,
   buildCombinedGraphData,
   buildThreadGraph,
   getNodeFocus,
+  hydrateKnowledgeGraph,
   hydrateMemoryGraph,
   normalizeConversationName,
+  rankNodeConnections,
 } from "../knowledgeVisualization";
 
 describe("knowledgeVisualization helpers", () => {
@@ -129,6 +133,159 @@ describe("knowledgeVisualization helpers", () => {
           matchKey: "conversation:project/session-a",
         }),
       ]),
+    );
+  });
+
+  it("hydrates stored knowledge graph nodes with attributes and claim links", () => {
+    const knowledgeGraph = hydrateKnowledgeGraph({
+      nodes: [
+        {
+          id: "knowledge:person:alice",
+          label: "Alice Nguyen",
+          type: "person",
+          node_kind: "entity",
+          node_type: "person",
+          attributes: { city: "Vancouver", role: "designer" },
+        },
+      ],
+      links: [
+        {
+          source: "knowledge:person:alice",
+          target: "knowledge:person:bob",
+          type: "claim",
+          predicate: "friend_of",
+          confidence: 0.95,
+        },
+      ],
+      metadata: { node_count: 1, claim_count: 1 },
+    });
+
+    expect(knowledgeGraph.nodes[0]).toEqual(
+      expect.objectContaining({
+        graphKey: "knowledge",
+        nodeKind: "entity",
+        nodeType: "person",
+        attributes: { city: "Vancouver", role: "designer" },
+      }),
+    );
+    expect(knowledgeGraph.links[0]).toEqual(
+      expect.objectContaining({
+        graphKey: "knowledge",
+        weight: 0.95,
+      }),
+    );
+
+    const combined = buildCombinedGraphData({
+      threadGraph: { nodes: [], links: [], metadata: {} },
+      memoryGraph: { nodes: [], links: [], metadata: {} },
+      knowledgeGraph,
+      includeThreadProjection: false,
+      includeMemoryProjection: false,
+      includeKnowledgeOverlay: true,
+      levels: { knowledge: 0 },
+      planeOffset: 0,
+    });
+
+    expect(combined.nodes).toHaveLength(1);
+    expect(combined.links).toHaveLength(1);
+    expect(combined.metadata.maxLevels.knowledge).toBe(0);
+  });
+
+  it("applies stored graph layout hints before falling back to radial placement", () => {
+    const knowledgeGraph = hydrateKnowledgeGraph({
+      nodes: [
+        {
+          id: "knowledge:person:self",
+          label: "Self",
+          type: "person",
+          attributes: { layout_slot: "self" },
+        },
+        {
+          id: "knowledge:person:friend-jules",
+          label: "Jules Park",
+          type: "person",
+          attributes: { layout_slot: "club_friend" },
+        },
+        {
+          id: "knowledge:org:computer-club",
+          label: "Vancouver Computer Club",
+          type: "organization",
+          attributes: { layout_slot: "computer_club" },
+        },
+      ],
+      links: [],
+      metadata: { node_count: 3, claim_count: 0 },
+    });
+
+    const combined = buildCombinedGraphData({
+      threadGraph: { nodes: [], links: [], metadata: {} },
+      memoryGraph: { nodes: [], links: [], metadata: {} },
+      knowledgeGraph,
+      includeThreadProjection: false,
+      includeMemoryProjection: false,
+      includeKnowledgeOverlay: true,
+      levels: { knowledge: 0 },
+      planeOffset: 0,
+    });
+    const byLabel = new Map(combined.nodes.map((node) => [node.label, node]));
+
+    expect(byLabel.get("Self")).toEqual(
+      expect.objectContaining({
+        anchorX: VISUALIZATION_WIDTH / 2,
+        anchorY: VISUALIZATION_HEIGHT / 2,
+      }),
+    );
+    expect(byLabel.get("Jules Park")?.anchorX).toBeGreaterThan(
+      byLabel.get("Self")?.anchorX,
+    );
+    expect(byLabel.get("Vancouver Computer Club")?.anchorX).toBeGreaterThan(
+      byLabel.get("Jules Park")?.anchorX,
+    );
+  });
+
+  it("ranks selected-node connections using edge weights and relationship metadata", () => {
+    const nodes = [
+      { id: "knowledge:person:self", label: "Self", type: "person" },
+      { id: "knowledge:person:friend-maya", label: "Maya Stone", type: "person" },
+      { id: "knowledge:person:family-lena", label: "Lena Rivera", type: "person" },
+      { id: "knowledge:org:job", label: "Float Systems Lab", type: "organization" },
+    ];
+    const links = [
+      {
+        source: "knowledge:person:self",
+        target: "knowledge:org:job",
+        predicate: "works_at",
+        weight: 0.9,
+        metadata: { relationship: "job" },
+      },
+      {
+        source: "knowledge:person:self",
+        target: "knowledge:person:friend-maya",
+        predicate: "friend_of",
+        weight: 0.95,
+        metadata: { relationship: "friend", relationship_strength: "close" },
+      },
+      {
+        source: "knowledge:person:self",
+        target: "knowledge:person:family-lena",
+        predicate: "family_of",
+        weight: 0.96,
+        metadata: { relationship: "family" },
+      },
+    ];
+
+    const ranked = rankNodeConnections("knowledge:person:self", nodes, links);
+
+    expect(ranked.map((connection) => connection.label)).toEqual([
+      "Maya Stone",
+      "Lena Rivera",
+      "Float Systems Lab",
+    ]);
+    expect(ranked[0]).toEqual(
+      expect.objectContaining({
+        predicate: "friend_of",
+        relation: "friend",
+      }),
     );
   });
 

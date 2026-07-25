@@ -9,13 +9,10 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BACKEND_ROOT = REPO_ROOT / "backend"
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
-
-from app.local_providers import LocalProviderManager
 
 
 @dataclass
@@ -100,6 +97,8 @@ def _run_provider(
     inference_prompt: str,
     manage_server: bool,
 ) -> List[Step]:
+    from app.local_providers import LocalProviderManager
+
     cfg: Dict[str, Any] = {
         "local_provider": provider,
         "local_provider_mode": mode,
@@ -211,8 +210,12 @@ def _run_provider(
                 )
             )
         else:
-            steps.append(Step("inference", False, "Skipped because no model is selected."))
-            steps.append(Step("unload-model", False, "Skipped because no model is selected."))
+            steps.append(
+                Step("inference", False, "Skipped because no model is selected.")
+            )
+            steps.append(
+                Step("unload-model", False, "Skipped because no model is selected.")
+            )
     finally:
         if started_here and manage_server and mode == "local-managed":
             stopped = manager.provider_stop(provider)
@@ -249,8 +252,12 @@ def main() -> int:
         default="",
         help="Optional provider=model map, e.g. 'lmstudio=gpt-oss-20b,ollama=llama3.2'.",
     )
-    parser.add_argument("--host", default="127.0.0.1", help="Host override for both providers.")
-    parser.add_argument("--lmstudio-port", type=int, default=1234, help="LM Studio port.")
+    parser.add_argument(
+        "--host", default="127.0.0.1", help="Host override for both providers."
+    )
+    parser.add_argument(
+        "--lmstudio-port", type=int, default=1234, help="LM Studio port."
+    )
     parser.add_argument("--ollama-port", type=int, default=11434, help="Ollama port.")
     parser.add_argument(
         "--base-url",
@@ -262,7 +269,9 @@ def main() -> int:
         default="",
         help="Optional lms CLI path override for LM Studio managed mode.",
     )
-    parser.add_argument("--api-token", default="", help="Optional API token for inference.")
+    parser.add_argument(
+        "--api-token", default="", help="Optional API token for inference."
+    )
     parser.add_argument(
         "--context-length",
         type=int,

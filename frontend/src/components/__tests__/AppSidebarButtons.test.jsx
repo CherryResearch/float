@@ -121,6 +121,24 @@ describe("App sidebar open buttons", () => {
     expect(document.querySelector(".sidebar.left-sidebar")).not.toHaveClass("collapsed");
   });
 
+  test("follow-up click after a mobile pointer press does not close the sidebar", async () => {
+    const { default: App } = await import("../App");
+    render(<App />);
+
+    const leftOpenButton = screen.getByTitle("Show history sidebar");
+    fireEvent.pointerDown(leftOpenButton, { button: 0 });
+    await waitFor(() =>
+      expect(document.querySelector(".sidebar.left-sidebar")).not.toHaveClass("collapsed"),
+    );
+
+    // Mobile browsers synthesize a click after pointerdown. By then the opener
+    // is gone, so the click can retarget to the document and must be ignored.
+    fireEvent.click(document.body);
+
+    expect(document.querySelector(".sidebar.left-sidebar")).not.toHaveClass("collapsed");
+    expect(screen.queryByTitle("Show history sidebar")).not.toBeInTheDocument();
+  });
+
   test("click opens right sidebar in narrow layout", async () => {
     const { default: App } = await import("../App");
     render(<App />);
@@ -157,5 +175,17 @@ describe("App sidebar open buttons", () => {
     render(<App />);
 
     expect(document.querySelector(".main-chat")).toHaveClass("main-chat--settings");
+  });
+
+  test("starts with both sidebars collapsed in Pixel 9 landscape", async () => {
+    window.innerWidth = 924;
+    window.innerHeight = 412;
+    const { default: App } = await import("../App");
+    render(<App />);
+
+    expect(screen.getByTitle("Show history sidebar")).toBeInTheDocument();
+    expect(screen.getByTitle("Show agent console")).toBeInTheDocument();
+    expect(document.querySelector(".sidebar.left-sidebar")).toHaveClass("collapsed");
+    expect(document.querySelector(".sidebar.right-sidebar")).toHaveClass("collapsed");
   });
 });

@@ -9,10 +9,45 @@ import KnowledgeSyncTab from "../KnowledgeSyncTab";
 expect.extend(matchers);
 
 const buildOverview = () => ({
+  deployment_status: {
+    schema_version: 1,
+    software: {
+      release_version: "0.1.0a1",
+      build_code: "b12",
+      label: "0.1.0a1 // b12",
+      state: "built",
+      snapshot_digest: "sha256:test-snapshot",
+    },
+    data: {
+      deployment_id: "deployment-studio-1234",
+      display_name: "Studio",
+      state: "synced",
+      workspace_count: 1,
+      last_updated_at: "2026-07-16T10:00:00+00:00",
+      revision: {
+        digest: "a".repeat(64),
+        code: "d-studio123456",
+        observed_at_iso: "2026-07-16T10:00:00+00:00",
+      },
+      sync_checkpoint: {
+        state: "synced",
+        summary: "Local data matches the last successful sync checkpoint",
+        peer_deployment_id: "deployment-pear-1234",
+        peer_label: "Pear",
+        last_synced_at: 1784217600,
+      },
+    },
+  },
   current_device: {
+    deployment_id: "deployment-studio-1234",
     display_name: "Studio",
     hostname: "studio-host",
     source_namespace: "Studio",
+    software: {
+      release_version: "0.1.0a1",
+      build_code: "b12",
+      label: "0.1.0a1 // b12",
+    },
   },
   device_access: {
     visibility: {
@@ -94,6 +129,53 @@ const buildOverview = () => ({
   },
 });
 
+const buildPairedOverview = (remoteUrl = "http://peer.float:5000") => {
+  const overview = buildOverview();
+  const peer = {
+    id: "peer-pear",
+    label: "Pear",
+    remote_url: remoteUrl,
+    scopes: ["sync"],
+    remote_device_id: "remote-device-1",
+    remote_public_key: "pk-pear",
+    remote_device_name: "Pear",
+    remote_deployment_id: "deployment-pear-1234",
+    remote_software: {
+      release_version: "0.1.0a1",
+      build_code: "b11",
+      label: "0.1.0a1 // b11",
+      snapshot_digest: "sha256:pear-snapshot",
+    },
+    remote_data: {
+      deployment_id: "deployment-pear-1234",
+      display_name: "Pear",
+      state: "ready",
+      workspace_count: 1,
+      revision: {
+        digest: "b".repeat(64),
+        code: "d-pear12345678",
+      },
+    },
+    data_checkpoint: {
+      state: "local_changes",
+      summary: "Local data changed after the last successful sync",
+      peer_deployment_id: "deployment-pear-1234",
+      peer_label: "Pear",
+      last_synced_at: 1784217600,
+    },
+    last_status_at: "2026-07-15T12:00:00+00:00",
+    local_workspace_ids: ["root"],
+    remote_workspace_ids: ["root"],
+    workspace_mode: "merge",
+    local_target_workspace_id: "root",
+    remote_target_workspace_id: "root",
+  };
+  overview.sync_defaults.remote_url = remoteUrl;
+  overview.sync_defaults.saved_peers = [peer];
+  overview.device_counts.paired = 1;
+  return overview;
+};
+
 const buildMobileServeStatus = (overrides = {}) => ({
   ok: true,
   installed: true,
@@ -110,6 +192,7 @@ const buildMobileServeStatus = (overrides = {}) => ({
 });
 
 const buildPlanResponse = () => ({
+  plan_receipt: "receipt-token",
   remote: {
     display_name: "Pear",
     hostname: "pear-host",
@@ -320,6 +403,33 @@ describe("KnowledgeSyncTab", () => {
     vi.spyOn(axios, "post").mockResolvedValue({ data: {} });
   });
 
+  it("shows software and data as equal deployment status dimensions", async () => {
+    render(<KnowledgeSyncTab />);
+
+    expect(await screen.findByText("Deployment status")).toBeInTheDocument();
+    expect(screen.getByText("0.1.0a1 // b12")).toBeInTheDocument();
+    expect(screen.getByText("Studio // d-studio123456")).toBeInTheDocument();
+    expect(screen.getByText(/Last synced .* with Pear/i)).toBeInTheDocument();
+    expect(document.querySelector('[data-status-dimension="software"]')).toBeInTheDocument();
+    expect(document.querySelector('[data-status-dimension="data"]')).toBeInTheDocument();
+  });
+
+  it("keeps a saved peer's last observed software and data identity visible", async () => {
+    axios.get.mockImplementation((url) => {
+      if (url === "/api/sync/overview") return Promise.resolve({ data: buildPairedOverview() });
+      if (url === "/api/sync/mobile-serve/status") return Promise.resolve({ data: buildMobileServeStatus() });
+      if (url === "/api/user-settings") return Promise.resolve({ data: { device_display_name: "Studio" } });
+      if (url === "/api/actions") return Promise.resolve({ data: { actions: [] } });
+      return Promise.reject(new Error(`Unexpected GET ${url}`));
+    });
+
+    render(<KnowledgeSyncTab />);
+
+    expect(
+      await screen.findByText(/Last known peer status: software 0\.1\.0a1 \/\/ b11; data Pear \/\/ d-pear12345678\./i),
+    ).toBeInTheDocument();
+  });
+
   it("starts Mobile Float Tailscale Serve from the sync panel", async () => {
     axios.post.mockImplementation((url, payload) => {
       if (url === "/api/sync/mobile-serve/start") {
@@ -355,6 +465,13 @@ describe("KnowledgeSyncTab", () => {
   });
 
   it("lets you review and uncheck individual sync items before pulling", async () => {
+    axios.get.mockImplementation((url) => {
+      if (url === "/api/sync/overview") return Promise.resolve({ data: buildPairedOverview() });
+      if (url === "/api/sync/mobile-serve/status") return Promise.resolve({ data: buildMobileServeStatus() });
+      if (url === "/api/user-settings") return Promise.resolve({ data: { device_display_name: "Studio" } });
+      if (url === "/api/actions") return Promise.resolve({ data: { actions: [] } });
+      return Promise.reject(new Error(`Unexpected GET ${url}`));
+    });
     axios.post.mockImplementation((url, payload) => {
       if (url === "/api/user-settings") {
         return Promise.resolve({ data: { status: "saved" } });
@@ -368,9 +485,10 @@ describe("KnowledgeSyncTab", () => {
           direction: "pull",
           sections: ["conversations", "settings"],
           item_selections: {
-            conversations: ["conv-a", "conv-c"],
+            conversations: ["conv-a"],
             settings: ["settings"],
           },
+          plan_receipt: "receipt-token",
         });
         return Promise.resolve({
           data: {
@@ -389,16 +507,13 @@ describe("KnowledgeSyncTab", () => {
 
     render(<KnowledgeSyncTab />);
 
-    fireEvent.change(await screen.findByLabelText("Remote Float URL"), {
-      target: { value: "http://peer.float:5000" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: /preview sync/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /preview changes/i }));
 
-    expect(await screen.findByText(/1 new on Pear, 1 newer on Pear, 1 deleted on Pear, 4 already match here\./i)).toBeInTheDocument();
-    expect(screen.getByText(/1 only on this device, 2 newer here, 0 deleted here, 4 already match there\./i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /review pull items \(3\/3\)/i })).toBeInTheDocument();
+    expect(await screen.findByText(/1 add or restore here, 1 update here, 1 delete here, 0 conflicts, 0 known differences, 4 already match\./i)).toBeInTheDocument();
+    expect(screen.getByText(/1 add or restore there, 2 update there, 0 delete there, 0 conflicts, 0 known differences, 4 already match\./i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /review pull items \(2\/3\)/i })).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: /review pull items \(3\/3\)/i }));
+    fireEvent.click(screen.getByRole("button", { name: /review pull items \(2\/3\)/i }));
 
     const dialog = await screen.findByRole("dialog", {
       name: /review pull items for conversations/i,
@@ -410,10 +525,10 @@ describe("KnowledgeSyncTab", () => {
     fireEvent.click(within(dialog).getByRole("checkbox", { name: /Beta/i }));
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /review pull items \(2\/3\)/i })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /review pull items \(1\/3\)/i })).toBeInTheDocument();
     });
 
-    fireEvent.click(screen.getByRole("button", { name: /pull here/i }));
+    fireEvent.click(screen.getByRole("button", { name: /apply pull here \(2\)/i }));
 
     await waitFor(() => {
       expect(axios.post).toHaveBeenCalledWith(
@@ -423,9 +538,10 @@ describe("KnowledgeSyncTab", () => {
           direction: "pull",
           sections: ["conversations", "settings"],
           item_selections: {
-            conversations: ["conv-a", "conv-c"],
+            conversations: ["conv-a"],
             settings: ["settings"],
           },
+          plan_receipt: "receipt-token",
         }),
         expect.anything(),
       );
@@ -433,7 +549,106 @@ describe("KnowledgeSyncTab", () => {
     expect(await screen.findByText(/Pull complete\..*Stored under Pear\//i)).toBeInTheDocument();
   });
 
+  it("keeps checkpointed deletions explicit and conflicts non-actionable", async () => {
+    const preview = buildPlanResponse();
+    const checkpointedItems = [
+      {
+        resource_id: "conv-deleted-there",
+        selection_id: "conv-deleted-there",
+        label: "Deleted there",
+        status: "remote_deleted",
+        baseline_available: true,
+      },
+      {
+        resource_id: "conv-deleted-here",
+        selection_id: "conv-deleted-here",
+        label: "Deleted here",
+        status: "local_deleted",
+        baseline_available: true,
+      },
+      {
+        resource_id: "conv-conflict",
+        selection_id: "conv-conflict",
+        label: "Both edited",
+        status: "conflict",
+        baseline_available: true,
+      },
+    ];
+    preview.pull_sections[0] = {
+      ...preview.pull_sections[0],
+      only_remote: 1,
+      only_local: 1,
+      remote_deleted: 1,
+      local_deleted: 1,
+      conflicts: 1,
+      identical: 2,
+      change_count: 3,
+      items: checkpointedItems,
+      all_items: checkpointedItems,
+    };
+    axios.get.mockImplementation((url) => {
+      if (url === "/api/sync/overview") return Promise.resolve({ data: buildPairedOverview() });
+      if (url === "/api/sync/mobile-serve/status") return Promise.resolve({ data: buildMobileServeStatus() });
+      if (url === "/api/user-settings") return Promise.resolve({ data: { device_display_name: "Studio" } });
+      if (url === "/api/actions") return Promise.resolve({ data: { actions: [] } });
+      return Promise.reject(new Error(`Unexpected GET ${url}`));
+    });
+    axios.post.mockImplementation((url) => {
+      if (url === "/api/sync/plan") return Promise.resolve({ data: preview });
+      return Promise.resolve({ data: {} });
+    });
+
+    render(<KnowledgeSyncTab />);
+    fireEvent.click(await screen.findByRole("button", { name: /preview changes/i }));
+
+    expect(await screen.findByText("Deleted remotely since sync")).toBeInTheDocument();
+    expect(screen.getByText("Deleted here since sync")).toBeInTheDocument();
+    expect(screen.getByText("Both changed")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /review pull items \(1\/2\)/i })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /review pull items \(1\/2\)/i }));
+    const dialog = await screen.findByRole("dialog", {
+      name: /review pull items for conversations/i,
+    });
+    expect(within(dialog).getByText("Delete here")).toBeInTheDocument();
+    expect(within(dialog).getByText("Add or restore here")).toBeInTheDocument();
+    expect(within(dialog).queryByText("Both edited")).not.toBeInTheDocument();
+  });
+
+  it("invalidates a preview when workspace mapping changes", async () => {
+    axios.get.mockImplementation((url) => {
+      if (url === "/api/sync/overview") return Promise.resolve({ data: buildPairedOverview() });
+      if (url === "/api/sync/mobile-serve/status") return Promise.resolve({ data: buildMobileServeStatus() });
+      if (url === "/api/user-settings") return Promise.resolve({ data: { device_display_name: "Studio" } });
+      if (url === "/api/actions") return Promise.resolve({ data: { actions: [] } });
+      return Promise.reject(new Error(`Unexpected GET ${url}`));
+    });
+    axios.post.mockImplementation((url) => {
+      if (url === "/api/sync/plan") return Promise.resolve({ data: buildPlanResponse() });
+      return Promise.resolve({ data: {} });
+    });
+
+    render(<KnowledgeSyncTab />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /preview changes/i }));
+    expect(await screen.findByText(/1 add or restore here/i)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("radio", { name: /import nested/i }));
+
+    expect(await screen.findByText(/Sync settings changed\. Preview changes again/i)).toBeInTheDocument();
+    expect(screen.queryByText(/1 add or restore here/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /pull selected here/i })).toBeDisabled();
+    expect(axios.post).not.toHaveBeenCalledWith("/api/sync/apply", expect.anything(), expect.anything());
+  });
+
   it("shows staged sync progress and lets the user cancel preview requests", async () => {
+    axios.get.mockImplementation((url) => {
+      if (url === "/api/sync/overview") return Promise.resolve({ data: buildPairedOverview() });
+      if (url === "/api/sync/mobile-serve/status") return Promise.resolve({ data: buildMobileServeStatus() });
+      if (url === "/api/user-settings") return Promise.resolve({ data: { device_display_name: "Studio" } });
+      if (url === "/api/actions") return Promise.resolve({ data: { actions: [] } });
+      return Promise.reject(new Error(`Unexpected GET ${url}`));
+    });
     axios.post.mockImplementation((url, payload, config) => {
       if (url !== "/api/sync/plan") {
         return Promise.resolve({ data: {} });
@@ -451,10 +666,7 @@ describe("KnowledgeSyncTab", () => {
 
     render(<KnowledgeSyncTab />);
 
-    fireEvent.change(await screen.findByLabelText("Remote Float URL"), {
-      target: { value: "http://192.168.50.45:59185" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: /preview sync/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /preview changes/i }));
 
     expect(await screen.findByText("Previewing sync")).toBeInTheDocument();
     expect(screen.getByText(/Stage-based progress while Float waits on the request\./i)).toBeInTheDocument();
@@ -508,7 +720,7 @@ describe("KnowledgeSyncTab", () => {
 
     expect(
       await screen.findByText(
-        /Last completed sync: Sync pull from http:\/\/peer\.float:5000, 3 changed items at /i,
+        /Last completed sync: Pull completed, 3 changed items at /i,
       ),
     ).toBeInTheDocument();
   });
@@ -587,7 +799,8 @@ describe("KnowledgeSyncTab", () => {
     render(<KnowledgeSyncTab />);
 
     expect(await screen.findByText("Sync ownership")).toBeInTheDocument();
-    expect(screen.getByText("Pear at http://pear.float:5000")).toBeInTheDocument();
+    expect(screen.getAllByText("Pear").length).toBeGreaterThan(0);
+    expect(screen.queryByText("Pear at http://pear.float:5000")).not.toBeInTheDocument();
     expect(screen.getAllByText("Review required").length).toBeGreaterThan(0);
     expect(
       screen.getByText(/Unfinished: Automatic stop-kill safeguards are future work\./i),
@@ -708,7 +921,7 @@ describe("KnowledgeSyncTab", () => {
     expect(within(inspector).getByText("Manual approval required")).toBeInTheDocument();
   });
 
-  it("moves browser-shaped trusted-device records into the legacy cleanup bucket", async () => {
+  it("uses backend trust provenance for the legacy cleanup bucket", async () => {
     const overview = buildOverview();
     overview.inbound_devices = [
       {
@@ -718,13 +931,16 @@ describe("KnowledgeSyncTab", () => {
         status_label: "Trusted device",
         created_at: 1770000000,
         last_seen: 1770000060,
-        capabilities: { requested_scopes: ["sync"] },
+        capabilities: { requested_scopes: ["sync"], paired_via_offer: true },
       },
+    ];
+    overview.legacy_inbound_devices = [
       {
         id: "legacy-ua-1",
         name: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        status: "trusted_device",
-        status_label: "Trusted device",
+        status: "unverified_legacy_record",
+        status_label: "Unverified legacy record",
+        legacy_record: true,
         created_at: 1770000000,
         last_seen: 1770000060,
         capabilities: { requested_scopes: ["sync", "stream"] },
@@ -745,7 +961,7 @@ describe("KnowledgeSyncTab", () => {
 
     render(<KnowledgeSyncTab />);
 
-    expect(await screen.findByText("Legacy browser records")).toBeInTheDocument();
+    expect(await screen.findByText("Unverified legacy records")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Prune 1/i })).toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: "Revoke" })).toHaveLength(1);
     expect(screen.getByText("Pear Laptop")).toBeInTheDocument();
@@ -823,7 +1039,47 @@ describe("KnowledgeSyncTab", () => {
     expect(await screen.findByText(/Device and sync defaults saved\./i)).toBeInTheDocument();
   });
 
-  it("requires a remote check before previewing a saved pair at a changed address", async () => {
+  it("shows inherited workspace lineage and the upstream sync-back target", async () => {
+    const overview = buildOverview();
+    overview.workspaces.profiles.push({
+      id: "sync-pear-self",
+      name: "Pear / Self",
+      slug: "pear-self",
+      namespace: "Pear/self",
+      root_path: "data/sync/Pear/self",
+      kind: "synced",
+      imported: true,
+      source_peer_id: "peer-pear",
+      source_device_name: "Pear",
+      source_workspace_id: "self",
+      source_workspace_name: "Self",
+      lineage_id: "self-lineage-uuid",
+      origin_deployment_id: "origin-deployment-uuid",
+      upstream_deployment_id: "upstream-deployment-uuid",
+    });
+    axios.get.mockImplementation((url) => {
+      if (url === "/api/sync/overview") {
+        return Promise.resolve({ data: overview });
+      }
+      if (url === "/api/user-settings") {
+        return Promise.resolve({ data: { device_display_name: "Studio" } });
+      }
+      if (url === "/api/actions") {
+        return Promise.resolve({ data: { actions: [] } });
+      }
+      return Promise.reject(new Error(`Unexpected GET ${url}`));
+    });
+
+    render(<KnowledgeSyncTab />);
+
+    const source = await screen.findByText(/Source: Pear \/ Self/i);
+    const workspaceCard = source.closest("article");
+    expect(workspaceCard).toHaveTextContent(/sync back to upstream-dep/i);
+    expect(workspaceCard).toHaveTextContent(/Lineage self-lineage/i);
+    expect(workspaceCard).toHaveTextContent(/origin origin-deplo/i);
+  });
+
+  it("requires address verification before saving or previewing a moved pair", async () => {
     const overview = buildOverview();
     overview.sync_defaults.saved_peers = [
       {
@@ -864,14 +1120,280 @@ describe("KnowledgeSyncTab", () => {
     fireEvent.change(screen.getByLabelText("Remote Float URL"), {
       target: { value: "http://pear.local:61234" },
     });
-    fireEvent.click(screen.getByRole("button", { name: /preview sync/i }));
-
-    expect(
-      await screen.findByText(/Check remote before previewing from a changed address/i),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /preview changes/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /save connection settings/i })).toBeDisabled();
+    expect(screen.getAllByRole("button", { name: /verify device and address/i }).length).toBeGreaterThan(0);
+    expect(await screen.findByText(/Address change\. Verify the device and address/i)).toBeInTheDocument();
     expect(axios.post).not.toHaveBeenCalledWith(
       "/api/sync/plan",
       expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it("routes ordinary Markdown to Documents only after explicit confirmation", async () => {
+    axios.post.mockImplementation((url) => {
+      if (url === "/api/conversations/import/preview") {
+        return Promise.resolve({
+          data: {
+            detected_files: [
+              {
+                path: "profile.md",
+                classification: "document",
+                message_count: 0,
+                suggested_action: "document",
+                allowed_actions: ["document"],
+                preview: "# Profile",
+                warnings: [],
+              },
+            ],
+          },
+        });
+      }
+      if (url === "/api/knowledge/upload") {
+        return Promise.resolve({ data: { id: "profile-doc" } });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    const { container } = render(<KnowledgeSyncTab />);
+    await screen.findByText("Import and export");
+    const input = container.querySelector('input.knowledge-sync-hidden-input[type="file"]');
+    const file = new File(["# Profile\n\nLikes pears."], "profile.md", {
+      type: "text/markdown",
+    });
+
+    fireEvent.change(input, { target: { files: [file] } });
+
+    expect(await screen.findByText("Document detected")).toBeInTheDocument();
+    expect(axios.post).toHaveBeenCalledWith(
+      "/api/conversations/import/preview",
+      expect.any(FormData),
+    );
+    expect(
+      axios.post.mock.calls.filter(([url]) =>
+        ["/api/conversations/import", "/api/knowledge/upload"].includes(url),
+      ),
+    ).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole("button", { name: /save as document/i }));
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith(
+        "/api/knowledge/upload",
+        expect.any(FormData),
+      );
+    });
+    const documentCall = axios.post.mock.calls.find(
+      ([url]) => url === "/api/knowledge/upload",
+    );
+    expect(documentCall[1].get("file")).toBe(file);
+    expect(axios.post).not.toHaveBeenCalledWith(
+      "/api/conversations/import",
+      expect.anything(),
+    );
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Saved profile.md to Documents and knowledge search.",
+    );
+  });
+
+  it("announces a document import failure as an alert", async () => {
+    axios.post.mockImplementation((url) => {
+      if (url === "/api/conversations/import/preview") {
+        return Promise.resolve({
+          data: {
+            classification: "document",
+            message_count: 0,
+            suggested_action: "document",
+            allowed_actions: ["document"],
+            warnings: [],
+          },
+        });
+      }
+      if (url === "/api/knowledge/upload") {
+        return Promise.reject({
+          response: { data: { detail: "Document storage unavailable" } },
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    const { container } = render(<KnowledgeSyncTab />);
+    await screen.findByText("Import and export");
+    const input = container.querySelector('input.knowledge-sync-hidden-input[type="file"]');
+
+    fireEvent.change(input, {
+      target: {
+        files: [new File(["# Notes"], "notes.md", { type: "text/markdown" })],
+      },
+    });
+
+    expect(await screen.findByText("Document detected")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /save as document/i }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Document storage unavailable",
+    );
+  });
+
+  it("imports a recognized transcript only after the conversation action is clicked", async () => {
+    axios.post.mockImplementation((url) => {
+      if (url === "/api/conversations/import/preview") {
+        return Promise.resolve({
+          data: {
+            classification: "conversation",
+            message_count: 2,
+            role_counts: { user: 1, ai: 1 },
+            suggested_action: "conversation",
+            allowed_actions: ["conversation", "document"],
+          },
+        });
+      }
+      if (url === "/api/conversations/import") {
+        return Promise.resolve({
+          data: { status: "imported", name: "sync-transcript", message_count: 2 },
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    const { container } = render(<KnowledgeSyncTab />);
+    await screen.findByText("Import and export");
+    const input = container.querySelector('input.knowledge-sync-hidden-input[type="file"]');
+    const file = new File(["### [user]\nHello\n### [ai]\nHi"], "float-chat.markdown", {
+      type: "text/markdown",
+    });
+
+    fireEvent.change(input, { target: { files: [file] } });
+
+    expect(await screen.findByText("Conversation transcript detected")).toBeInTheDocument();
+    expect(axios.post).not.toHaveBeenCalledWith(
+      "/api/conversations/import",
+      expect.anything(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /^import conversation$/i }));
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith(
+        "/api/conversations/import",
+        expect.any(FormData),
+      );
+    });
+    const conversationCall = axios.post.mock.calls.find(
+      ([url]) => url === "/api/conversations/import",
+    );
+    expect(conversationCall[1].get("intent")).toBe("conversation");
+    expect(axios.post).not.toHaveBeenCalledWith(
+      "/api/knowledge/upload",
+      expect.anything(),
+    );
+  });
+
+  it("does not write ambiguous Markdown until its recognized messages are explicitly chosen", async () => {
+    axios.post.mockImplementation((url) => {
+      if (url === "/api/conversations/import/preview") {
+        return Promise.resolve({
+          data: {
+            classification: "ambiguous",
+            message_count: 1,
+            role_counts: { user: 1 },
+            suggested_action: "review",
+            allowed_actions: ["conversation", "document"],
+            warnings: ["Unstructured content appears outside the recognized transcript."],
+          },
+        });
+      }
+      if (url === "/api/conversations/import") {
+        return Promise.resolve({
+          data: { status: "imported", name: "reviewed-mixed", message_count: 1 },
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    const { container } = render(<KnowledgeSyncTab />);
+    await screen.findByText("Import and export");
+    const input = container.querySelector('input.knowledge-sync-hidden-input[type="file"]');
+    const file = new File(["# Notes\n### [user]\nHello"], "mixed.md", {
+      type: "text/markdown",
+    });
+
+    fireEvent.change(input, { target: { files: [file] } });
+
+    expect(await screen.findByText("Mixed or ambiguous Markdown")).toBeInTheDocument();
+    expect(screen.getByText(/outside the recognized transcript/i)).toBeInTheDocument();
+    expect(axios.post).toHaveBeenCalledWith(
+      "/api/conversations/import/preview",
+      expect.any(FormData),
+    );
+    expect(
+      axios.post.mock.calls.filter(([url]) =>
+        ["/api/conversations/import", "/api/knowledge/upload"].includes(url),
+      ),
+    ).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole("button", { name: /import recognized messages/i }));
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith(
+        "/api/conversations/import",
+        expect.any(FormData),
+      );
+    });
+    const conversationCall = axios.post.mock.calls.find(
+      ([url]) => url === "/api/conversations/import",
+    );
+    expect(conversationCall[1].get("intent")).toBe("conversation");
+    expect(conversationCall[1].get("confirm_ambiguous")).toBe("true");
+    expect(axios.post).not.toHaveBeenCalledWith(
+      "/api/knowledge/upload",
+      expect.anything(),
+    );
+  });
+
+  it("preserves reviewed JSON selection as a conversation-only import", async () => {
+    axios.post.mockImplementation((url) => {
+      if (url === "/api/conversations/import/preview") {
+        return Promise.resolve({
+          data: {
+            detected_files: [{ path: "exports/sync-chat.json", message_count: 4 }],
+          },
+        });
+      }
+      if (url === "/api/conversations/import") {
+        return Promise.resolve({
+          data: {
+            status: "imported",
+            imports: [{ name: "imports/sync-chat" }],
+            message_count: 4,
+          },
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    const { container } = render(<KnowledgeSyncTab />);
+    await screen.findByText("Import and export");
+    const input = container.querySelector('input.knowledge-sync-hidden-input[type="file"]');
+    fireEvent.change(input, {
+      target: {
+        files: [new File(["{}"], "conversations.json", { type: "application/json" })],
+      },
+    });
+
+    expect(await screen.findByText("exports/sync-chat.json")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /import selected/i }));
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith(
+        "/api/conversations/import",
+        expect.any(FormData),
+      );
+    });
+    const conversationCall = axios.post.mock.calls.find(
+      ([url]) => url === "/api/conversations/import",
+    );
+    expect(JSON.parse(conversationCall[1].get("selected_files"))).toEqual([
+      "exports/sync-chat.json",
+    ]);
+    expect(conversationCall[1].get("format")).toBe("json");
+    expect(axios.post).not.toHaveBeenCalledWith(
+      "/api/knowledge/upload",
       expect.anything(),
     );
   });

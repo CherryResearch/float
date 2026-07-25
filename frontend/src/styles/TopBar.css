@@ -109,7 +109,7 @@ body.dark-mode .topbar-tabs .MuiTab-root:hover {
   justify-content: center;
 }
 
-@media (max-width: 900px) {
+@media (max-width: 900px), (orientation: landscape) and (max-width: 1000px) and (max-height: 600px) {
   /* On narrower screens, prefer start alignment for better scroll behavior */
   .topbar-tabs .MuiTabs-flexContainer {
     justify-content: flex-start;
@@ -315,7 +315,7 @@ body.dark-mode .chip:hover {
   max-width: var(--topbar-approval-chip-width);
 }
 
-@media (max-width: 900px) {
+@media (max-width: 900px), (orientation: landscape) and (max-width: 1000px) and (max-height: 600px) {
   .session-name {
     display: none;
   }
@@ -326,7 +326,7 @@ body.dark-mode .chip:hover {
 }
 
 /* Compact TopBar controls on narrow/portrait screens */
-@media (max-width: 600px), (orientation: portrait) and (max-width: 900px) {
+@media (max-width: 600px), (orientation: portrait) and (max-width: 900px), (orientation: landscape) and (max-width: 1000px) and (max-height: 600px) {
   :root {
     --topbar-control-width: clamp(80px, 42vw, 104px);
     --topbar-mode-chip-width: 72px;

@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import ssl
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict
-import base64
-import hmac
-import hashlib
 
 try:
     import jwt as _pyjwt  # PyJWT
+
     _HAVE_PYJWT = hasattr(_pyjwt, "encode") and hasattr(_pyjwt, "decode")
 except Exception:  # pragma: no cover - allow tests to stub jwt
     _pyjwt = None
@@ -88,12 +89,16 @@ class SyncService:
             return _pyjwt.encode(payload, self.secret_key, algorithm="HS256")  # type: ignore[attr-defined]
         # Minimal JWT HS256 implementation (for test environments without PyJWT)
         header = {"alg": "HS256", "typ": "JWT"}
+
         def b64url(data: bytes) -> str:
             return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
         header_b64 = b64url(json.dumps(header, separators=(",", ":")).encode("utf-8"))
         payload_b64 = b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
         signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
-        sig = hmac.new(self.secret_key.encode("utf-8"), signing_input, hashlib.sha256).digest()
+        sig = hmac.new(
+            self.secret_key.encode("utf-8"), signing_input, hashlib.sha256
+        ).digest()
         return f"{header_b64}.{payload_b64}.{b64url(sig)}"
 
     def verify_token(self, token: str) -> Dict[str, Any]:
@@ -104,11 +109,15 @@ class SyncService:
         except ValueError:
             err = getattr(_jwt_mod, "InvalidTokenError", ValueError)
             raise err("Invalid token format")
+
         def b64url_decode(s: str) -> bytes:
             pad = "=" * (-len(s) % 4)
             return base64.urlsafe_b64decode((s + pad).encode("ascii"))
+
         signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
-        expected = hmac.new(self.secret_key.encode("utf-8"), signing_input, hashlib.sha256).digest()
+        expected = hmac.new(
+            self.secret_key.encode("utf-8"), signing_input, hashlib.sha256
+        ).digest()
         actual = b64url_decode(sig_b64)
         if not hmac.compare_digest(expected, actual):
             err = getattr(_jwt_mod, "InvalidTokenError", ValueError)

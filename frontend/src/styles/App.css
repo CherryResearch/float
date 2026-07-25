@@ -206,6 +206,7 @@ body.dark-mode .topbar-inner {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  height: 100dvh;
   padding-top: var(--topbar-total-height); /* offset for fixed TopBar */
   box-sizing: border-box;
   /* Always show a vertical scrollbar to keep width consistent across sub-tabs */
@@ -220,6 +221,10 @@ body.dark-mode .topbar-inner {
 
 .main-chat--settings .center-rail {
   min-height: 0;
+}
+
+.main-chat--knowledge-visualizations .center-rail {
+  max-width: min(1120px, calc(100vw - 96px));
 }
 
 /* Button shown when a sidebar is collapsed */
@@ -308,7 +313,7 @@ body.dark-mode .show-sidebar-btn {
   box-shadow: 0 8px 20px rgba(0, 0, 0, 0.18);
 }
 
-@media (max-width: 600px) {
+@media (max-width: 600px), (orientation: landscape) and (max-width: 1000px) and (max-height: 600px) {
   :root {
     --center-rail-max: 100%;
     --input-offset: 172px;
@@ -321,11 +326,16 @@ body.dark-mode .show-sidebar-btn {
     padding-right: 8px;
   }
 
+  .main-chat--knowledge-visualizations .center-rail {
+    max-width: 100%;
+  }
+
   /* On small screens, keep grid but tighten paddings */
 
   .main-chat {
     padding-top: var(--topbar-total-height);
     height: 100vh;
+    height: 100dvh;
     box-sizing: border-box;
     overflow-y: scroll;
     scrollbar-gutter: stable both-edges;

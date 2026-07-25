@@ -1,70 +1,7 @@
-import importlib.util
 import json
-import sys
-import types
-from pathlib import Path
 
-# Load modules without importing app.services package
-ROOT = Path(__file__).resolve().parents[4]
-SERVICES = ROOT / "backend/app/services"
-UTILS = ROOT / "backend/app/utils"
-
-app_pkg = types.ModuleType("app")
-app_pkg.__path__ = [str(ROOT / "backend/app")]
-sys.modules.setdefault("app", app_pkg)
-
-services_pkg = types.ModuleType("app.services")
-services_pkg.__path__ = [str(SERVICES)]
-services_pkg.RAG_IMPORT_ERROR = RuntimeError(
-    "stub services init for isolated test loading"
-)
-sys.modules.setdefault("app.services", services_pkg)
-
-utils_pkg = types.ModuleType("app.utils")
-utils_pkg.__path__ = [str(UTILS)]
-sys.modules.setdefault("app.utils", utils_pkg)
-
-existing_utils = sys.modules.get("app.utils")
-if existing_utils is None or not hasattr(existing_utils, "verify_signature"):
-    spec_utils_init = importlib.util.spec_from_file_location(
-        "app.utils", UTILS / "__init__.py"
-    )
-    loaded_utils = importlib.util.module_from_spec(spec_utils_init)
-    loaded_utils.__path__ = [str(UTILS)]
-    sys.modules["app.utils"] = loaded_utils
-    spec_utils_init.loader.exec_module(loaded_utils)
-
-existing_services = sys.modules.get("app.services")
-if existing_services is None or not hasattr(existing_services, "RAG_IMPORT_ERROR"):
-    spec_services_init = importlib.util.spec_from_file_location(
-        "app.services", SERVICES / "__init__.py"
-    )
-    loaded_services = importlib.util.module_from_spec(spec_services_init)
-    loaded_services.__path__ = [str(SERVICES)]
-    sys.modules["app.services"] = loaded_services
-    spec_services_init.loader.exec_module(loaded_services)
-
-spec_cs = importlib.util.spec_from_file_location(
-    "app.utils.conversation_store", UTILS / "conversation_store.py"
-)
-conversation_store = importlib.util.module_from_spec(spec_cs)
-sys.modules["app.utils.conversation_store"] = conversation_store
-spec_cs.loader.exec_module(conversation_store)
-sys.modules["app.utils"].conversation_store = conversation_store
-
-spec_sts = importlib.util.spec_from_file_location(
-    "app.services.semantic_tags_service", SERVICES / "semantic_tags_service.py"
-)
-sts = importlib.util.module_from_spec(spec_sts)
-sys.modules["app.services.semantic_tags_service"] = sts
-spec_sts.loader.exec_module(sts)
-
-spec_ts = importlib.util.spec_from_file_location(
-    "app.services.threads_service", SERVICES / "threads_service.py"
-)
-threads_service = importlib.util.module_from_spec(spec_ts)
-sys.modules["app.services.threads_service"] = threads_service
-spec_ts.loader.exec_module(threads_service)
+from app.services import threads_service
+from app.utils import conversation_store
 
 
 def _setup_conversation(tmp_path):
@@ -359,7 +296,7 @@ def test_generate_threads_tolerates_string_message_entries(monkeypatch, tmp_path
         {
             "conv1": [
                 "legacy string message",
-                {"content": "dict message"},
+                {"content": "dict message", "source_message_index": 7},
                 123,
             ]
         },
@@ -383,6 +320,8 @@ def test_generate_threads_tolerates_string_message_entries(monkeypatch, tmp_path
         *args,
         **kwargs,
     ):
+        observed["message_indices"] = list(args[6])
+        observed["dates"] = list(args[7])
         return {
             "tag_counts": {},
             "cluster_count": 1,
@@ -402,6 +341,8 @@ def test_generate_threads_tolerates_string_message_entries(monkeypatch, tmp_path
 
     assert result.get("cluster_count") == 1
     assert observed["texts"] == ["legacy string message", "dict message"]
+    assert observed["message_indices"] == [0, 7]
+    assert observed["dates"] == ["", ""]
 
 
 def test_generate_threads_respects_explicit_k_option(monkeypatch, tmp_path):
@@ -955,6 +896,63 @@ def test_generate_threads_normalizes_conversation_summary_keys(monkeypatch, tmp_
     assert (
         overview[0]["conversation_breakdown"][0]["conversation"] == "events/tea_party"
     )
+
+
+def test_thread_overview_compacts_source_ranges_and_dates():
+    assert threads_service._compact_message_ranges(
+        [7, "3", 2, 3, 4, 7, 9, 10, None, "bad", -1]
+    ) == [
+        {"start": 2, "end": 4},
+        {"start": 7, "end": 7},
+        {"start": 9, "end": 10},
+    ]
+    assert threads_service._compact_message_ranges([None, "bad", -1]) == []
+
+    summary = threads_service._ensure_summary_schema(
+        {
+            "threads": {
+                "planning": [
+                    {
+                        "conversation": "events/tea_party.json#msg=2",
+                        "message_index": 2,
+                        "message_indices": [2, 3, 4, 7, 7],
+                        "date": "2026-02-02",
+                        "first_date": "2026-02-01",
+                        "latest_date": "2026-02-03",
+                    },
+                    {
+                        "conversation": "events/tea_party",
+                        "message_index": 10,
+                        "message_indices": [9, 10],
+                        "date": "2026-02-05",
+                    },
+                ],
+                "undated": [
+                    {
+                        "conversation": "notes/undated",
+                        "message_index": 5,
+                        "message_indices": [5],
+                    }
+                ],
+            }
+        }
+    )
+
+    assert summary["schema"]["thread_overview_version"] == 2
+    rows = {row["label"]: row for row in summary["thread_overview"]["threads"]}
+    planning = rows["planning"]["conversation_breakdown"][0]
+    assert planning["message_count"] == 6
+    assert planning["message_ranges"] == [
+        {"start": 2, "end": 4},
+        {"start": 7, "end": 7},
+        {"start": 9, "end": 10},
+    ]
+    assert planning["first_date"] == "2026-02-01"
+    assert planning["latest_date"] == "2026-02-05"
+    undated = rows["undated"]["conversation_breakdown"][0]
+    assert undated["message_ranges"] == [{"start": 5, "end": 5}]
+    assert undated["first_date"] == ""
+    assert undated["latest_date"] == ""
 
 
 def test_read_summary_migrates_legacy_repo_root_summary(monkeypatch, tmp_path):

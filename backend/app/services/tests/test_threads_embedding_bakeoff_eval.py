@@ -80,18 +80,22 @@ def test_threads_embedding_bakeoff_writes_eval_artifacts_not_live_summary(tmp_pa
     for model_slug in ("hash-16", "hash-32"):
         summary_path = run_dir / f"threads_summary__{model_slug}.json"
         response_path = run_dir / f"response__{model_slug}.json"
+        attribution_path = run_dir / f"source_attribution__{model_slug}.json"
         assert summary_path.exists()
         assert response_path.exists()
+        assert attribution_path.exists()
         response = json.loads(response_path.read_text(encoding="utf-8"))
         assert response["status"] == "ok"
         assert response["thread_count"] >= 1
         assert response["structural_metrics"]["structural_score"] is not None
+        assert response["source_attribution"]["complete"] is True
+        assert response["source_attribution_path"].endswith(attribution_path.name)
 
     report = (run_dir / "report.md").read_text(encoding="utf-8")
     assert "## Ranking Signal" in report
     readable = (run_dir / "readable_report.md").read_text(encoding="utf-8")
     assert "Readable Masked Report" in readable
-    assert "chat_01:" in readable
+    assert "chat_01 [messages" in readable
 
 
 def test_threads_embedding_bakeoff_can_freeze_source_conversations(tmp_path):
@@ -213,6 +217,10 @@ def test_threads_embedding_bakeoff_can_freeze_source_conversations(tmp_path):
     assert len(frozen_messages) == 2
     assert frozen_messages[0]["content"].startswith("Topic threads mixed")
     assert frozen_messages[1]["content"].startswith("Sync approval")
+    assert [message["source_message_index"] for message in frozen_messages] == [
+        2,
+        3,
+    ]
 
     spec = json.loads((run_dir / "run_spec.json").read_text(encoding="utf-8"))
     assert spec["corpus"]["conversation_count"] == 1
@@ -223,6 +231,10 @@ def test_threads_embedding_bakeoff_can_freeze_source_conversations(tmp_path):
     assert spec["corpus_freeze"]["files"][0]["source_path"] == "recent/alpha.json"
     assert spec["corpus_freeze"]["files"][0]["frozen_message_count"] == 2
     assert spec["corpus_freeze"]["files"][0]["truncated"] is True
+    assert spec["corpus_freeze"]["files"][0]["retained_source_message_indices"] == [
+        2,
+        3,
+    ]
 
     with (run_dir / "summary.csv").open("r", encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
@@ -230,6 +242,25 @@ def test_threads_embedding_bakeoff_can_freeze_source_conversations(tmp_path):
     assert rows[0]["status"] == "ok"
     assert rows[0]["score"] == ""
     assert rows[0]["structural_score"]
+    assert rows[0]["attribution_complete"] == "True"
+    assert rows[0]["attributed_thread_count"]
+    assert rows[0]["missing_attribution_count"] == "0"
+
+    response = json.loads(
+        (run_dir / "response__hash-16.json").read_text(encoding="utf-8")
+    )
+    attribution_path = run_dir / "source_attribution__hash-16.json"
+    receipt = json.loads(attribution_path.read_text(encoding="utf-8"))
+    assert response["source_attribution_path"].endswith(attribution_path.name)
+    assert receipt["receipt_profile"] == "threads_source_attribution_masked_v1"
+    assert receipt["complete"] is True
+    assert receipt["threads"]
+    assert receipt["threads"][0]["sources"][0]["source_ref"] == "chat_01"
+    assert receipt["threads"][0]["sources"][0]["evidence_ranges"]
+    serialized_receipt = json.dumps(receipt, sort_keys=True)
+    assert str(source.resolve()) not in serialized_receipt
+    assert "recent/alpha" not in serialized_receipt
+    assert "Topic threads mixed" not in serialized_receipt
 
     template = json.loads(template_path.read_text(encoding="utf-8"))
     assert template["expected_topics"] == []
@@ -284,6 +315,80 @@ def test_threads_embedding_bakeoff_can_select_legible_source_conversations(tmp_p
     assert freeze.manifest["selection"] == "legible"
     assert freeze.manifest["files"][0]["source_path"] == "older_rich.json"
     assert freeze.manifest["files"][0]["selection_score"] > 0
+
+
+def test_threads_embedding_bakeoff_corpus_nuggets_preserve_source_indices(tmp_path):
+    module = _load_runner_module()
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "sample.json").write_text(
+        json.dumps(
+            [
+                {
+                    "content": "created-at message",
+                    "created_at": "2026-07-10T10:00:00Z",
+                    "source_message_index": 7,
+                },
+                "raw string message",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    nuggets = module._corpus_nuggets(corpus)
+
+    assert [item["message_index"] for item in nuggets] == [7, 1]
+    assert [item["date"] for item in nuggets] == ["2026-07-10", ""]
+
+
+@pytest.mark.parametrize(
+    ("conversation", "message_ranges", "expected_complete"),
+    [
+        ("secret/private_name", [{"start": 0, "end": 0}], False),
+        ("sample", [], False),
+        ("sample", [{"start": 0, "end": 0}], True),
+    ],
+)
+def test_threads_source_attribution_receipt_never_falls_back_to_raw_source(
+    conversation,
+    message_ranges,
+    expected_complete,
+):
+    module = _load_runner_module()
+    run_spec = {
+        "corpus": {
+            "sha256": "corpus-digest",
+            "files": [{"path": "sample.json", "sha256": "file-digest"}],
+        }
+    }
+    summary = {
+        "thread_overview": {
+            "threads": [
+                {
+                    "item_count": 1,
+                    "conversation_breakdown": [
+                        {
+                            "conversation": conversation,
+                            "message_count": 1,
+                            "message_ranges": message_ranges,
+                            "first_date": "",
+                            "latest_date": "",
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+
+    receipt = module._source_attribution_receipt(summary, run_spec=run_spec)
+
+    assert receipt["complete"] is expected_complete
+    source = receipt["threads"][0]["sources"][0]
+    assert source["source_ref"] in {"chat_01", "[unmapped-source]"}
+    serialized = json.dumps(receipt, sort_keys=True)
+    assert "secret/private_name" not in serialized
+    if expected_complete:
+        assert receipt["dated_source_count"] == 0
 
 
 def test_threads_embedding_bakeoff_openai_embedding_spec_batches(monkeypatch):
@@ -632,3 +737,76 @@ def test_threads_embedding_bakeoff_scores_source_with_expected_topics_file(tmp_p
     assert rows[0]["score"]
     assert rows[0]["topic_body_coverage"]
     assert rows[0]["structural_score"]
+
+
+@pytest.mark.parametrize(
+    ("expected_topics", "expected_status"),
+    [
+        ([{"id": "missing", "terms": ["missing"]}], "error"),
+        ([], "ok"),
+    ],
+)
+def test_threads_embedding_bakeoff_records_missing_attribution(
+    tmp_path,
+    monkeypatch,
+    expected_topics,
+    expected_status,
+):
+    module = _load_runner_module()
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "sample.json").write_text(
+        json.dumps([{"content": "private sentinel"}]),
+        encoding="utf-8",
+    )
+
+    def fake_generate_threads(**_kwargs):
+        return {
+            "threads": {
+                "private generated label": [
+                    {
+                        "conversation": "",
+                        "message_index": None,
+                        "excerpt": "private sentinel",
+                    }
+                ]
+            },
+            "thread_overview": {
+                "total_threads": 1,
+                "threads": [
+                    {
+                        "label": "private generated label",
+                        "item_count": 1,
+                        "conversation_count": 0,
+                        "message_count": 0,
+                        "conversation_breakdown": [],
+                    }
+                ],
+            },
+            "cluster_count": 1,
+            "metadata": {},
+        }
+
+    monkeypatch.setattr(
+        module.threads_service, "generate_threads", fake_generate_threads
+    )
+    result = module.run_bakeoff(
+        corpus_dir=corpus,
+        models=["hash:16"],
+        run_root=tmp_path / "runs",
+        run_id=f"missing-attribution-{expected_status}",
+        infer_topics=False,
+        expected_topics=expected_topics,
+    )
+
+    response = result["responses"][0]
+    assert response["status"] == expected_status
+    assert response["source_attribution"]["complete"] is False
+    receipt_path = Path(response["source_attribution_path"])
+    assert receipt_path.exists()
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["status"] == "fail"
+    assert receipt["missing_attribution_count"] == 1
+    serialized = json.dumps(receipt, sort_keys=True)
+    assert "private generated label" not in serialized
+    assert "private sentinel" not in serialized

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Set
 
@@ -10,9 +9,6 @@ from app import config as app_config
 
 WORKFLOW_DEFAULT = "default"
 SKILL_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
-PACK_ID_PATTERN = re.compile(r"^[a-z0-9_.-]+$")
-MAX_MODULE_PACK_FILE_BYTES = 5 * 1024 * 1024
-MAX_MODULE_PACK_TOTAL_BYTES = 50 * 1024 * 1024
 
 BUILTIN_WORKFLOWS: Dict[str, Dict[str, Any]] = {
     "default": {
@@ -280,249 +276,25 @@ def addon_roots() -> List[Path]:
     return [repo_addons_root(), addons_root()]
 
 
-def normalize_pack_id(value: str | None) -> str:
-    raw = str(value or "").strip().lower().replace("\\", "/")
-    if "/" in raw:
-        raw = raw.rsplit("/", 1)[-1]
-    raw = re.sub(r"\s+", "_", raw)
-    raw = re.sub(r"[^a-z0-9_.-]+", "_", raw)
-    raw = re.sub(r"_+", "_", raw).strip("._-")
-    return raw[:120] if PACK_ID_PATTERN.fullmatch(raw[:120] or "") else ""
-
-
-def _reject_traversal_text(value: str | None) -> None:
-    raw = str(value or "")
-    parts = [part for part in raw.replace("\\", "/").split("/") if part]
-    if any(part == ".." for part in parts):
-        raise ValueError("Paths containing '..' are not allowed.")
-
-
-def _resolve_user_path(value: str | None, *, must_exist: bool = False) -> Path:
-    raw = str(value or "").strip()
-    if not raw:
-        raise ValueError("Path is required.")
-    _reject_traversal_text(raw)
-    candidate = Path(raw)
-    if not candidate.is_absolute():
-        candidate = app_config.REPO_ROOT / candidate
-    resolved = candidate.resolve()
-    if must_exist and not resolved.exists():
-        raise ValueError("Path does not exist.")
-    return resolved
-
-
-def _safe_child_path(root: Path, *parts: str) -> Path:
-    root_resolved = root.resolve()
-    target = root_resolved.joinpath(*parts).resolve()
-    try:
-        target.relative_to(root_resolved)
-    except Exception as exc:
-        raise ValueError("Resolved path escapes the target root.") from exc
-    return target
-
-
-def _display_path(path: Path) -> str:
-    try:
-        return path.resolve().relative_to(app_config.REPO_ROOT.resolve()).as_posix()
-    except Exception:
-        return str(path)
-
-
-def _load_json_object(path: Path) -> Dict[str, Any]:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise ValueError(f"Unable to read JSON from {path.name}.") from exc
-    if not isinstance(payload, dict):
-        raise ValueError("config.json must contain a JSON object.")
-    return payload
-
-
-def _iter_addon_config_paths(root: Path) -> Iterable[Path]:
-    if not root.exists():
-        return []
-    paths: List[Path] = []
-    for path in sorted(root.iterdir()):
-        if path.is_dir():
-            config_path = path / "config.json"
-            if config_path.is_file():
-                paths.append(config_path)
-        elif path.is_file() and path.suffix.lower() == ".json":
-            # Legacy migration compatibility. New packages should use
-            # {addon}/config.json so assets and skills can travel with config.
-            paths.append(path)
-    return paths
-
-
-def _addon_package_path(config_path: Path) -> Path:
-    return (
-        config_path.parent if config_path.name == "config.json" else config_path.parent
-    )
-
-
-def _normalize_addon_config(
-    payload: Dict[str, Any],
-    *,
-    fallback_id: str,
-) -> Dict[str, Any]:
-    addon_id = normalize_pack_id(str(payload.get("id") or fallback_id))
-    if not addon_id:
-        raise ValueError(
-            "Add-on id must contain letters, numbers, dot, dash, or underscore."
-        )
-    normalized: Dict[str, Any] = dict(payload)
-    normalized["id"] = addon_id
-    if not str(normalized.get("label") or "").strip():
-        normalized["label"] = addon_id.replace("_", " ").replace("-", " ").title()
-    if not str(normalized.get("status") or "").strip():
-        normalized["status"] = "available"
-
-    module_candidates: List[Any] = []
-    if isinstance(payload.get("modules"), list):
-        module_candidates.extend(payload.get("modules") or [])
-    elif payload.get("modules") is not None:
-        raise ValueError("config.json field 'modules' must be a list when present.")
-    if isinstance(payload.get("module"), dict):
-        module_candidates.append(payload.get("module"))
-    elif payload.get("module") is not None:
-        raise ValueError("config.json field 'module' must be an object when present.")
-
-    modules: List[Dict[str, Any]] = []
-    seen_modules: Set[str] = set()
-    for candidate in module_candidates:
-        if not isinstance(candidate, dict):
-            raise ValueError("Each module entry in config.json must be an object.")
-        module_id = normalize_pack_id(str(candidate.get("id") or ""))
-        if not module_id:
-            raise ValueError("Each module entry must include a valid id.")
-        if module_id in seen_modules:
-            raise ValueError(f"Duplicate module id: {module_id}")
-        seen_modules.add(module_id)
-        module_payload = dict(candidate)
-        module_payload["id"] = module_id
-        module_payload["skill_id"] = normalize_pack_id(
-            str(candidate.get("skill_id") or module_id)
-        )
-        if not module_payload["skill_id"]:
-            raise ValueError(f"Module {module_id} has an invalid skill_id.")
-        module_payload["tool_names"] = _coerce_tool_names(candidate.get("tool_names"))
-        modules.append(module_payload)
-
-    if module_candidates:
-        normalized["modules"] = modules
-    normalized.pop("module", None)
-    return normalized
-
-
-def _declared_skill_ids(addon_config: Dict[str, Any]) -> Set[str]:
-    ids: Set[str] = set()
-    for module in addon_config.get("modules") or []:
-        if not isinstance(module, dict):
-            continue
-        skill_id = normalize_pack_id(
-            str(module.get("skill_id") or module.get("id") or "")
-        )
-        if skill_id:
-            ids.add(skill_id)
-    return ids
-
-
-def _collect_pack_files(source_root: Path) -> List[Dict[str, Any]]:
-    if not source_root.is_dir():
-        raise ValueError("Module pack source must be a folder.")
-    files: List[Dict[str, Any]] = []
-    total_size = 0
-    for path in sorted(source_root.rglob("*")):
-        if path.is_symlink():
-            raise ValueError("Symlinks are not supported in module or skill packs.")
-        if not path.is_file():
-            continue
-        resolved = path.resolve()
-        try:
-            rel_path = resolved.relative_to(source_root.resolve())
-        except Exception as exc:
-            raise ValueError("Pack file escapes the source folder.") from exc
-        if any(part in {"", ".", ".."} for part in rel_path.parts):
-            raise ValueError("Invalid pack file path.")
-        stat = resolved.stat()
-        size_bytes = int(stat.st_size)
-        if size_bytes > MAX_MODULE_PACK_FILE_BYTES:
-            raise ValueError(f"Pack file is too large: {rel_path.as_posix()}")
-        total_size += size_bytes
-        if total_size > MAX_MODULE_PACK_TOTAL_BYTES:
-            raise ValueError("Module pack is too large.")
-        files.append(
-            {
-                "relative_path": rel_path.as_posix(),
-                "source_path": str(resolved),
-                "size_bytes": size_bytes,
-            }
-        )
-    return files
-
-
-def _is_addon_skill_markdown(relative_path: str, declared_ids: Set[str]) -> bool:
-    path = Path(relative_path)
-    if path.suffix.lower() != ".md":
-        return False
-    if path.name.lower() == "readme.md":
-        return False
-    if path.parts and path.parts[0].lower() == "skills":
-        return True
-    return normalize_pack_id(path.stem) in declared_ids
-
-
-def _skill_summary_from_file(path: Path) -> str:
-    try:
-        return _skill_summary_from_text(
-            path.read_text(encoding="utf-8", errors="ignore")
-        )
-    except Exception:
-        return ""
-
-
-def _copy_operations_payload(operations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [
-        {
-            "relative_path": str(item.get("relative_path") or ""),
-            "source_path": str(item.get("source_path") or ""),
-            "destination_path": str(item.get("destination_path") or ""),
-            "size_bytes": int(item.get("size_bytes") or 0),
-            **({"kind": item["kind"]} if item.get("kind") else {}),
-            **({"skill_id": item["skill_id"]} if item.get("skill_id") else {}),
-            **(
-                {"will_overwrite": bool(item["will_overwrite"])}
-                if "will_overwrite" in item
-                else {}
-            ),
-        }
-        for item in operations
-    ]
-
-
 def list_addons() -> List[Dict[str, Any]]:
     entries_by_id: Dict[str, Dict[str, Any]] = {}
     for source, root in (("repo", repo_addons_root()), ("local", addons_root())):
-        for path in _iter_addon_config_paths(root):
+        for path in sorted(root.iterdir()):
+            if not path.is_file() or path.suffix.lower() not in {".json"}:
+                continue
             try:
-                payload = _load_json_object(path)
-                addon_id = normalize_pack_id(
-                    str(payload.get("id") or path.parent.name or path.stem)
-                )
+                payload = json.loads(path.read_text(encoding="utf-8"))
             except Exception:
                 payload = {}
-                addon_id = normalize_pack_id(path.parent.name or path.stem)
-            if not addon_id:
-                continue
-            package_path = _addon_package_path(path)
+            if not isinstance(payload, dict):
+                payload = {}
+            addon_id = str(payload.get("id") or path.stem)
             entries_by_id[addon_id] = {
                 "id": addon_id,
-                "label": str(payload.get("label") or addon_id),
+                "label": str(payload.get("label") or path.stem),
                 "description": str(payload.get("description") or "").strip(),
                 "status": str(payload.get("status") or "available"),
                 "path": str(path),
-                "config_path": str(path),
-                "package_path": str(package_path),
                 "source": source,
             }
     return sorted(entries_by_id.values(), key=lambda item: item["id"])
@@ -548,12 +320,8 @@ def _iter_addon_module_entries(
     source: str,
     path: Path,
 ) -> Iterable[Dict[str, Any]]:
-    addon_id = normalize_pack_id(
-        str(payload.get("id") or path.parent.name or path.stem)
-    )
-    if not addon_id:
-        return
-    addon_label = str(payload.get("label") or addon_id).strip() or addon_id
+    addon_id = str(payload.get("id") or path.stem).strip() or path.stem
+    addon_label = str(payload.get("label") or path.stem).strip() or path.stem
     candidates: List[Any] = []
     if isinstance(payload.get("modules"), list):
         candidates.extend(payload.get("modules") or [])
@@ -562,11 +330,11 @@ def _iter_addon_module_entries(
     for candidate in candidates:
         if not isinstance(candidate, dict):
             continue
-        module_id = normalize_pack_id(str(candidate.get("id") or ""))
+        module_id = str(candidate.get("id") or "").strip()
         if not module_id:
             continue
         label = str(candidate.get("label") or module_id.replace("_", " ")).strip()
-        skill_id = normalize_pack_id(str(candidate.get("skill_id") or module_id))
+        skill_id = str(candidate.get("skill_id") or module_id).strip()
         yield {
             "id": module_id,
             "label": label or module_id,
@@ -578,30 +346,22 @@ def _iter_addon_module_entries(
             "tool_names": _coerce_tool_names(candidate.get("tool_names")),
             "source": source,
             "source_path": str(path),
-            "config_path": str(path),
-            "package_path": str(_addon_package_path(path)),
             "addon_id": addon_id,
             "addon_label": addon_label,
-            "config": (
-                candidate.get("config")
-                if isinstance(candidate.get("config"), dict)
-                else {}
-            ),
-            "assets": (
-                candidate.get("assets")
-                if isinstance(candidate.get("assets"), list)
-                else []
-            ),
         }
 
 
 def list_custom_modules() -> List[Dict[str, Any]]:
     entries_by_id: Dict[str, Dict[str, Any]] = {}
     for root_source, root in (("repo", repo_addons_root()), ("custom", addons_root())):
-        for path in _iter_addon_config_paths(root):
+        for path in sorted(root.iterdir()):
+            if not path.is_file() or path.suffix.lower() != ".json":
+                continue
             try:
-                payload = _load_json_object(path)
+                payload = json.loads(path.read_text(encoding="utf-8"))
             except Exception:
+                payload = {}
+            if not isinstance(payload, dict):
                 continue
             for entry in _iter_addon_module_entries(
                 payload,
@@ -616,30 +376,13 @@ def _custom_module_ids() -> Set[str]:
     return {str(item.get("id") or "") for item in list_custom_modules()}
 
 
-def markdown_summary_from_text(text: str) -> str:
-    lines = text.splitlines()
-    start_index = 0
-    if lines and str(lines[0] or "").strip() == "---":
-        frontmatter_description = ""
-        for index, raw_line in enumerate(lines[1:], start=1):
-            line = str(raw_line or "").strip()
-            if line == "---":
-                start_index = index + 1
-                break
-            if line.lower().startswith("description:") and not frontmatter_description:
-                frontmatter_description = line.split(":", 1)[1].strip().strip("\"'")
-        if frontmatter_description:
-            return frontmatter_description
-    for raw_line in lines[start_index:]:
+def _skill_summary_from_text(text: str) -> str:
+    for raw_line in text.splitlines():
         line = str(raw_line or "").strip()
         if not line or line.startswith("#"):
             continue
         return line
     return ""
-
-
-def _skill_summary_from_text(text: str) -> str:
-    return markdown_summary_from_text(text)
 
 
 def _skill_entry_from_path(
@@ -767,415 +510,6 @@ def delete_local_skill_doc(skill_id: str | None) -> Dict[str, Any]:
     if payload is None:
         raise ValueError("Unable to read skill doc.")
     return payload
-
-
-def preview_import_addon_pack(
-    source_path: str | None,
-    *,
-    addon_id: str | None = None,
-    overwrite: bool = False,
-) -> Dict[str, Any]:
-    source_root = _resolve_user_path(source_path, must_exist=True)
-    if not source_root.is_dir():
-        raise ValueError("Module pack source must be a folder.")
-    config_path = source_root / "config.json"
-    if not config_path.is_file():
-        raise ValueError("Module pack must include config.json at the folder root.")
-    payload = _load_json_object(config_path)
-    normalized_id = normalize_pack_id(
-        str(addon_id or payload.get("id") or source_root.name)
-    )
-    normalized_config = _normalize_addon_config(payload, fallback_id=normalized_id)
-    normalized_id = str(normalized_config["id"])
-    target_root = _safe_child_path(addons_root(), normalized_id)
-    files = _collect_pack_files(source_root)
-    declared_ids = _declared_skill_ids(normalized_config)
-    local_skill_root = local_skills_root()
-    operations: List[Dict[str, Any]] = []
-    skill_operations: List[Dict[str, Any]] = []
-
-    for file_info in files:
-        rel_path = str(file_info["relative_path"])
-        source_file = Path(str(file_info["source_path"]))
-        destination = _safe_child_path(target_root, *Path(rel_path).parts)
-        operation = {
-            **file_info,
-            "destination_path": str(destination),
-            "kind": "config" if rel_path == "config.json" else "file",
-            "will_overwrite": destination.exists(),
-        }
-        operations.append(operation)
-        if _is_addon_skill_markdown(rel_path, declared_ids):
-            skill_id = normalize_pack_id(source_file.stem)
-            if not skill_id:
-                raise ValueError(f"Invalid skill markdown filename: {rel_path}")
-            skill_target = _safe_child_path(local_skill_root, f"{skill_id}.md")
-            skill_operations.append(
-                {
-                    "relative_path": f"{skill_id}.md",
-                    "source_path": str(source_file),
-                    "destination_path": str(skill_target),
-                    "size_bytes": int(file_info.get("size_bytes") or 0),
-                    "kind": "skill",
-                    "skill_id": skill_id,
-                    "summary": _skill_summary_from_file(source_file),
-                    "will_overwrite": skill_target.exists(),
-                }
-            )
-
-    target_exists = target_root.exists()
-    blocking_targets = [
-        item
-        for item in [*operations, *skill_operations]
-        if item.get("will_overwrite") and not overwrite
-    ]
-    target_blocked = target_exists and not overwrite
-    warnings: List[str] = []
-    if target_blocked:
-        warnings.append(
-            "The destination add-on folder already exists; set overwrite=true to replace it."
-        )
-    if blocking_targets:
-        warnings.append(
-            "Existing files would be overwritten; set overwrite=true to apply."
-        )
-    return {
-        "status": "preview",
-        "type": "module_pack",
-        "dry_run": True,
-        "overwrite": bool(overwrite),
-        "source_path": str(source_root),
-        "destination_path": str(target_root),
-        "target_exists": target_exists,
-        "addon": {
-            "id": normalized_id,
-            "label": str(normalized_config.get("label") or normalized_id),
-            "status": str(normalized_config.get("status") or "available"),
-            "module_ids": [
-                str(module.get("id"))
-                for module in (normalized_config.get("modules") or [])
-                if isinstance(module, dict) and module.get("id")
-            ],
-            "skill_ids": sorted(declared_ids),
-            "config": normalized_config,
-        },
-        "files": _copy_operations_payload(operations),
-        "skill_docs": _copy_operations_payload(skill_operations),
-        "file_count": len(operations),
-        "skill_doc_count": len(skill_operations),
-        "total_bytes": sum(int(item.get("size_bytes") or 0) for item in operations),
-        "would_overwrite": target_exists
-        or any(item.get("will_overwrite") for item in skill_operations),
-        "can_write": not blocking_targets and not target_blocked,
-        "warnings": warnings,
-    }
-
-
-def import_addon_pack(
-    source_path: str | None,
-    *,
-    addon_id: str | None = None,
-    dry_run: bool = True,
-    overwrite: bool = False,
-) -> Dict[str, Any]:
-    preview = preview_import_addon_pack(
-        source_path,
-        addon_id=addon_id,
-        overwrite=overwrite,
-    )
-    if dry_run:
-        return preview
-    if not preview.get("can_write"):
-        raise ValueError("Import would overwrite existing files; set overwrite=true.")
-
-    target_root = Path(str(preview["destination_path"]))
-    if target_root.exists():
-        if not overwrite:
-            raise ValueError("Module pack already exists; set overwrite=true.")
-        try:
-            target_root.relative_to(addons_root().resolve())
-        except Exception as exc:
-            raise ValueError(
-                "Refusing to replace a folder outside data/modules/addons."
-            ) from exc
-        shutil.rmtree(target_root)
-    target_root.mkdir(parents=True, exist_ok=True)
-
-    normalized_config = preview["addon"]["config"]
-    for item in preview.get("files") or []:
-        source_file = Path(str(item.get("source_path") or ""))
-        destination = Path(str(item.get("destination_path") or ""))
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if str(item.get("relative_path") or "") == "config.json":
-            destination.write_text(
-                json.dumps(normalized_config, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
-        else:
-            shutil.copy2(source_file, destination)
-
-    local_skill_root = local_skills_root()
-    local_skill_root.mkdir(parents=True, exist_ok=True)
-    for item in preview.get("skill_docs") or []:
-        destination = Path(str(item.get("destination_path") or ""))
-        try:
-            destination.resolve().relative_to(local_skill_root.resolve())
-        except Exception as exc:
-            raise ValueError(
-                "Refusing to write skill outside data/modules/skills."
-            ) from exc
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(Path(str(item.get("source_path") or "")), destination)
-
-    result = preview_import_addon_pack(
-        source_path,
-        addon_id=addon_id,
-        overwrite=True,
-    )
-    result["status"] = "imported"
-    result["dry_run"] = False
-    return result
-
-
-def preview_export_addon_pack(
-    addon_id: str | None,
-    destination_path: str | None,
-    *,
-    overwrite: bool = False,
-) -> Dict[str, Any]:
-    normalized_id = normalize_pack_id(addon_id)
-    if not normalized_id:
-        raise ValueError("Invalid add-on id.")
-    source_root = _safe_child_path(addons_root(), normalized_id)
-    config_path = source_root / "config.json"
-    if not config_path.is_file():
-        raise ValueError(
-            "Only local add-on packs under data/modules/addons can be exported."
-        )
-    destination_root = _resolve_user_path(destination_path, must_exist=False)
-    if destination_root.exists() and destination_root.is_file():
-        raise ValueError("Export destination must be a folder.")
-    target_root = _safe_child_path(destination_root, normalized_id)
-    payload = _normalize_addon_config(
-        _load_json_object(config_path),
-        fallback_id=normalized_id,
-    )
-    files = _collect_pack_files(source_root)
-    operations: List[Dict[str, Any]] = []
-    for file_info in files:
-        rel_path = str(file_info["relative_path"])
-        destination = _safe_child_path(target_root, *Path(rel_path).parts)
-        operations.append(
-            {
-                **file_info,
-                "destination_path": str(destination),
-                "kind": "config" if rel_path == "config.json" else "file",
-                "will_overwrite": destination.exists(),
-            }
-        )
-
-    skill_operations: List[Dict[str, Any]] = []
-    for skill_id in sorted(_declared_skill_ids(payload)):
-        source_file = _safe_child_path(local_skills_root(), f"{skill_id}.md")
-        if not source_file.is_file():
-            continue
-        destination = _safe_child_path(target_root, "skills", f"{skill_id}.md")
-        skill_operations.append(
-            {
-                "relative_path": f"skills/{skill_id}.md",
-                "source_path": str(source_file),
-                "destination_path": str(destination),
-                "size_bytes": int(source_file.stat().st_size),
-                "kind": "skill",
-                "skill_id": skill_id,
-                "summary": _skill_summary_from_file(source_file),
-                "will_overwrite": destination.exists(),
-            }
-        )
-
-    blocking_targets = [
-        item
-        for item in [*operations, *skill_operations]
-        if item.get("will_overwrite") and not overwrite
-    ]
-    return {
-        "status": "preview",
-        "type": "module_pack",
-        "dry_run": True,
-        "overwrite": bool(overwrite),
-        "source_path": str(source_root),
-        "destination_path": str(target_root),
-        "target_exists": target_root.exists(),
-        "addon": {
-            "id": normalized_id,
-            "label": str(payload.get("label") or normalized_id),
-            "status": str(payload.get("status") or "available"),
-            "module_ids": [
-                str(module.get("id"))
-                for module in (payload.get("modules") or [])
-                if isinstance(module, dict) and module.get("id")
-            ],
-            "skill_ids": sorted(_declared_skill_ids(payload)),
-            "config": payload,
-        },
-        "files": _copy_operations_payload(operations),
-        "skill_docs": _copy_operations_payload(skill_operations),
-        "file_count": len(operations),
-        "skill_doc_count": len(skill_operations),
-        "total_bytes": sum(
-            int(item.get("size_bytes") or 0)
-            for item in [*operations, *skill_operations]
-        ),
-        "would_overwrite": any(
-            item.get("will_overwrite") for item in [*operations, *skill_operations]
-        ),
-        "can_write": not blocking_targets,
-        "warnings": (
-            ["Existing files would be overwritten; set overwrite=true to apply."]
-            if blocking_targets
-            else []
-        ),
-    }
-
-
-def export_addon_pack(
-    addon_id: str | None,
-    destination_path: str | None,
-    *,
-    dry_run: bool = True,
-    overwrite: bool = False,
-) -> Dict[str, Any]:
-    preview = preview_export_addon_pack(
-        addon_id,
-        destination_path,
-        overwrite=overwrite,
-    )
-    if dry_run:
-        return preview
-    if not preview.get("can_write"):
-        raise ValueError("Export would overwrite existing files; set overwrite=true.")
-    for item in preview.get("files") or []:
-        source_file = Path(str(item.get("source_path") or ""))
-        destination = Path(str(item.get("destination_path") or ""))
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source_file, destination)
-    for item in preview.get("skill_docs") or []:
-        source_file = Path(str(item.get("source_path") or ""))
-        destination = Path(str(item.get("destination_path") or ""))
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source_file, destination)
-    result = preview_export_addon_pack(
-        addon_id,
-        destination_path,
-        overwrite=True,
-    )
-    result["status"] = "exported"
-    result["dry_run"] = False
-    return result
-
-
-def import_skill_markdown(
-    source_path: str | None,
-    *,
-    skill_id: str | None = None,
-    dry_run: bool = True,
-    overwrite: bool = False,
-) -> Dict[str, Any]:
-    source_file = _resolve_user_path(source_path, must_exist=True)
-    if not source_file.is_file() or source_file.suffix.lower() != ".md":
-        raise ValueError("Skill import source must be a markdown file.")
-    normalized_id = normalize_pack_id(str(skill_id or source_file.stem))
-    if not normalized_id:
-        raise ValueError("Invalid skill id.")
-    target = _safe_child_path(local_skills_root(), f"{normalized_id}.md")
-    will_overwrite = target.exists()
-    preview = {
-        "status": "preview",
-        "type": "skill",
-        "dry_run": True,
-        "overwrite": bool(overwrite),
-        "skill_id": normalized_id,
-        "source_path": str(source_file),
-        "destination_path": str(target),
-        "summary": _skill_summary_from_file(source_file),
-        "size_bytes": int(source_file.stat().st_size),
-        "would_overwrite": will_overwrite,
-        "can_write": overwrite or not will_overwrite,
-        "warnings": (
-            [
-                "Existing skill markdown would be overwritten; set overwrite=true to apply."
-            ]
-            if will_overwrite and not overwrite
-            else []
-        ),
-    }
-    if dry_run:
-        return preview
-    if will_overwrite and not overwrite:
-        raise ValueError("Skill already exists; set overwrite=true.")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source_file, target)
-    preview["status"] = "imported"
-    preview["dry_run"] = False
-    preview["would_overwrite"] = target.exists()
-    preview["can_write"] = True
-    return preview
-
-
-def export_skill_markdown(
-    skill_id: str | None,
-    destination_path: str | None,
-    *,
-    dry_run: bool = True,
-    overwrite: bool = False,
-) -> Dict[str, Any]:
-    normalized_id = normalize_pack_id(skill_id)
-    if not normalized_id:
-        raise ValueError("Invalid skill id.")
-    source_file = _safe_child_path(local_skills_root(), f"{normalized_id}.md")
-    if not source_file.is_file():
-        raise ValueError(
-            "Only local skill markdown under data/modules/skills can be exported."
-        )
-    destination = _resolve_user_path(destination_path, must_exist=False)
-    target = (
-        destination
-        if destination.suffix.lower() == ".md"
-        else destination / f"{normalized_id}.md"
-    )
-    _reject_traversal_text(str(target))
-    will_overwrite = target.exists()
-    preview = {
-        "status": "preview",
-        "type": "skill",
-        "dry_run": True,
-        "overwrite": bool(overwrite),
-        "skill_id": normalized_id,
-        "source_path": str(source_file),
-        "destination_path": str(target),
-        "summary": _skill_summary_from_file(source_file),
-        "size_bytes": int(source_file.stat().st_size),
-        "would_overwrite": will_overwrite,
-        "can_write": overwrite or not will_overwrite,
-        "warnings": (
-            [
-                "Existing skill markdown would be overwritten; set overwrite=true to apply."
-            ]
-            if will_overwrite and not overwrite
-            else []
-        ),
-    }
-    if dry_run:
-        return preview
-    if will_overwrite and not overwrite:
-        raise ValueError("Export would overwrite an existing file; set overwrite=true.")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source_file, target)
-    preview["status"] = "exported"
-    preview["dry_run"] = False
-    preview["would_overwrite"] = target.exists()
-    preview["can_write"] = True
-    return preview
 
 
 def _module_catalog_entry(

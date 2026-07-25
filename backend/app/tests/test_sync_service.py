@@ -16,7 +16,10 @@ def test_destination_management(tmp_path):
 
 def test_jwt_authentication(tmp_path):
     cfg = tmp_path / "dest.json"
-    svc = SyncService(secret_key="another", config_path=cfg)
+    svc = SyncService(
+        secret_key="test-sync-secret-key-at-least-32-bytes",
+        config_path=cfg,
+    )
 
     token = svc.generate_token({"sub": "tester"})
     payload = svc.verify_token(token)
