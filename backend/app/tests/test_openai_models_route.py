@@ -192,7 +192,7 @@ def test_openai_models_route_reports_latest_alias_metadata(monkeypatch):
     }
 
 
-def test_openai_models_route_hides_deprecated_models_from_new_selection(monkeypatch):
+def test_openai_models_route_hides_removed_models_from_new_selection(monkeypatch):
     from app.routers import model_catalog
 
     class DummyResponse:
@@ -230,7 +230,7 @@ def test_openai_models_route_hides_deprecated_models_from_new_selection(monkeypa
         "gpt-5-chat-latest",
     ]
     assert payload["selectable_models"] == ["chat-latest", "gpt-5.4-mini"]
-    assert payload["selection"]["status"] == "deprecated"
+    assert payload["selection"]["status"] == "removed"
     assert payload["migration"] == {
         "from": "gpt-5-chat-latest",
         "to": "gpt-5.5",

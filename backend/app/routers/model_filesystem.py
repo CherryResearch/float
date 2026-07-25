@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import errno
 import hashlib
-import os
 import shutil
 import subprocess
 import sys
@@ -765,7 +764,7 @@ async def reveal_model_directory(
         elif sys.platform == "darwin":
             subprocess.Popen(["open", str(open_target)])
             opened = True
-        elif os.name == "nt":
+        elif sys.platform.startswith("win"):
             subprocess.Popen(["explorer.exe", f"/select,{str(open_target)}"])
             opened = True
     except Exception:

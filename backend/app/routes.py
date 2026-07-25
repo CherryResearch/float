@@ -17,7 +17,7 @@ import threading
 import textwrap
 import zipfile
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, Iterable, List, Optional, Literal, Union
 
 import socket
@@ -14597,7 +14597,10 @@ def _is_external_knowledge_source(metadata: Dict[str, Any]) -> bool:
     rel = _infer_relative_from_source(source_text, _resolve_data_files_root())
     if rel:
         return False
-    return Path(source_text).expanduser().is_absolute()
+    return (
+        Path(source_text).expanduser().is_absolute()
+        or PureWindowsPath(source_text).is_absolute()
+    )
 
 
 def _sanitize_knowledge_metadata_for_api(metadata: Dict[str, Any]) -> Dict[str, Any]:

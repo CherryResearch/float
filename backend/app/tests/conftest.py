@@ -65,6 +65,7 @@ def pytest_runtest_makereport(item, call):
 def pytest_sessionfinish(session, exitstatus):
     logs = getattr(session, "test_logs", [])
     conv_dir = getattr(session, "conversation_dir", CONV_ROOT)
+    conv_dir.mkdir(parents=True, exist_ok=True)
     (conv_dir / "summary.json").write_text(json.dumps(logs, indent=2))
 
 
