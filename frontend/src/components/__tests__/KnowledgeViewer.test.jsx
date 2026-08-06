@@ -108,4 +108,16 @@ describe("KnowledgeViewer", () => {
     );
     expect(screen.getByText("skills tab body")).toBeInTheDocument();
   });
+
+  it("lazy loads the graph explorer only on the visualizations tab", async () => {
+    render(
+      <MemoryRouter initialEntries={["/knowledge?tab=visualizations"]}>
+        <Routes>
+          <Route path="/knowledge" element={<KnowledgeViewer />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("visualizations tab body")).toBeInTheDocument();
+  });
 });

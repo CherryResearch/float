@@ -54,6 +54,19 @@ def test_search_web_missing_required_raises():
 
 
 def test_tool_decision_returns_structured_error_on_invalid_args(client):
+    from app.main import app
+
+    app.state.pending_tools = {
+        "bad-search": {
+            "id": "bad-search",
+            "name": "search_web",
+            "args": {"max_results": 3},
+            "session_id": "sess-test",
+            "message_id": "msg-test",
+            "chain_id": "msg-test",
+            "status": "proposed",
+        }
+    }
     payload = {
         "request_id": "bad-search",
         "decision": "accept",
@@ -61,6 +74,7 @@ def test_tool_decision_returns_structured_error_on_invalid_args(client):
         "args": {"max_results": 3},
         "session_id": "sess-test",
         "message_id": "msg-test",
+        "chain_id": "msg-test",
     }
     res = client.post("/api/tools/decision", json=payload)
     assert res.status_code == 200
@@ -284,7 +298,8 @@ def test_routes_suggest_memory_read_compatibility_names():
     from app.routes import _suggest_tool_names
 
     suggestions = _suggest_tool_names("memory.read")
-    assert suggestions[:3] == ["recall", "remember", "memory.save"]
+    assert suggestions[:2] == ["recall", "remember"]
+    assert "memory.save" not in suggestions
 
 
 def test_chat_context_schema_converts_to_service_context():

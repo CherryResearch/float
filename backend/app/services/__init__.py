@@ -17,6 +17,7 @@ from .reflection_service import ReflectionService, build_reflection_service
 from .stt_service import STTService
 from .sync_service import SyncService
 from .tts_service import TTSService
+from .work_run_store import WorkRunStore
 
 try:  # pragma: no cover - optional dependency
     from .rag_service import RAGService
@@ -42,6 +43,7 @@ __all__ = [
     "SyncService",
     "STTService",
     "TTSService",
+    "WorkRunStore",
     "parse_google_calendar",
     "parse_ics",
     "get_capture_service",

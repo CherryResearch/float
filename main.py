@@ -3,7 +3,9 @@
 
 import argparse
 import importlib.util
+import json
 import os
+import secrets
 import shutil
 import signal
 import socket
@@ -15,8 +17,42 @@ import webbrowser
 from urllib.parse import urlparse
 
 
-def _build_backend_cmd(port: int, host: str = "127.0.0.1") -> list[str]:
-    return [
+def _saved_lan_visibility(repo_root: str) -> bool:
+    """Read the runtime-owned LAN preference without importing the backend."""
+
+    settings_path = os.path.join(repo_root, "user_settings.json")
+    try:
+        with open(settings_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return False
+    return (
+        bool(payload.get("sync_visible_on_lan")) if isinstance(payload, dict) else False
+    )
+
+
+def _resolve_backend_host(
+    *,
+    repo_root: str,
+    explicit_host: str | None = None,
+    lan_mode: bool | None = None,
+) -> str:
+    """Resolve an explicit CLI choice before the saved sync preference."""
+
+    if lan_mode is True:
+        return "0.0.0.0"
+    if lan_mode is False:
+        return "127.0.0.1"
+    configured = str(explicit_host or "").strip()
+    if configured:
+        return configured
+    return "0.0.0.0" if _saved_lan_visibility(repo_root) else "127.0.0.1"
+
+
+def _build_backend_cmd(
+    port: int, host: str = "127.0.0.1", *, reload: bool = False
+) -> list[str]:
+    command = [
         sys.executable,
         "-m",
         "uvicorn",
@@ -25,8 +61,21 @@ def _build_backend_cmd(port: int, host: str = "127.0.0.1") -> list[str]:
         host,
         "--port",
         str(port),
-        "--reload",
     ]
+    if reload:
+        command.append("--reload")
+    return command
+
+
+def _backend_proxy_connect_host(bind_host: str) -> str:
+    """Choose an address the local Vite proxy can use for the backend bind."""
+
+    normalized = str(bind_host or "").strip().strip("[]")
+    if normalized in {"", "0.0.0.0"}:
+        return "127.0.0.1"
+    if normalized == "::":
+        return "::1"
+    return normalized
 
 
 def _build_worker_cmd() -> list[str]:
@@ -149,14 +198,28 @@ def main():
     )
     parser.add_argument(
         "--backend-host",
-        default=os.getenv("FLOAT_BACKEND_HOST", "127.0.0.1"),
-        help="Backend bind host (default: 127.0.0.1)",
+        default=None,
+        help=(
+            "Backend bind host override. Without an override, the saved "
+            "Visible on LAN preference selects 127.0.0.1 or 0.0.0.0."
+        ),
     )
-    parser.add_argument(
+    lan_group = parser.add_mutually_exclusive_group()
+    lan_group.add_argument(
         "--lan",
-        action="store_true",
+        dest="lan_mode",
+        action="store_const",
+        const=True,
         help="Bind the backend to 0.0.0.0 for explicit LAN/device access",
     )
+    lan_group.add_argument(
+        "--no-lan",
+        dest="lan_mode",
+        action="store_const",
+        const=False,
+        help="Bind the backend to 127.0.0.1 even when LAN visibility is saved on",
+    )
+    parser.set_defaults(lan_mode=None)
     parser.add_argument(
         "--frontend-port",
         type=int,
@@ -201,7 +264,10 @@ def main():
         "-dev",
         dest="dev_mode",
         action="store_true",
-        help="Enable dev mode for this run (sets FLOAT_DEV_MODE=true)",
+        help=(
+            "Enable the Dev Panel and backend source auto-reload for this run "
+            "(sets FLOAT_DEV_MODE=true)"
+        ),
     )
     parser.add_argument(
         "--backend-auto-restart",
@@ -273,9 +339,20 @@ def main():
     )
     args = parser.parse_args()
 
-    args.backend_host = str(args.backend_host or "127.0.0.1").strip()
-    if args.lan:
-        args.backend_host = "0.0.0.0"
+    basedir = os.path.dirname(os.path.abspath(__file__))
+    explicit_backend_host = str(
+        args.backend_host or os.getenv("FLOAT_BACKEND_HOST") or ""
+    ).strip()
+
+    def _effective_backend_host() -> str:
+        return _resolve_backend_host(
+            repo_root=basedir,
+            explicit_host=explicit_backend_host,
+            lan_mode=args.lan_mode,
+        )
+
+    args.backend_host = _effective_backend_host()
+    backend_host_locked = bool(explicit_backend_host or args.lan_mode is not None)
 
     if args.dev_mode:
         os.environ["FLOAT_DEV_MODE"] = "true"
@@ -296,9 +373,12 @@ def main():
         print("[INFO] Nothing to start. Exiting.")
         sys.exit(0)
 
-    basedir = os.path.dirname(os.path.abspath(__file__))
     state_path = os.path.join(basedir, ".dev_state.json")
     service_env = os.environ.copy()
+    frontend_proxy_token = str(
+        service_env.get("FLOAT_FRONTEND_PROXY_TOKEN") or secrets.token_urlsafe(32)
+    )
+    service_env["FLOAT_FRONTEND_PROXY_TOKEN"] = frontend_proxy_token
     original_broker_url = service_env.get("CELERY_BROKER_URL")
     original_result_backend = service_env.get("CELERY_RESULT_BACKEND")
     original_redis_url = service_env.get("REDIS_URL")
@@ -338,6 +418,8 @@ def main():
                 state = _json.load(f) or {}
         except Exception:
             state = {}
+    state["backend_host_locked"] = backend_host_locked
+    state["backend_reload_enabled"] = bool(args.dev_mode)
 
     # Auto-select or reuse ports if set to 0
     def _choose_port():
@@ -406,11 +488,23 @@ def main():
             return list(processes.items())
 
     def _launch_backend() -> subprocess.Popen:
+        # Re-read the saved preference on every launcher-managed restart. This
+        # lets the sync UI change the real listener without replacing the
+        # frontend or the launcher process.
+        args.backend_host = _effective_backend_host()
+        state["backend_host"] = args.backend_host
         print(f"[INFO] Starting backend on {args.backend_host}:{args.backend_port}...")
+        backend_env = service_env.copy()
+        backend_env["FLOAT_BACKEND_HOST"] = args.backend_host
+        backend_env["FLOAT_BACKEND_PORT"] = str(args.backend_port)
         backend_proc = subprocess.Popen(
-            _build_backend_cmd(args.backend_port, args.backend_host),
+            _build_backend_cmd(
+                args.backend_port,
+                args.backend_host,
+                reload=bool(args.dev_mode),
+            ),
             cwd=os.path.join(basedir, "backend"),
-            env=service_env,
+            env=backend_env,
         )
         _register_process("backend", backend_proc)
         _start_monitor("backend", backend_proc)
@@ -527,6 +621,10 @@ def main():
         # Pass ports to the Vite dev server
         frontend_env["VITE_PORT"] = str(args.frontend_port)
         frontend_env["BACKEND_PORT"] = str(args.backend_port)
+        frontend_env["BACKEND_PROXY_HOST"] = _backend_proxy_connect_host(
+            args.backend_host
+        )
+        frontend_env["BACKEND_PROXY_TOKEN"] = frontend_proxy_token
         # Use npm.cmd on Windows for compatibility
         npm_exe = shutil.which("npm") or shutil.which("npm.cmd")
         if not npm_exe:

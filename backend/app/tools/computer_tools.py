@@ -1,15 +1,86 @@
 from __future__ import annotations
 
-import json
+import logging
 import subprocess
-from datetime import datetime, timezone
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from app import config as app_config
+from app.services.attachment_promotion_service import (
+    AttachmentIndexRequest,
+    promote_capture_to_attachment,
+)
 from app.services.capture_service import get_capture_service
 from app.services.computer_service import get_computer_service
-from app.utils import verify_signature
-from app.utils.blob_store import BLOBS_DIR, put_asset
+from app.utils import blob_store, verify_signature
+from app.utils.attachment_metadata import mutate_attachment_metadata
+
+logger = logging.getLogger(__name__)
+_CAPTURE_INDEX_LOCK = threading.Lock()
+_CAPTURE_INDEX_INFLIGHT: set[str] = set()
+
+
+def _runtime_app():
+    from app.main import app
+
+    return app
+
+
+def _queue_capture_attachment_index(index_request: AttachmentIndexRequest) -> bool:
+    """Run the shared attachment indexer without blocking a model tool call."""
+
+    content_hash = index_request.content_hash
+    with _CAPTURE_INDEX_LOCK:
+        if content_hash in _CAPTURE_INDEX_INFLIGHT:
+            return False
+        _CAPTURE_INDEX_INFLIGHT.add(content_hash)
+
+    def _run() -> None:
+        try:
+            from app import routes
+
+            routes._index_uploaded_attachment(
+                _runtime_app(),
+                index_request.data,
+                filename=index_request.filename,
+                content_type=index_request.content_type,
+                url=index_request.url,
+                content_hash=index_request.content_hash,
+                started_at=index_request.started_at,
+                index_generation=index_request.index_generation,
+            )
+        except Exception:
+            try:
+
+                def _mark_failed(metadata: Dict[str, Any]) -> Dict[str, Any]:
+                    if str(metadata.get("index_status") or "").lower() == "indexing":
+                        metadata["index_status"] = "error"
+                    if str(metadata.get("caption_status") or "").lower() == "pending":
+                        metadata["caption_status"] = "error"
+                    return metadata
+
+                mutate_attachment_metadata(
+                    blob_store.BLOBS_DIR,
+                    content_hash,
+                    _mark_failed,
+                )
+            except Exception:
+                logger.debug(
+                    "Could not mark capture attachment indexing as failed",
+                    exc_info=True,
+                )
+            logger.exception("Capture attachment indexing failed to start")
+        finally:
+            with _CAPTURE_INDEX_LOCK:
+                _CAPTURE_INDEX_INFLIGHT.discard(content_hash)
+
+    threading.Thread(
+        target=_run,
+        name=f"float-capture-index-{content_hash[:12]}",
+        daemon=True,
+    ).start()
+    return True
 
 
 def computer_session_start(
@@ -166,63 +237,22 @@ def capture_promote(
     payload = {"capture_id": capture_id}
     verify_signature(signature, user, "capture.promote", payload)
     service = get_capture_service()
-    capture = service.get_capture(capture_id)
-    if capture is None:
-        raise FileNotFoundError(f"Unknown capture '{capture_id}'")
-    existing_ref = capture.get("attachment_ref")
-    if isinstance(existing_ref, dict) and existing_ref.get("content_hash"):
-        promoted = service.mark_promoted(capture_id, attachment_ref=existing_ref)
-        return {"capture": promoted, "attachment": existing_ref}
-    target = service.capture_path(capture_id)
-    if target is None:
-        raise FileNotFoundError(f"Unknown capture '{capture_id}'")
-    data = target.read_bytes()
-    filename = str(capture.get("filename") or target.name).strip() or target.name
-    content_type = (
-        str(capture.get("content_type") or "image/png").strip() or "image/png"
+    runtime_app = _runtime_app()
+    config = getattr(runtime_app.state, "config", None)
+    if not isinstance(config, dict):
+        config = app_config.load_config()
+    promotion = promote_capture_to_attachment(
+        service,
+        capture_id,
+        metadata_root=blob_store.BLOBS_DIR,
+        caption_engine=str(config.get("image_caption_engine") or "local"),
     )
-    asset_info = put_asset(data, filename=filename, origin="captured")
-    content_hash = asset_info["content_hash"]
-    uploaded_at = (
-        datetime.now(tz=timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    meta_path = BLOBS_DIR / f"{content_hash}.json"
-    meta_path.write_text(
-        json.dumps(
-            {
-                "filename": filename,
-                "content_type": content_type,
-                "size": len(data),
-                "uploaded_at": uploaded_at,
-                "origin": "captured",
-                "relative_path": asset_info.get("relative_path"),
-                "path": asset_info.get("path"),
-                "capture_source": capture.get("capture_source")
-                or capture.get("source"),
-                "capture_id": capture_id,
-                "capture_sensitivity": capture.get("sensitivity"),
-                "caption_status": "pending",
-                "index_status": "not_applicable",
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-    attachment_ref = {
-        "content_hash": content_hash,
-        "filename": filename,
-        "content_type": content_type,
-        "size": len(data),
-        "url": f"/api/attachments/{content_hash}/{filename}",
-        "uploaded_at": uploaded_at,
-        "origin": "captured",
-        "relative_path": asset_info.get("relative_path"),
+    if promotion.index_request is not None:
+        _queue_capture_attachment_index(promotion.index_request)
+    return {
+        "capture": promotion.capture,
+        "attachment": promotion.attachment,
     }
-    promoted = service.mark_promoted(capture_id, attachment_ref=attachment_ref)
-    return {"capture": promoted, "attachment": attachment_ref}
 
 
 def capture_delete(

@@ -22,6 +22,15 @@ except ImportError:  # Running directly from the scripts directory.
 
 INSTALL_SCHEMA_VERSION = 1
 
+# Paths that were managed by an older release snapshot but are intentionally no
+# longer shipped. Keep this list explicit so upgrades can prune the exact retired
+# file while unknown or runtime-owned manifest entries still fail closed.
+RETIRED_SHIPPED_PATHS = frozenset(
+    {
+        "backend/app/services/tests/test_threads_embedding_bakeoff_eval.py",
+    }
+)
+
 
 def _now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
@@ -127,6 +136,7 @@ def _manifest_files(payload: dict[str, Any]) -> set[str]:
         if (
             relative != release.BUILD_RECEIPT_NAME
             and not release.is_manifest_relative_path(relative)
+            and relative not in RETIRED_SHIPPED_PATHS
         ):
             raise ValueError(
                 "Installed deployment manifest contains a non-shipped path: "

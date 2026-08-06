@@ -524,6 +524,7 @@ class GraphStore:
     ) -> Dict[str, Any]:
         """Return a visualization-ready projection of durable graph state."""
 
+        store_summary = self.summary()
         raw_nodes = self.list_nodes(limit=node_limit)
         raw_claims = self.list_claims(limit=claim_limit)
         node_ids = {str(node.get("node_id") or "") for node in raw_nodes}
@@ -589,6 +590,14 @@ class GraphStore:
                 "node_count": len(nodes),
                 "claim_count": len(visible_claims),
                 "link_count": len(links),
+                "total_node_count": store_summary["node_count"],
+                "total_claim_count": store_summary["claim_count"],
+                "nodes_truncated": store_summary["node_count"] > len(raw_nodes),
+                "claims_truncated": store_summary["claim_count"] > len(raw_claims),
+                "truncated": (
+                    store_summary["node_count"] > len(raw_nodes)
+                    or store_summary["claim_count"] > len(raw_claims)
+                ),
                 "source": "graph_store",
                 "maxLevel": 1 if any(node.get("level") == 1 for node in nodes) else 0,
             },

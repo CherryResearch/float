@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import axios from "axios";
 import { useNavigate } from "react-router-dom";
+import Tooltip from "@mui/material/Tooltip";
 import CsvTableEditor from "./CsvTableEditor";
 import CsvTablePreview from "./CsvTablePreview";
 import MarkdownPreview from "./MarkdownPreview";
@@ -12,6 +13,7 @@ import {
   getDocumentExtension,
   MARKDOWN_DOC_EXTENSIONS,
 } from "../utils/documentFormats";
+import { safeAttachmentSourceUrl } from "../utils/attachmentProvenance";
 
 const DOC_SEARCH_MODES = {
   CATALOG: "catalog",
@@ -57,7 +59,13 @@ export const buildAttachmentViewerItems = (items = []) =>
   items.map((att) => ({
     src: att.url,
     alt: att.filename || att.content_hash,
-    label: att.filename || att.content_hash,
+    label: att.display_name || att.filename || att.content_hash,
+    filename: att.filename || "",
+    displayName: att.display_name || "",
+    folder: att.folder || "",
+    sourceUrl: att.source_url || "",
+    sourceUrlRecordedAt: att.source_url_recorded_at || "",
+    retrievalUrl: att.url || "",
     size: typeof att.size === "number" ? att.size : null,
     uploadedAt: att.uploaded_at || null,
     contentHash: att.content_hash || null,
@@ -86,10 +94,20 @@ export const buildAttachmentViewerItems = (items = []) =>
 
 export const describeAttachmentCard = (attachment, folderLabel) => {
   const att = attachment && typeof attachment === "object" ? attachment : {};
-  const label = att.filename || att.content_hash || "";
-  const captionText = typeof att.caption === "string" ? att.caption.trim() : "";
+  const label = att.display_name || att.filename || att.content_hash || "";
+  const cleanupPending =
+    att.content_available === false
+    || String(att.deletion_status || "").trim().toLowerCase() === "cleanup_pending";
+  const isCaptionUnavailable =
+    att.placeholder_caption === true
+    || String(att.caption_status || "").trim().toLowerCase() === "placeholder";
+  const captionText =
+    !isCaptionUnavailable && typeof att.caption === "string" ? att.caption.trim() : "";
   const pathLabel = stripDataFilesPrefix(att.relative_path || "");
   const secondaryMeta = [
+    att.display_name && att.filename && att.display_name !== att.filename
+      ? `file ${att.filename}`
+      : "",
     att.size ? formatBytes(att.size) : "",
     att.uploaded_at ? formatTimestamp(att.uploaded_at) : "",
     att.capture_source ? `${att.origin || "capture"}:${att.capture_source}` : "",
@@ -98,6 +116,16 @@ export const describeAttachmentCard = (attachment, folderLabel) => {
     pathLabel || "",
   ].filter(Boolean);
   const badges = [
+    cleanupPending
+      ? {
+          key: "cleanup",
+          label: "cleanup pending",
+          title: "Stored bytes were removed, but retrieval or metadata cleanup must be retried.",
+          tooltip: "The saved file is gone. Retry cleanup to remove the remaining retrieval or metadata record.",
+          className:
+            "attachment-badge attachment-badge--placeholder attachment-badge--interactive",
+        }
+      : null,
     {
       key: "folder",
       label: folderLabel,
@@ -122,7 +150,7 @@ export const describeAttachmentCard = (attachment, folderLabel) => {
           className: "attachment-badge attachment-badge--source",
         }
       : null,
-    att.index_status
+    att.index_status && !cleanupPending
       ? {
           key: "index",
           label: att.index_status,
@@ -135,28 +163,47 @@ export const describeAttachmentCard = (attachment, folderLabel) => {
           className: "attachment-badge attachment-badge--status",
         }
       : null,
-    att.caption_status
+    att.caption_status && !isCaptionUnavailable && !cleanupPending
       ? {
           key: "caption",
-          label: att.caption_status,
+          label: captionStatusPresentation(att.caption_status),
           title: [
-            `caption: ${att.caption_status}`,
+            captionStatusPresentation(att.caption_status),
             att.caption_model ? `model: ${att.caption_model}` : "",
             att.caption_recorded_at ? `date: ${formatTimestamp(att.caption_recorded_at)}` : "",
           ].filter(Boolean).join(" | "),
           className: "attachment-badge attachment-badge--status",
         }
       : null,
-    att.placeholder_caption
+    isCaptionUnavailable && !cleanupPending
       ? {
           key: "placeholder",
-          label: "placeholder",
-          title: "Placeholder caption",
-          className: "attachment-badge attachment-badge--placeholder",
+          label: "caption unavailable",
+          title: "Caption unavailable",
+          tooltip:
+            String(att.index_status || "").trim().toLowerCase() === "indexed"
+              ? "No readable caption was generated. CLIP image retrieval is indexed separately and can still find this image."
+              : "No readable caption was generated. Captioning and CLIP image retrieval are separate; check the retrieval status alongside this badge.",
+          className:
+            "attachment-badge attachment-badge--placeholder attachment-badge--interactive",
         }
       : null,
   ].filter(Boolean);
   return { label, captionText, secondaryMeta, badges };
+};
+
+const captionStatusPresentation = (statusValue) => {
+  const status = String(statusValue || "").trim().toLowerCase();
+  const labels = {
+    generated: "auto caption",
+    manual: "manual caption",
+    pending: "caption pending",
+    missing: "caption missing",
+    error: "caption failed",
+    disabled: "captioning off",
+    unavailable: "caption unavailable",
+  };
+  return labels[status] || (status ? `caption ${status}` : "");
 };
 
 const normalizePath = (value) => {
@@ -509,6 +556,7 @@ const DocumentsTab = ({ focusId = null }) => {
   }, [semanticMatches, showArchived]);
 
   const [attachments, setAttachments] = useState([]);
+  const [attachmentsLoaded, setAttachmentsLoaded] = useState(false);
   const [attachmentsLoading, setAttachmentsLoading] = useState(false);
   const [attachmentsError, setAttachmentsError] = useState("");
   const [attachmentQuery, setAttachmentQuery] = useState("");
@@ -559,6 +607,9 @@ const DocumentsTab = ({ focusId = null }) => {
   const [attachmentDragHash, setAttachmentDragHash] = useState("");
   const [dragOverAttachmentFolder, setDragOverAttachmentFolder] = useState("");
   const [draggingFolderName, setDraggingFolderName] = useState("");
+  const [attachmentEditor, setAttachmentEditor] = useState(null);
+  const [attachmentActionBusy, setAttachmentActionBusy] = useState("");
+  const mediaViewerRefs = useRef(new Map());
   const [activeDoc, setActiveDoc] = useState(null);
   const [activeDocMode, setActiveDocMode] = useState("view");
   const [activeDocBody, setActiveDocBody] = useState("");
@@ -601,6 +652,7 @@ const DocumentsTab = ({ focusId = null }) => {
       setAttachmentsError("");
       const res = await axios.get("/api/attachments");
       setAttachments(res.data?.attachments || []);
+      setAttachmentsLoaded(true);
     } catch (err) {
       console.error("load attachments failed", err);
       setAttachmentsError("Failed to load uploads");
@@ -671,12 +723,19 @@ const DocumentsTab = ({ focusId = null }) => {
   }, [attachmentFolderOrder]);
 
   useEffect(() => {
+    if (!attachmentsLoaded) return;
     const validKeys = new Set(attachments.map((att) => attachmentKeyOf(att)).filter(Boolean));
+    const authoritativeKeys = new Set(
+      attachments
+        .filter((att) => Object.prototype.hasOwnProperty.call(att || {}, "folder"))
+        .map((att) => attachmentKeyOf(att))
+        .filter(Boolean),
+    );
     setAttachmentFolderAssignments((prev) => {
       let changed = false;
       const next = {};
       Object.entries(prev).forEach(([key, folderName]) => {
-        if (!validKeys.has(key)) {
+        if (!validKeys.has(key) || authoritativeKeys.has(key)) {
           changed = true;
           return;
         }
@@ -684,7 +743,7 @@ const DocumentsTab = ({ focusId = null }) => {
       });
       return changed ? next : prev;
     });
-  }, [attachments]);
+  }, [attachments, attachmentsLoaded]);
 
   useEffect(() => {
     if (!docsInfoOpen || ragStatus) return;
@@ -889,17 +948,39 @@ const DocumentsTab = ({ focusId = null }) => {
     setAttachmentsIndexBusy(true);
     setAttachmentsIndexStatus(null);
     try {
+      const captionStatusResponse = await axios.get("/api/attachments/caption/status");
+      const captionStatus = captionStatusResponse.data || {};
+      if (captionStatus.engine === "cloud") {
+        const imageCount = attachments.filter((attachment) =>
+          String(attachment?.content_type || "").toLowerCase().startsWith("image/"),
+        ).length;
+        const confirmed = window.confirm(
+          `Refresh image retrieval for ${imageCount} saved image${imageCount === 1 ? "" : "s"}? `
+            + "Your saved caption setting is Cloud/provider, so eligible image bytes may be sent "
+            + "to the configured API provider.",
+        );
+        if (!confirmed) {
+          setAttachmentsIndexStatus({ cancelled: true });
+          return;
+        }
+      }
       const res = await axios.post("/api/attachments/rag/rehydrate", {
         dry_run: false,
       });
       setAttachmentsIndexStatus(res.data || null);
+      await loadAttachments();
     } catch (err) {
       console.error("attachments reindex failed", err);
-      setAttachmentsIndexStatus({ error: "rehydrate_failed" });
+      setAttachmentsIndexStatus({
+        error:
+          err?.config?.url === "/api/attachments/caption/status"
+            ? "caption_status_unavailable"
+            : "rehydrate_failed",
+      });
     } finally {
       setAttachmentsIndexBusy(false);
     }
-  }, []);
+  }, [attachments, loadAttachments]);
 
   const openSystemUri = useCallback((uriValue) => {
     if (typeof uriValue !== "string" || !uriValue.trim()) return false;
@@ -968,8 +1049,96 @@ const DocumentsTab = ({ focusId = null }) => {
     }
   }, [openSystemUri]);
 
+  const replaceAttachment = useCallback((contentHash, descriptor) => {
+    const safeHash = String(contentHash || "").trim();
+    if (!safeHash || !descriptor || typeof descriptor !== "object") return;
+    setAttachments((prev) =>
+      prev.map((attachment) =>
+        attachmentKeyOf(attachment) === safeHash
+          ? { ...attachment, ...descriptor, content_hash: safeHash }
+          : attachment,
+      ),
+    );
+  }, []);
+
+  const mirrorAttachmentFolder = useCallback((attachmentKey, folderName) => {
+    const safeKey = String(attachmentKey || "").trim();
+    if (!safeKey) return;
+    const normalizedFolder = normalizeAttachmentFolderName(String(folderName || ""));
+    if (!normalizedFolder || normalizedFolder === ATTACHMENT_FOLDER_UNSORTED) {
+      setAttachmentFolderAssignments((prev) => {
+        if (!(safeKey in prev)) return prev;
+        const next = { ...prev };
+        delete next[safeKey];
+        return next;
+      });
+      return;
+    }
+    setAttachmentFolderAssignments((prev) => {
+      if (prev[safeKey] === normalizedFolder) return prev;
+      return { ...prev, [safeKey]: normalizedFolder };
+    });
+    setAttachmentFolderOrder((prev) =>
+      prev.includes(normalizedFolder) ? prev : [...prev, normalizedFolder],
+    );
+  }, []);
+
+  const patchAttachmentMetadata = useCallback(
+    async (attachment, updates, actionLabel) => {
+      const contentHash = attachmentKeyOf(attachment);
+      if (!contentHash) return null;
+      setAttachmentActionBusy(contentHash);
+      setActionStatus("");
+      try {
+        const response = await axios.patch(
+          `/api/attachments/${encodeURIComponent(contentHash)}/metadata`,
+          updates,
+        );
+        const descriptor = response.data?.attachment || {};
+        replaceAttachment(contentHash, descriptor);
+        if (Object.prototype.hasOwnProperty.call(updates, "folder")) {
+          mirrorAttachmentFolder(contentHash, descriptor.folder || updates.folder || "");
+        }
+        setActionStatus(`${actionLabel} saved.`);
+        return { ...attachment, ...descriptor };
+      } catch (err) {
+        const status = err?.response?.status;
+        if (
+          Object.prototype.hasOwnProperty.call(updates, "folder")
+          && (status === 404 || status === 405)
+        ) {
+          mirrorAttachmentFolder(contentHash, updates.folder || "");
+          setActionStatus(
+            "Folder saved in this browser; update Float to sync gallery organization across devices.",
+          );
+          return { ...attachment, folder: updates.folder || "" };
+        }
+        const detail = err?.response?.data?.detail;
+        setActionStatus(
+          typeof detail === "string" && detail
+            ? `${actionLabel} failed: ${detail}`
+            : `${actionLabel} failed.`,
+        );
+        return null;
+      } finally {
+        setAttachmentActionBusy("");
+      }
+    },
+    [mirrorAttachmentFolder, replaceAttachment],
+  );
+
   const getAttachmentFolderFor = useCallback(
     (attachment) => {
+      const hasPersistedFolder = Boolean(
+        attachment && Object.prototype.hasOwnProperty.call(attachment, "folder"),
+      );
+      const persistedFolder = normalizeAttachmentFolderName(
+        String(attachment?.folder || ""),
+      );
+      if (persistedFolder) return persistedFolder;
+      // An explicitly empty backend folder is authoritative. The browser mirror
+      // only exists for older backends that do not return the field at all.
+      if (hasPersistedFolder) return ATTACHMENT_FOLDER_UNSORTED;
       const key = attachmentKeyOf(attachment);
       if (key) {
         const folderName = normalizeAttachmentFolderName(
@@ -992,27 +1161,158 @@ const DocumentsTab = ({ focusId = null }) => {
     setActionStatus(`Gallery folder ready: ${folderName}`);
   }, [newAttachmentFolderName]);
 
-  const assignAttachmentToFolder = useCallback((attachmentKey, folderName) => {
+  const assignAttachmentToFolder = useCallback(async (attachmentKey, folderName) => {
     const safeKey = String(attachmentKey || "").trim();
     if (!safeKey) return;
     const normalizedFolder = normalizeAttachmentFolderName(String(folderName || ""));
-    if (!normalizedFolder || normalizedFolder === ATTACHMENT_FOLDER_UNSORTED) {
-      setAttachmentFolderAssignments((prev) => {
-        if (!(safeKey in prev)) return prev;
-        const next = { ...prev };
-        delete next[safeKey];
-        return next;
-      });
-      return;
-    }
-    setAttachmentFolderAssignments((prev) => {
-      if (prev[safeKey] === normalizedFolder) return prev;
-      return { ...prev, [safeKey]: normalizedFolder };
-    });
-    setAttachmentFolderOrder((prev) =>
-      prev.includes(normalizedFolder) ? prev : [...prev, normalizedFolder],
+    const attachment = attachments.find((item) => attachmentKeyOf(item) === safeKey);
+    if (!attachment) return;
+    const folder =
+      !normalizedFolder || normalizedFolder === ATTACHMENT_FOLDER_UNSORTED
+        ? null
+        : normalizedFolder;
+    const updated = await patchAttachmentMetadata(
+      attachment,
+      { folder },
+      "Gallery folder",
     );
+    if (updated) {
+      mirrorAttachmentFolder(safeKey, folder || "");
+    }
+    return updated;
+  }, [attachments, mirrorAttachmentFolder, patchAttachmentMetadata]);
+
+  const beginAttachmentEditor = useCallback((attachment, mode) => {
+    const key = attachmentKeyOf(attachment);
+    if (!key) return;
+    setAttachmentEditor({
+      key,
+      mode,
+      draft:
+        mode === "rename"
+          ? String(attachment.display_name || "")
+          : mode === "source"
+            ? String(attachment.source_url || "")
+          : normalizeAttachmentFolderName(String(attachment.folder || ""))
+            || ATTACHMENT_FOLDER_UNSORTED,
+    });
   }, []);
+
+  const saveAttachmentEditor = useCallback(async () => {
+    if (!attachmentEditor?.key) return;
+    const attachment = attachments.find(
+      (item) => attachmentKeyOf(item) === attachmentEditor.key,
+    );
+    if (!attachment) return;
+    let updated = null;
+    if (attachmentEditor.mode === "rename") {
+      updated = await patchAttachmentMetadata(
+        attachment,
+        { display_name: String(attachmentEditor.draft || "").trim() || null },
+        "Display name",
+      );
+    } else if (attachmentEditor.mode === "move") {
+      updated = await assignAttachmentToFolder(
+        attachmentEditor.key,
+        attachmentEditor.draft,
+      );
+    } else if (attachmentEditor.mode === "source") {
+      const rawSourceUrl = String(attachmentEditor.draft || "").trim();
+      const sourceUrl = safeAttachmentSourceUrl(rawSourceUrl);
+      if (rawSourceUrl && !sourceUrl) {
+        setActionStatus(
+          "Recorded sources must be http(s) URLs without embedded or signed credentials.",
+        );
+        return;
+      }
+      updated = await patchAttachmentMetadata(
+        attachment,
+        { source_url: sourceUrl || null },
+        "Source provenance",
+      );
+    }
+    if (updated) setAttachmentEditor(null);
+  }, [assignAttachmentToFolder, attachmentEditor, attachments, patchAttachmentMetadata]);
+
+  const deleteAttachment = useCallback(async (attachment) => {
+    const contentHash = attachmentKeyOf(attachment);
+    if (!contentHash) return;
+    const displayName = attachment.display_name || attachment.filename || contentHash;
+    const cleanupPending =
+      attachment.content_available === false
+      || String(attachment.deletion_status || "").trim().toLowerCase() === "cleanup_pending";
+    const confirmed = window.confirm(
+      cleanupPending
+        ? `Retry cleanup for ${displayName}? The stored file is already gone; this removes the remaining retrieval and metadata records.`
+        : `Delete ${displayName}? This removes the stored file, its caption, and its retrieval records. This cannot be undone.`,
+    );
+    if (!confirmed) return;
+    setAttachmentActionBusy(contentHash);
+    setActionStatus("");
+    try {
+      await axios.delete(`/api/attachments/${encodeURIComponent(contentHash)}`);
+      setAttachments((prev) =>
+        prev.filter((item) => attachmentKeyOf(item) !== contentHash),
+      );
+      mirrorAttachmentFolder(contentHash, "");
+      setAttachmentEditor((prev) => (prev?.key === contentHash ? null : prev));
+      setActionStatus(
+        cleanupPending
+          ? `Finished cleanup for ${displayName}.`
+          : `Deleted ${displayName} and its retrieval records.`,
+      );
+    } catch (err) {
+      const detail = err?.response?.data?.detail;
+      if (detail && typeof detail === "object" && detail.status === "partial") {
+        const cleanupFailed = Array.isArray(detail.cleanup_failed)
+          ? detail.cleanup_failed.filter(Boolean)
+          : [];
+        if (detail.content_deleted === true) {
+          setAttachments((prev) => prev.map((item) => (
+            attachmentKeyOf(item) === contentHash
+              ? {
+                  ...item,
+                  content_available: false,
+                  deletion_status: "cleanup_pending",
+                  cleanup_failed: cleanupFailed,
+                  url: "",
+                  relative_path: "",
+                }
+              : item
+          )));
+          setAttachmentEditor((prev) => (prev?.key === contentHash ? null : prev));
+        }
+        const failedLabel = cleanupFailed.length
+          ? ` (${cleanupFailed.join(", ")})`
+          : "";
+        setActionStatus(
+          `${detail.message || "Attachment cleanup is incomplete"}${failedLabel}. Retry cleanup from this card.`,
+        );
+        return;
+      }
+      setActionStatus(
+        typeof detail === "string" && detail
+          ? `Delete failed: ${detail}`
+          : detail && typeof detail === "object" && detail.message
+            ? `Delete failed: ${detail.message}`
+          : "Delete failed.",
+      );
+    } finally {
+      setAttachmentActionBusy("");
+    }
+  }, [mirrorAttachmentFolder]);
+
+  const handleViewerAttachmentChange = useCallback(
+    (descriptor) => {
+      const contentHash = attachmentKeyOf(descriptor);
+      if (!contentHash) return;
+      replaceAttachment(contentHash, descriptor);
+      if (Object.prototype.hasOwnProperty.call(descriptor, "folder")) {
+        mirrorAttachmentFolder(contentHash, descriptor.folder || "");
+      }
+    },
+    [mirrorAttachmentFolder, replaceAttachment],
+  );
 
   const handleAttachmentDragStart = useCallback((event, attachment) => {
     const key = attachmentKeyOf(attachment);
@@ -1406,11 +1706,14 @@ const DocumentsTab = ({ focusId = null }) => {
     Object.values(attachmentFolderAssignments).forEach((folderName) => {
       pushFolder(folderName);
     });
-    sortedAttachments.forEach((attachment) => {
-      pushFolder(getAttachmentSourceFolderName(attachment));
-    });
+    sortedAttachments.forEach((attachment) => pushFolder(getAttachmentFolderFor(attachment)));
     return ordered;
-  }, [attachmentFolderAssignments, attachmentFolderOrder, sortedAttachments]);
+  }, [
+    attachmentFolderAssignments,
+    attachmentFolderOrder,
+    getAttachmentFolderFor,
+    sortedAttachments,
+  ]);
 
   useEffect(() => {
     if (
@@ -1442,14 +1745,20 @@ const DocumentsTab = ({ focusId = null }) => {
     if (!term) return sortedAttachments;
     return sortedAttachments.filter((att) => {
       const name = (att.filename || "").toLowerCase();
+      const displayName = String(att.display_name || "").toLowerCase();
       const hash = (att.content_hash || "").toLowerCase();
       const sourceLabel = String(att.source_sync_label || att.source_sync_namespace || "").toLowerCase();
+      const sourceUrl = String(att.source_url || "").toLowerCase();
       const relativePath = String(att.relative_path || "").toLowerCase();
+      const folder = String(att.folder || "").toLowerCase();
       return (
         name.includes(term)
+        || displayName.includes(term)
         || hash.includes(term)
         || sourceLabel.includes(term)
+        || sourceUrl.includes(term)
         || relativePath.includes(term)
+        || folder.includes(term)
       );
     });
   }, [sortedAttachments, attachmentQuery]);
@@ -1465,9 +1774,21 @@ const DocumentsTab = ({ focusId = null }) => {
     });
   }, [activeAttachmentFolder, getAttachmentFolderFor, searchedAttachments]);
 
-  const attachmentViewerItems = useMemo(
-    () => buildAttachmentViewerItems(filteredAttachments),
+  const viewableAttachments = useMemo(
+    () => filteredAttachments.filter(
+      (attachment) => attachment.content_available !== false && Boolean(attachment.url),
+    ),
     [filteredAttachments],
+  );
+  const attachmentViewerItems = useMemo(
+    () => buildAttachmentViewerItems(viewableAttachments),
+    [viewableAttachments],
+  );
+  const attachmentViewerIndexByKey = useMemo(
+    () => new Map(
+      viewableAttachments.map((attachment, index) => [attachmentKeyOf(attachment), index]),
+    ),
+    [viewableAttachments],
   );
 
   const docCountLabel = useMemo(() => {
@@ -2186,17 +2507,36 @@ const DocumentsTab = ({ focusId = null }) => {
               type="button"
               onClick={reindexUploads}
               disabled={attachmentsIndexBusy}
-              title="(Re)caption + memorize existing image uploads into the knowledge base"
+              title="Rebuild image retrieval and generate missing captions using the saved caption setting"
             >
-              {attachmentsIndexBusy ? "memorizing..." : "memorize"}
+              {attachmentsIndexBusy ? "refreshing index..." : "refresh image index"}
             </button>
           </div>
         </div>
         {attachmentsIndexStatus ? (
           <div className="status-note">
             {typeof attachmentsIndexStatus.reindexed === "number"
-              ? `memorized ${attachmentsIndexStatus.reindexed}`
-              : attachmentsIndexStatus.error || "updated"}
+              ? [
+                  `refreshed ${attachmentsIndexStatus.reindexed} image${attachmentsIndexStatus.reindexed === 1 ? "" : "s"}`,
+                  typeof attachmentsIndexStatus.captions_generated === "number"
+                    ? `generated ${attachmentsIndexStatus.captions_generated} caption${attachmentsIndexStatus.captions_generated === 1 ? "" : "s"}`
+                    : null,
+                  typeof attachmentsIndexStatus.captions_unavailable === "number" &&
+                  attachmentsIndexStatus.captions_unavailable > 0
+                    ? `${attachmentsIndexStatus.captions_unavailable} caption${attachmentsIndexStatus.captions_unavailable === 1 ? "" : "s"} unavailable`
+                    : null,
+                  typeof attachmentsIndexStatus.failed === "number" &&
+                  attachmentsIndexStatus.failed > 0
+                    ? `${attachmentsIndexStatus.failed} failed`
+                    : null,
+                ]
+                  .filter(Boolean)
+                  .join("; ")
+              : attachmentsIndexStatus.cancelled
+                ? "Refresh cancelled; no images were sent."
+                : attachmentsIndexStatus.error === "caption_status_unavailable"
+                  ? "Could not verify the saved caption setting, so no images were processed."
+                  : attachmentsIndexStatus.error || "updated"}
           </div>
         ) : null}
         {attachmentsError && <div className="attachments-error">{attachmentsError}</div>}
@@ -2268,28 +2608,55 @@ const DocumentsTab = ({ focusId = null }) => {
         {filteredAttachments.length ? (
           <div className="attachments-grid">
             {filteredAttachments.map((att, idx) => {
-              const label = att.filename || att.content_hash;
+              const label = att.display_name || att.filename || att.content_hash;
               const assignmentKey = attachmentKeyOf(att);
               const key = assignmentKey || `att-${idx}`;
               const folderName = getAttachmentFolderFor(att);
               const folderLabel =
                 folderName === ATTACHMENT_FOLDER_UNSORTED ? "unsorted" : folderName;
               const card = describeAttachmentCard(att, folderLabel);
+              const sourceUrl = safeAttachmentSourceUrl(att.source_url);
+              const cleanupPending =
+                att.content_available === false
+                || String(att.deletion_status || "").trim().toLowerCase() === "cleanup_pending";
+              const isImage =
+                String(att.content_type || "").toLowerCase().startsWith("image/")
+                || DOC_IMAGE_EXTENSIONS.has(getDocumentExtension(att.filename || att.url));
+              const editorOpen = attachmentEditor?.key === assignmentKey;
+              const busy = attachmentActionBusy === assignmentKey;
+              const viewerIndex = attachmentViewerIndexByKey.get(assignmentKey);
               return (
                 <div
                   key={key}
                   className={`attachments-card${attachmentDragHash === key ? " is-dragging" : ""}`}
-                  draggable={Boolean(assignmentKey)}
+                  draggable={Boolean(assignmentKey) && !cleanupPending}
                   onDragStart={(event) => handleAttachmentDragStart(event, att)}
                   onDragEnd={clearAttachmentDragState}
                 >
-                  <MediaViewer
-                    src={att.url}
-                    alt={label}
-                    showLink={false}
-                    contextItems={attachmentViewerItems}
-                    contextIndex={idx}
-                  />
+                  {cleanupPending ? (
+                    <div className="attachment-cleanup-state" role="status">
+                      <strong>Stored file removed</strong>
+                      <span>
+                        {Array.isArray(att.cleanup_failed) && att.cleanup_failed.length
+                          ? `Cleanup still needs: ${att.cleanup_failed.join(", ")}.`
+                          : "Retrieval or metadata cleanup still needs a retry."}
+                      </span>
+                    </div>
+                  ) : (
+                    <MediaViewer
+                      ref={(handle) => {
+                        if (!assignmentKey) return;
+                        if (handle) mediaViewerRefs.current.set(assignmentKey, handle);
+                        else mediaViewerRefs.current.delete(assignmentKey);
+                      }}
+                      src={att.url}
+                      alt={label}
+                      showLink={false}
+                      contextItems={attachmentViewerItems}
+                      contextIndex={viewerIndex ?? 0}
+                      onAttachmentChange={handleViewerAttachmentChange}
+                    />
+                  )}
                   <div className="attachment-meta">
                     <div className="attachment-topline">
                       <span className="attachment-name" title={card.label}>
@@ -2297,25 +2664,138 @@ const DocumentsTab = ({ focusId = null }) => {
                       </span>
                       <div className="attachment-topline-meta">
                         <div className="attachment-badges">
-                          {card.badges.map((badge) => (
-                            <span
-                              key={badge.key}
-                              className={badge.className}
-                              title={badge.title}
-                            >
-                              {badge.label}
-                            </span>
-                          ))}
+                          {card.badges.map((badge) =>
+                            badge.tooltip ? (
+                              <Tooltip
+                                key={badge.key}
+                                title={badge.tooltip}
+                                placement="top"
+                                arrow
+                                enterTouchDelay={0}
+                                leaveTouchDelay={4000}
+                              >
+                                <button
+                                  type="button"
+                                  className={badge.className}
+                                  aria-label={`${badge.label}. ${badge.tooltip}`}
+                                >
+                                  {badge.label}
+                                </button>
+                              </Tooltip>
+                            ) : (
+                              <span
+                                key={badge.key}
+                                className={badge.className}
+                                title={badge.title}
+                              >
+                                {badge.label}
+                              </span>
+                            ),
+                          )}
                         </div>
-                        <div className="attachment-actions">
-                          <button
-                            type="button"
-                            onClick={() => revealAttachment(att)}
-                            title="Reveal upload location in your OS file browser. If blocked, location text appears above."
+                        <details className="attachment-action-menu">
+                          <summary
+                            aria-label={`Actions for ${card.label}`}
+                            title={`Open actions for ${card.label}`}
                           >
-                            reveal
-                          </button>
-                        </div>
+                            actions
+                          </summary>
+                          <div className="attachment-action-popover">
+                            {!cleanupPending ? (
+                              <>
+                              <button
+                                type="button"
+                                onClick={(event) => {
+                                  mediaViewerRefs.current.get(assignmentKey)?.open();
+                                  event.currentTarget.closest("details")?.removeAttribute("open");
+                                }}
+                              >
+                                open viewer
+                              </button>
+                              {isImage ? (
+                                <button
+                                  type="button"
+                                  onClick={(event) => {
+                                    mediaViewerRefs.current.get(assignmentKey)?.editCaption();
+                                    event.currentTarget.closest("details")?.removeAttribute("open");
+                                  }}
+                                  title="Write a manual caption or retry automatic captioning"
+                                >
+                                  edit caption
+                                </button>
+                              ) : null}
+                              <button
+                                type="button"
+                                onClick={(event) => {
+                                  beginAttachmentEditor(att, "rename");
+                                  event.currentTarget.closest("details")?.removeAttribute("open");
+                                }}
+                                title="Change the gallery label without renaming the stored file"
+                              >
+                                rename display label
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(event) => {
+                                  beginAttachmentEditor(att, "move");
+                                  event.currentTarget.closest("details")?.removeAttribute("open");
+                                }}
+                                title="Choose a logical gallery folder without moving the stored file"
+                              >
+                                move to folder
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(event) => {
+                                  beginAttachmentEditor(att, "source");
+                                  event.currentTarget.closest("details")?.removeAttribute("open");
+                                }}
+                                title="Record or clear a web source reference without changing Float's saved copy; the page may change later"
+                              >
+                                edit source provenance
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(event) => {
+                                  window.open(att.url, "_blank", "noopener,noreferrer");
+                                  setActionStatus("Opened Float retrieval copy.");
+                                  event.currentTarget.closest("details")?.removeAttribute("open");
+                                }}
+                              >
+                                open Float copy
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(event) => {
+                                  revealAttachment(att);
+                                  event.currentTarget.closest("details")?.removeAttribute("open");
+                                }}
+                                title="Reveal the durable stored copy in your OS file browser"
+                              >
+                                reveal stored file
+                              </button>
+                              </>
+                            ) : null}
+                            <button
+                              type="button"
+                              className="attachment-action-danger"
+                              onClick={(event) => {
+                                deleteAttachment(att);
+                                event.currentTarget.closest("details")?.removeAttribute("open");
+                              }}
+                              disabled={busy}
+                              title={cleanupPending
+                                ? "Retry removal of the remaining retrieval and metadata records"
+                                : "Delete the attachment blob, caption, and retrieval records"}
+                            >
+                              {busy
+                                ? "deleting..."
+                                : cleanupPending
+                                  ? "retry cleanup"
+                                  : "delete attachment + retrieval"}
+                            </button>
+                          </div>
+                        </details>
                       </div>
                     </div>
                     {card.captionText ? (
@@ -2330,6 +2810,119 @@ const DocumentsTab = ({ focusId = null }) => {
                     ) : (
                       <div className="attachment-secondary-line attachment-secondary-line--empty" />
                     )}
+                    {sourceUrl && !cleanupPending ? (
+                      <div className="attachment-location-links" aria-label="Attachment locations">
+                        <a
+                          href={sourceUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          title={
+                            att.source_url_recorded_at
+                              ? `Web source recorded ${formatTimestamp(att.source_url_recorded_at)}; it may have changed since import`
+                              : "Recorded web source; it may have changed since import"
+                          }
+                        >
+                          recorded source
+                        </a>
+                        <span aria-hidden="true">|</span>
+                        <a
+                          href={att.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          title="Open Float's current API retrieval copy"
+                        >
+                          Float copy
+                        </a>
+                      </div>
+                    ) : null}
+                    {editorOpen && !cleanupPending ? (
+                      <form
+                        className="attachment-inline-editor"
+                        aria-label={
+                          attachmentEditor.mode === "rename"
+                            ? `Rename ${card.label}`
+                            : attachmentEditor.mode === "source"
+                              ? `Edit source provenance for ${card.label}`
+                              : `Move ${card.label}`
+                        }
+                        onSubmit={(event) => {
+                          event.preventDefault();
+                          saveAttachmentEditor();
+                        }}
+                      >
+                        <label>
+                          {attachmentEditor.mode === "rename"
+                            ? "Display label"
+                            : attachmentEditor.mode === "source"
+                              ? "Recorded source URL"
+                              : "Gallery folder"}
+                          {attachmentEditor.mode === "rename" ? (
+                            <input
+                              type="text"
+                              value={attachmentEditor.draft}
+                              placeholder={att.filename || "Original filename"}
+                              autoFocus
+                              onChange={(event) =>
+                                setAttachmentEditor((prev) => ({
+                                  ...prev,
+                                  draft: event.target.value,
+                                }))
+                              }
+                            />
+                          ) : attachmentEditor.mode === "source" ? (
+                            <input
+                              type="url"
+                              value={attachmentEditor.draft}
+                              placeholder="https://example.com/original-page"
+                              autoFocus
+                              onChange={(event) =>
+                                setAttachmentEditor((prev) => ({
+                                  ...prev,
+                                  draft: event.target.value,
+                                }))
+                              }
+                            />
+                          ) : (
+                            <select
+                              value={attachmentEditor.draft}
+                              autoFocus
+                              onChange={(event) =>
+                                setAttachmentEditor((prev) => ({
+                                  ...prev,
+                                  draft: event.target.value,
+                                }))
+                              }
+                            >
+                              <option value={ATTACHMENT_FOLDER_UNSORTED}>unsorted</option>
+                              {attachmentFolders.map((name) => (
+                                <option key={`move-${assignmentKey}-${name}`} value={name}>
+                                  {name}
+                                </option>
+                              ))}
+                            </select>
+                          )}
+                        </label>
+                        <div className="attachment-inline-editor-actions">
+                          <button type="submit" disabled={busy}>
+                            {busy ? "saving..." : "save"}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setAttachmentEditor(null)}
+                            disabled={busy}
+                          >
+                            cancel
+                          </button>
+                        </div>
+                        <p>
+                          {attachmentEditor.mode === "rename"
+                            ? `Original filename remains ${att.filename || "unchanged"}.`
+                            : attachmentEditor.mode === "source"
+                              ? "This is passive provenance, not Float's saved copy. Clear the field to remove it."
+                              : "Gallery folders organize the view; they do not move the stored file."}
+                        </p>
+                      </form>
+                    ) : null}
                   </div>
                 </div>
               );

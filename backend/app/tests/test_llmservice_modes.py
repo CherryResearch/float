@@ -1,10 +1,19 @@
+import base64
+import hashlib
+import io
 import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import requests
 from app.base_services import LLMService, ModelContext, _model_supports_native_images
+from PIL import Image
+
+
+def _content_hash(label: object) -> str:
+    return hashlib.sha256(str(label).encode("utf-8")).hexdigest()
 
 
 class DummyTokenizer:
@@ -223,6 +232,85 @@ def test_generate_api_responses_persists_response_ids_and_writes_capture(
     )
 
 
+def test_function_tool_responses_non_streaming_uses_extended_timeout_with_retry(
+    monkeypatch,
+):
+    for key in ("LLM_REQUEST_TIMEOUT", "LLM_TIMEOUT", "FLOAT_REQUEST_TIMEOUT"):
+        monkeypatch.delenv(key, raising=False)
+
+    captured_timeouts = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured_timeouts.append(timeout)
+        if len(captured_timeouts) == 1:
+            raise requests.exceptions.ReadTimeout("provider is still reasoning")
+        return DummyApiResponse(
+            {
+                "id": "resp_native_timeout_retry",
+                "model": "gpt-5.6-sol",
+                "output_text": "Recovered after retry.",
+            }
+        )
+
+    monkeypatch.setenv("LLM_API_RETRIES", "1")
+    monkeypatch.setenv("LLM_API_RETRY_DELAY", "0")
+    monkeypatch.setattr("app.base_services.http_session.post", fake_post)
+    service = LLMService(
+        mode="api",
+        config={
+            "api_url": "https://example.test/v1/responses",
+            "api_key": "test-key",
+            "api_model": "gpt-5.6-sol",
+            "request_timeout": 30,
+            "stream_idle_timeout": 45,
+            "timeout_backoff": [30, 90],
+        },
+    )
+
+    result = service.generate(
+        [],
+        native_tool_definitions=[
+            {
+                "type": "function",
+                "name": "recall",
+                "description": "Recall saved context.",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+    )
+
+    assert result["text"] == "Recovered after retry."
+    assert captured_timeouts == [(30.0, 45.0), (30.0, 60.0)]
+
+
+def test_structured_prompt_timeout_returns_truthful_failure(monkeypatch):
+    def fake_post(url, headers=None, json=None, timeout=None):
+        raise requests.exceptions.ReadTimeout("provider read timed out")
+
+    monkeypatch.setenv("LLM_API_RETRIES", "1")
+    monkeypatch.setenv("LLM_API_RETRY_DELAY", "0")
+    monkeypatch.setattr("app.base_services.http_session.post", fake_post)
+    service = LLMService(
+        mode="api",
+        config={
+            "api_url": "https://example.test/v1/responses",
+            "api_key": "test-key",
+            "api_model": "gpt-5.6-sol",
+            "request_timeout": 30,
+            "stream_idle_timeout": 180,
+        },
+    )
+
+    result = service.generate([])
+
+    assert result["text"] == (
+        "The model provider timed out before returning a response."
+    )
+    assert "You said" not in result["text"]
+    assert result["metadata"]["category"] == "timeout"
+    assert "stream idle timeout" in result["metadata"]["hint"]
+
+
 def test_generate_api_streaming_responses_persists_response_ids_and_writes_capture(
     monkeypatch, tmp_path
 ):
@@ -291,6 +379,257 @@ def test_generate_api_streaming_responses_persists_response_ids_and_writes_captu
         event.get("type") == "content" and event.get("content") == "hi"
         for event in events
     )
+
+
+def test_generate_api_streaming_responses_parses_gpt56_function_call(monkeypatch):
+    captured = {"calls": 0}
+    function_call = {
+        "type": "function_call",
+        "id": "fc_read_1",
+        "call_id": "call_read_1",
+        "name": "read_file",
+        "arguments": '{"path":"workspace/note.txt"}',
+    }
+
+    def fake_post(url, headers=None, json=None, timeout=None, stream=False):
+        captured["calls"] += 1
+        captured["payload"] = json
+        captured["stream"] = stream
+        return DummyStreamingApiResponse(
+            _build_sse_lines(
+                {
+                    "type": "response.reasoning_summary_text.delta",
+                    "delta": "I should read the requested file.",
+                },
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {**function_call, "arguments": ""},
+                },
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "output_index": 0,
+                    "item_id": "fc_read_1",
+                    "delta": '{"path":"workspace/',
+                },
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "output_index": 0,
+                    "item_id": "fc_read_1",
+                    "delta": 'note.txt"}',
+                },
+                {
+                    "type": "response.function_call_arguments.done",
+                    "output_index": 0,
+                    "item_id": "fc_read_1",
+                    "arguments": function_call["arguments"],
+                },
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": function_call,
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_gpt56_tool",
+                        "model": "gpt-5.6-sol",
+                        "status": "completed",
+                        "output": [function_call],
+                    },
+                },
+            )
+        )
+
+    monkeypatch.setattr("app.base_services.http_session.post", fake_post)
+    service = LLMService(
+        mode="api",
+        config={
+            "api_url": "https://example.test/v1/responses",
+            "api_key": "test-key",
+            "api_model": "gpt-5.6-sol",
+        },
+    )
+    context = ModelContext(
+        tools=[
+            {
+                "name": "read_file",
+                "description": "Read a text file from the workspace.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            }
+        ]
+    )
+    events = []
+
+    result = service.generate(
+        "Read workspace/note.txt and quote its first line.",
+        context=context,
+        session_id="sess-gpt56",
+        stream_message_id="m-gpt56",
+        stream_consumer=events.append,
+    )
+
+    assert captured["calls"] == 1
+    assert captured["stream"] is True
+    assert captured["payload"]["model"] == "gpt-5.6-sol"
+    assert captured["payload"]["tools"][0]["name"] == "read_file"
+    assert result["text"] == "[[tool_call:0]]"
+    assert result["thought"] == "I should read the requested file."
+    assert result["tools_used"] == [
+        {
+            "name": "read_file",
+            "args": {"path": "workspace/note.txt"},
+            "call_id": "call_read_1",
+            "response_item": function_call,
+        }
+    ]
+    tool_deltas = [event for event in events if event.get("type") == "tool_call_delta"]
+    assert [event.get("fragment") for event in tool_deltas] == [
+        '{"path":"workspace/',
+        'note.txt"}',
+    ]
+    assert tool_deltas[-1]["arguments"] == function_call["arguments"]
+    visible_content = "".join(
+        str(event.get("content") or "")
+        for event in events
+        if event.get("type") == "content"
+    )
+    assert "workspace/note.txt" not in visible_content
+    assert function_call["arguments"] not in visible_content
+    assert result["metadata"]["response_id"] == "resp_gpt56_tool"
+
+
+def test_generate_api_streaming_responses_drops_incomplete_function_call(
+    monkeypatch,
+):
+    function_call = {
+        "type": "function_call",
+        "id": "fc_partial_1",
+        "call_id": "call_partial_1",
+        "name": "read_file",
+        "arguments": "",
+    }
+
+    def fake_post(url, headers=None, json=None, timeout=None, stream=False):
+        if not stream:
+            return DummyApiResponse({"output_text": "Recovered without a tool call."})
+        return DummyStreamingApiResponse(
+            _build_sse_lines(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": function_call,
+                },
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "output_index": 0,
+                    "item_id": "fc_partial_1",
+                    "delta": '{"path":"workspace/',
+                },
+            )
+        )
+
+    monkeypatch.setattr("app.base_services.http_session.post", fake_post)
+    service = LLMService(
+        mode="api",
+        config={
+            "api_url": "https://example.test/v1/responses",
+            "api_key": "test-key",
+            "api_model": "gpt-5.6-sol",
+        },
+    )
+    events = []
+
+    result = service.generate(
+        "Read the note.",
+        context=ModelContext(
+            tools=[
+                {
+                    "name": "read_file",
+                    "description": "Read a file.",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ]
+        ),
+        stream_consumer=events.append,
+    )
+
+    assert result["tools_used"] == []
+
+
+def test_generate_api_streaming_responses_drops_malformed_completed_call(
+    monkeypatch,
+):
+    function_call = {
+        "type": "function_call",
+        "id": "fc_malformed_1",
+        "call_id": "call_malformed_1",
+        "name": "read_file",
+        "arguments": '{"path":',
+    }
+
+    def fake_post(url, headers=None, json=None, timeout=None, stream=False):
+        if not stream:
+            return DummyApiResponse({"output_text": "Recovered without a tool call."})
+        return DummyStreamingApiResponse(
+            _build_sse_lines(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {**function_call, "arguments": ""},
+                },
+                {
+                    "type": "response.function_call_arguments.done",
+                    "output_index": 0,
+                    "item_id": "fc_malformed_1",
+                    "arguments": function_call["arguments"],
+                },
+                {
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": function_call,
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_malformed_tool",
+                        "model": "gpt-5.6-sol",
+                        "status": "completed",
+                        "output": [function_call],
+                    },
+                },
+            )
+        )
+
+    monkeypatch.setattr("app.base_services.http_session.post", fake_post)
+    service = LLMService(
+        mode="api",
+        config={
+            "api_url": "https://example.test/v1/responses",
+            "api_key": "test-key",
+            "api_model": "gpt-5.6-sol",
+        },
+    )
+
+    result = service.generate(
+        "Read the note.",
+        context=ModelContext(
+            tools=[
+                {
+                    "name": "read_file",
+                    "description": "Read a file.",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ]
+        ),
+        stream_consumer=lambda event: None,
+    )
+
+    assert result["tools_used"] == []
 
 
 def _mark_local_preflight_ready(monkeypatch):
@@ -657,7 +996,7 @@ def test_generate_local_gemma4_multimodal_path(monkeypatch):
             {
                 "name": "sample.png",
                 "type": "image/png",
-                "content_hash": "hash-image",
+                "content_hash": _content_hash("local-gemma-image"),
             }
         ],
     )
@@ -1095,14 +1434,15 @@ def test_generate_api_inlines_native_image_parts_for_supported_models(monkeypatc
             "api_model": "gpt-4.1-mini",
         },
     )
+    content_hash = _content_hash("native-image")
     result = svc.generate(
         "describe the image",
         attachments=[
             {
                 "name": "sample.png",
                 "type": "image/png",
-                "url": "/api/attachments/hash-native/sample.png",
-                "content_hash": "hash-native",
+                "url": f"/api/attachments/{content_hash}/sample.png",
+                "content_hash": content_hash,
             }
         ],
         vision_workflow="caption",
@@ -1115,6 +1455,301 @@ def test_generate_api_inlines_native_image_parts_for_supported_models(monkeypatc
     assert result["metadata"]["vision"]["workflow"] == "caption"
     assert result["metadata"]["vision"]["native_image_input"] is True
     assert result["metadata"]["vision"]["fallback_used"] is False
+
+
+def test_generate_api_does_not_read_unmanaged_context_image_path(
+    monkeypatch,
+):
+    captured = {}
+    unmanaged_file = Path(__file__).resolve().parents[3] / "pyproject.toml"
+    assert unmanaged_file.is_file()
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured["payload"] = json
+        return DummyApiResponse(
+            {
+                "model": "gpt-4.1-mini",
+                "choices": [{"message": {"content": "safe"}}],
+            }
+        )
+
+    monkeypatch.setattr("app.base_services.http_session.post", fake_post)
+    svc = LLMService(
+        mode="api",
+        config={
+            "api_url": "https://example.test/v1/chat/completions",
+            "api_key": "test-key",
+            "api_model": "gpt-4.1-mini",
+        },
+    )
+
+    svc.generate(
+        "hello",
+        context=ModelContext(metadata={"images": [{"path": str(unmanaged_file)}]}),
+    )
+
+    serialized = json.dumps(captured["payload"])
+    assert "data:image" not in serialized
+    assert "Consider these images" not in serialized
+
+
+def test_generate_api_inlines_four_images_with_distinct_provenance_references(
+    monkeypatch,
+):
+    captured = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured["payload"] = json
+        return DummyApiResponse(
+            {
+                "id": "resp_four_images",
+                "model": "gpt-5.4",
+                "output_text": "vision ok",
+            }
+        )
+
+    monkeypatch.setattr("app.base_services.http_session.post", fake_post)
+    monkeypatch.setattr("app.base_services.load_blob", lambda _content_hash: b"img")
+
+    svc = LLMService(
+        mode="api",
+        config={
+            "api_url": "https://example.test/v1/responses",
+            "api_key": "test-key",
+            "api_model": "gpt-5.4",
+        },
+    )
+    attachments = []
+    for index in range(1, 5):
+        content_hash = _content_hash(f"provenance-{index}")
+        attachments.append(
+            {
+                "name": f"image-{index}.png",
+                "type": "image/png",
+                "url": f"/api/attachments/{content_hash}/image-{index}.png",
+                "content_hash": content_hash,
+                "relative_path": f"uploads/{content_hash}/image-{index}.png",
+                "_canonical_attachment_resolved": True,
+                **(
+                    {
+                        "display_name": "Ravine owl",
+                        "source_url": "https://example.test/gallery/original",
+                        "source_url_recorded_at": "2026-07-29T12:00:00Z",
+                    }
+                    if index == 1
+                    else {}
+                ),
+            }
+        )
+
+    result = svc.generate("compare these", attachments=attachments)
+
+    user_content = next(
+        item["content"]
+        for item in captured["payload"]["input"]
+        if isinstance(item, dict)
+        and item.get("role") == "user"
+        and any(
+            isinstance(part, dict) and part.get("type") == "input_image"
+            for part in (item.get("content") or [])
+        )
+    )
+    image_indexes = [
+        index
+        for index, part in enumerate(user_content)
+        if isinstance(part, dict) and part.get("type") == "input_image"
+    ]
+    assert len(image_indexes) == 4
+    for ordinal, image_index in enumerate(image_indexes, start=1):
+        content_hash = _content_hash(f"provenance-{ordinal}")
+        reference = user_content[image_index - 1]
+        assert reference["type"] == "input_text"
+        expected_label = "Ravine owl" if ordinal == 1 else f"image-{ordinal}.png"
+        assert f"Image {ordinal} ({expected_label})" in reference["text"]
+        assert (
+            f"content_hash={content_hash} (durable attachment/sync id)"
+            in reference["text"]
+        )
+        assert (
+            "relative_path="
+            f"uploads/{content_hash}/image-{ordinal}.png "
+            "(current managed deployment-relative storage path)" in reference["text"]
+        )
+        assert (
+            f"url=/api/attachments/{content_hash}/image-{ordinal}.png "
+            "(reconstructable API retrieval route)" in reference["text"]
+        )
+        if ordinal == 1:
+            assert (
+                "source_url=https://example.test/gallery/original "
+                "(recorded external provenance, recorded 2026-07-29T12:00:00Z; "
+                "not the durable copy)" in reference["text"]
+            )
+    assert result["metadata"]["vision"]["native_image_input"] is True
+    assert result["metadata"]["vision"]["fallback_used"] is False
+
+
+def test_native_image_references_omit_unresolved_and_credentialed_provenance(
+    monkeypatch,
+):
+    captured = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured["payload"] = json
+        return DummyApiResponse(
+            {"id": "resp_safe_refs", "model": "gpt-5.4", "output_text": "ok"}
+        )
+
+    monkeypatch.setattr("app.base_services.http_session.post", fake_post)
+    monkeypatch.setattr("app.base_services.load_blob", lambda _hash: b"image")
+    unresolved_hash = _content_hash("unresolved-client-reference")
+    canonical_hash = _content_hash("canonical-signed-reference")
+    svc = LLMService(
+        mode="api",
+        config={
+            "api_url": "https://example.test/v1/responses",
+            "api_key": "test-key",
+            "api_model": "gpt-5.4",
+        },
+    )
+
+    svc.generate(
+        "compare",
+        attachments=[
+            {
+                "name": "client.png",
+                "type": "image/png",
+                "url": f"/api/attachments/{unresolved_hash}/client.png",
+                "content_hash": unresolved_hash,
+                "relative_path": "workspace/private/client.png",
+                "source_url": "https://example.test/client-supplied",
+            },
+            {
+                "name": "canonical.png",
+                "type": "image/png",
+                "url": f"/api/attachments/{canonical_hash}/canonical.png",
+                "content_hash": canonical_hash,
+                "relative_path": f"uploads/{canonical_hash}/canonical.png",
+                "source_url": "https://user:password@example.test/source.png",
+                "_canonical_attachment_resolved": True,
+            },
+        ],
+    )
+
+    user_content = next(
+        item["content"]
+        for item in captured["payload"]["input"]
+        if isinstance(item, dict)
+        and item.get("role") == "user"
+        and any(
+            isinstance(part, dict) and part.get("type") == "input_image"
+            for part in (item.get("content") or [])
+        )
+    )
+    references = [
+        str(user_content[index - 1].get("text") or "")
+        for index, part in enumerate(user_content)
+        if isinstance(part, dict) and part.get("type") == "input_image"
+    ]
+    assert references[0] == "Image 1 (client.png)"
+    assert unresolved_hash not in references[0]
+    assert "workspace/private" not in references[0]
+    assert "client-supplied" not in references[0]
+    assert f"content_hash={canonical_hash}" in references[1]
+    assert f"url=/api/attachments/{canonical_hash}/canonical.png" in references[1]
+    assert "user:password" not in references[1]
+    assert "source_url=" not in references[1]
+
+
+def test_generate_api_fallback_uses_actual_attachment_ordinal(monkeypatch):
+    captured = {}
+
+    def empty_captioner(raw, *, model=None, **_kwargs):
+        return SimpleNamespace(model=model), {
+            "image_caption": "",
+            "placeholder": False,
+        }
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured["payload"] = json
+        return DummyApiResponse(
+            {
+                "id": "resp_fifth_fallback",
+                "model": "gpt-5.4",
+                "output_text": "vision ok",
+            }
+        )
+
+    monkeypatch.setattr("app.base_services.http_session.post", fake_post)
+    monkeypatch.setattr("app.base_services.load_blob", lambda _content_hash: b"img")
+    monkeypatch.setattr(
+        "app.base_services.run_shared_vision_captioner", empty_captioner
+    )
+
+    svc = LLMService(
+        mode="api",
+        config={
+            "api_url": "https://example.test/v1/responses",
+            "api_key": "test-key",
+            "api_model": "gpt-5.4",
+        },
+    )
+    attachments = []
+    for index in range(1, 5):
+        content_hash = _content_hash(f"ordinal-{index}")
+        attachments.append(
+            {
+                "name": f"image-{index}.png",
+                "type": "image/png",
+                "url": f"/api/attachments/{content_hash}/image-{index}.png",
+                "content_hash": content_hash,
+                "_canonical_attachment_resolved": True,
+            }
+        )
+    attachments.append(dict(attachments[0]))
+    fifth_hash = _content_hash("ordinal-5")
+    attachments.append(
+        {
+            "name": "image-5.png",
+            "type": "image/png",
+            "url": f"/api/attachments/{fifth_hash}/image-5.png",
+            "content_hash": fifth_hash,
+            "relative_path": f"uploads/{fifth_hash}/image-5.png",
+            "source_url": "https://example.test/images/fifth",
+            "_canonical_attachment_resolved": True,
+        }
+    )
+
+    result = svc.generate("compare these", attachments=attachments)
+
+    content_parts = [
+        part
+        for item in captured["payload"]["input"]
+        if isinstance(item, dict)
+        for part in (item.get("content") or [])
+        if isinstance(part, dict)
+    ]
+    assert sum(part.get("type") == "input_image" for part in content_parts) == 4
+    fallback_text = next(
+        str(part.get("text") or "")
+        for part in content_parts
+        if "Image delivery notice" in str(part.get("text") or "")
+    )
+    assert "Image 5 (image-5.png)" in fallback_text
+    assert f"/api/attachments/{fifth_hash}/image-5.png" in fallback_text
+    fallback_reference = next(
+        str(part.get("text") or "")
+        for part in content_parts
+        if f"content_hash={fifth_hash} (durable attachment/sync id)"
+        in str(part.get("text") or "")
+    )
+    assert f"relative_path=uploads/{fifth_hash}/image-5.png" in fallback_reference
+    assert f"url=/api/attachments/{fifth_hash}/image-5.png" in fallback_reference
+    assert "source_url=https://example.test/images/fifth" in fallback_reference
+    vision_meta = result["metadata"]["vision"]
+    assert vision_meta["native_image_input"] is True
+    assert vision_meta["fallback_used"] is True
+    assert vision_meta["fallback_images"] == 1
 
 
 def test_generate_api_inlines_transient_camera_capture_for_responses(
@@ -1207,13 +1842,12 @@ def test_generate_api_caption_fallback_resolves_transient_camera_capture(
         capture_source="chat_camera",
     )
 
-    class DummyCaptioner:
-        def __init__(self, model):
-            self.model = model
-
-        def run(self, raw):
-            assert raw == b"fallback-camera-image"
-            return {"image_caption": "Transient camera caption", "placeholder": False}
+    def dummy_captioner(raw, *, model=None, **_kwargs):
+        assert raw == b"fallback-camera-image"
+        return SimpleNamespace(model=model), {
+            "image_caption": "Transient camera caption",
+            "placeholder": False,
+        }
 
     def fake_post(url, headers=None, json=None, timeout=None):
         captured["payload"] = json
@@ -1230,7 +1864,9 @@ def test_generate_api_caption_fallback_resolves_transient_camera_capture(
     monkeypatch.setattr("app.base_services.http_session.post", fake_post)
     monkeypatch.setattr("app.base_services.load_blob", missing_blob)
     monkeypatch.setattr("app.base_services.get_capture_service", lambda: service)
-    monkeypatch.setattr("app.base_services.VisionCaptioner", DummyCaptioner)
+    monkeypatch.setattr(
+        "app.base_services.run_shared_vision_captioner", dummy_captioner
+    )
 
     svc = LLMService(
         mode="api",
@@ -1322,14 +1958,21 @@ def test_generate_api_blocks_supported_model_when_image_bytes_missing(monkeypatc
 
 def test_generate_api_uses_local_caption_fallback_for_non_vision_models(monkeypatch):
     captured = {}
+    logo_path = (
+        Path(__file__).resolve().parents[3] / "docs" / "resources" / "floatlogo.png"
+    )
+    image_bytes = logo_path.read_bytes()
+    with Image.open(io.BytesIO(image_bytes)) as decoded:
+        assert decoded.width > 32
+        assert decoded.height > 32
+        assert decoded.getbbox() is not None
 
-    class DummyCaptioner:
-        def __init__(self, model):
-            self.model = model
-
-        def run(self, raw):
-            assert raw == b"fallback-image"
-            return {"image_caption": "Local fallback caption", "placeholder": False}
+    def dummy_captioner(raw, *, model=None, **_kwargs):
+        assert raw == image_bytes
+        return SimpleNamespace(model=model), {
+            "image_caption": "Local fallback caption",
+            "placeholder": False,
+        }
 
     def fake_post(url, headers=None, json=None, timeout=None):
         captured["url"] = url
@@ -1343,9 +1986,11 @@ def test_generate_api_uses_local_caption_fallback_for_non_vision_models(monkeypa
 
     monkeypatch.setattr("app.base_services.http_session.post", fake_post)
     monkeypatch.setattr(
-        "app.base_services.load_blob", lambda _content_hash: b"fallback-image"
+        "app.base_services.load_blob", lambda _content_hash: image_bytes
     )
-    monkeypatch.setattr("app.base_services.VisionCaptioner", DummyCaptioner)
+    monkeypatch.setattr(
+        "app.base_services.run_shared_vision_captioner", dummy_captioner
+    )
 
     svc = LLMService(
         mode="api",
@@ -1354,16 +1999,18 @@ def test_generate_api_uses_local_caption_fallback_for_non_vision_models(monkeypa
             "api_key": "test-key",
             "api_model": "text-only-model",
             "vision_model": "local-caption-model",
+            "image_caption_engine": "local",
         },
     )
+    content_hash = hashlib.sha256(image_bytes).hexdigest()
     result = svc.generate(
         "describe the image",
         attachments=[
             {
                 "name": "fallback.png",
                 "type": "image/png",
-                "url": "/api/attachments/hash-fallback/fallback.png",
-                "content_hash": "hash-fallback",
+                "url": f"/api/attachments/{content_hash}/fallback.png",
+                "content_hash": content_hash,
             }
         ],
         vision_workflow="caption",
@@ -1389,16 +2036,208 @@ def test_generate_api_uses_local_caption_fallback_for_non_vision_models(monkeypa
     )
 
 
+def test_generate_api_reuses_canonical_stored_caption_before_loading_vision_model(
+    monkeypatch,
+):
+    captured = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured["payload"] = json
+        return DummyApiResponse(
+            {
+                "model": "text-only-model",
+                "choices": [{"message": {"content": "fallback ok"}}],
+            }
+        )
+
+    def unexpected_caption(*_args, **_kwargs):
+        raise AssertionError("stored caption should prevent local model loading")
+
+    def unexpected_blob(_content_hash):
+        raise AssertionError("stored caption should prevent an unnecessary blob read")
+
+    monkeypatch.setattr("app.base_services.http_session.post", fake_post)
+    monkeypatch.setattr("app.base_services.load_blob", unexpected_blob)
+    monkeypatch.setattr(
+        "app.base_services.run_shared_vision_captioner", unexpected_caption
+    )
+    content_hash = _content_hash("stored-caption")
+    svc = LLMService(
+        mode="api",
+        config={
+            "api_url": "https://example.test/v1/chat/completions",
+            "api_key": "test-key",
+            "api_model": "text-only-model",
+            "vision_model": "local-caption-model",
+            "image_caption_engine": "local",
+        },
+    )
+
+    result = svc.generate(
+        "what is in the image?",
+        attachments=[
+            {
+                "name": "meal.png",
+                "type": "image/png",
+                "url": f"/api/attachments/{content_hash}/meal.png",
+                "content_hash": content_hash,
+                "relative_path": f"uploads/{content_hash}/meal.png",
+                "_canonical_attachment_resolved": True,
+                "caption": "A bowl of noodles with greens.",
+                "caption_status": "manual",
+                "caption_model": "manual-caption",
+            }
+        ],
+        vision_workflow="image_qa",
+    )
+
+    content = captured["payload"]["messages"][-1]["content"]
+    assert any(
+        "Saved attachment caption: Image 1 (meal.png): "
+        "A bowl of noodles with greens." in str(part.get("text", ""))
+        for part in content
+        if isinstance(part, dict)
+    )
+    detail = result["metadata"]["vision"]["fallback_attachments"][0]
+    assert detail["caption"] == "A bowl of noodles with greens."
+    assert detail["caption_model"] == "manual-caption"
+
+
+@pytest.mark.parametrize("caption_engine", ["cloud", "off"])
+def test_chat_fallback_does_not_implicitly_invoke_cloud_or_disabled_caption_engine(
+    monkeypatch,
+    caption_engine,
+):
+    captured = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured["payload"] = json
+        return DummyApiResponse(
+            {
+                "model": "text-only-model",
+                "choices": [{"message": {"content": "fallback ok"}}],
+            }
+        )
+
+    def unexpected_caption(*_args, **_kwargs):
+        raise AssertionError("chat fallback must not invoke this caption engine")
+
+    monkeypatch.setattr("app.base_services.http_session.post", fake_post)
+    monkeypatch.setattr("app.base_services.load_blob", lambda _hash: b"image")
+    monkeypatch.setattr(
+        "app.base_services.run_shared_vision_captioner", unexpected_caption
+    )
+    content_hash = _content_hash(f"{caption_engine}-fallback")
+    svc = LLMService(
+        mode="api",
+        config={
+            "api_url": "https://example.test/v1/chat/completions",
+            "api_key": "test-key",
+            "api_model": "text-only-model",
+            "image_caption_engine": caption_engine,
+        },
+    )
+
+    result = svc.generate(
+        "describe it",
+        attachments=[
+            {
+                "name": "image.png",
+                "type": "image/png",
+                "content_hash": content_hash,
+            }
+        ],
+        vision_workflow="caption",
+    )
+
+    content = captured["payload"]["messages"][-1]["content"]
+    notice = next(
+        str(part.get("text") or "")
+        for part in content
+        if isinstance(part, dict) and "Image delivery notice" in str(part.get("text"))
+    )
+    if caption_engine == "cloud":
+        assert "did not send the image to a separate cloud captioning service" in notice
+    else:
+        assert "Image caption generation is disabled" in notice
+    detail = result["metadata"]["vision"]["fallback_attachments"][0]
+    assert detail["placeholder"] is True
+
+
+def test_two_consecutive_chat_fallbacks_reuse_one_shared_captioner(monkeypatch):
+    import workers.multimodal as multimodal
+
+    captured = []
+    created = []
+    logo_path = (
+        Path(__file__).resolve().parents[3] / "docs" / "resources" / "floatlogo.png"
+    )
+    image_bytes = logo_path.read_bytes()
+    with Image.open(io.BytesIO(image_bytes)) as decoded:
+        assert decoded.width > 32 and decoded.height > 32
+        assert decoded.getbbox() is not None
+
+    class CountingCaptioner:
+        def __init__(self, model):
+            self.model = model
+            self.runs = 0
+            created.append(self)
+
+        def run(self, raw):
+            assert raw == image_bytes
+            self.runs += 1
+            return {"image_caption": "The Float logo.", "placeholder": False}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured.append(json)
+        return DummyApiResponse(
+            {
+                "model": "text-only-model",
+                "choices": [{"message": {"content": "fallback ok"}}],
+            }
+        )
+
+    multimodal.reset_shared_vision_captioner()
+    monkeypatch.setattr(multimodal, "VisionCaptioner", CountingCaptioner)
+    monkeypatch.setattr("app.base_services.http_session.post", fake_post)
+    monkeypatch.setattr("app.base_services.load_blob", lambda _hash: image_bytes)
+    content_hash = hashlib.sha256(image_bytes).hexdigest()
+    svc = LLMService(
+        mode="api",
+        config={
+            "api_url": "https://example.test/v1/chat/completions",
+            "api_key": "test-key",
+            "api_model": "text-only-model",
+            "vision_model": "test/local-caption-model",
+            "image_caption_engine": "local",
+        },
+    )
+    attachment = {
+        "name": "floatlogo.png",
+        "type": "image/png",
+        "content_hash": content_hash,
+    }
+
+    try:
+        svc.generate("first", attachments=[attachment], vision_workflow="caption")
+        svc.generate("second", attachments=[attachment], vision_workflow="caption")
+    finally:
+        multimodal.reset_shared_vision_captioner()
+
+    assert len(captured) == 2
+    assert len(created) == 1
+    assert created[0].runs == 2
+
+
 def test_generate_api_uses_placeholder_caption_without_hashlib_crash(monkeypatch):
     captured = {}
 
-    class EmptyCaptioner:
-        def __init__(self, model):
-            self.model = model
-
-        def run(self, raw):
-            assert raw == b"fallback-image"
-            return {"image_caption": "", "placeholder": False}
+    def empty_captioner(raw, *, model=None, **_kwargs):
+        assert raw == b"fallback-image"
+        return SimpleNamespace(model=model), {
+            "image_caption": "",
+            "placeholder": False,
+        }
 
     def fake_post(url, headers=None, json=None, timeout=None):
         captured["payload"] = json
@@ -1413,7 +2252,9 @@ def test_generate_api_uses_placeholder_caption_without_hashlib_crash(monkeypatch
     monkeypatch.setattr(
         "app.base_services.load_blob", lambda _content_hash: b"fallback-image"
     )
-    monkeypatch.setattr("app.base_services.VisionCaptioner", EmptyCaptioner)
+    monkeypatch.setattr(
+        "app.base_services.run_shared_vision_captioner", empty_captioner
+    )
 
     svc = LLMService(
         mode="api",
@@ -1425,14 +2266,15 @@ def test_generate_api_uses_placeholder_caption_without_hashlib_crash(monkeypatch
         },
     )
 
+    content_hash = _content_hash("fallback-without-caption")
     result = svc.generate(
         "describe the image",
         attachments=[
             {
                 "name": "fallback-no-caption.png",
                 "type": "image/png",
-                "url": "/api/attachments/hash-fallback/fallback-no-caption.png",
-                "content_hash": "",
+                "url": f"/api/attachments/{content_hash}/fallback-no-caption.png",
+                "content_hash": content_hash,
             }
         ],
         vision_workflow="caption",
@@ -1482,14 +2324,15 @@ def test_generate_api_merges_attachments_when_prompt_is_sequence(monkeypatch):
         },
     )
 
+    recalled_hash = _content_hash("recalled-sequence")
     svc.generate(
         [],
         attachments=[
             {
                 "name": "recalled.png",
                 "type": "image/png",
-                "url": "/api/attachments/hash-recalled/recalled.png",
-                "content_hash": "hash-recalled",
+                "url": f"/api/attachments/{recalled_hash}/recalled.png",
+                "content_hash": recalled_hash,
             }
         ],
         vision_workflow="image_qa",
@@ -1506,6 +2349,13 @@ def test_generate_api_dedupes_recalled_context_attachments_against_prompt_attach
     monkeypatch,
 ):
     captured = {}
+    logo_path = (
+        Path(__file__).resolve().parents[3] / "docs" / "resources" / "floatlogo.png"
+    )
+    image_bytes = logo_path.read_bytes()
+    with Image.open(io.BytesIO(image_bytes)) as decoded:
+        assert decoded.width > 32 and decoded.height > 32
+        assert decoded.getbbox() is not None
 
     def fake_post(url, headers=None, json=None, timeout=None):
         captured["payload"] = json
@@ -1519,7 +2369,7 @@ def test_generate_api_dedupes_recalled_context_attachments_against_prompt_attach
 
     monkeypatch.setattr("app.base_services.http_session.post", fake_post)
     monkeypatch.setattr(
-        "app.base_services.load_blob", lambda _content_hash: b"img-bytes"
+        "app.base_services.load_blob", lambda _content_hash: image_bytes
     )
 
     svc = LLMService(
@@ -1530,11 +2380,12 @@ def test_generate_api_dedupes_recalled_context_attachments_against_prompt_attach
             "api_model": "gpt-5.4",
         },
     )
+    recalled_hash = hashlib.sha256(image_bytes).hexdigest()
     attachment = {
         "name": "recalled.png",
         "type": "image/png",
-        "url": "/api/attachments/hash-recalled/recalled.png",
-        "content_hash": "hash-recalled",
+        "url": f"/api/attachments/{recalled_hash}/recalled.png",
+        "content_hash": recalled_hash,
     }
     ctx = ModelContext(system_prompt="")
     ctx.add_message(
@@ -1559,3 +2410,17 @@ def test_generate_api_dedupes_recalled_context_attachments_against_prompt_attach
         if isinstance(part, dict) and part.get("type") == "input_image"
     ]
     assert len(image_parts) == 1
+    assert any(
+        isinstance(part, dict) and part.get("type") == "input_image"
+        for part in (input_items[-1].get("content") or [])
+    )
+    assert all(
+        not any(
+            isinstance(part, dict) and part.get("type") == "input_image"
+            for part in (item.get("content") or [])
+        )
+        for item in input_items[:-1]
+        if isinstance(item, dict)
+    )
+    encoded = image_parts[0]["image_url"].split(",", 1)[1]
+    assert hashlib.sha256(base64.b64decode(encoded)).hexdigest() == recalled_hash

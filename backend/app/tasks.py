@@ -3,12 +3,17 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 from app import config as app_config
+from app.services.calendar_jobs import (
+    coerce_epoch_seconds,
+    due_occurrence_time,
+    occurrence_times,
+)
 from app.services.rag_provider import ingest_calendar_event, try_ingest_text
 from app.services.stt_service import STTService
 from app.services.tts_service import TTSService
@@ -19,7 +24,6 @@ from app.utils.telemetry import set_request_id
 from app.utils.time_resolution import resolve_timezone_name
 from celery import Celery
 from celery import signals as celery_signals
-from dateutil import rrule
 
 # Attempt to import service classes.
 # Fallback to dummy implementations if unavailable.
@@ -246,6 +250,26 @@ def _float_online() -> bool:
     return os.getenv("FLOAT_ONLINE", "true").lower() == "true"
 
 
+def _release_prompt_dispatch(event_id: str, occurrence_time: Optional[float]) -> None:
+    """Release an unconsumed dispatch claim so the next poll can retry it."""
+
+    if occurrence_time is None:
+        return
+
+    def release(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        marker = coerce_epoch_seconds(current.get("last_prompt_dispatched"))
+        if marker is None or abs(marker - float(occurrence_time)) > 0.5:
+            return None
+        last_triggered = coerce_epoch_seconds(current.get("last_triggered")) or 0
+        if last_triggered > 0:
+            current["last_prompt_dispatched"] = last_triggered
+        else:
+            current.pop("last_prompt_dispatched", None)
+        return current
+
+    calendar_store.update_event(event_id, release)
+
+
 def _emit_calendar_notification(
     *,
     event_id: str,
@@ -283,10 +307,18 @@ def send_event_prompt(event_id: str, occ_time: Optional[float] = None) -> str:
     if not event:
         return "event not found"
     status = event.get("status", "pending")
+    if str(status).strip().lower() in {
+        "acknowledged",
+        "skipped",
+        "cancelled",
+        "paused",
+    }:
+        return "event inactive"
     if not event.get("rrule") and status != "pending":
         return "event already processed"
 
     if not _float_online():
+        _release_prompt_dispatch(event_id, occ_time)
         return "float offline"
 
     tz = ZoneInfo(resolve_timezone_name(event.get("timezone")))
@@ -302,10 +334,27 @@ def send_event_prompt(event_id: str, occ_time: Optional[float] = None) -> str:
     else:
         message = f"Upcoming event '{title}' at {start_dt.isoformat()}."
 
-    event["status"] = "prompted"
-    event["prompt_message"] = message
-    event["last_triggered"] = start
-    calendar_store.save_event(event_id, event)
+    claimed = False
+
+    def claim_prompt(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        nonlocal claimed
+        current_status = str(current.get("status") or "pending").strip().lower()
+        if current_status in {"acknowledged", "skipped", "cancelled", "paused"}:
+            return None
+        last_triggered = coerce_epoch_seconds(current.get("last_triggered")) or 0
+        if last_triggered >= float(start) - 0.5:
+            return None
+        current["status"] = "scheduled" if current.get("rrule") else "prompted"
+        current["prompt_message"] = message
+        current["last_triggered"] = start
+        claimed = True
+        return current
+
+    event = calendar_store.update_event(event_id, claim_prompt)
+    if not event:
+        return "event not found"
+    if not claimed:
+        return "event inactive or already processed"
     try:
         ingest_calendar_event(event_id, event)
     except Exception:
@@ -358,25 +407,78 @@ def dispatch_due_calendar_prompts(*, enqueue: bool = True) -> list[dict[str, Any
         event = calendar_store.load_event(event_id)
         if not isinstance(event, dict):
             continue
+        if str(event.get("status") or "pending").strip().lower() in {
+            "acknowledged",
+            "skipped",
+            "cancelled",
+            "paused",
+        }:
+            continue
         tz = ZoneInfo(resolve_timezone_name(event.get("timezone")))
         now = datetime.now(tz)
-        lead = timedelta(seconds=lead_seconds)
         rrule_str = event.get("rrule")
         if rrule_str:
-            start_dt = datetime.fromtimestamp(
-                event.get("start_time", now.timestamp()), tz
+            now_ts = now.timestamp()
+            last_triggered = coerce_epoch_seconds(event.get("last_triggered")) or 0
+            last_dispatched = (
+                coerce_epoch_seconds(event.get("last_prompt_dispatched")) or 0
             )
-            rule = rrule.rrulestr(rrule_str, dtstart=start_dt)
-            last = event.get("last_triggered")
-            after = datetime.fromtimestamp(last, tz) if last else now
-            next_dt = rule.after(after)
-            if next_dt and next_dt <= now + lead:
-                occ_time = next_dt.timestamp()
-                if enqueue:
-                    send_event_prompt.delay(event_id, occ_time)
-                else:
-                    send_event_prompt.run(event_id, occ_time)
-                triggered.append({"event_id": event_id, "occ_time": occ_time})
+            last = max(last_triggered, last_dispatched)
+            latest_due = due_occurrence_time(event, now=now_ts)
+            occ_time = None
+            if latest_due is not None:
+                if latest_due > last + 0.5:
+                    occ_time = latest_due
+            if occ_time is None and (
+                latest_due is None or latest_due <= last_triggered + 0.5
+            ):
+                future = occurrence_times(
+                    event,
+                    range_start=max(now_ts, last + 0.5),
+                    range_end=now_ts + lead_seconds,
+                    limit=2,
+                )
+                occ_time = next(
+                    (candidate for candidate in future if candidate > last + 0.5),
+                    None,
+                )
+            if occ_time is not None:
+                claimed = False
+
+                def claim_dispatch(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                    nonlocal claimed
+                    current_status = (
+                        str(current.get("status") or "pending").strip().lower()
+                    )
+                    if current_status in {
+                        "acknowledged",
+                        "skipped",
+                        "cancelled",
+                        "paused",
+                    }:
+                        return None
+                    current_last = max(
+                        coerce_epoch_seconds(current.get("last_triggered")) or 0,
+                        coerce_epoch_seconds(current.get("last_prompt_dispatched"))
+                        or 0,
+                    )
+                    if occ_time <= current_last + 0.5:
+                        return None
+                    current["last_prompt_dispatched"] = occ_time
+                    claimed = True
+                    return current
+
+                calendar_store.update_event(event_id, claim_dispatch)
+                if claimed:
+                    try:
+                        if enqueue:
+                            send_event_prompt.delay(event_id, occ_time)
+                        else:
+                            send_event_prompt.run(event_id, occ_time)
+                    except Exception:
+                        _release_prompt_dispatch(event_id, occ_time)
+                        raise
+                    triggered.append({"event_id": event_id, "occ_time": occ_time})
             continue
 
         if event.get("status", "pending") != "pending":
@@ -384,8 +486,7 @@ def dispatch_due_calendar_prompts(*, enqueue: bool = True) -> list[dict[str, Any
         start = event.get("start_time")
         if start is None:
             continue
-        start_dt = datetime.fromtimestamp(start, tz)
-        if start_dt <= now + lead:
+        if float(start) <= now.timestamp() + lead_seconds:
             if enqueue:
                 send_event_prompt.delay(event_id, start)
             else:

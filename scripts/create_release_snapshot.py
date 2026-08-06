@@ -86,6 +86,7 @@ EXCLUDED_PREFIXES = (
     "backend/.env.example",
     "backend/app/sae/train.py",
     "backend/app/services/tests/test_threads_embedding_bakeoff_eval.py",
+    "backend/app/tests/test_tool_confusion_api_eval.py",
     "backend/conversations/",
     "backend/logs/",
     "backend/models/",

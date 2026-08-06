@@ -1,6 +1,8 @@
 import hashlib
+import os
 import re
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, Optional
 
@@ -26,6 +28,59 @@ _HEX_SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 
 def _hex_sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _file_matches_content_hash(path: Path, content_hash: str) -> bool:
+    """Return whether a regular stored asset still matches its address."""
+
+    if path.is_symlink() or not path.is_file():
+        return False
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return False
+    return digest.hexdigest() == content_hash
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Replace one asset from a same-directory temporary file."""
+
+    temporary_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=str(path.parent),
+            prefix=".asset-",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def is_canonical_content_hash(value: object) -> bool:
+    """Return whether *value* is an exact lowercase SHA-256 digest."""
+
+    return isinstance(value, str) and bool(_HEX_SHA256_RE.fullmatch(value))
+
+
+def require_canonical_content_hash(value: object) -> str:
+    """Validate a public blob identifier before it participates in a path lookup."""
+
+    if not is_canonical_content_hash(value):
+        raise ValueError(
+            "content_hash must be exactly 64 lowercase hexadecimal characters"
+        )
+    return value
 
 
 def _resolve_data_root() -> Path:
@@ -103,25 +158,36 @@ def asset_origin_dirname(origin: str) -> str:
 
 
 def _is_hash_dir(entry: Path) -> bool:
-    return entry.is_dir() and bool(_HEX_SHA256_RE.fullmatch(entry.name.lower()))
+    return entry.is_dir() and is_canonical_content_hash(entry.name)
 
 
-def _iter_sync_attachment_roots(content_hash: str) -> Iterator[Path]:
-    normalized_hash = str(content_hash or "").strip().lower()
-    if not normalized_hash:
+def _iter_sync_attachment_root_candidates(content_hash: str) -> Iterator[Path]:
+    try:
+        normalized_hash = require_canonical_content_hash(content_hash)
+    except ValueError:
         return
     data_root = _resolve_managed_data_root()
     sync_root = data_root / "sync"
     if sync_root.exists():
         pattern = f"*/workspace/**/attachments/{normalized_hash}"
         for candidate_root in sync_root.glob(pattern):
-            if _is_hash_dir(candidate_root):
-                yield candidate_root
+            yield candidate_root
     legacy_sync_root = _resolve_data_files_root() / "workspace" / "sync"
     if legacy_sync_root.exists():
         for candidate_root in legacy_sync_root.rglob(normalized_hash):
-            if _is_hash_dir(candidate_root):
-                yield candidate_root
+            yield candidate_root
+
+
+def _iter_sync_attachment_roots(content_hash: str) -> Iterator[Path]:
+    data_root = _resolve_managed_data_root().resolve()
+    for candidate_root in _iter_sync_attachment_root_candidates(content_hash):
+        try:
+            resolved = candidate_root.resolve()
+            resolved.relative_to(data_root)
+        except Exception:
+            continue
+        if _is_hash_dir(candidate_root):
+            yield resolved
 
 
 def iter_attachment_hashes() -> Iterator[str]:
@@ -135,7 +201,7 @@ def iter_attachment_hashes() -> Iterator[str]:
                 continue
             candidate = entry.stem if name.endswith(".json") else name
             candidate = str(candidate or "").strip().lower()
-            if candidate and candidate not in seen:
+            if is_canonical_content_hash(candidate) and candidate not in seen:
                 seen.add(candidate)
                 yield candidate
     except FileNotFoundError:
@@ -168,11 +234,18 @@ def _migrate_legacy_sync_attachment(
     *,
     filename: Optional[str] = None,
 ) -> Optional[Path]:
-    normalized_hash = str(content_hash or "").strip().lower()
+    try:
+        normalized_hash = require_canonical_content_hash(content_hash)
+    except ValueError:
+        return None
     legacy_root = _resolve_data_files_root() / "workspace" / "sync"
-    if not normalized_hash or not legacy_root.exists():
+    if not legacy_root.exists():
         return None
     for candidate_root in legacy_root.rglob(normalized_hash):
+        try:
+            candidate_root.resolve().relative_to(legacy_root.resolve())
+        except Exception:
+            continue
         if not _is_hash_dir(candidate_root):
             continue
         files = [child for child in candidate_root.iterdir() if child.is_file()]
@@ -210,15 +283,25 @@ def _migrate_legacy_sync_attachment(
 
 def _iter_asset_candidates(content_hash: str) -> Iterator[Path]:
     files_dir = _resolve_data_files_root()
-    normalized_hash = str(content_hash or "").strip().lower()
-    if not normalized_hash:
+    try:
+        normalized_hash = require_canonical_content_hash(content_hash)
+    except ValueError:
         return
     for dirname in ASSET_ORIGIN_DIRS.values():
         candidate_root = files_dir / dirname / normalized_hash
+        try:
+            candidate_root.resolve().relative_to(files_dir.resolve())
+        except Exception:
+            continue
         if candidate_root.exists() and candidate_root.is_dir():
             for candidate in candidate_root.iterdir():
-                if candidate.is_file():
-                    yield candidate
+                try:
+                    resolved = candidate.resolve()
+                    resolved.relative_to(files_dir.resolve())
+                except Exception:
+                    continue
+                if resolved.is_file():
+                    yield resolved
     migrated = _migrate_legacy_sync_attachment(normalized_hash)
     if migrated is not None and migrated.exists() and migrated.is_file():
         yield migrated
@@ -233,8 +316,9 @@ def find_asset_path(
     *,
     filename: Optional[str] = None,
 ) -> Optional[Path]:
-    normalized_hash = str(content_hash or "").strip().lower()
-    if not normalized_hash:
+    try:
+        normalized_hash = require_canonical_content_hash(content_hash)
+    except ValueError:
         return None
     wanted_name = Path(str(filename or "")).name.strip()
     fallback: Optional[Path] = None
@@ -263,8 +347,8 @@ def put_asset(
         target_path.relative_to(files_dir)
     except Exception as exc:
         raise ValueError("asset target escaped data/files root") from exc
-    if not target_path.exists():
-        target_path.write_bytes(data)
+    if not _file_matches_content_hash(target_path, content_hash):
+        _atomic_write_bytes(target_path, data)
     relative_path = target_path.relative_to(files_dir).as_posix()
     return {
         "content_hash": content_hash,
@@ -277,24 +361,37 @@ def put_asset(
 
 def put_blob(data: bytes) -> str:
     """Store a complete blob addressed by content hash; return hash."""
+
     h = _hex_sha256(data)
-    path = BLOBS_DIR / h
-    if not path.exists():
-        path.write_bytes(data)
+    blob_root = BLOBS_DIR.resolve()
+    blob_root.mkdir(parents=True, exist_ok=True)
+    path = blob_root / h
+    if not _file_matches_content_hash(path, h):
+        _atomic_write_bytes(path, data)
     return h
 
 
 def get_blob(content_hash: str) -> bytes:
-    asset_path = find_asset_path(content_hash)
+    normalized_hash = require_canonical_content_hash(content_hash)
+    asset_path = find_asset_path(normalized_hash)
     if asset_path is not None and asset_path.exists():
         return asset_path.read_bytes()
-    return (BLOBS_DIR / content_hash).read_bytes()
+    target = (BLOBS_DIR / normalized_hash).resolve()
+    target.relative_to(BLOBS_DIR.resolve())
+    return target.read_bytes()
 
 
 def exists(content_hash: str) -> bool:
+    if not is_canonical_content_hash(content_hash):
+        return False
     if find_asset_path(content_hash) is not None:
         return True
-    return (BLOBS_DIR / content_hash).exists()
+    target = (BLOBS_DIR / content_hash).resolve()
+    try:
+        target.relative_to(BLOBS_DIR.resolve())
+    except Exception:
+        return False
+    return target.is_file()
 
 
 def put_chunks(chunks: Iterable[bytes]) -> str:
@@ -304,17 +401,52 @@ def put_chunks(chunks: Iterable[bytes]) -> str:
 
 def delete(content_hash: str) -> bool:
     """Delete a blob by content hash; return True if removed or already missing."""
-    normalized_hash = str(content_hash or "").strip().lower()
+    if not is_canonical_content_hash(content_hash):
+        return False
+    normalized_hash = content_hash
+    files_dir = _resolve_data_files_root().resolve()
+    managed_root = _resolve_managed_data_root().resolve()
+    directory_targets = [
+        files_dir / dirname / normalized_hash for dirname in ASSET_ORIGIN_DIRS.values()
+    ]
+    directory_targets.append(files_dir / "workspace" / "sync" / normalized_hash)
     try:
-        (BLOBS_DIR / normalized_hash).unlink(missing_ok=True)
-        files_dir = _resolve_data_files_root()
-        for dirname in ASSET_ORIGIN_DIRS.values():
-            shutil.rmtree(files_dir / dirname / normalized_hash, ignore_errors=True)
-        shutil.rmtree(
-            files_dir / "workspace" / "sync" / normalized_hash, ignore_errors=True
+        directory_targets.extend(
+            list(_iter_sync_attachment_root_candidates(normalized_hash))
         )
-        for candidate_root in _iter_sync_attachment_roots(normalized_hash):
-            shutil.rmtree(candidate_root, ignore_errors=True)
-        return True
     except Exception:
         return False
+
+    success = True
+    blob_target = (BLOBS_DIR / normalized_hash).resolve()
+    try:
+        blob_target.relative_to(BLOBS_DIR.resolve())
+        blob_target.unlink(missing_ok=True)
+    except Exception:
+        success = False
+
+    seen: set[str] = set()
+    for target in directory_targets:
+        try:
+            resolved = target.resolve()
+            if str(resolved) in seen:
+                continue
+            seen.add(str(resolved))
+            allowed = False
+            for root in (files_dir, managed_root):
+                try:
+                    resolved.relative_to(root)
+                    allowed = True
+                    break
+                except Exception:
+                    continue
+            if not allowed:
+                success = False
+                continue
+            if resolved.exists():
+                shutil.rmtree(resolved)
+        except FileNotFoundError:
+            continue
+        except Exception:
+            success = False
+    return success

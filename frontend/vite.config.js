@@ -1,14 +1,27 @@
 import { defineConfig, createLogger } from "vite";
 import react from "@vitejs/plugin-react";
 
-const backendTarget = `http://localhost:${process.env.BACKEND_PORT || 8000}`;
+// The launcher supplies a connectable address for the selected bind. In the
+// normal listener-toggle flow this remains IPv4 loopback for both 127.0.0.1
+// and 0.0.0.0, avoiding Windows localhost/IPv6 ambiguity.
+const rawBackendProxyHost = (process.env.BACKEND_PROXY_HOST || '127.0.0.1').trim();
+const backendProxyHost = rawBackendProxyHost.includes(':') && !rawBackendProxyHost.startsWith('[')
+  ? `[${rawBackendProxyHost}]`
+  : rawBackendProxyHost;
+const backendTarget = `http://${backendProxyHost}:${process.env.BACKEND_PORT || 8000}`;
 const configuredHost = process.env.VITE_HOST?.trim();
 const configuredAllowedHosts = (process.env.VITE_ALLOWED_HOSTS || '')
   .split(',')
   .map((host) => host.trim())
   .filter(Boolean);
 const allowedHosts = Array.from(new Set(['.ts.net', ...configuredAllowedHosts]));
-const trustedBackendProxyHeaders = { 'x-float-frontend-proxy': '1' };
+const backendProxyToken = (process.env.BACKEND_PROXY_TOKEN || '').trim();
+const trustedBackendProxyHeaders = {
+  'x-float-frontend-proxy': '1',
+  ...(backendProxyToken
+    ? { 'x-float-frontend-proxy-token': backendProxyToken }
+    : {}),
+};
 const connectionErrorCodes = new Set(['ECONNREFUSED', 'ECONNRESET']);
 const STARTUP_COLOR = '\x1b[33m';
 const COLOR_RESET = '\x1b[0m';

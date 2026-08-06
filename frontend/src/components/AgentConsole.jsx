@@ -40,10 +40,7 @@ import {
   hasMatchingToolContinuationSignature,
   releaseToolContinuationLock,
 } from "../utils/toolContinuations";
-import {
-  handleUnifiedPress,
-  supportsHoverInteractions,
-} from "../utils/pointerInteractions";
+import { handleUnifiedPress } from "../utils/pointerInteractions";
 import { thinkingPayloadForMode } from "../utils/reasoningEffort";
 import { outputTokenPayload } from "../utils/generationLimits";
 import {
@@ -301,6 +298,8 @@ const statusTone = (status) => {
     case "pending":
     case "queued":
       return { label: "pending", hue: "var(--color-lavender)" };
+    case "stop_requested":
+      return { label: "stop requested", hue: "var(--color-warning, #b7791f)" };
     case "invoked":
     case "ok":
     case "success":
@@ -394,7 +393,11 @@ const COMPACT_CONSOLE_PIP_LABELS = {
   Background: "bg",
   Context: "ctx",
   Device: "dev",
-  Model: "mdl",
+  Lane: "lane",
+  Model: "model",
+  Operation: "op",
+  Budget: "ctx",
+  Retrieval: "rag",
   Loaded: "loaded",
   Provider: "prv",
   Runtime: "run",
@@ -415,10 +418,23 @@ const compactConsolePipLabel = (label) => {
   return COMPACT_CONSOLE_PIP_LABELS[normalized] || normalized;
 };
 
-const compactConsolePipValue = (value) => {
+const compactConsolePipValue = (value, label = "") => {
   const normalized = typeof value === "string" ? value.trim() : "";
   if (!normalized) return "";
-  const lower = normalized.toLowerCase();
+  const normalizedLabel = typeof label === "string" ? label.trim().toLowerCase() : "";
+  if (normalizedLabel === "lane") {
+    const laneValues = {
+      "cloud api": "Cloud",
+      "server/lan": "Server",
+      "local provider": "Provider",
+      "direct local": "Local",
+    };
+    return laneValues[normalized.toLowerCase()] || normalized;
+  }
+  const compactValue = ["model", "provider"].includes(normalizedLabel)
+    ? normalized.split(/[\\/]/).filter(Boolean).at(-1) || normalized
+    : normalized;
+  const lower = compactValue.toLowerCase();
   if (lower === "connected") return "on";
   if (lower === "disconnected" || lower === "offline") return "off";
   if (lower === "stopped") return "off";
@@ -428,11 +444,11 @@ const compactConsolePipValue = (value) => {
   if (lower === "transformer model not selected") return "none";
   if (lower === "local model") return "local";
   if (lower === "0 task updates") return "0";
-  const versionedOpenAiModel = normalized.match(
+  const versionedOpenAiModel = compactValue.match(
     /^(gpt-\d+(?:\.\d+)?(?:-[a-z]+)?)-\d{4}-\d{2}-\d{2}$/i,
   );
   if (versionedOpenAiModel) return versionedOpenAiModel[1];
-  return normalized;
+  return compactValue;
 };
 
 const formatRuntimeClockTime = (value) => {
@@ -677,7 +693,9 @@ const isOpaqueEmptyAgentRecord = (agent, { showToolEntries = true } = {}) => {
 
 const shouldShowAgentInConsole = (agent, { showToolEntries = true } = {}) => {
   const id = String(agent?.id || "").trim();
-  if (!id || id === "system:celery") return false;
+  if (!id || id === "system:celery" || id === "system:background-autonomy") {
+    return false;
+  }
   if (isOpaqueEmptyAgentRecord(agent, { showToolEntries })) return false;
   return true;
 };
@@ -691,8 +709,18 @@ const isBackgroundWorkAgent = (agent) => {
   const provenance =
     agent.provenance && typeof agent.provenance === "object" ? agent.provenance : null;
   const kind = String(provenance?.kind || agent.kind || "").trim().toLowerCase();
-  return kind === "task_chain" || kind === "background" || kind === "background_reflection";
+  return (
+    kind === "task_chain" ||
+    kind === "scheduled_prompt" ||
+    kind === "background" ||
+    kind === "background_reflection"
+  );
 };
+
+const isActiveRunStatus = (value) =>
+  ["active", "running", "streaming", "stop_requested"].includes(
+    String(value || "").trim().toLowerCase(),
+  );
 
 const isReflectionAgent = (agent) => {
   if (!agent || typeof agent !== "object") return false;
@@ -702,6 +730,104 @@ const isReflectionAgent = (agent) => {
     agent.provenance && typeof agent.provenance === "object" ? agent.provenance : null;
   const kind = String(provenance?.kind || agent.kind || "").trim().toLowerCase();
   return kind === "background_reflection";
+};
+
+const backgroundWorkIdentity = (agent) => {
+  if (!isBackgroundWorkAgent(agent)) return "";
+  const events = Array.isArray(agent?.events) ? agent.events : [];
+  const taskIdCandidates = [
+    agent?.task_id,
+    agent?.metadata?.task_id,
+    agent?.metadata?.reflection?.task_id,
+    agent?.provenance?.task_id,
+    ...events
+      .slice()
+      .reverse()
+      .flatMap((entry) => [
+        entry?.task_id,
+        entry?.metadata?.task_id,
+        entry?.metadata?.reflection?.task_id,
+      ]),
+  ];
+  const taskId = taskIdCandidates
+    .map((value) => String(value || "").trim())
+    .find(Boolean);
+  if (taskId) return `task:${taskId.toLowerCase()}`;
+
+  const id = String(agent?.id || agent?.agent_id || agent?.session_id || "")
+    .trim()
+    .toLowerCase();
+  const normalizedId = id.replace(/^(?:task|background|reflection):/, "");
+  return normalizedId ? `task:${normalizedId}` : "";
+};
+
+const backgroundAgentTimestamp = (agent) => {
+  const direct = Number(agent?.updatedAt ?? agent?.updated_at ?? agent?.timestamp);
+  if (Number.isFinite(direct)) return direct;
+  const events = Array.isArray(agent?.events) ? agent.events : [];
+  return events.reduce((latest, entry) => {
+    const timestamp = Number(entry?.timestamp);
+    return Number.isFinite(timestamp) ? Math.max(latest, timestamp) : latest;
+  }, 0);
+};
+
+const backgroundEventIdentity = (entry) =>
+  [
+    entry?.id,
+    entry?.request_id,
+    entry?.task_id,
+    entry?.type,
+    entry?.name,
+    entry?.status,
+    entry?.timestamp,
+    normalizePreviewText(
+      entry?.content || entry?.text || entry?.message || entry?.description,
+    ),
+  ]
+    .map((value) => String(value ?? "").trim())
+    .join("|");
+
+const mergeBackgroundAgentRecords = (left, right) => {
+  const newer =
+    backgroundAgentTimestamp(right) >= backgroundAgentTimestamp(left) ? right : left;
+  const older = newer === right ? left : right;
+  const seenEvents = new Set();
+  const events = [
+    ...(Array.isArray(older?.events) ? older.events : []),
+    ...(Array.isArray(newer?.events) ? newer.events : []),
+  ]
+    .filter((entry) => {
+      const key = backgroundEventIdentity(entry);
+      if (seenEvents.has(key)) return false;
+      seenEvents.add(key);
+      return true;
+    })
+    .sort((a, b) => (Number(a?.timestamp) || 0) - (Number(b?.timestamp) || 0));
+  return {
+    ...older,
+    ...newer,
+    events,
+  };
+};
+
+const dedupeBackgroundWorkAgents = (agents) => {
+  const output = [];
+  const identityIndexes = new Map();
+  (Array.isArray(agents) ? agents : []).forEach((agent) => {
+    const identity = backgroundWorkIdentity(agent);
+    if (!identity) {
+      output.push(agent);
+      return;
+    }
+    const existingIndex = identityIndexes.get(identity);
+    if (existingIndex === undefined) {
+      identityIndexes.set(identity, output.length);
+      output.push(agent);
+      return;
+    }
+    output[existingIndex] = mergeBackgroundAgentRecords(output[existingIndex], agent);
+  });
+  return output;
 };
 
 const GENERIC_REFLECTION_LABELS = new Set([
@@ -947,7 +1073,7 @@ const renderConsolePip = ({ key, label, value, title, tone = "", compact = false
     .join(": ");
   const fullTitle = [pipTitle, title].filter(Boolean).join(" - ");
   const visibleLabel = compact ? compactConsolePipLabel(label) : label;
-  const visibleValue = compact ? compactConsolePipValue(value) : value;
+  const visibleValue = compact ? compactConsolePipValue(value, label) : value;
 
   return (
     <span
@@ -984,7 +1110,9 @@ const formatHandoffMeta = (handoff) => {
 
 const controlModeTitle = (mode) => {
   const key = typeof mode === "string" ? mode.trim().toLowerCase() : "";
-  if (key === "runtime_revoke") return "Sends a runtime stop request to the delegated task.";
+  if (key === "runtime_revoke") {
+    return "Requests cancellation. External or non-cooperative work can keep running until it acknowledges the request.";
+  }
   if (key === "queued_request") return "Stores a redirect request for the delegated run.";
   if (key === "soft") return "Updates delegated-run state in the console for now.";
   return "";
@@ -1406,37 +1534,68 @@ const AgentConsole = ({
   const usingProviderRuntime =
     state.backendMode === "local" && Boolean(selectedLocalProvider);
   const isLocalMode = (state.backendMode || "").toLowerCase() === "local";
-  const backgroundAgent = React.useMemo(
+  const backgroundQueueAgent = React.useMemo(
     () =>
       (Array.isArray(agents) ? agents : []).find(
         (agent) => String(agent?.id || "").trim() === "system:celery",
       ) || null,
     [agents],
   );
-  const systemTaskCount = React.useMemo(
+  const backgroundAutonomyAgent = React.useMemo(
     () =>
-      (Array.isArray(agents) ? agents : []).reduce((total, agent) => {
-        if (String(agent?.id || "").trim().startsWith("system:")) return total;
-        const events = Array.isArray(agent?.events) ? agent.events : [];
-        return (
-          total +
-          events.reduce(
-            (eventTotal, entry) => (entry?.type === "task" ? eventTotal + 1 : eventTotal),
-            0,
-          )
-        );
-      }, 0),
+      (Array.isArray(agents) ? agents : []).find(
+        (agent) => String(agent?.id || "").trim() === "system:background-autonomy",
+      ) || null,
     [agents],
   );
+  const backgroundRunAgents = React.useMemo(
+    () =>
+      (Array.isArray(agents) ? agents : []).filter((agent) => {
+        const id = String(agent?.id || "").trim();
+        return !id.startsWith("system:") && isBackgroundWorkAgent(agent) && !isReflectionAgent(agent);
+      }),
+    [agents],
+  );
+  const queueJobCount = React.useMemo(() => {
+    const resources = backgroundQueueAgent?.resources;
+    if (!resources || typeof resources !== "object") return 0;
+    return ["active_count", "reserved_count", "scheduled_count"].reduce(
+      (total, key) => total + Math.max(0, Number(resources[key]) || 0),
+      0,
+    );
+  }, [backgroundQueueAgent]);
   const activeAgentCount = React.useMemo(
-    () =>
-      (Array.isArray(agents) ? agents : []).filter(
-        (agent) =>
-          isBackgroundWorkAgent(agent) &&
-          String(agent?.status || "").trim().toLowerCase() === "active",
-      ).length,
-    [agents],
+    () => {
+      const promptTaskRuns = dedupeBackgroundWorkAgents(backgroundRunAgents).filter(
+        (agent) => isActiveRunStatus(agent?.status),
+      ).length;
+      return promptTaskRuns + (isActiveRunStatus(backgroundAutonomyAgent?.status) ? 1 : 0);
+    },
+    [backgroundAutonomyAgent, backgroundRunAgents],
   );
+  const backgroundRunCount = React.useMemo(() => {
+    const runKeys = new Set();
+    backgroundRunAgents.forEach((agent, index) => {
+      const agentRunIds = new Set();
+      const addRunId = (value) => {
+        const runId = String(value || "").trim();
+        if (runId) agentRunIds.add(runId);
+      };
+      addRunId(agent?.run_id);
+      addRunId(agent?.metadata?.run_id);
+      (Array.isArray(agent?.events) ? agent.events : []).forEach((event) => {
+        addRunId(event?.run_id);
+        addRunId(event?.metadata?.run_id);
+      });
+      if (agentRunIds.size) {
+        agentRunIds.forEach((runId) => runKeys.add(`run:${runId}`));
+        return;
+      }
+      const agentId = String(agent?.id || agent?.agent_id || agent?.session_id || "").trim();
+      runKeys.add(`agent:${agentId || index}`);
+    });
+    return runKeys.size;
+  }, [backgroundRunAgents]);
   const persistCalendarTask = React.useCallback(
     async (payload) => {
       const eventId = String(payload?.id || "").trim();
@@ -1478,6 +1637,7 @@ const AgentConsole = ({
         id: `background-${promptSlug}-${startTime}`,
         title: `Background: ${truncatePreviewText(normalizedPrompt, 56)}`,
         description: normalizedPrompt,
+        session_id: state.sessionId ? String(state.sessionId) : undefined,
         start_time: startTime,
         end_time: startTime + 15 * 60,
         timezone: preferredTimezone,
@@ -1487,11 +1647,31 @@ const AgentConsole = ({
             kind: "prompt",
             prompt: normalizedPrompt,
             conversation_mode: "new_chat",
+            origin_session_id: state.sessionId ? String(state.sessionId) : undefined,
           },
         ],
+        background_job: {
+          schema_version: 1,
+          patience: {
+            stop_condition: "one_pass",
+            max_attempts: 1,
+            max_runtime_seconds: 900,
+            satisfied_threshold: 0.8,
+          },
+          execution: {
+            reasoning_effort: "inherit",
+            allow_subagents: true,
+            sandbox_processes: true,
+            permissions: [],
+          },
+          ownership: {
+            owner_kind: state.sessionId ? "conversation" : "calendar_event",
+            conversation_id: state.sessionId ? String(state.sessionId) : undefined,
+          },
+        },
       };
     },
-    [preferredTimezone],
+    [preferredTimezone, state.sessionId],
   );
   const scheduleBackgroundPrompt = React.useCallback(() => {
     if (backgroundPromptPending) return;
@@ -1516,18 +1696,18 @@ const AgentConsole = ({
     if (!backendReady || backgroundPromptPending) return;
     const normalizedPrompt = normalizePreviewText(backgroundPromptDraft);
     if (!normalizedPrompt) {
-      setBackgroundPromptFeedback("Write a prompt before starting a background agent.");
+      setBackgroundPromptFeedback("Write a prompt before running it.");
       return;
     }
     const payload = buildBackgroundTaskPayload(normalizedPrompt, new Date(Date.now() - 1000));
     setBackgroundPromptPending(true);
-    setBackgroundPromptFeedback("Starting background agent...");
+    setBackgroundPromptFeedback("Running prompt in a new chat...");
     try {
       const eventId = await persistCalendarTask(payload);
       await axios.post(`/api/calendar/events/${encodeURIComponent(eventId)}/run?force=true`, null);
       onRefreshAgents?.();
       onRefreshCalendar?.();
-      setBackgroundPromptFeedback("Started background agent.");
+      setBackgroundPromptFeedback("Prompt started in a new chat.");
       setBackgroundPromptDraft("");
       setBackgroundPromptOpen(false);
     } catch (err) {
@@ -1576,11 +1756,15 @@ const AgentConsole = ({
         run_now: Boolean(runNow),
       };
       setReflectionPending(true);
-      setReflectionFeedback(runNow ? "Running reflection..." : "Saving reflection...");
+      setReflectionFeedback(
+        runNow ? "Running reflection..." : "Saving and scoring reflection...",
+      );
       try {
         await axios.post("/api/reflections/tasks", payload);
         onRefreshAgents?.();
-        setReflectionFeedback(runNow ? "Reflection started." : "Reflection saved.");
+        setReflectionFeedback(
+          runNow ? "Reflection started." : "Reflection saved and scored.",
+        );
         setReflectionQuestionDraft("");
         setReflectionMemoryKey("");
         setBackgroundPromptOpen(false);
@@ -1634,32 +1818,51 @@ const AgentConsole = ({
     }
   }, []);
   const backgroundReflectionAgents = React.useMemo(
-    () => (Array.isArray(agents) ? agents : []).filter(isReflectionAgent),
+    () => dedupeBackgroundWorkAgents(agents).filter(isReflectionAgent),
     [agents],
   );
 
   const renderBackgroundPanel = React.useCallback(() => {
     if (backgroundPanelHidden) return null;
-    const taskLabel =
-      systemTaskCount === 1 ? "1 queue update" : `${systemTaskCount} queue updates`;
+    const taskLabel = queueJobCount === 1 ? "1 worker job" : `${queueJobCount} worker jobs`;
     const activeLabel =
-      activeAgentCount === 1 ? "1 active" : `${activeAgentCount} active`;
+      activeAgentCount === 1 ? "1 active run" : `${activeAgentCount} active runs`;
     const reflectionCount = backgroundReflectionAgents.length;
     const reflectionLabel =
       reflectionCount === 1 ? "1 reflection" : `${reflectionCount} reflections`;
     const backgroundSubtitle = `${activeLabel}, ${reflectionLabel}, ${taskLabel}`;
-    const backgroundDetail =
-      typeof backgroundAgent?.summary === "string" && backgroundAgent.summary.trim()
-        ? backgroundAgent.summary.trim()
-        : backgroundSubtitle;
+    const backgroundDetail = [backgroundAutonomyAgent?.summary, backgroundQueueAgent?.summary]
+      .map((value) => (typeof value === "string" ? value.trim() : ""))
+      .filter(Boolean)
+      .join(" · ") || backgroundSubtitle;
+    const autonomyResources =
+      backgroundAutonomyAgent?.resources &&
+      typeof backgroundAutonomyAgent.resources === "object"
+        ? backgroundAutonomyAgent.resources
+        : {};
+    const autonomyMode = String(autonomyResources.mode || "manual").replaceAll("_", " ");
+    const autonomyStatus = String(backgroundAutonomyAgent?.status || "idle");
+    const routineValue = autonomyResources.enabled
+      ? `${autonomyMode} · ${autonomyStatus}`
+      : "disabled";
+    const runCount = backgroundRunCount;
     const backgroundInspector = (
       <StateInspector
         title="Background work"
-        summary="Reflection is bounded background thinking over selected context. Patience is the reflection pass budget; it does not count tool calls or normal chat turns."
+        summary="Agent Console owns manual and scheduled background runs. Settings owns the opt-in routine scheduler and its safety budgets."
         rows={[
-          { label: "Prompt job", value: "scheduled chat or task run" },
-          { label: "Reflection job", value: "scored note with optional surfacing" },
-          { label: "Routine scheduler", value: "disabled unless explicitly enabled" },
+          { label: "Routine autonomy", value: routineValue },
+          {
+            label: "Worker queue",
+            value: backgroundQueueAgent?.summary || "No worker snapshot",
+          },
+          {
+            label: "Recorded runs",
+            value: `${runCount} prompt/task run${runCount === 1 ? "" : "s"}, ${reflectionCount} reflection${reflectionCount === 1 ? "" : "s"}`,
+          },
+          { label: "Run now", value: "start here in Agent Console" },
+          { label: "Schedule once", value: "save here as a calendar task" },
+          { label: "Routine review", value: "configure in Settings > Background" },
         ]}
         label="?"
         ariaLabel="Explain background work"
@@ -1798,7 +2001,7 @@ const AgentConsole = ({
 
     return (
       <ConsoleObjectCard
-        title="background"
+        title="background work"
         subtitle={backgroundSubtitle}
         preview={backgroundDetail}
         ariaLabel="background"
@@ -1921,9 +2124,9 @@ const AgentConsole = ({
                       className="agent-card-control-btn"
                       disabled={reflectionPending || !reflectionQuestionDraft.trim()}
                       onClick={() => submitReflectionTask(false)}
-                      title="Save this reflection task for a later pass"
+                      title="Save and score this reflection for a later pass"
                     >
-                      Save reflection
+                      Save &amp; score
                     </button>
                     <button
                       type="button"
@@ -1961,9 +2164,9 @@ const AgentConsole = ({
                         !backendReady || backgroundPromptPending || !backgroundPromptDraft.trim()
                       }
                       onClick={startBackgroundPrompt}
-                      title="Start background agent"
+                      title="Run prompt in new chat"
                     >
-                      {backgroundPromptPending ? "Starting..." : "Start"}
+                      {backgroundPromptPending ? "Running..." : "Run in new chat"}
                     </button>
                     <button
                       type="button"
@@ -2012,7 +2215,7 @@ const AgentConsole = ({
     );
   }, [
     activeAgentCount,
-    backgroundAgent,
+    backgroundAutonomyAgent,
     backgroundComposerMode,
     backgroundPanelCollapsed,
     backgroundPanelHidden,
@@ -2020,7 +2223,9 @@ const AgentConsole = ({
     backgroundPromptFeedback,
     backgroundPromptOpen,
     backgroundPromptPending,
+    backgroundQueueAgent,
     backgroundReflectionAgents,
+    backgroundRunCount,
     backendReady,
     hiddenAgents,
     onOpenConversation,
@@ -2030,10 +2235,10 @@ const AgentConsole = ({
     reflectionPending,
     reflectionQuestionDraft,
     reflectionSourceMode,
+    queueJobCount,
     scheduleBackgroundPrompt,
     startBackgroundPrompt,
     submitReflectionTask,
-    systemTaskCount,
   ]);
   const clampSidebarWidth = React.useCallback((value, minWidth, maxWidth) => {
     if (!Number.isFinite(value)) return minWidth;
@@ -2300,7 +2505,7 @@ const AgentConsole = ({
   );
   const visibleAgents = React.useMemo(
     () =>
-      displayAgents.filter(
+      dedupeBackgroundWorkAgents(displayAgents).filter(
         (agent) =>
           !isReflectionAgent(agent) && shouldShowAgentInConsole(agent, { showToolEntries }),
       ),
@@ -3915,7 +4120,11 @@ const AgentConsole = ({
       const sourceLabel = String(review?.source_label || "remote device").trim();
       if (!backendReady || !reviewId) return;
       setSyncReviewPendingKey(`${decision}:${reviewId}`);
-      setSyncReviewFeedback("");
+      setSyncReviewFeedback(
+        decision === "approve"
+          ? `Applying sync from ${sourceLabel}... This can take a moment while local indexes refresh.`
+          : `Rejecting sync from ${sourceLabel}...`,
+      );
       try {
         await axios.post(
           `/api/sync/reviews/${encodeURIComponent(reviewId)}/${decision}`,
@@ -4174,7 +4383,7 @@ const AgentConsole = ({
                       Revert
                     </button>
                   </div>
-                  {detail?.loading ? <p className="status-note">Loading diffÃ¢â‚¬Â¦</p> : null}
+                  {detail?.loading ? <p className="status-note">Loading diff...</p> : null}
                   {detail?.error ? <p className="status-note">{detail.error}</p> : null}
                   {detailItems.length ? (
                     <div className="agent-history-diff-list">
@@ -4968,6 +5177,8 @@ const AgentConsole = ({
           start_time: Math.floor(base.getTime() / 1000),
           timezone: preferredTimezone,
           title: `Schedule tool: ${resolveToolDisplayName(entry)}`,
+          session_id: batch?.sessionId || entry.session_id || state.sessionId || undefined,
+          message_id: batch?.messageId || entry.message_id || entry.chain_id || undefined,
         },
         onSubmit: async ({ args, name, continueTarget }) => {
           const editedEntry = {
@@ -5044,41 +5255,42 @@ const AgentConsole = ({
         <div className="agent-tool-batch-controls">
           <button
             type="button"
-            className="tool-action-btn continue needs-tool-continue"
-            disabled={busy || hasBlockedAccept}
-            aria-label={
-              hasBlockedAccept
-                ? "One or more tools need editable arguments before the batch can run."
-                : `Approve ${label} and continue the assistant response.`
-            }
-            onClick={(event) => {
-              event.stopPropagation();
-              void runToolReviewBatch(batch, "accept", { force: true });
-            }}
-          >
-            Continue
-          </button>
-          <button
-            type="button"
             className="tool-action-btn accept"
             disabled={busy || hasBlockedAccept}
             aria-label={
               hasBlockedAccept
                 ? "One or more tools need editable arguments before the batch can run."
-                : "Approve every pending tool in this batch."
+                : `Accept all ${label} and continue the assistant response.`
             }
             onClick={(event) => {
               event.stopPropagation();
               void runToolReviewBatch(batch, "accept");
             }}
           >
-            Accept
+            Accept all + continue
+          </button>
+          <button
+            type="button"
+            className="tool-action-btn retry"
+            disabled={busy || hasBlockedAccept}
+            aria-label={
+              hasBlockedAccept
+                ? "One or more tools need editable arguments before the batch can run."
+                : `Accept all ${label} and force a new assistant continuation. Use only to recover a stalled response.`
+            }
+            title="Recovery action: accept the batch and force a new assistant continuation."
+            onClick={(event) => {
+              event.stopPropagation();
+              void runToolReviewBatch(batch, "accept", { force: true });
+            }}
+          >
+            Accept all + retry answer
           </button>
           <button
             type="button"
             className="tool-action-btn deny"
             disabled={busy}
-            aria-label="Deny every pending tool in this batch."
+            aria-label="Deny all pending tools in this batch."
             onClick={(event) => {
               event.stopPropagation();
               void runToolReviewBatch(batch, "deny");
@@ -5254,11 +5466,13 @@ const AgentConsole = ({
                           state.selectedCalendarDate instanceof Date
                             ? new Date(state.selectedCalendarDate)
                             : new Date();
-                        return {
-                          start_time: Math.floor(base.getTime() / 1000),
-                          timezone: preferredTimezone,
-                          title: `Retry tool: ${entry.name || "tool"}`,
-                        };
+                          return {
+                            start_time: Math.floor(base.getTime() / 1000),
+                            timezone: preferredTimezone,
+                            title: `Retry tool: ${entry.name || "tool"}`,
+                            session_id: sessionForEntry || undefined,
+                            message_id: messageForEntry || undefined,
+                          };
                       })(),
                       onSubmit: async ({ args, name, continueTarget }) => {
                         await retryResolvedTool(args, name, continueTarget);
@@ -5525,6 +5739,8 @@ const AgentConsole = ({
                     start_time: Math.floor(base.getTime() / 1000),
                     timezone: preferredTimezone,
                     title: `Schedule tool: ${entry.name || "tool"}`,
+                    session_id: sessionForEntry || undefined,
+                    message_id: messageForEntry || undefined,
                   };
                 })(),
                 onSubmit: async ({ args, name, continueTarget }) => {
@@ -5596,8 +5812,7 @@ const AgentConsole = ({
                   const toolArgs = args || {};
                   const chain =
                     targetChain || messageForEntry || sessionForEntry || undefined;
-                  const continueInline =
-                    schedule.conversation_mode !== "new_chat";
+                  const requestId = entry.id ? String(entry.id) : eventId;
                   try {
                     await axios.post(
                       `/api/calendar/events/${encodeURIComponent(eventId)}`,
@@ -5608,11 +5823,26 @@ const AgentConsole = ({
                         location: schedule.location,
                         start_time: schedule.start_time,
                         end_time: schedule.end_time,
+                        rrule: schedule.rrule,
                         timezone: schedule.timezone,
                         status: schedule.status || "scheduled",
+                        background_job: schedule.background_job,
+                        actions: [
+                          {
+                            id: requestId,
+                            request_id: requestId,
+                            kind: "tool",
+                            name: toolName,
+                            args: toolArgs,
+                            prompt: schedule.prompt,
+                            conversation_mode: schedule.conversation_mode,
+                            session_id: sessionForEntry || undefined,
+                            message_id: messageForEntry || undefined,
+                            chain_id: chain,
+                          },
+                        ],
                       },
                     );
-                    const requestId = entry.id ? String(entry.id) : eventId;
                     await axios.post("/api/tools/schedule", {
                       request_id: requestId,
                       event_id: eventId,
@@ -5620,9 +5850,9 @@ const AgentConsole = ({
                       args: toolArgs,
                       prompt: schedule.prompt,
                       conversation_mode: schedule.conversation_mode,
-                      session_id: continueInline ? sessionForEntry || undefined : undefined,
-                      message_id: continueInline ? messageForEntry || undefined : undefined,
-                      chain_id: continueInline ? chain : undefined,
+                      session_id: sessionForEntry || undefined,
+                      message_id: messageForEntry || undefined,
+                      chain_id: chain,
                     });
 
                     if (messageForEntry && entry.id) {
@@ -5797,7 +6027,10 @@ const AgentConsole = ({
     const stopBusy = agentControlPendingKey === `stop${busyControlPrefix}`;
     const redirectBusy = agentControlPendingKey === `redirect${busyControlPrefix}`;
     const isHidden = !!(agentKeyString && hiddenAgents[agentKeyString]);
-    const isCompact = !!(agentKeyString && collapsedAgents[agentKeyString]);
+    const compactOverride = agentKeyString ? collapsedAgents[agentKeyString] : undefined;
+    const isCompact = agentKeyString
+      ? compactOverride ?? isBackgroundWorkAgent(agent)
+      : false;
     const showAllActivity = !!(agentKeyString && expandedAgents[agentKeyString]);
     const cardHasFocus =
       normalizedFocus &&
@@ -5966,10 +6199,10 @@ const AgentConsole = ({
                   className="agent-card-control-btn danger"
                   onClick={() => runAgentControl(agentKeyString, "stop")}
                   title={controlModeTitle(controlMeta?.modes?.stop)}
-                  aria-label="Stop delegated run"
+                  aria-label="Request stop for delegated run"
                   disabled={!agentKeyString || Boolean(agentControlPendingKey)}
                 >
-                  {stopBusy ? "stopping..." : "stop"}
+                  {stopBusy ? "requesting..." : "request stop"}
                 </button>
               )}
               {canOpenConversationAction && (
@@ -6101,7 +6334,7 @@ const AgentConsole = ({
               total {formatTokenCount(totalTokens || 0)}
             </span>
             <span className="agent-resource-note">
-              token estimates
+              reported tokens
             </span>
           </div>
         )}
@@ -6596,6 +6829,45 @@ const AgentConsole = ({
       return `${dateLabel} -> ${endDateLabel}`;
     };
 
+    const summarizeActionArguments = (value) => {
+      const args =
+        value && typeof value === "object" && !Array.isArray(value) ? value : {};
+      const keys = Object.keys(args);
+      if (!keys.length) return "No argument fields";
+      const visibleKeys = keys
+        .filter((key) => /^[a-zA-Z_][a-zA-Z0-9_.-]{0,31}$/.test(key))
+        .slice(0, 3);
+      const hiddenCount = keys.length - visibleKeys.length;
+      const countLabel = `${keys.length} argument field${keys.length === 1 ? "" : "s"}`;
+      if (!visibleKeys.length) return countLabel;
+      return `${countLabel}: ${visibleKeys.join(", ")}${
+        hiddenCount > 0 ? ` +${hiddenCount} more` : ""
+      }`;
+    };
+
+    const summarizeScheduledAction = (action) => {
+      const kind = String(action?.kind || action?.type || "").trim().toLowerCase();
+      if (kind === "tool") {
+        return {
+          kind: "Tool",
+          name: String(action?.name || "").trim() || "Unnamed tool",
+          metadata: summarizeActionArguments(action?.args),
+        };
+      }
+      if (kind === "prompt") {
+        return {
+          kind: "Prompt",
+          name: "Configured prompt",
+          metadata: "Text hidden in this card",
+        };
+      }
+      return {
+        kind: "Action",
+        name: "Scheduled action",
+        metadata: "Review to inspect",
+      };
+    };
+
     return (
       <div className="agent-tasks-panel" aria-label="upcoming tasks">
         <div className="tasks-panel-header">
@@ -6714,41 +6986,9 @@ const AgentConsole = ({
                     ? [{ kind: "tool", name: parsedTool.tool, args: parsedTool.args }]
                     : [];
               const hasActions = resolvedActions.length > 0;
-              const actionPayloadText = (() => {
-                if (!hasActions) return null;
-                if (resolvedActions.length === 1) {
-                  const action = resolvedActions[0];
-                  const kind = String(action.kind || action.type || "").toLowerCase();
-                  if (kind === "tool") {
-                    const toolName = (action.name && String(action.name)) || "tool";
-                    const toolArgs =
-                      action.args && typeof action.args === "object" ? action.args : {};
-                    return JSON.stringify({ tool: toolName, args: toolArgs }, null, 2);
-                  }
-                  if (kind === "prompt") {
-                    const prompt = action.prompt ? String(action.prompt) : "";
-                    return JSON.stringify({ prompt }, null, 2);
-                  }
-                }
-                const summarized = resolvedActions.map((action) => {
-                  const kind = String(action.kind || action.type || "").toLowerCase();
-                  if (kind === "tool") {
-                    const toolName = (action.name && String(action.name)) || "tool";
-                    const toolArgs =
-                      action.args && typeof action.args === "object" ? action.args : {};
-                    const prompt = action.prompt ? String(action.prompt) : undefined;
-                    return prompt
-                      ? { kind, name: toolName, args: toolArgs, prompt }
-                      : { kind, name: toolName, args: toolArgs };
-                  }
-                  if (kind === "prompt") {
-                    const prompt = action.prompt ? String(action.prompt) : "";
-                    return { kind, prompt };
-                  }
-                  return action;
-                });
-                return JSON.stringify(summarized, null, 2);
-              })();
+              const actionSummaries = resolvedActions.map(summarizeScheduledAction);
+              const visibleActionSummaries = actionSummaries.slice(0, 3);
+              const hiddenActionCount = actionSummaries.length - visibleActionSummaries.length;
               return (
                 <li key={key} className="task-card-item">
                   <article className={`task-card status-${cardStatusClass}`}>
@@ -6776,10 +7016,30 @@ const AgentConsole = ({
                     <h4 className="task-card-title">
                       {event.summary || "Untitled task"}
                     </h4>
-                    {hasActions && actionPayloadText ? (
-                      <pre className="task-card-code" aria-label="Scheduled actions payload">
-                        {actionPayloadText}
-                      </pre>
+                    {hasActions ? (
+                      <div className="task-card-action-summary">
+                        <ul aria-label="Scheduled actions">
+                          {visibleActionSummaries.map((summary, actionIndex) => (
+                            <li key={`${key}-action-${actionIndex}`}>
+                              <div className="task-card-action-summary-main">
+                                <span>{summary.kind}</span>
+                                {summary.kind === "Tool" ? (
+                                  <code>{summary.name}</code>
+                                ) : (
+                                  <strong>{summary.name}</strong>
+                                )}
+                              </div>
+                              <small>{summary.metadata}</small>
+                            </li>
+                          ))}
+                        </ul>
+                        {hiddenActionCount > 0 ? (
+                          <p>
+                            +{hiddenActionCount} more action
+                            {hiddenActionCount === 1 ? "" : "s"}; Review to inspect.
+                          </p>
+                        ) : null}
+                      </div>
                     ) : (
                       event.description && (
                         <p className="task-card-description">{event.description}</p>
@@ -7015,14 +7275,19 @@ const AgentConsole = ({
           data-runtime-lane={contract.lane}
           data-runtime-availability={contract.availability}
         >
-          {renderConsolePip({
-            key: "runtime-contract-lane",
-            label: "Lane",
-            value: laneLabel,
-            title: `Runtime lane: ${laneLabel}`,
-            tone: contract.lane === RUNTIME_PANEL_LANES.LOCAL_PROVIDER ? "provider" : "runtime",
-            compact,
-          })}
+          {!compact
+            ? renderConsolePip({
+                key: "runtime-contract-lane",
+                label: "Lane",
+                value: laneLabel,
+                title: `Runtime lane: ${laneLabel}`,
+                tone:
+                  contract.lane === RUNTIME_PANEL_LANES.LOCAL_PROVIDER
+                    ? "provider"
+                    : "runtime",
+                compact,
+              })
+            : null}
           {renderConsolePip({
             key: "runtime-contract-model",
             label: "Model",
@@ -7033,7 +7298,7 @@ const AgentConsole = ({
             tone: contract.model ? "connected" : "idle",
             compact,
           })}
-          {contract.endpoint
+          {contract.endpoint && !compact
             ? renderConsolePip({
                 key: "runtime-contract-endpoint",
                 label: "Endpoint",
@@ -7744,8 +8009,7 @@ const AgentConsole = ({
         return id && String(id) === String(sessionId);
       });
       if (match?.resources) return match.resources;
-      const fallback = (agents || []).find((agent) => agent?.resources);
-      return fallback?.resources || null;
+      return null;
     })();
     const tokenLimit =
       typeof state.maxContextLength === "number" && state.maxContextLength > 0
@@ -8211,47 +8475,11 @@ const AgentConsole = ({
       <button
         className="collapse-btn"
         onClick={(event) =>
-          handleUnifiedPress(event, () => {
-            const btn = event.currentTarget;
-            if (btn.__hoverTimer) {
-              clearTimeout(btn.__hoverTimer);
-              btn.__hoverTimer = null;
-            }
-            if (btn.__lastHoverToggleAt && Date.now() - btn.__lastHoverToggleAt < 300) {
-              return;
-            }
-            onToggle?.();
-          })
+          handleUnifiedPress(event, () => onToggle?.())
         }
         onPointerDown={(event) =>
-          handleUnifiedPress(event, () => {
-            const btn = event.currentTarget;
-            if (btn.__hoverTimer) {
-              clearTimeout(btn.__hoverTimer);
-              btn.__hoverTimer = null;
-            }
-            if (btn.__lastHoverToggleAt && Date.now() - btn.__lastHoverToggleAt < 300) {
-              return;
-            }
-            onToggle?.();
-          })
+          handleUnifiedPress(event, () => onToggle?.())
         }
-        onMouseEnter={(event) => {
-          if (!supportsHoverInteractions()) return;
-          const btn = event.currentTarget;
-          if (btn.__hoverTimer) clearTimeout(btn.__hoverTimer);
-          btn.__hoverTimer = setTimeout(() => {
-            btn.__lastHoverToggleAt = Date.now();
-            onToggle?.();
-          }, 1000);
-        }}
-        onMouseLeave={(event) => {
-          const btn = event.currentTarget;
-          if (btn.__hoverTimer) {
-            clearTimeout(btn.__hoverTimer);
-            btn.__hoverTimer = null;
-          }
-        }}
         aria-label="Collapse agent console"
         title="Collapse agent console"
       >
@@ -8272,16 +8500,16 @@ const AgentConsole = ({
         <div className="right-header-controls-scroll history-controls-scroll">
           <div className="history-controls-scroll-content right-header-controls-scroll-content">
             <div className="console-permission-control">
-              <label htmlFor="console-permission-select">permissions</label>
+              <label htmlFor="console-permission-select">tool approval</label>
               <select
                 id="console-permission-select"
                 className="console-permission-select"
                 value={state.approvalLevel}
                 onChange={handleApprovalLevelChange}
-                title="Select tool permissions level"
-                aria-label="Tool permissions level"
+                title="Choose when Float asks before running tools"
+                aria-label="Tool approval mode"
               >
-                <option value="all">All</option>
+                <option value="all">Review all</option>
                 <option value="high">High Risk Only</option>
                 <option value="auto">Full Auto</option>
               </select>

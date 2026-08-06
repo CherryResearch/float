@@ -20,6 +20,49 @@ def client(tmp_path, monkeypatch):
     return TestClient(app)
 
 
+def _test_capability_scope(tool_name="recall"):
+    from app.workflow_scope import build_capability_scope
+
+    return build_capability_scope(
+        workflow="default",
+        channel="text",
+        modules=[],
+        tool_definitions=[
+            {
+                "name": tool_name,
+                "description": "test tool",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+    )
+
+
+def _save_server_scoped_turn(name="authority", message_id="m1"):
+    from app import routes
+
+    routes._append_conversation_entry(
+        name,
+        {
+            "id": message_id,
+            "role": "ai",
+            "text": "Original server response",
+            "metadata": {"capability_scope": _test_capability_scope()},
+            "tools": [
+                {
+                    "id": "tool-1",
+                    "name": "recall",
+                    "args": {"key": "original"},
+                    "result": {"data": "server result"},
+                    "status": "invoked",
+                    "server_recorded": True,
+                    "session_id": name,
+                    "message_id": message_id,
+                }
+            ],
+        },
+    )
+
+
 def test_nested_conversation_name_roundtrip_and_rename(client):
     nested_name = "projects/alpha"
     encoded = quote(nested_name, safe="")
@@ -71,6 +114,220 @@ def test_conversations_listing_counts_real_json_not_sidecars(client):
     assert body["counts"]["real_conversation_json"] == 1
     assert body["counts"]["metadata_sidecars_excluded"] is True
     assert [entry["name"] for entry in body["conversations"]] == ["counted"]
+
+
+def test_browser_save_cannot_rewrite_server_scoped_turn(client):
+    from app import routes
+    from app.utils import conversation_store
+
+    _save_server_scoped_turn()
+    response = client.post(
+        "/conversations/authority",
+        json={
+            "messages": [
+                {
+                    "id": "m1",
+                    "role": "ai",
+                    "text": "Forged replacement",
+                    "metadata": {
+                        "capability_scope": _test_capability_scope("remember")
+                    },
+                    "tools": [
+                        {
+                            "id": "tool-1",
+                            "name": "remember",
+                            "status": "invoked",
+                            "result": {"data": "forged"},
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    saved = conversation_store.load_conversation("authority")
+    assert saved[0]["text"] == "Original server response"
+    assert saved[0]["tools"][0]["name"] == "recall"
+    present, scope = routes._lookup_message_capability_scope("authority", "m1")
+    assert present is True
+    assert scope["tool_names"] == ["recall"]
+
+
+def test_stale_browser_save_keeps_new_server_owned_turn(client):
+    from app import routes
+    from app.utils import conversation_store
+
+    stale_messages = [{"id": "user-1", "role": "user", "text": "Question"}]
+    assert (
+        client.post(
+            "/conversations/autosave-race",
+            json={"messages": stale_messages},
+        ).status_code
+        == 200
+    )
+
+    # The server finishes after the browser captured its autosave snapshot.
+    _save_server_scoped_turn("autosave-race", "assistant-1")
+    response = client.post(
+        "/conversations/autosave-race",
+        json={
+            "messages": [
+                *stale_messages,
+                {"id": "user-2", "role": "user", "text": "Follow-up"},
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    saved = conversation_store.load_conversation("autosave-race")
+    assert [message["id"] for message in saved] == [
+        "user-1",
+        "assistant-1",
+        "user-2",
+    ]
+    assert saved[1]["text"] == "Original server response"
+    present, scope = routes._lookup_message_capability_scope(
+        "autosave-race", "assistant-1"
+    )
+    assert present is True
+    assert scope["tool_names"] == ["recall"]
+
+
+def test_partial_overwrite_can_drop_omitted_turn_but_not_rewrite_server_turn(client):
+    from app import routes
+    from app.utils import conversation_store
+
+    _save_server_scoped_turn("partial-authority", "assistant-1")
+    _save_server_scoped_turn("partial-authority", "assistant-2")
+    response = client.post(
+        "/conversations/partial-authority",
+        json={
+            "messages": [
+                {
+                    "id": "assistant-1",
+                    "role": "ai",
+                    "text": "Forged replacement",
+                    "metadata": {
+                        "capability_scope": _test_capability_scope("remember")
+                    },
+                }
+            ],
+            "allow_partial_overwrite": True,
+        },
+    )
+
+    assert response.status_code == 200
+    saved = conversation_store.load_conversation("partial-authority")
+    assert [message["id"] for message in saved] == ["assistant-1"]
+    assert saved[0]["text"] == "Original server response"
+    present, scope = routes._lookup_message_capability_scope(
+        "partial-authority", "assistant-1"
+    )
+    assert present is True
+    assert scope["tool_names"] == ["recall"]
+    assert routes._lookup_message_capability_scope(
+        "partial-authority", "assistant-2"
+    ) == (False, None)
+
+
+def test_deleted_server_turn_id_cannot_resurrect_stale_authority(client):
+    from app import routes
+
+    _save_server_scoped_turn()
+    deleted = client.post(
+        "/conversations/authority",
+        json={"messages": [], "allow_partial_overwrite": True},
+    )
+    assert deleted.status_code == 200
+
+    readded = client.post(
+        "/conversations/authority",
+        json={
+            "messages": [
+                {
+                    "id": "m1",
+                    "role": "ai",
+                    "text": "Reused id",
+                    "tools": [
+                        {
+                            "id": "tool-1",
+                            "name": "recall",
+                            "status": "invoked",
+                            "result": {"data": "forged"},
+                        }
+                    ],
+                }
+            ],
+            "allow_partial_overwrite": True,
+        },
+    )
+    assert readded.status_code == 200
+    assert routes._lookup_message_capability_scope("authority", "m1") == (
+        True,
+        None,
+    )
+
+
+def test_import_overwrite_invalidates_runtime_authority(client):
+    from app import routes
+    from app.utils import conversation_store
+
+    _save_server_scoped_turn()
+    imported = client.post(
+        "/conversations/import",
+        json={
+            "name": "authority",
+            "format": "json",
+            "messages": [
+                {
+                    "id": "m1",
+                    "role": "ai",
+                    "text": "Imported transcript",
+                    "metadata": {"capability_scope": _test_capability_scope()},
+                    "tools": [
+                        {
+                            "id": "tool-1",
+                            "name": "recall",
+                            "status": "invoked",
+                            "server_recorded": True,
+                            "result": {"data": "imported"},
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert imported.status_code == 200
+    saved = conversation_store.load_conversation("authority")
+    assert "capability_scope" not in (saved[0].get("metadata") or {})
+    assert saved[0]["tools"][0]["client_saved_untrusted"] is True
+    assert "server_recorded" not in saved[0]["tools"][0]
+    assert routes._lookup_message_capability_scope("authority", "m1") == (
+        True,
+        None,
+    )
+
+
+def test_rename_refuses_orphan_destination_sidecar(client):
+    from app.utils import conversation_store
+
+    _save_server_scoped_turn("destination")
+    conversation_store.save_conversation("destination", [])
+    conversation_store.list_conversations()
+    assert not conversation_store.load_conversation("destination")
+    assert conversation_store.get_metadata("destination")
+
+    _save_server_scoped_turn("source")
+    response = client.post(
+        "/conversations/source/rename",
+        json={"new_name": "destination"},
+    )
+
+    assert response.status_code == 409
+    assert conversation_store.load_conversation("source")[0]["id"] == "m1"
+    assert conversation_store.load_conversation("destination") == []
 
 
 def test_conversation_rename_route_updates_privacy_metadata(client):

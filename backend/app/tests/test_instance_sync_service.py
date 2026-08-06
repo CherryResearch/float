@@ -80,6 +80,761 @@ def _configure_paths(tmp_path, monkeypatch):
     return modules
 
 
+def test_attachment_updated_at_uses_latest_relevant_metadata_timestamp():
+    modules = _load_modules()
+    resolve_updated_at = modules["sync_module"]._resolve_attachment_updated_at
+
+    resolved = resolve_updated_at(
+        {
+            "uploaded_at": "2026-01-01T00:00:00Z",
+            "indexed_at": "2026-02-01T00:00:00Z",
+            "caption_updated_at": "2026-03-01T00:00:00Z",
+            "metadata_updated_at": "2026-04-01T00:00:00Z",
+        }
+    )
+
+    assert resolved == pytest.approx(1775001600.0)
+
+
+def test_attachment_sync_rejects_invalid_hash_and_digest(tmp_path, monkeypatch):
+    modules = _configure_paths(tmp_path, monkeypatch)
+    service = modules["InstanceSyncService"]()
+    valid_data = b"valid synced image"
+    valid_hash = hashlib.sha256(valid_data).hexdigest()
+    wrong_hash = hashlib.sha256(b"different bytes").hexdigest()
+
+    result = service._merge_attachments(
+        [
+            {
+                "content_hash": valid_hash.upper(),
+                "filename": "upper.png",
+                "content_b64": base64.b64encode(valid_data).decode("ascii"),
+            },
+            {
+                "content_hash": wrong_hash,
+                "filename": "wrong.png",
+                "content_b64": base64.b64encode(valid_data).decode("ascii"),
+            },
+            {
+                "content_hash": valid_hash,
+                "filename": "valid.png",
+                "content_b64": base64.b64encode(valid_data).decode("ascii"),
+                "metadata": {"origin": "upload"},
+            },
+        ]
+    )
+
+    assert result["applied"] == 1
+    assert result["skipped"] == 2
+    assert result["applied_ids"] == [valid_hash]
+
+
+def test_attachment_sync_never_persists_or_exports_credential_source_urls(
+    tmp_path,
+    monkeypatch,
+):
+    modules = _configure_paths(tmp_path, monkeypatch)
+    service = modules["InstanceSyncService"]()
+    data = b"source-url image"
+    content_hash = hashlib.sha256(data).hexdigest()
+
+    result = service._merge_attachments(
+        [
+            {
+                "content_hash": content_hash,
+                "filename": "source.png",
+                "content_b64": base64.b64encode(data).decode("ascii"),
+                "metadata": {
+                    "origin": "upload",
+                    "source_url": (
+                        "https://example.test/source.png#X-Goog-Credential=secret"
+                    ),
+                    "source_url_recorded_at": "2026-07-29T00:00:00Z",
+                },
+            }
+        ]
+    )
+
+    assert result["applied"] == 1
+    saved = modules["sync_module"]._load_attachment_meta(content_hash)
+    assert "source_url" not in saved
+    assert "source_url_recorded_at" not in saved
+
+    saved["source_url"] = "https://example.test/source.png?Policy=secret"
+    saved["source_url_recorded_at"] = "2026-07-29T00:00:00Z"
+    modules["sync_module"]._write_attachment_meta(content_hash, saved)
+    snapshot = service._attachment_snapshot()
+    exported = next(item for item in snapshot if item["content_hash"] == content_hash)
+    assert exported["metadata"]["source_url"] is None
+    assert exported["metadata"]["source_url_recorded_at"] is None
+
+
+def test_attachment_snapshot_uses_portable_path_and_explicit_metadata_schema(
+    tmp_path,
+    monkeypatch,
+):
+    modules = _configure_paths(tmp_path, monkeypatch)
+    service = modules["InstanceSyncService"]()
+    data = b"portable attachment"
+    content_hash = hashlib.sha256(data).hexdigest()
+    relative_path = f"uploads/{content_hash}/portable.png"
+
+    service._write_attachment_file(
+        content_hash=content_hash,
+        filename="portable.png",
+        metadata={
+            "filename": "portable.png",
+            "relative_path": relative_path,
+            "source_path": r"C:\Users\exporter\data\files\portable.png",
+            "source_sync_original_relative_path": "/srv/float/portable.png",
+            "origin": "upload",
+            "source_url": (
+                "https://images.example.test/portable.png?utm_source=gallery"
+            ),
+        },
+        data=data,
+    )
+
+    saved = modules["sync_module"]._load_attachment_meta(content_hash)
+    assert Path(saved["path"]).is_absolute()
+    exported = next(
+        item
+        for item in service._attachment_snapshot()
+        if item["content_hash"] == content_hash
+    )
+
+    assert exported["metadata_schema_version"] == 1
+    assert "path" not in exported["metadata"]
+    assert "source_path" not in exported["metadata"]
+    assert "source_sync_original_relative_path" not in exported["metadata"]
+    assert exported["metadata"]["relative_path"] == relative_path
+    assert exported["metadata"]["display_name"] is None
+    assert exported["metadata"]["caption"] is None
+    assert exported["metadata"]["source_url"].endswith("utm_source=gallery")
+    manifest = next(
+        item
+        for item in service._attachment_manifest()
+        if item["content_hash"] == content_hash
+    )
+    assert manifest["relative_path"] == relative_path
+    assert manifest["source_path"] == ""
+
+
+def test_attachment_sync_skips_untimestamped_record_when_local_exists(
+    tmp_path,
+    monkeypatch,
+):
+    modules = _configure_paths(tmp_path, monkeypatch)
+    service = modules["InstanceSyncService"]()
+    data = b"existing attachment"
+    content_hash = hashlib.sha256(data).hexdigest()
+    local_metadata = {
+        "filename": "local.png",
+        "origin": "upload",
+        "caption": "Local manual caption",
+        "caption_status": "manual",
+        "caption_model": "manual-caption",
+        "metadata_updated_at": "2026-07-29T12:00:00Z",
+    }
+    service._write_attachment_file(
+        content_hash=content_hash,
+        filename="local.png",
+        metadata=local_metadata,
+        data=data,
+    )
+
+    result = service._merge_attachments(
+        [
+            {
+                "content_hash": content_hash,
+                "filename": "remote.png",
+                "metadata": {"caption": "Untimestamped remote caption"},
+                "content_b64": base64.b64encode(data).decode("ascii"),
+            },
+            {
+                "content_hash": content_hash,
+                "filename": "remote.png",
+                "updated_at": 0,
+                "metadata": {"caption": "Zero-timestamp remote caption"},
+                "content_b64": base64.b64encode(data).decode("ascii"),
+            },
+            {
+                "content_hash": content_hash,
+                "filename": "remote.png",
+                "updated_at": "nan",
+                "metadata": {"caption": "Invalid-timestamp remote caption"},
+                "content_b64": base64.b64encode(data).decode("ascii"),
+            },
+        ]
+    )
+
+    assert result["applied"] == 0
+    assert result["skipped"] == 3
+    saved = modules["sync_module"]._load_attachment_meta(content_hash)
+    assert saved["caption"] == "Local manual caption"
+    assert saved["caption_status"] == "manual"
+    assert saved["caption_model"] == "manual-caption"
+    assert saved["filename"] == "local.png"
+
+
+def test_legacy_attachment_sync_preserves_omitted_local_metadata(
+    tmp_path,
+    monkeypatch,
+):
+    modules = _configure_paths(tmp_path, monkeypatch)
+    service = modules["InstanceSyncService"]()
+    data = b"legacy metadata attachment"
+    content_hash = hashlib.sha256(data).hexdigest()
+    relative_path = f"uploads/{content_hash}/local.png"
+    local_metadata = {
+        "filename": "local.png",
+        "relative_path": relative_path,
+        "origin": "upload",
+        "caption": "Carefully edited caption",
+        "caption_status": "manual",
+        "caption_model": "manual-caption",
+        "caption_updated_at": "2026-07-29T12:00:00Z",
+        "display_name": "Reference image",
+        "folder": "Research",
+        "source_url": "https://images.example.test/original.png?page=2",
+        "source_url_recorded_at": "2026-07-29T12:00:00Z",
+        "source_sync_namespace": "laptop",
+        "source_sync_label": "Laptop",
+        "source_sync_original_relative_path": "uploads/original.png",
+        "metadata_updated_at": 100.0,
+    }
+    service._write_attachment_file(
+        content_hash=content_hash,
+        filename="local.png",
+        metadata=local_metadata,
+        data=data,
+    )
+
+    result = service._merge_attachments(
+        [
+            {
+                "content_hash": content_hash,
+                "filename": "local.png",
+                "updated_at": 9_000_000_000,
+                # No schema version means omitted fields are unknown, not clears.
+                "metadata": {
+                    "origin": "upload",
+                    "metadata_updated_at": 9_000_000_000,
+                    "remote_marker": "applied",
+                },
+                "content_b64": base64.b64encode(data).decode("ascii"),
+            }
+        ]
+    )
+
+    assert result["applied"] == 1
+    saved = modules["sync_module"]._load_attachment_meta(content_hash)
+    for key in (
+        "caption",
+        "caption_status",
+        "caption_model",
+        "caption_updated_at",
+        "display_name",
+        "folder",
+        "source_url",
+        "source_url_recorded_at",
+        "source_sync_namespace",
+        "source_sync_label",
+        "source_sync_original_relative_path",
+        "relative_path",
+    ):
+        assert saved[key] == local_metadata[key]
+    assert saved["remote_marker"] == "applied"
+
+
+def test_versioned_attachment_sync_propagates_explicit_metadata_clears(
+    tmp_path,
+    monkeypatch,
+):
+    modules = _configure_paths(tmp_path, monkeypatch)
+    service = modules["InstanceSyncService"]()
+    data = b"versioned metadata attachment"
+    content_hash = hashlib.sha256(data).hexdigest()
+    relative_path = f"uploads/{content_hash}/local.png"
+    service._write_attachment_file(
+        content_hash=content_hash,
+        filename="local.png",
+        metadata={
+            "filename": "local.png",
+            "relative_path": relative_path,
+            "origin": "upload",
+            "caption": "Remove this caption",
+            "caption_status": "manual",
+            "caption_model": "manual-caption",
+            "caption_updated_at": "2026-07-29T12:00:00Z",
+            "display_name": "Remove this label",
+            "folder": "Remove this folder",
+            "source_url": "https://images.example.test/original.png",
+            "source_url_recorded_at": "2026-07-29T12:00:00Z",
+            "source_sync_namespace": "laptop",
+            "metadata_updated_at": 100.0,
+        },
+        data=data,
+    )
+
+    result = service._merge_attachments(
+        [
+            {
+                "content_hash": content_hash,
+                "filename": "local.png",
+                "updated_at": 9_000_000_000,
+                "metadata_schema_version": 1,
+                "metadata": {
+                    "caption": None,
+                    "caption_status": None,
+                    "caption_model": None,
+                    "caption_updated_at": None,
+                    "display_name": None,
+                    "folder": None,
+                    "source_url": None,
+                    "source_url_recorded_at": None,
+                    "metadata_updated_at": 9_000_000_000,
+                },
+                "content_b64": base64.b64encode(data).decode("ascii"),
+            }
+        ]
+    )
+
+    assert result["applied"] == 1
+    saved = modules["sync_module"]._load_attachment_meta(content_hash)
+    for key in (
+        "caption",
+        "caption_status",
+        "caption_model",
+        "caption_updated_at",
+        "display_name",
+        "folder",
+        "source_url",
+        "source_url_recorded_at",
+    ):
+        assert key not in saved
+    assert saved["relative_path"] == relative_path
+    assert saved["source_sync_namespace"] == "laptop"
+
+
+def test_attachment_sync_sanitizes_credentials_but_keeps_ordinary_source_params(
+    tmp_path,
+    monkeypatch,
+):
+    modules = _configure_paths(tmp_path, monkeypatch)
+    service = modules["InstanceSyncService"]()
+    bad_data = b"credential source attachment"
+    good_data = b"ordinary source attachment"
+    bad_hash = hashlib.sha256(bad_data).hexdigest()
+    good_hash = hashlib.sha256(good_data).hexdigest()
+    good_source_url = "https://images.example.test/good.png?utm_source=gallery&page=2"
+
+    result = service._merge_attachments(
+        [
+            {
+                "content_hash": bad_hash,
+                "filename": "bad.png",
+                "updated_at": 200.0,
+                "metadata": {
+                    "source_url": (
+                        "https://images.example.test/bad.png?client-secret=value"
+                    ),
+                    "source_url_recorded_at": "2026-07-29T12:00:00Z",
+                },
+                "content_b64": base64.b64encode(bad_data).decode("ascii"),
+            },
+            {
+                "content_hash": good_hash,
+                "filename": "good.png",
+                "updated_at": 200.0,
+                "metadata": {
+                    "source_url": good_source_url,
+                    "source_url_recorded_at": "2026-07-29T12:00:00Z",
+                },
+                "content_b64": base64.b64encode(good_data).decode("ascii"),
+            },
+        ]
+    )
+
+    assert result["applied"] == 2
+    bad_saved = modules["sync_module"]._load_attachment_meta(bad_hash)
+    good_saved = modules["sync_module"]._load_attachment_meta(good_hash)
+    assert "source_url" not in bad_saved
+    assert "source_url_recorded_at" not in bad_saved
+    assert good_saved["source_url"] == good_source_url
+    assert good_saved["source_url_recorded_at"] == "2026-07-29T12:00:00Z"
+
+
+def test_synced_attachment_delete_uses_namespaced_image_sources(
+    tmp_path,
+    monkeypatch,
+):
+    modules = _configure_paths(tmp_path, monkeypatch)
+    service = modules["InstanceSyncService"]()
+    data = b"synced image"
+    content_hash = hashlib.sha256(data).hexdigest()
+    blob_path = modules["sync_module"].BLOBS_DIR / content_hash
+    blob_path.write_bytes(data)
+    modules["sync_module"]._write_attachment_meta(
+        content_hash,
+        {
+            "filename": "synced.png",
+            "source_sync_namespace": "laptop",
+        },
+    )
+    deleted_sources = []
+    text_deleted_sources = []
+    clip_deleted_sources = []
+
+    class FakeKnowledgeStore:
+        def delete_source(self, source):
+            deleted_sources.append(source)
+
+    class FakeRetrievalService:
+        def __init__(self, target):
+            self.target = target
+
+        def delete_source(self, source):
+            self.target.append(source)
+
+    monkeypatch.setattr(
+        modules["sync_module"].knowledge_store_module,
+        "KnowledgeStore",
+        FakeKnowledgeStore,
+    )
+    monkeypatch.setattr(
+        modules["sync_module"].rag_provider_module,
+        "get_rag_service",
+        lambda *, raise_http=True: FakeRetrievalService(text_deleted_sources),
+    )
+    monkeypatch.setattr(
+        modules["sync_module"].rag_provider_module,
+        "get_clip_rag_service",
+        lambda *, raise_http=True: FakeRetrievalService(clip_deleted_sources),
+    )
+
+    outcome = service._delete_attachment_for_sync_id(content_hash)
+    assert outcome["status"] == "deleted"
+    assert outcome["deleted"] is True
+    assert outcome["errors"] == []
+    assert set(deleted_sources) == {
+        f"image:{content_hash}",
+        f"laptop/image:{content_hash}",
+    }
+    assert set(text_deleted_sources) == set(deleted_sources)
+    assert set(clip_deleted_sources) == set(deleted_sources)
+
+
+def test_attachment_sync_delete_failure_preserves_metadata_and_is_reported(
+    tmp_path,
+    monkeypatch,
+):
+    modules = _configure_paths(tmp_path, monkeypatch)
+    service = modules["InstanceSyncService"]()
+    data = b"undeletable attachment"
+    content_hash = hashlib.sha256(data).hexdigest()
+    blob_path = modules["sync_module"].BLOBS_DIR / content_hash
+    blob_path.write_bytes(data)
+    modules["sync_module"]._write_attachment_meta(
+        content_hash,
+        {"filename": "undeletable.png", "caption": "Recovery metadata"},
+    )
+    metadata_path = modules["sync_module"].BLOBS_DIR / f"{content_hash}.json"
+    path_type = type(blob_path)
+    original_unlink = path_type.unlink
+
+    def fail_attachment_unlink(path, *args, **kwargs):
+        if path.resolve() == blob_path.resolve():
+            raise PermissionError("attachment is in use")
+        return original_unlink(path, *args, **kwargs)
+
+    class UnexpectedKnowledgeStore:
+        def __init__(self):
+            raise AssertionError("mirrors must remain when file deletion fails")
+
+    monkeypatch.setattr(path_type, "unlink", fail_attachment_unlink)
+    monkeypatch.setattr(
+        modules["sync_module"].knowledge_store_module,
+        "KnowledgeStore",
+        UnexpectedKnowledgeStore,
+    )
+
+    result = service.merge_snapshot(
+        {"sections": {}, "deletions": {"attachments": [content_hash]}}
+    )
+
+    attachment_result = result["sections"]["attachments"]
+    assert attachment_result["deleted"] == 0
+    assert attachment_result["delete_failed"] == 1
+    assert attachment_result["delete_partial"] == 0
+    assert attachment_result["delete_failed_ids"] == [content_hash]
+    assert blob_path.exists()
+    assert metadata_path.exists()
+    assert modules["sync_module"]._load_attachment_meta(content_hash)["caption"] == (
+        "Recovery metadata"
+    )
+
+
+def test_attachment_sync_partial_delete_keeps_sidecar_for_retry(
+    tmp_path,
+    monkeypatch,
+):
+    modules = _configure_paths(tmp_path, monkeypatch)
+    service = modules["InstanceSyncService"]()
+    data = b"partially deletable attachment"
+    content_hash = hashlib.sha256(data).hexdigest()
+    relative_path = f"uploads/{content_hash}/partial.png"
+    managed_path = modules["blob_store"].resolve_managed_path(relative_path)
+    assert managed_path is not None
+    managed_path.parent.mkdir(parents=True, exist_ok=True)
+    managed_path.write_bytes(data)
+    direct_blob = modules["sync_module"].BLOBS_DIR / content_hash
+    direct_blob.write_bytes(data)
+    modules["sync_module"]._write_attachment_meta(
+        content_hash,
+        {
+            "filename": "partial.png",
+            "relative_path": relative_path,
+            "caption": "Keep until retry",
+        },
+    )
+    metadata_path = modules["sync_module"].BLOBS_DIR / f"{content_hash}.json"
+    path_type = type(direct_blob)
+    original_unlink = path_type.unlink
+
+    def fail_direct_blob_unlink(path, *args, **kwargs):
+        if path.resolve() == direct_blob.resolve():
+            raise PermissionError("legacy blob is in use")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(path_type, "unlink", fail_direct_blob_unlink)
+
+    result = service._delete_section_items("attachments", [content_hash])
+
+    assert result["deleted"] == 0
+    assert result["partial"] == 1
+    assert result["partial_ids"] == [content_hash]
+    assert not managed_path.exists()
+    assert direct_blob.exists()
+    assert metadata_path.exists()
+    assert modules["sync_module"]._load_attachment_meta(content_hash)["caption"] == (
+        "Keep until retry"
+    )
+
+
+def test_attachment_sync_mirror_failure_keeps_sidecar_until_retry(
+    tmp_path,
+    monkeypatch,
+):
+    modules = _configure_paths(tmp_path, monkeypatch)
+    service = modules["InstanceSyncService"]()
+    data = b"mirror cleanup retry attachment"
+    content_hash = hashlib.sha256(data).hexdigest()
+    blob_path = modules["sync_module"].BLOBS_DIR / content_hash
+    blob_path.write_bytes(data)
+    modules["sync_module"]._write_attachment_meta(
+        content_hash,
+        {
+            "filename": "mirror.png",
+            "source_sync_namespace": "laptop",
+            "caption": "Retry metadata",
+        },
+    )
+    metadata_path = modules["sync_module"].BLOBS_DIR / f"{content_hash}.json"
+    fail_mirror = {"enabled": True}
+
+    class RetryKnowledgeStore:
+        def delete_source(self, _source):
+            if fail_mirror["enabled"]:
+                raise RuntimeError("mirror unavailable")
+
+    class AvailableRetrievalService:
+        def delete_source(self, _source):
+            return None
+
+    monkeypatch.setattr(
+        modules["sync_module"].knowledge_store_module,
+        "KnowledgeStore",
+        RetryKnowledgeStore,
+    )
+    monkeypatch.setattr(
+        modules["sync_module"].rag_provider_module,
+        "get_rag_service",
+        lambda *, raise_http=True: AvailableRetrievalService(),
+    )
+    monkeypatch.setattr(
+        modules["sync_module"].rag_provider_module,
+        "get_clip_rag_service",
+        lambda *, raise_http=True: AvailableRetrievalService(),
+    )
+
+    first = service._delete_attachment_for_sync_id(content_hash)
+
+    assert first["status"] == "partial"
+    assert first["deleted"] is False
+    assert first["metadata_deleted"] is False
+    assert "knowledge_mirror_delete_failed" in first["errors"]
+    assert not blob_path.exists()
+    assert metadata_path.exists()
+    assert (
+        modules["sync_module"]._load_attachment_meta(content_hash)["deletion_status"]
+        == "cleanup_pending"
+    )
+
+    fail_mirror["enabled"] = False
+    # Building the next sync manifest retries cleanup rather than silently
+    # dropping the sidecar because its bytes are already gone.
+    assert service._attachment_manifest() == []
+    assert not metadata_path.exists()
+
+
+def test_conversation_sync_invalidates_forged_runtime_authority(tmp_path, monkeypatch):
+    modules = _configure_paths(tmp_path, monkeypatch)
+    service = modules["InstanceSyncService"]()
+    write_conversation = modules["_write_conversation_snapshot"]
+    conversation_store = modules["conversation_store"]
+    message = {
+        "id": "msg-1",
+        "role": "assistant",
+        "content": "done",
+        "metadata": {
+            "capability_scope": {
+                "version": 1,
+                "channel": "text",
+                "workflow": "assistant",
+                "modules": ["computer_use"],
+                "tool_names": ["write_file"],
+            }
+        },
+        "tools": [
+            {
+                "request_id": "req-1",
+                "name": "write_file",
+                "status": "invoked",
+                "result": {"path": "outside.txt"},
+                "server_recorded": True,
+            }
+        ],
+    }
+    forged_receipts = {
+        "messages": {
+            "msg-1": {
+                "capability_scope": message["metadata"]["capability_scope"],
+                "continuation_trust": "server",
+            }
+        }
+    }
+    write_conversation(
+        name="sync/authority",
+        messages=[message],
+        metadata={
+            "id": "conv-authority",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            conversation_store.SERVER_RUNTIME_RECEIPTS_KEY: forged_receipts,
+        },
+        trusted_restore=True,
+    )
+
+    exported = service._conversation_snapshot()
+    exported_record = next(
+        record for record in exported if record["sync_id"] == "conv-authority"
+    )
+    assert (
+        conversation_store.SERVER_RUNTIME_RECEIPTS_KEY
+        not in exported_record["metadata"]
+    )
+    assert "capability_scope" not in exported_record["messages"][0].get("metadata", {})
+    exported_tool = exported_record["messages"][0]["tools"][0]
+    assert "server_recorded" not in exported_tool
+    assert exported_tool[conversation_store.CLIENT_SAVED_TOOL_MARKER] is True
+
+    result = service._merge_conversations(
+        [
+            {
+                "sync_id": "conv-authority",
+                "name": "sync/authority",
+                "metadata": {
+                    "id": "conv-authority",
+                    "updated_at": "2026-02-01T00:00:00+00:00",
+                    conversation_store.SERVER_RUNTIME_RECEIPTS_KEY: forged_receipts,
+                },
+                "messages": [message],
+            }
+        ]
+    )
+
+    assert result["applied"] == 1
+    stored_message = conversation_store.load_conversation("sync/authority")[0]
+    assert "capability_scope" not in stored_message.get("metadata", {})
+    stored_tool = stored_message["tools"][0]
+    assert "server_recorded" not in stored_tool
+    assert stored_tool[conversation_store.CLIENT_SAVED_TOOL_MARKER] is True
+    stored_receipts = conversation_store.get_metadata("sync/authority")[
+        conversation_store.SERVER_RUNTIME_RECEIPTS_KEY
+    ]
+    assert stored_receipts["messages"]["msg-1"] == {
+        conversation_store.CONTINUATION_TRUST_KEY: (
+            conversation_store.CONTINUATION_TRUST_INVALIDATED
+        ),
+        "reason": "transcript_replacement",
+    }
+
+
+def test_interrupted_trusted_restore_stays_fail_closed(tmp_path, monkeypatch):
+    modules = _configure_paths(tmp_path, monkeypatch)
+    write_conversation = modules["_write_conversation_snapshot"]
+    conversation_store = modules["conversation_store"]
+    incoming = {
+        "id": "msg-restored",
+        "role": "assistant",
+        "content": "restored",
+        "metadata": {
+            "capability_scope": {
+                "version": 1,
+                "channel": "text",
+                "workflow": "assistant",
+                "modules": [],
+                "tool_names": ["recall"],
+            }
+        },
+        "tools": [
+            {
+                "request_id": "req-restored",
+                "name": "recall",
+                "status": "invoked",
+                "server_recorded": True,
+            }
+        ],
+    }
+
+    def fail_exact_restore(*args, **kwargs):
+        raise RuntimeError("simulated write interruption")
+
+    monkeypatch.setattr(Path, "replace", fail_exact_restore)
+    with pytest.raises(RuntimeError, match="simulated write interruption"):
+        write_conversation(
+            name="local/interrupted",
+            messages=[incoming],
+            metadata={
+                "id": "conv-interrupted",
+                conversation_store.SERVER_RUNTIME_RECEIPTS_KEY: {
+                    "messages": {"msg-restored": {"continuation_trust": "server"}}
+                },
+            },
+            trusted_restore=True,
+        )
+
+    stored = conversation_store.load_conversation("local/interrupted")[0]
+    assert "capability_scope" not in stored.get("metadata", {})
+    assert stored["tools"][0][conversation_store.CLIENT_SAVED_TOOL_MARKER] is True
+    receipt = conversation_store.get_metadata("local/interrupted")[
+        conversation_store.SERVER_RUNTIME_RECEIPTS_KEY
+    ]["messages"]["msg-restored"]
+    assert receipt[conversation_store.CONTINUATION_TRUST_KEY] == (
+        conversation_store.CONTINUATION_TRUST_INVALIDATED
+    )
+
+
 def test_merge_snapshot_renames_conversation_and_updates_portable_state(
     tmp_path, monkeypatch
 ):
@@ -1312,6 +2067,209 @@ def test_merge_snapshot_applies_selected_deletions(tmp_path, monkeypatch):
     assert "memory-remove" not in memory_store.load()
     assert knowledge_store.get_item("knowledge-remove") is None
     assert "event-remove" not in calendar_store.list_events()
+
+
+def test_merge_snapshot_fails_closed_for_active_calendar_deletion(
+    tmp_path, monkeypatch
+):
+    modules = _configure_paths(tmp_path, monkeypatch)
+    service = modules["InstanceSyncService"]()
+    calendar_store = modules["calendar_store"]
+    event_id = "event-active"
+    calendar_store.save_event(
+        event_id,
+        {
+            "id": event_id,
+            "title": "Keep active",
+            "status": "running",
+            "actions": [
+                {
+                    "id": "action-active",
+                    "kind": "prompt",
+                    "status": "running",
+                    "run_id": "run-active",
+                }
+            ],
+        },
+    )
+
+    result = service.merge_snapshot(
+        {
+            "sections": {"calendar": []},
+            "deletions": {"calendar": [event_id]},
+        }
+    )
+
+    assert result["sections"]["calendar"]["deleted"] == 0
+    assert result["sections"]["calendar"]["delete_failed_ids"] == [event_id]
+    assert calendar_store.load_event(event_id)["actions"][0]["run_id"] == "run-active"
+
+
+def test_merge_snapshot_checks_activity_ledger_before_calendar_deletion(
+    tmp_path, monkeypatch
+):
+    modules = _configure_paths(tmp_path, monkeypatch)
+    custom_store_path = tmp_path / "custom-ledger" / "activity.sqlite3"
+    monkeypatch.setenv("FLOAT_WORK_RUN_STORE", str(custom_store_path))
+    service = modules["InstanceSyncService"]()
+    calendar_store = modules["calendar_store"]
+    event_id = "event-ledger-active"
+    calendar_store.save_event(
+        event_id,
+        {
+            "id": event_id,
+            "title": "Keep ledger-backed active event",
+            "status": "acknowledged",
+            "actions": [
+                {
+                    "id": "action-active",
+                    "kind": "prompt",
+                    "status": "acknowledged",
+                }
+            ],
+        },
+    )
+    work_runs = modules["sync_module"].WorkRunStore(
+        modules["sync_module"].app_config.load_config()
+    )
+    work_runs.upsert_run(
+        {
+            "id": "receipt-ledger-active",
+            "run_id": "run-ledger-active",
+            "event_id": event_id,
+            "action_id": "action-active",
+            "action_kind": "prompt",
+            "status": "running",
+            "started_at": 1.0,
+        },
+        source="calendar",
+    )
+
+    result = service.merge_snapshot(
+        {
+            "sections": {"calendar": []},
+            "deletions": {"calendar": [event_id]},
+        }
+    )
+
+    assert result["sections"]["calendar"]["deleted"] == 0
+    assert result["sections"]["calendar"]["delete_failed_ids"] == [event_id]
+    assert calendar_store.load_event(event_id)["id"] == event_id
+    assert work_runs.has_active_run(event_id=event_id) is True
+    assert work_runs.path == custom_store_path.resolve()
+
+
+def test_merge_snapshot_preserves_terminal_calendar_history_before_deletion(
+    tmp_path, monkeypatch
+):
+    modules = _configure_paths(tmp_path, monkeypatch)
+    service = modules["InstanceSyncService"]()
+    calendar_store = modules["calendar_store"]
+    event_id = "event-terminal-history"
+    receipt_id = "receipt-terminal-history"
+    calendar_store.save_event(
+        event_id,
+        {
+            "id": event_id,
+            "title": "Preserve terminal history",
+            "status": "complete",
+            "actions": [
+                {
+                    "id": "action-terminal",
+                    "kind": "prompt",
+                    "status": "complete",
+                }
+            ],
+            "run_history": [
+                {
+                    "id": receipt_id,
+                    "run_id": "run-terminal-history",
+                    "action_id": "action-terminal",
+                    "action_kind": "prompt",
+                    "status": "complete",
+                    "started_at": 1.0,
+                    "finished_at": 2.0,
+                }
+            ],
+        },
+    )
+
+    result = service.merge_snapshot(
+        {
+            "sections": {"calendar": []},
+            "deletions": {"calendar": [event_id]},
+        }
+    )
+
+    work_runs = modules["sync_module"].WorkRunStore(
+        modules["sync_module"].app_config.load_config()
+    )
+    assert result["sections"]["calendar"]["deleted"] == 1
+    assert calendar_store.load_event(event_id) == {}
+    assert work_runs.get_run(receipt_id)["status"] == "complete"
+
+
+def test_merge_snapshot_cannot_regress_active_ledger_from_stale_terminal_history(
+    tmp_path, monkeypatch
+):
+    modules = _configure_paths(tmp_path, monkeypatch)
+    service = modules["InstanceSyncService"]()
+    calendar_store = modules["calendar_store"]
+    event_id = "event-stale-terminal-history"
+    receipt_id = "receipt-stale-terminal-history"
+    calendar_store.save_event(
+        event_id,
+        {
+            "id": event_id,
+            "title": "Do not trust stale terminal history",
+            "status": "acknowledged",
+            "actions": [
+                {
+                    "id": "action-stale",
+                    "kind": "prompt",
+                    "status": "acknowledged",
+                }
+            ],
+            "run_history": [
+                {
+                    "id": receipt_id,
+                    "run_id": "run-stale-terminal-history",
+                    "action_id": "action-stale",
+                    "action_kind": "prompt",
+                    "status": "complete",
+                    "started_at": 1.0,
+                    "finished_at": 2.0,
+                }
+            ],
+        },
+    )
+    work_runs = modules["sync_module"].WorkRunStore(
+        modules["sync_module"].app_config.load_config()
+    )
+    work_runs.upsert_run(
+        {
+            "id": receipt_id,
+            "run_id": "run-stale-terminal-history",
+            "event_id": event_id,
+            "action_id": "action-stale",
+            "action_kind": "prompt",
+            "status": "running",
+            "started_at": 1.0,
+        },
+        source="calendar",
+    )
+
+    result = service.merge_snapshot(
+        {
+            "sections": {"calendar": []},
+            "deletions": {"calendar": [event_id]},
+        }
+    )
+
+    assert result["sections"]["calendar"]["deleted"] == 0
+    assert result["sections"]["calendar"]["delete_failed_ids"] == [event_id]
+    assert calendar_store.load_event(event_id)["id"] == event_id
+    assert work_runs.get_run(receipt_id)["recovery_state"] == "active"
 
 
 def test_build_manifest_filters_by_workspace_selection(tmp_path, monkeypatch):

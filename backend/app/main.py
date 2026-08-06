@@ -67,6 +67,13 @@ async def lifespan(app: FastAPI):
     except Exception:
         # best-effort; MCP startup issues should not prevent app startup
         pass
+    try:
+        backfill = await asyncio.to_thread(routes_module.backfill_work_run_ledger, app)
+        logger.info("Work-run ledger backfill complete: %s", backfill)
+    except Exception:
+        # Existing Calendar/reflection rows remain canonical and can be retried
+        # by the Activity endpoints if the local ledger is temporarily busy.
+        logger.warning("Work-run ledger backfill failed", exc_info=True)
     worker = asyncio.create_task(evaluate_pending_tasks(app))
     jobmon = asyncio.create_task(monitor_model_jobs(app))
     scheduled_tools = asyncio.create_task(scheduled_tool_runner(app))
@@ -315,7 +322,13 @@ try:
     action_history_service = services.ActionHistoryService(config)
     logger.info("ActionHistoryService initialized.")
 
-    reflection_service = services.ReflectionService(config)
+    work_run_store = services.WorkRunStore(config)
+    logger.info("WorkRunStore initialized.")
+
+    reflection_service = services.ReflectionService(
+        config,
+        work_run_store=work_run_store,
+    )
     logger.info("ReflectionService initialized.")
 
     background_autonomy_service = services.BackgroundAutonomyService(
@@ -332,6 +345,7 @@ try:
     app.state.rag_handler = rag_handler
     app.state.livekit_service = livekit_service
     app.state.action_history_service = action_history_service
+    app.state.work_run_store = work_run_store
     app.state.reflection_service = reflection_service
     app.state.background_autonomy_service = background_autonomy_service
     app.state.computer_service = computer_service

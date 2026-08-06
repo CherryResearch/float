@@ -74,6 +74,7 @@ def test_create_task_accepts_iso_datetime_and_normalizes_legacy_actions(
     assert event["end_time"] == 1773225900
     assert event["actions"] == [
         {
+            "id": "action-1",
             "kind": "prompt",
             "prompt": "Use image recall and continue inline.",
             "conversation_mode": "inline",

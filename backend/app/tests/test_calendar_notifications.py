@@ -161,3 +161,198 @@ def test_dispatch_due_calendar_prompts_flushes_overdue_reminders(
     assert stored["status"] == "prompted"
     assert notifications[0]["event_id"] == "overnight"
     assert notifications[0]["description"] == "Check the overnight notes."
+
+
+def test_recurring_prompt_dispatch_coalesces_to_latest_missed_occurrence(
+    temp_calendar_dir, monkeypatch
+):
+    start = datetime.now(timezone.utc) - timedelta(minutes=10)
+    calendar_store.save_event(
+        "recurring-catchup",
+        {
+            "id": "recurring-catchup",
+            "title": "Recurring catch-up",
+            "start_time": start.timestamp(),
+            "timezone": "UTC",
+            "rrule": "FREQ=MINUTELY;INTERVAL=2;COUNT=10",
+            "status": "scheduled",
+        },
+    )
+    monkeypatch.setattr(
+        user_settings,
+        "load_settings",
+        lambda: {"calendar_notify_minutes": 0},
+    )
+    calls = []
+    monkeypatch.setattr(
+        send_event_prompt,
+        "delay",
+        lambda event_id, occ_time: calls.append((event_id, occ_time)),
+    )
+
+    triggered = dispatch_due_calendar_prompts(enqueue=True)
+
+    assert len(triggered) == 1
+    assert calls == [("recurring-catchup", triggered[0]["occ_time"])]
+    assert triggered[0]["occ_time"] > start.timestamp() + 8 * 60
+    stored = calendar_store.load_event("recurring-catchup")
+    assert stored["last_prompt_dispatched"] == triggered[0]["occ_time"]
+    assert dispatch_due_calendar_prompts(enqueue=True) == []
+
+
+def test_recurring_prompt_dispatch_keeps_next_day_lead_time(
+    temp_calendar_dir, monkeypatch
+):
+    now = datetime.now(timezone.utc)
+    first = now - timedelta(hours=23, minutes=55)
+    next_occurrence = first + timedelta(days=1)
+    calendar_store.save_event(
+        "nightly-lead",
+        {
+            "id": "nightly-lead",
+            "title": "Nightly lead",
+            "start_time": first.timestamp(),
+            "timezone": "UTC",
+            "rrule": "FREQ=DAILY;COUNT=365",
+            "status": "scheduled",
+            "last_triggered": first.timestamp(),
+            "last_prompt_dispatched": first.timestamp(),
+        },
+    )
+    monkeypatch.setattr(
+        user_settings,
+        "load_settings",
+        lambda: {"calendar_notify_minutes": 10},
+    )
+    calls = []
+    monkeypatch.setattr(
+        send_event_prompt,
+        "delay",
+        lambda event_id, occ_time: calls.append((event_id, occ_time)),
+    )
+
+    triggered = dispatch_due_calendar_prompts(enqueue=True)
+
+    assert triggered == [
+        {
+            "event_id": "nightly-lead",
+            "occ_time": pytest.approx(next_occurrence.timestamp(), abs=1),
+        }
+    ]
+    assert calls[0][0] == "nightly-lead"
+
+
+def test_malformed_rrule_does_not_abort_other_reminders(temp_calendar_dir, monkeypatch):
+    now = datetime.now(timezone.utc)
+    calendar_store.save_event(
+        "malformed",
+        {
+            "id": "malformed",
+            "title": "Malformed recurrence",
+            "start_time": (now - timedelta(minutes=1)).timestamp(),
+            "timezone": "UTC",
+            "rrule": "FREQ=NOPE;BYDAY=???",
+            "status": "scheduled",
+        },
+    )
+    calendar_store.save_event(
+        "valid-reminder",
+        {
+            "id": "valid-reminder",
+            "title": "Valid reminder",
+            "start_time": (now + timedelta(minutes=1)).timestamp(),
+            "timezone": "UTC",
+            "status": "pending",
+        },
+    )
+    monkeypatch.setattr(
+        user_settings,
+        "load_settings",
+        lambda: {"calendar_notify_minutes": 5},
+    )
+    calls = []
+    monkeypatch.setattr(
+        send_event_prompt,
+        "delay",
+        lambda event_id, occ_time: calls.append((event_id, occ_time)),
+    )
+
+    triggered = dispatch_due_calendar_prompts(enqueue=True)
+
+    assert [item["event_id"] for item in triggered] == ["valid-reminder"]
+    assert calls[0][0] == "valid-reminder"
+
+
+def test_recurring_dispatch_releases_claim_when_enqueue_fails(
+    temp_calendar_dir, monkeypatch
+):
+    start = datetime.now(timezone.utc) - timedelta(minutes=2)
+    calendar_store.save_event(
+        "retry-enqueue",
+        {
+            "id": "retry-enqueue",
+            "title": "Retry enqueue",
+            "start_time": start.timestamp(),
+            "timezone": "UTC",
+            "rrule": "FREQ=MINUTELY;COUNT=3",
+            "status": "scheduled",
+        },
+    )
+    monkeypatch.setattr(
+        user_settings, "load_settings", lambda: {"calendar_notify_minutes": 0}
+    )
+
+    def fail_enqueue(*_args, **_kwargs):
+        raise RuntimeError("broker down")
+
+    monkeypatch.setattr(send_event_prompt, "delay", fail_enqueue)
+    with pytest.raises(RuntimeError, match="broker down"):
+        dispatch_due_calendar_prompts(enqueue=True)
+    assert "last_prompt_dispatched" not in calendar_store.load_event("retry-enqueue")
+
+    calls = []
+    monkeypatch.setattr(
+        send_event_prompt,
+        "delay",
+        lambda event_id, occ_time: calls.append((event_id, occ_time)),
+    )
+    triggered = dispatch_due_calendar_prompts(enqueue=True)
+    assert calls == [("retry-enqueue", triggered[0]["occ_time"])]
+
+
+def test_offline_prompt_worker_releases_recurring_dispatch_claim(
+    temp_calendar_dir, monkeypatch
+):
+    start = datetime.now(timezone.utc) - timedelta(minutes=1)
+    calendar_store.save_event(
+        "retry-offline",
+        {
+            "id": "retry-offline",
+            "title": "Retry offline",
+            "start_time": start.timestamp(),
+            "timezone": "UTC",
+            "rrule": "FREQ=MINUTELY;COUNT=3",
+            "status": "scheduled",
+        },
+    )
+    monkeypatch.setattr(
+        user_settings, "load_settings", lambda: {"calendar_notify_minutes": 0}
+    )
+    queued = []
+    monkeypatch.setattr(
+        send_event_prompt,
+        "delay",
+        lambda event_id, occ_time: queued.append((event_id, occ_time)),
+    )
+    first = dispatch_due_calendar_prompts(enqueue=True)
+    occurrence = first[0]["occ_time"]
+    assert queued == [("retry-offline", occurrence)]
+
+    monkeypatch.setattr("app.tasks._float_online", lambda: False)
+    assert send_event_prompt.run("retry-offline", occurrence) == "float offline"
+    stored = calendar_store.load_event("retry-offline")
+    assert "last_prompt_dispatched" not in stored
+
+    queued.clear()
+    retried = dispatch_due_calendar_prompts(enqueue=True)
+    assert queued == [("retry-offline", retried[0]["occ_time"])]

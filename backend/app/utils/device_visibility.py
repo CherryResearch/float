@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ipaddress
+import os
+import secrets
 import socket
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
@@ -12,13 +14,32 @@ _LOOPBACK_ALIASES = {"localhost", "testclient"}
 _TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
 
 
+def is_lan_binding_host(host: str) -> bool:
+    normalized = str(host or "").strip().strip("[]").lower()
+    return normalized in {"0.0.0.0", "::"} or classify_host(normalized) == "lan"
+
+
+def _backend_binding_status() -> Dict[str, Any]:
+    bind_host = str(os.getenv("FLOAT_BACKEND_HOST") or "").strip()
+    normalized = bind_host.strip("[]").lower()
+    binding_known = bool(normalized)
+    lan_listening = is_lan_binding_host(normalized)
+    return {
+        "bind_host": bind_host,
+        "binding_known": binding_known,
+        "lan_listening": lan_listening,
+    }
+
+
 def load_visibility_settings() -> Dict[str, Any]:
     settings = user_settings.load_settings()
+    binding = _backend_binding_status()
     return {
         "lan_visible": bool(settings.get("sync_visible_on_lan")),
         "online_visible": bool(settings.get("sync_visible_online")),
         "online_url": str(settings.get("sync_online_url") or "").strip(),
         "online_supported": False,
+        **binding,
     }
 
 
@@ -86,9 +107,21 @@ def is_trusted_frontend_proxy(request: Optional[Request]) -> bool:
         return False
     client = getattr(request, "client", None)
     direct = str(getattr(client, "host", "") or "").strip()
-    return (
-        classify_host(direct) == "loopback"
-        and str(request.headers.get("x-float-frontend-proxy") or "").strip() == "1"
+    marker_present = (
+        str(request.headers.get("x-float-frontend-proxy") or "").strip() == "1"
+    )
+    if not marker_present:
+        return False
+    if classify_host(direct) == "loopback":
+        return True
+    expected_token = str(os.getenv("FLOAT_FRONTEND_PROXY_TOKEN") or "").strip()
+    supplied_token = str(
+        request.headers.get("x-float-frontend-proxy-token") or ""
+    ).strip()
+    return bool(
+        expected_token
+        and supplied_token
+        and secrets.compare_digest(expected_token, supplied_token)
     )
 
 
@@ -208,9 +241,21 @@ def advertised_device_access(request: Optional[Request]) -> Dict[str, Any]:
     settings = load_visibility_settings()
     scheme, origin = _request_origin(request)
     origin_host, origin_port = _split_host_port(origin)
-    lan_host = _preferred_lan_host(origin_host)
+    bound_host = str(settings.get("bind_host") or "").strip().strip("[]")
+    bound_host_normalized = bound_host.lower()
+    lan_host = (
+        bound_host
+        if bound_host_normalized not in {"0.0.0.0", "::"}
+        and classify_host(bound_host) == "lan"
+        else _preferred_lan_host(origin_host)
+    )
     local_url = _format_origin(scheme, "127.0.0.1", origin_port)
-    lan_url = _format_origin(scheme, lan_host, origin_port)
+    candidate_lan_url = _format_origin(scheme, lan_host, origin_port)
+    lan_url = (
+        candidate_lan_url
+        if settings["lan_visible"] and settings["lan_listening"]
+        else ""
+    )
     online_url = ""
     online_status = "coming_soon"
     if settings["online_visible"] and settings["online_url"]:
@@ -220,12 +265,23 @@ def advertised_device_access(request: Optional[Request]) -> Dict[str, Any]:
         "request_scope": classify_host(client_host(request)),
         "visibility": {
             "lan_enabled": settings["lan_visible"],
+            "lan_listening": settings["lan_listening"],
+            "lan_binding_known": settings["binding_known"],
+            "lan_bind_host": settings["bind_host"],
+            "lan_state": (
+                "listening"
+                if settings["lan_visible"] and settings["lan_listening"]
+                else "restart_required"
+                if settings["lan_visible"]
+                else "hidden"
+            ),
             "online_enabled": settings["online_visible"],
             "online_supported": settings["online_supported"],
         },
         "advertised_urls": {
             "local": local_url,
             "lan": lan_url,
+            "lan_candidate": candidate_lan_url,
             "internet": online_url,
         },
         "internet_status": online_status,

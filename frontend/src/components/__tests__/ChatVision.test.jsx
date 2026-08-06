@@ -959,9 +959,15 @@ describe("Chat vision integration", () => {
     fireEvent.click(await screen.findByRole("button", { name: /capture from camera/i }));
 
     expect(getUserMedia).toHaveBeenCalledTimes(1);
-    expect(await screen.findByRole("alert")).toHaveTextContent(
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(
       "Permission denied by browser",
     );
+    const alertStack = alert.closest(".input-alert-stack");
+    expect(alertStack?.parentElement).toBe(document.body);
+    expect(document.querySelector(".input-box .input-alert-stack")).toBeNull();
+    await waitFor(() => expect(alertStack?.style.position).toBe("fixed"));
+    expect(alertStack?.style.zIndex).toBe("3620");
   });
 
   it("pastes image clipboard items into attachments", async () => {
@@ -1009,6 +1015,7 @@ describe("Chat vision integration", () => {
     const closeButton = await screen.findByRole("button", {
       name: /close camera preview/i,
     });
+    expect(screen.getByRole("region", { name: /camera preview/i })).toBeInTheDocument();
     fireEvent.click(closeButton);
 
     await waitFor(() => expect(stopTrack).toHaveBeenCalled());

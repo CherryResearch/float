@@ -1,10 +1,13 @@
+import copy
 import importlib.util
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
+from app import base_services
 from app.base_services import MemoryManager
 from app.utils import generate_signature, time_resolution
 
@@ -244,6 +247,63 @@ def test_remember_can_persist_structured_graph_updates(tmp_path, monkeypatch):
     projection = manager._graph_store.projection()
     assert projection["metadata"]["node_count"] == 7
     assert any(link["predicate"] == "friend_of" for link in projection["links"])
+
+
+def test_persist_builds_snapshot_after_acquiring_lock(tmp_path, monkeypatch):
+    manager = MemoryManager({})
+    manager._store_path = tmp_path / "memory.sqlite3"
+    first_writer_waiting = threading.Event()
+    release_first_writer = threading.Event()
+    saved_snapshots = []
+    errors = []
+
+    class ControlledPersistLock:
+        def __enter__(self):
+            if threading.current_thread().name == "first-memory-writer":
+                first_writer_waiting.set()
+                if not release_first_writer.wait(timeout=5):
+                    raise TimeoutError("first writer was not released")
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    def fake_save(snapshot, _path):
+        saved_snapshots.append(copy.deepcopy(snapshot))
+
+    def write_memory(key, value):
+        try:
+            manager.upsert_item(key, value)
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    manager._persist_lock = ControlledPersistLock()
+    monkeypatch.setattr(base_services.memory_store, "save", fake_save)
+
+    first = threading.Thread(
+        target=write_memory,
+        args=("alpha", "first"),
+        name="first-memory-writer",
+    )
+    first.start()
+    assert first_writer_waiting.wait(timeout=5)
+
+    second = threading.Thread(
+        target=write_memory,
+        args=("beta", "second"),
+        name="second-memory-writer",
+    )
+    second.start()
+    second.join(timeout=5)
+    assert not second.is_alive()
+
+    release_first_writer.set()
+    first.join(timeout=5)
+    assert not first.is_alive()
+    assert errors == []
+    assert len(saved_snapshots) == 2
+    assert set(saved_snapshots[0]) == {"alpha", "beta"}
+    assert set(saved_snapshots[-1]) == {"alpha", "beta"}
 
 
 def test_evergreen_memories_do_not_receive_review_or_decay_by_default(memory_manager):

@@ -1,6 +1,6 @@
 import React from "react";
 import { afterEach, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import "@testing-library/jest-dom/vitest";
 
@@ -58,6 +58,8 @@ const renderWithGlobalState = (
 
 describe("HistorySidebar", () => {
   afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
@@ -102,7 +104,11 @@ describe("HistorySidebar", () => {
     const newChatButton = within(rightRail).getByRole("button", { name: /^new chat$/i });
     expect(rightRail).toContainElement(newChatButton);
     expect(overflowActions).not.toContainElement(newChatButton);
-    expect(within(leftRail).getByRole("button", { name: /updated/i })).toBeInTheDocument();
+    expect(
+      within(leftRail).getByRole("button", {
+        name: /conversation sort mode: updated\. activate to change/i,
+      }),
+    ).toBeInTheDocument();
     expect(within(overflowActions).getByRole("button", { name: /^import$/i })).toBeInTheDocument();
     expect(within(overflowActions).getByRole("button", { name: /fork/i })).toBeInTheDocument();
     expect(within(overflowActions).getByRole("button", { name: /new folder/i })).toBeInTheDocument();
@@ -126,6 +132,32 @@ describe("HistorySidebar", () => {
     fireEvent.click(collapseButton);
 
     expect(onToggle).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not collapse while the pointer is only exploring the control", async () => {
+    const onToggle = vi.fn();
+    renderWithGlobalState(<HistorySidebar collapsed={false} onToggle={onToggle} />);
+
+    await waitFor(() => {
+      expect(axiosMocks.get).toHaveBeenCalledWith(
+        "/api/conversations",
+        expect.objectContaining({ params: { detailed: true } }),
+      );
+    });
+
+    vi.stubGlobal(
+      "matchMedia",
+      vi.fn().mockReturnValue({ matches: true }),
+    );
+    vi.useFakeTimers();
+    fireEvent.mouseEnter(
+      screen.getByRole("button", { name: /collapse history sidebar/i }),
+    );
+    act(() => {
+      vi.advanceTimersByTime(1200);
+    });
+
+    expect(onToggle).not.toHaveBeenCalled();
   });
 
   it("syncs text history when loading a different conversation", async () => {

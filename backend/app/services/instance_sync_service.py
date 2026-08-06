@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import ipaddress
 import json
 import logging
+import math
 import socket
 import sqlite3
 import uuid
@@ -14,11 +16,24 @@ from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urlparse
 
 import requests
+from app import config as app_config
+from app.services import rag_provider as rag_provider_module
+from app.services.calendar_jobs import merge_external_calendar_update
+from app.services.work_run_projection import delete_calendar_event_with_receipts
+from app.services.work_run_store import WorkRunStore
 from app.utils import blob_store, calendar_store, conversation_store
 from app.utils import graph_store as graph_store_module
 from app.utils import knowledge_store as knowledge_store_module
 from app.utils import memory_store, sync_checkpoint_store, theme_store, user_settings
 from app.utils.attachment_media import build_attachment_media_descriptor
+from app.utils.attachment_metadata import (
+    attachment_metadata_lock,
+    delete_attachment_metadata,
+    mutate_attachment_metadata,
+    read_attachment_metadata,
+    sanitize_attachment_source_url,
+    write_attachment_metadata,
+)
 from app.utils.blob_store import BLOBS_DIR, find_asset_path
 from app.utils.blob_store import iter_attachment_hashes as iter_stored_attachment_hashes
 from app.utils.blob_store import managed_relative_path, resolve_managed_path
@@ -30,6 +45,16 @@ from app.utils.workspace_registry import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _is_valid_attachment_hash(value: Any) -> bool:
+    raw = str(value or "").strip()
+    return (
+        len(raw) == 64
+        and raw == raw.lower()
+        and all(character in "0123456789abcdef" for character in raw)
+    )
+
 
 SYNC_SECTION_LABELS: Dict[str, str] = {
     "conversations": "Conversations",
@@ -89,6 +114,69 @@ _ATTACHMENT_ORIGIN_DIRS = {
     "upload": "uploads",
     "captured": "captured",
     "screenshot": "screenshots",
+}
+_ATTACHMENT_SYNC_METADATA_SCHEMA_VERSION = 1
+# Schema-versioned snapshots make these fields explicit so a newer peer can
+# distinguish a deliberate clear from an omitted field in a legacy snapshot.
+_ATTACHMENT_SYNC_EXPLICIT_FIELDS = {
+    "caption",
+    "caption_generated_at",
+    "caption_model",
+    "caption_status",
+    "caption_updated_at",
+    "display_name",
+    "folder",
+    "placeholder_caption",
+    "source_url",
+    "source_url_recorded_at",
+}
+_ATTACHMENT_LOCAL_PROTECTED_FIELDS = {
+    "caption",
+    "caption_generated_at",
+    "caption_model",
+    "caption_recorded_at",
+    "caption_status",
+    "caption_updated_at",
+    "capture_id",
+    "capture_sensitivity",
+    "capture_source",
+    "clip_embedding_dim",
+    "clip_embedding_model",
+    "clip_indexed_at",
+    "content_type",
+    "display_name",
+    "embedding_dim",
+    "embedding_model",
+    "filename",
+    "folder",
+    "index_status",
+    "index_warning",
+    "indexed_at",
+    "metadata_updated_at",
+    "origin",
+    "placeholder_caption",
+    "relative_path",
+    "sensitivity",
+    "size",
+    "source_path",
+    "source_url",
+    "source_url_recorded_at",
+    "uploaded_at",
+}
+_SYNC_ATTACHMENT_CONTENT_TYPES = {
+    "application/json",
+    "application/octet-stream",
+    "application/pdf",
+    "audio/mpeg",
+    "audio/wav",
+    "image/gif",
+    "image/jpeg",
+    "image/png",
+    "image/svg+xml",
+    "image/webp",
+    "text/plain",
+    "video/mp4",
+    "video/webm",
 }
 
 
@@ -160,20 +248,96 @@ def _format_byte_count(value: Any) -> str:
 
 
 def _load_attachment_meta(content_hash: str) -> Dict[str, Any]:
-    meta_path = BLOBS_DIR / f"{content_hash}.json"
-    if not meta_path.exists():
+    if not _is_valid_attachment_hash(content_hash):
         return {}
     try:
-        payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        payload = read_attachment_metadata(BLOBS_DIR, content_hash)
     except Exception:
         return {}
     return payload if isinstance(payload, dict) else {}
 
 
 def _write_attachment_meta(content_hash: str, metadata: Dict[str, Any]) -> None:
-    meta_path = BLOBS_DIR / f"{content_hash}.json"
-    meta_path.parent.mkdir(parents=True, exist_ok=True)
-    meta_path.write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
+    if not _is_valid_attachment_hash(content_hash):
+        raise ValueError("Invalid attachment content_hash")
+    write_attachment_metadata(BLOBS_DIR, content_hash, metadata)
+
+
+def _mutate_attachment_meta(
+    content_hash: str,
+    mutate: Any,
+) -> Dict[str, Any]:
+    if not _is_valid_attachment_hash(content_hash):
+        raise ValueError("Invalid attachment content_hash")
+    return mutate_attachment_metadata(BLOBS_DIR, content_hash, mutate)
+
+
+def _attachment_metadata_without_source_credentials(
+    metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    cleaned = dict(metadata or {})
+    content_type = str(cleaned.get("content_type") or "").strip().lower()
+    if content_type in _SYNC_ATTACHMENT_CONTENT_TYPES:
+        cleaned["content_type"] = content_type
+    else:
+        cleaned.pop("content_type", None)
+    # Absolute paths only describe the exporting host. ``relative_path`` is the
+    # portable storage locator and is resolved inside the receiving data root.
+    cleaned.pop("path", None)
+    for field in (
+        "relative_path",
+        "source_path",
+        "source_sync_relative_path",
+        "source_sync_original_relative_path",
+    ):
+        if field not in cleaned:
+            continue
+        portable_path = _portable_attachment_relative_path(cleaned.get(field))
+        if portable_path:
+            cleaned[field] = portable_path
+        else:
+            cleaned.pop(field, None)
+    raw_source_url = cleaned.get("source_url")
+    try:
+        source_url = sanitize_attachment_source_url(raw_source_url)
+    except ValueError:
+        source_url = ""
+    if source_url:
+        cleaned["source_url"] = source_url
+    else:
+        cleaned.pop("source_url", None)
+        cleaned.pop("source_url_recorded_at", None)
+    return cleaned
+
+
+def _attachment_metadata_for_snapshot(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    cleaned = _attachment_metadata_without_source_credentials(metadata)
+    for field in _ATTACHMENT_SYNC_EXPLICIT_FIELDS:
+        cleaned.setdefault(field, None)
+    return cleaned
+
+
+def _merge_attachment_metadata_preserving_local(
+    local_metadata: Dict[str, Any],
+    incoming_metadata: Dict[str, Any],
+    *,
+    explicit_clears: Iterable[str] = (),
+) -> Dict[str, Any]:
+    """Merge an attachment record without treating legacy omission as deletion."""
+
+    safe_local = _attachment_metadata_without_source_credentials(local_metadata)
+    merged = dict(incoming_metadata)
+    protected_fields = set(_ATTACHMENT_LOCAL_PROTECTED_FIELDS)
+    protected_fields.update(
+        key for key in safe_local if str(key).startswith("source_sync_")
+    )
+    cleared = {str(key) for key in explicit_clears}
+    for key in protected_fields:
+        if key not in merged and key not in cleared and key in safe_local:
+            merged[key] = safe_local[key]
+    for key in cleared:
+        merged.pop(key, None)
+    return merged
 
 
 def _resolve_attachment_updated_at(
@@ -181,15 +345,34 @@ def _resolve_attachment_updated_at(
     *,
     fallback_path: Optional[Path] = None,
 ) -> float:
-    for key in ("caption_updated_at", "indexed_at", "uploaded_at", "updated_at"):
-        ts = _coerce_timestamp(metadata.get(key))
-        if ts > 0:
-            return ts
+    timestamps = [
+        _coerce_timestamp(metadata.get(key))
+        for key in (
+            "metadata_updated_at",
+            "caption_updated_at",
+            "caption_generated_at",
+            "source_url_recorded_at",
+            "clip_indexed_at",
+            "indexed_at",
+            "uploaded_at",
+            "updated_at",
+        )
+    ]
+    latest = max(
+        (
+            timestamp
+            for timestamp in timestamps
+            if timestamp > 0 and math.isfinite(timestamp)
+        ),
+        default=0.0,
+    )
+    if latest > 0:
+        return latest
     if fallback_path is not None and fallback_path.exists():
         try:
             return float(fallback_path.stat().st_mtime)
         except Exception:
-            return 0.0
+            pass
     return 0.0
 
 
@@ -211,6 +394,19 @@ def _coerce_relative_files_path(value: str) -> str:
     parts = [
         segment for segment in raw.split("/") if segment and segment not in {".", ".."}
     ]
+    return "/".join(parts)
+
+
+def _portable_attachment_relative_path(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw or Path(raw).is_absolute() or urlparse(raw).scheme:
+        return ""
+    normalized = raw.replace("\\", "/")
+    if normalized.startswith("/"):
+        return ""
+    parts = [segment for segment in normalized.split("/") if segment]
+    if not parts or any(segment in {".", ".."} for segment in parts):
+        return ""
     return "/".join(parts)
 
 
@@ -274,6 +470,8 @@ def _resolve_attachment_target(
     *,
     filename: Optional[str] = None,
 ) -> Optional[Path]:
+    if not _is_valid_attachment_hash(content_hash):
+        return None
     metadata = _load_attachment_meta(content_hash)
     rel_candidate = _coerce_relative_files_path(
         str(metadata.get("relative_path") or metadata.get("source_path") or "").strip()
@@ -311,29 +509,55 @@ def _write_conversation_snapshot(
     name: str,
     messages: List[Dict[str, Any]],
     metadata: Dict[str, Any],
+    trusted_restore: bool = False,
 ) -> None:
-    target = conversation_store._path(name)
-    target.parent.mkdir(parents=True, exist_ok=True)
-
-    def _serialize(obj: Any) -> Any:
-        if isinstance(obj, bytes):
-            return obj.decode("utf-8", errors="replace")
-        raise TypeError(
-            f"Object of type {obj.__class__.__name__} is not JSON serializable"
+    with conversation_store._METADATA_LOCK:
+        # Establish a fail-closed transcript/sidecar pair before any exact local
+        # authority restore. If the second phase is interrupted, continuation stays
+        # invalidated instead of pairing new content with stale runtime receipts.
+        conversation_store.replace_conversation_content(name, messages)
+        invalidated_receipts = conversation_store.get_metadata(name).get(
+            conversation_store.SERVER_RUNTIME_RECEIPTS_KEY
         )
+        if not trusted_restore:
+            messages = conversation_store.load_conversation(name)
+        else:
+            target = conversation_store._path(name)
+            target.parent.mkdir(parents=True, exist_ok=True)
 
-    with target.open("w", encoding="utf-8") as handle:
-        json.dump(messages, handle, indent=2, default=_serialize)
-    next_meta = dict(metadata or {})
-    next_meta["name"] = name
-    next_meta.setdefault("id", str(uuid.uuid4()))
-    next_meta.setdefault("created_at", next_meta.get("updated_at") or _now_iso())
-    next_meta.setdefault("updated_at", next_meta.get("created_at") or _now_iso())
-    next_meta.setdefault("display_name", next_meta.get("display_name") or name)
-    next_meta.setdefault("auto_title_applied", False)
-    next_meta.setdefault("manual_title", False)
-    next_meta["message_count"] = len(messages)
-    conversation_store._write_meta(name, next_meta)
+            def _serialize(obj: Any) -> Any:
+                if isinstance(obj, bytes):
+                    return obj.decode("utf-8", errors="replace")
+                raise TypeError(
+                    f"Object of type {obj.__class__.__name__} is not JSON serializable"
+                )
+
+            temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+            try:
+                with temporary.open("w", encoding="utf-8") as handle:
+                    json.dump(messages, handle, indent=2, default=_serialize)
+                temporary.replace(target)
+            finally:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        next_meta = copy.deepcopy(metadata or {})
+        if not trusted_restore:
+            next_meta.pop(conversation_store.SERVER_RUNTIME_RECEIPTS_KEY, None)
+            if isinstance(invalidated_receipts, dict):
+                next_meta[
+                    conversation_store.SERVER_RUNTIME_RECEIPTS_KEY
+                ] = copy.deepcopy(invalidated_receipts)
+        next_meta["name"] = name
+        next_meta.setdefault("id", str(uuid.uuid4()))
+        next_meta.setdefault("created_at", next_meta.get("updated_at") or _now_iso())
+        next_meta.setdefault("updated_at", next_meta.get("created_at") or _now_iso())
+        next_meta.setdefault("display_name", next_meta.get("display_name") or name)
+        next_meta.setdefault("auto_title_applied", False)
+        next_meta.setdefault("manual_title", False)
+        next_meta["message_count"] = len(messages)
+        conversation_store._write_meta(name, next_meta)
 
 
 def _portable_settings_snapshot() -> Dict[str, Any]:
@@ -2843,42 +3067,157 @@ class InstanceSyncService:
                 return name
         return ""
 
-    def _delete_attachment_for_sync_id(self, sync_id: str) -> bool:
-        content_hash = str(sync_id or "").strip().lower()
-        if not content_hash:
-            return False
-        meta = _load_attachment_meta(content_hash)
-        filename = _safe_attachment_filename(meta.get("filename"), content_hash)
-        deleted = False
-        target = _resolve_attachment_target(content_hash, filename=filename)
-        if target is not None and target.exists():
-            try:
-                target.unlink()
-                deleted = True
-            except Exception:
-                logger.debug("Failed to delete synced attachment file", exc_info=True)
-        for candidate in (BLOBS_DIR / content_hash, BLOBS_DIR / f"{content_hash}.json"):
-            if candidate.exists():
+    def _delete_attachment_for_sync_id(self, sync_id: str) -> Dict[str, Any]:
+        content_hash = str(sync_id or "").strip()
+        if not _is_valid_attachment_hash(content_hash):
+            return {
+                "status": "failed",
+                "deleted": False,
+                "content_hash": content_hash,
+                "files_deleted": 0,
+                "metadata_deleted": False,
+                "errors": ["invalid_attachment_id"],
+            }
+        files_deleted = 0
+        metadata_deleted = False
+        errors: List[str] = []
+        with attachment_metadata_lock(BLOBS_DIR, content_hash):
+            meta = _load_attachment_meta(content_hash)
+            metadata_path = BLOBS_DIR / f"{content_hash}.json"
+            metadata_exists = metadata_path.exists()
+            filename = _safe_attachment_filename(meta.get("filename"), content_hash)
+            target = _resolve_attachment_target(content_hash, filename=filename)
+            file_candidates: List[Path] = []
+            seen_candidates: set[str] = set()
+            for candidate in (target, BLOBS_DIR / content_hash):
+                if candidate is None or not candidate.exists():
+                    continue
+                candidate_key = str(candidate.resolve())
+                if candidate_key in seen_candidates:
+                    continue
+                seen_candidates.add(candidate_key)
+                file_candidates.append(candidate)
+            if not file_candidates and not metadata_exists:
+                return {
+                    "status": "missing",
+                    "deleted": False,
+                    "content_hash": content_hash,
+                    "files_deleted": 0,
+                    "metadata_deleted": False,
+                    "errors": [],
+                }
+            for candidate in file_candidates:
                 try:
                     candidate.unlink()
-                    deleted = True
+                    files_deleted += 1
                 except Exception:
+                    errors.append("file_delete_failed")
                     logger.debug(
-                        "Failed to delete synced attachment metadata", exc_info=True
+                        "Failed to delete synced attachment file", exc_info=True
                     )
-        try:
-            knowledge_store_module.KnowledgeStore().delete_source(
-                f"attachment:{content_hash}"
+            # The sidecar is the recovery record. Keep it intact whenever any
+            # file could not be removed so a retry can resolve the same target.
+            if errors:
+                return {
+                    "status": "partial" if files_deleted else "failed",
+                    "deleted": False,
+                    "content_hash": content_hash,
+                    "files_deleted": files_deleted,
+                    "metadata_deleted": False,
+                    "errors": errors,
+                }
+        sources = {f"image:{content_hash}"}
+        namespace = _coerce_relative_files_path(
+            str(meta.get("source_sync_namespace") or "")
+        )
+        if namespace:
+            sources.add(f"{namespace}/image:{content_hash}")
+        for source in sources:
+            try:
+                knowledge_store_module.KnowledgeStore().delete_source(source)
+            except Exception:
+                errors.append("knowledge_mirror_delete_failed")
+                logger.debug(
+                    "Failed to delete attachment knowledge mirror", exc_info=True
+                )
+            for getter in (
+                rag_provider_module.get_rag_service,
+                rag_provider_module.get_clip_rag_service,
+            ):
+                try:
+                    service = getter(raise_http=False)
+                    if service is not None:
+                        service.delete_source(source)
+                except Exception:
+                    errors.append("retrieval_mirror_delete_failed")
+                    logger.debug(
+                        "Failed to delete attachment retrieval mirror",
+                        exc_info=True,
+                    )
+        if errors:
+            try:
+                _mutate_attachment_meta(
+                    content_hash,
+                    lambda current: {
+                        **current,
+                        "deletion_status": "cleanup_pending",
+                        "cleanup_failed": list(dict.fromkeys(errors)),
+                        "metadata_updated_at": _now_iso(),
+                    },
+                )
+            except Exception:
+                errors.append("cleanup_state_write_failed")
+            return {
+                "status": "partial",
+                "deleted": False,
+                "content_hash": content_hash,
+                "files_deleted": files_deleted,
+                "metadata_deleted": False,
+                "errors": errors,
+            }
+        # Delete the sidecar last. Until file and mirror cleanup both succeed it
+        # remains the durable retry record, including namespaced mirror sources.
+        with attachment_metadata_lock(BLOBS_DIR, content_hash):
+            latest_meta = _load_attachment_meta(content_hash)
+            latest_filename = _safe_attachment_filename(
+                latest_meta.get("filename"), content_hash
             )
-        except Exception:
-            logger.debug("Failed to delete attachment knowledge mirror", exc_info=True)
-        return deleted
+            latest_target = _resolve_attachment_target(
+                content_hash,
+                filename=latest_filename,
+            )
+            if latest_meta != meta:
+                errors.append("attachment_metadata_changed")
+            elif (latest_target is not None and latest_target.exists()) or (
+                BLOBS_DIR / content_hash
+            ).exists():
+                errors.append("attachment_reappeared")
+            elif metadata_path.exists():
+                try:
+                    delete_attachment_metadata(BLOBS_DIR, content_hash)
+                    metadata_deleted = True
+                except Exception:
+                    errors.append("metadata_delete_failed")
+                    logger.debug(
+                        "Failed to delete synced attachment metadata",
+                        exc_info=True,
+                    )
+        return {
+            "status": "partial" if errors else "deleted",
+            "deleted": not errors,
+            "content_hash": content_hash,
+            "files_deleted": files_deleted,
+            "metadata_deleted": metadata_deleted,
+            "errors": errors,
+        }
 
     def _delete_section_items(
         self, section: str, sync_ids: List[str]
     ) -> Dict[str, Any]:
         deleted_ids: List[str] = []
         skipped_ids: List[str] = []
+        failed_ids: List[str] = []
+        partial_ids: List[str] = []
         if not sync_ids:
             return {"deleted": 0, "skipped": 0, "deleted_ids": []}
         if section == "conversations":
@@ -2918,17 +3257,37 @@ class InstanceSyncService:
                     skipped_ids.append(sync_id)
         elif section == "attachments":
             for sync_id in sync_ids:
-                if self._delete_attachment_for_sync_id(sync_id):
+                outcome = self._delete_attachment_for_sync_id(sync_id)
+                status = str(outcome.get("status") or "failed")
+                if status == "deleted":
                     deleted_ids.append(sync_id)
+                elif status == "partial":
+                    partial_ids.append(sync_id)
+                elif status == "failed":
+                    failed_ids.append(sync_id)
                 else:
                     skipped_ids.append(sync_id)
         elif section == "calendar":
             current = set(calendar_store.list_events())
+            try:
+                work_runs = WorkRunStore(app_config.load_config())
+            except Exception:
+                logger.exception(
+                    "Calendar sync deletion could not inspect active Activity runs"
+                )
+                work_runs = None
             for sync_id in sync_ids:
                 if sync_id not in current:
                     skipped_ids.append(sync_id)
                     continue
-                calendar_store.delete_event(sync_id)
+
+                try:
+                    if work_runs is None:
+                        raise calendar_store.CalendarEventActiveRunError(sync_id)
+                    delete_calendar_event_with_receipts(work_runs, sync_id)
+                except calendar_store.CalendarEventActiveRunError:
+                    failed_ids.append(sync_id)
+                    continue
                 deleted_ids.append(sync_id)
                 try:
                     knowledge_store_module.KnowledgeStore().delete_source(
@@ -2947,6 +3306,12 @@ class InstanceSyncService:
         }
         if skipped_ids:
             result["skipped_ids"] = skipped_ids
+        if failed_ids:
+            result["failed"] = len(failed_ids)
+            result["failed_ids"] = failed_ids
+        if partial_ids:
+            result["partial"] = len(partial_ids)
+            result["partial_ids"] = partial_ids
         return result
 
     def merge_snapshot(
@@ -3022,12 +3387,21 @@ class InstanceSyncService:
                 section,
                 deletion_ids.get(section) or [],
             )
-            if section_deletions.get("deleted") or section_deletions.get("skipped"):
+            if any(
+                section_deletions.get(key)
+                for key in ("deleted", "skipped", "failed", "partial")
+            ):
                 merged["deleted"] = int(section_deletions.get("deleted") or 0)
                 merged["delete_skipped"] = int(section_deletions.get("skipped") or 0)
+                merged["delete_failed"] = int(section_deletions.get("failed") or 0)
+                merged["delete_partial"] = int(section_deletions.get("partial") or 0)
                 merged["deleted_ids"] = section_deletions.get("deleted_ids") or []
                 if section_deletions.get("skipped_ids"):
                     merged["delete_skipped_ids"] = section_deletions["skipped_ids"]
+                if section_deletions.get("failed_ids"):
+                    merged["delete_failed_ids"] = section_deletions["failed_ids"]
+                if section_deletions.get("partial_ids"):
+                    merged["delete_partial_ids"] = section_deletions["partial_ids"]
             result["sections"][section] = merged
             notes = merged.get("notes")
             if isinstance(notes, list):
@@ -3114,7 +3488,9 @@ class InstanceSyncService:
             )
         return items
 
-    def _conversation_snapshot(self) -> List[Dict[str, Any]]:
+    def _conversation_snapshot(
+        self, *, include_runtime_authority: bool = False
+    ) -> List[Dict[str, Any]]:
         records: List[Dict[str, Any]] = []
         for entry in conversation_store.list_conversations(include_metadata=True):
             if not isinstance(entry, dict):
@@ -3122,13 +3498,38 @@ class InstanceSyncService:
             name = str(entry.get("name") or "").strip()
             if not name:
                 continue
-            metadata = conversation_store.get_metadata(name)
+            with conversation_store._METADATA_LOCK:
+                metadata = conversation_store.get_metadata(name)
+                messages = conversation_store.load_conversation(name)
+            if not include_runtime_authority:
+                metadata.pop(conversation_store.SERVER_RUNTIME_RECEIPTS_KEY, None)
+                for message in messages:
+                    if not isinstance(message, dict):
+                        continue
+                    message_metadata = message.get("metadata")
+                    if isinstance(message_metadata, dict):
+                        message_metadata.pop("capability_scope", None)
+                        if not message_metadata:
+                            message.pop("metadata", None)
+                    tools = message.get("tools")
+                    if not isinstance(tools, list):
+                        continue
+                    for tool in tools:
+                        if not isinstance(tool, dict):
+                            continue
+                        tool.pop("server_recorded", None)
+                        tool[conversation_store.CLIENT_SAVED_TOOL_MARKER] = True
             records.append(
                 {
                     "sync_id": str(metadata.get("id") or f"name:{name}"),
                     "name": name,
                     "metadata": metadata,
-                    "messages": conversation_store.load_conversation(name),
+                    "messages": messages,
+                    **(
+                        {"_trusted_local_restore": True}
+                        if include_runtime_authority
+                        else {}
+                    ),
                 }
             )
         return records
@@ -3790,9 +4191,37 @@ class InstanceSyncService:
         items: List[Dict[str, Any]] = []
         for content_hash in _iter_attachment_hashes():
             meta = _load_attachment_meta(content_hash)
+            if str(meta.get("deletion_status") or "").strip().lower() == (
+                "cleanup_pending"
+            ):
+                cleanup = self._delete_attachment_for_sync_id(content_hash)
+                if cleanup.get("status") in {"deleted", "missing"}:
+                    continue
+                meta = _load_attachment_meta(content_hash)
             filename = _safe_attachment_filename(meta.get("filename"), content_hash)
             target = _resolve_attachment_target(content_hash, filename=filename)
             if target is None or not target.exists():
+                if str(meta.get("deletion_status") or "").strip().lower() == (
+                    "cleanup_pending"
+                ):
+                    items.append(
+                        {
+                            "sync_id": content_hash,
+                            "content_hash": content_hash,
+                            "filename": filename,
+                            "source_sync_namespace": str(
+                                meta.get("source_sync_namespace") or ""
+                            ).strip(),
+                            "relative_path": "",
+                            "source_path": "",
+                            "updated_at": _resolve_attachment_updated_at(meta),
+                            "size": 0,
+                            "sensitivity": str(meta.get("sensitivity") or "")
+                            .strip()
+                            .lower(),
+                            "deletion_status": "cleanup_pending",
+                        }
+                    )
                 continue
             descriptor = build_attachment_media_descriptor(
                 content_hash,
@@ -3801,8 +4230,11 @@ class InstanceSyncService:
                 preferred_filename=filename,
             )
             if descriptor["metadata_changed"]:
-                _write_attachment_meta(content_hash, descriptor["metadata"])
-                meta = descriptor["metadata"]
+                descriptor_metadata = dict(descriptor["metadata"])
+                meta = _mutate_attachment_meta(
+                    content_hash,
+                    lambda current: {**current, **descriptor_metadata},
+                )
             filename = str(descriptor["filename"] or "").strip() or filename
             path_namespace = _attachment_path_namespace(
                 meta.get("relative_path") or meta.get("source_path")
@@ -3818,8 +4250,12 @@ class InstanceSyncService:
                     "content_hash": content_hash,
                     "filename": filename,
                     "source_sync_namespace": manifest_namespace,
-                    "relative_path": str(meta.get("relative_path") or "").strip(),
-                    "source_path": str(meta.get("source_path") or "").strip(),
+                    "relative_path": _portable_attachment_relative_path(
+                        meta.get("relative_path")
+                    ),
+                    "source_path": _portable_attachment_relative_path(
+                        meta.get("source_path")
+                    ),
                     "updated_at": _resolve_attachment_updated_at(
                         meta, fallback_path=target
                     ),
@@ -3844,8 +4280,11 @@ class InstanceSyncService:
                 preferred_filename=filename,
             )
             if descriptor["metadata_changed"]:
-                _write_attachment_meta(content_hash, descriptor["metadata"])
-                meta = descriptor["metadata"]
+                descriptor_metadata = dict(descriptor["metadata"])
+                meta = _mutate_attachment_meta(
+                    content_hash,
+                    lambda current: {**current, **descriptor_metadata},
+                )
             filename = str(descriptor["filename"] or "").strip() or filename
             records.append(
                 {
@@ -3855,7 +4294,10 @@ class InstanceSyncService:
                     "updated_at": _resolve_attachment_updated_at(
                         meta, fallback_path=target
                     ),
-                    "metadata": meta,
+                    "metadata_schema_version": (
+                        _ATTACHMENT_SYNC_METADATA_SCHEMA_VERSION
+                    ),
+                    "metadata": _attachment_metadata_for_snapshot(meta),
                     "content_b64": base64.b64encode(target.read_bytes()).decode(
                         "ascii"
                     ),
@@ -3871,6 +4313,26 @@ class InstanceSyncService:
         metadata: Dict[str, Any],
         data: bytes,
     ) -> None:
+        if not _is_valid_attachment_hash(content_hash):
+            raise ValueError("Invalid attachment content_hash")
+        with attachment_metadata_lock(BLOBS_DIR, content_hash):
+            self._write_attachment_file_locked(
+                content_hash=content_hash,
+                filename=filename,
+                metadata=metadata,
+                data=data,
+            )
+
+    def _write_attachment_file_locked(
+        self,
+        *,
+        content_hash: str,
+        filename: str,
+        metadata: Dict[str, Any],
+        data: bytes,
+    ) -> None:
+        if not _is_valid_attachment_hash(content_hash):
+            raise ValueError("Invalid attachment content_hash")
         rel_candidate = _coerce_relative_files_path(
             str(
                 metadata.get("relative_path") or metadata.get("source_path") or ""
@@ -3886,7 +4348,7 @@ class InstanceSyncService:
             normalized_meta["filename"] = target.name
             normalized_meta["relative_path"] = managed_relative_path(target)
             normalized_meta["path"] = str(target.resolve())
-            _write_attachment_meta(content_hash, normalized_meta)
+            _mutate_attachment_meta(content_hash, lambda _current: normalized_meta)
             return
         origin = str(metadata.get("origin") or "upload").strip().lower()
         dirname = _ATTACHMENT_ORIGIN_DIRS.get(origin)
@@ -3904,14 +4366,14 @@ class InstanceSyncService:
             normalized_meta["origin"] = origin
             normalized_meta["relative_path"] = managed_relative_path(target)
             normalized_meta["path"] = str(target.resolve())
-            _write_attachment_meta(content_hash, normalized_meta)
+            _mutate_attachment_meta(content_hash, lambda _current: normalized_meta)
             return
         target = BLOBS_DIR / content_hash
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
         normalized_meta = dict(metadata)
         normalized_meta["filename"] = filename
-        _write_attachment_meta(content_hash, normalized_meta)
+        _mutate_attachment_meta(content_hash, lambda _current: normalized_meta)
 
     def _merge_attachments(self, payload: Any) -> Dict[str, Any]:
         if not isinstance(payload, list):
@@ -3927,36 +4389,90 @@ class InstanceSyncService:
         for record in payload:
             if not isinstance(record, dict):
                 continue
-            content_hash = (
-                str(record.get("content_hash") or record.get("sync_id") or "")
-                .strip()
-                .lower()
-            )
-            if not content_hash:
+            content_hash = str(
+                record.get("content_hash") or record.get("sync_id") or ""
+            ).strip()
+            if not _is_valid_attachment_hash(content_hash):
+                skipped += 1
                 continue
             incoming_ts = _safe_float(record.get("updated_at"))
+            if not math.isfinite(incoming_ts):
+                incoming_ts = 0.0
             current = local_items.get(content_hash)
             current_ts = _safe_float((current or {}).get("updated_at"))
-            if current and current_ts > incoming_ts and incoming_ts > 0:
+            if current and incoming_ts <= 0:
+                skipped += 1
+                continue
+            if current and current_ts > incoming_ts:
                 skipped += 1
                 continue
             try:
-                data = base64.b64decode(str(record.get("content_b64") or ""))
+                data = base64.b64decode(
+                    str(record.get("content_b64") or ""),
+                    validate=True,
+                )
             except Exception:
                 skipped += 1
                 continue
-            metadata = (
+            if hashlib.sha256(data).hexdigest() != content_hash:
+                skipped += 1
+                continue
+            raw_metadata = (
                 dict(record.get("metadata"))
                 if isinstance(record.get("metadata"), dict)
                 else {}
             )
-            filename = _safe_attachment_filename(record.get("filename"), content_hash)
-            self._write_attachment_file(
-                content_hash=content_hash,
-                filename=filename,
-                metadata=metadata,
-                data=data,
+            raw_schema_version = _safe_float(record.get("metadata_schema_version"))
+            schema_version = (
+                int(raw_schema_version)
+                if math.isfinite(raw_schema_version) and raw_schema_version > 0
+                else 0
             )
+            explicit_clears = {
+                key
+                for key in _ATTACHMENT_SYNC_EXPLICIT_FIELDS
+                if schema_version >= _ATTACHMENT_SYNC_METADATA_SCHEMA_VERSION
+                and key in raw_metadata
+                and raw_metadata[key] is None
+            }
+            metadata = _attachment_metadata_without_source_credentials(raw_metadata)
+            with attachment_metadata_lock(BLOBS_DIR, content_hash):
+                latest_meta = _load_attachment_meta(content_hash)
+                latest_filename = _safe_attachment_filename(
+                    latest_meta.get("filename"), content_hash
+                )
+                latest_target = _resolve_attachment_target(
+                    content_hash,
+                    filename=latest_filename,
+                )
+                latest_ts = _resolve_attachment_updated_at(
+                    latest_meta,
+                    fallback_path=latest_target,
+                )
+                latest_exists = bool(latest_meta) or (
+                    latest_target is not None and latest_target.exists()
+                )
+                if latest_exists and incoming_ts <= 0:
+                    skipped += 1
+                    continue
+                if latest_exists and latest_ts > incoming_ts:
+                    skipped += 1
+                    continue
+                metadata = _merge_attachment_metadata_preserving_local(
+                    latest_meta,
+                    metadata,
+                    explicit_clears=explicit_clears,
+                )
+                filename = _safe_attachment_filename(
+                    record.get("filename") or latest_meta.get("filename"),
+                    content_hash,
+                )
+                self._write_attachment_file_locked(
+                    content_hash=content_hash,
+                    filename=filename,
+                    metadata=metadata,
+                    data=data,
+                )
             local_items[content_hash] = {
                 "sync_id": content_hash,
                 "updated_at": incoming_ts,
@@ -4050,7 +4566,13 @@ class InstanceSyncService:
             ):
                 skipped += 1
                 continue
-            calendar_store.save_event(event_id, payload_value)
+            calendar_store.update_event(
+                event_id,
+                lambda existing: merge_external_calendar_update(
+                    existing, payload_value
+                ),
+                create=True,
+            )
             applied += 1
         notes: List[str] = []
         if applied:

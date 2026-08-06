@@ -48,4 +48,24 @@ describe("StateInspector", () => {
     expect(screen.getByText("The assistant proposed this tool.")).toBeInTheDocument();
     expect(screen.getByText("Approve, edit, or deny this tool.")).toBeInTheDocument();
   });
+
+  it("portals a top-placed panel outside clipping containers", () => {
+    const { container } = render(
+      <div style={{ overflow: "hidden" }}>
+        <StateInspector
+          title="Message metadata"
+          summary="Routing details"
+          rows={[{ label: "Model", value: "gpt-5.6" }]}
+          placement="top"
+        />
+      </div>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Message metadata" }));
+
+    const dialog = screen.getByRole("dialog", { name: "Message metadata" });
+    expect(dialog).toHaveAttribute("data-placement", "top");
+    expect(dialog.parentElement).toBe(document.body);
+    expect(container).not.toContainElement(dialog);
+  });
 });

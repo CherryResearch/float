@@ -123,6 +123,49 @@ def test_graph_route_records_revertible_revision_history(tmp_path, monkeypatch):
     assert graph["metadata"]["claim_count"] == 0
 
 
+def test_conversation_wide_revert_requires_explicit_confirmation(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, with_action_history=True)
+
+    unconfirmed = client.post(
+        "/api/actions/revert",
+        json={"conversation_id": "chat-1"},
+    )
+    assert unconfirmed.status_code == 400
+    assert (
+        "entire chat requires explicit confirmation"
+        in unconfirmed.json()["detail"].lower()
+    )
+
+    confirmed = client.post(
+        "/api/actions/revert",
+        json={"conversation_id": "chat-1", "confirm_conversation": True},
+    )
+    assert confirmed.status_code == 200
+    assert confirmed.json()["status"] == "noop"
+
+    message_scoped = client.post(
+        "/api/actions/revert",
+        json={"conversation_id": "chat-1", "response_id": "message-1"},
+    )
+    assert message_scoped.status_code == 200
+    assert message_scoped.json()["status"] == "noop"
+
+
+def test_action_revert_maps_active_calendar_conflict_to_409(tmp_path, monkeypatch):
+    client = _make_client(tmp_path, monkeypatch, with_action_history=True)
+    from app.utils import calendar_store
+
+    def reject_active_calendar(**_kwargs):
+        raise calendar_store.CalendarEventActiveRunError("active-event")
+
+    client.app.state.action_history_service.revert_actions = reject_active_calendar
+
+    response = client.post("/api/actions/revert", json={"action_ids": ["action-1"]})
+
+    assert response.status_code == 409
+    assert "active run" in response.json()["detail"].lower()
+
+
 def test_work_history_projects_deployment_events_without_diff_or_revert(
     tmp_path, monkeypatch
 ):

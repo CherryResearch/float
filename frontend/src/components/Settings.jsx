@@ -114,6 +114,57 @@ const normalizeHarmonyFormatMode = (value, fallback = "auto") => {
   return fallback === "enabled" || fallback === "disabled" ? fallback : "auto";
 };
 
+const IMAGE_CAPTION_ENGINES = new Set(["local", "cloud", "off"]);
+
+const IMAGE_CAPTION_ENGINE_OPTIONS = [
+  {
+    value: "local",
+    label: "Local",
+    description: "Generate saved-image captions on this device.",
+  },
+  {
+    value: "off",
+    label: "Off",
+    description: "Keep automatic saved-image captioning disabled.",
+  },
+  {
+    value: "cloud",
+    label: "Cloud/provider",
+    description: "Send saved image bytes to the configured API provider for captions.",
+  },
+];
+
+const IMAGE_CAPTION_ENGINE_LABELS = Object.freeze({
+  local: "Local",
+  off: "Off",
+  cloud: "Cloud/provider",
+});
+
+const IMAGE_CAPTION_READINESS_REASONS = Object.freeze({
+  model_weights_unavailable: "Caption model weights were not found on this device.",
+  caption_dependencies_unavailable: "Local captioning dependencies are not installed.",
+  model_installed_not_loaded:
+    "The caption model is installed locally but has not been loaded yet. The first caption request loads it.",
+});
+
+const formatImageCaptionReadinessReason = (value) => {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (IMAGE_CAPTION_READINESS_REASONS[raw]) {
+    return IMAGE_CAPTION_READINESS_REASONS[raw];
+  }
+  if (/^[a-z0-9_]+$/.test(raw)) {
+    const readable = raw.replaceAll("_", " ");
+    return `${readable.charAt(0).toUpperCase()}${readable.slice(1)}.`;
+  }
+  return raw;
+};
+
+const normalizeImageCaptionEngine = (value, fallback = "local") => {
+  const normalized = String(value || "").trim().toLowerCase();
+  return IMAGE_CAPTION_ENGINES.has(normalized) ? normalized : fallback;
+};
+
 const resolveHarmonyFormat = (mode, prefersHarmony) => {
   const normalized = normalizeHarmonyFormatMode(mode);
   if (normalized === "disabled") return false;
@@ -393,14 +444,14 @@ const normalizePrivacyRouteMode = (value) => {
 
 const TOOL_WORKFLOW_OPTIONS = [
   { value: "disabled", label: "Disabled" },
-  { value: "text", label: "Text" },
-  { value: "live", label: "Live" },
-  { value: "both", label: "Both" },
+  { value: "text", label: "Chat" },
+  { value: "live", label: "Live voice" },
+  { value: "both", label: "Chat + live voice" },
 ];
 
 const TOOL_APPROVAL_OPTIONS = [
-  { value: "low", label: "Low" },
-  { value: "high", label: "High" },
+  { value: "low", label: "Lower approval" },
+  { value: "high", label: "Higher approval" },
 ];
 
 const normalizeToolWorkflow = (value, fallback = "text") => {
@@ -420,28 +471,28 @@ const normalizeToolApproval = (value, fallback = "high") => {
 const BACKGROUND_AUTONOMY_MODE_OPTIONS = [
   {
     value: "manual",
-    label: "Manual",
-    description: "Only run dry-runs or explicit ticks.",
+    label: "Manual only",
+    description: "No routine review; only explicit runs.",
   },
   {
     value: "basic",
-    label: "Basic test",
-    description: "Two short queued checks by default.",
+    label: "Fixed check count",
+    description: "Legacy routine: use its check count and spacing.",
   },
   {
     value: "overnight",
-    label: "Overnight review",
-    description: "Use the runtime budget, 30 minutes by default.",
+    label: "Fixed runtime",
+    description: "Legacy routine: use its session runtime budget.",
   },
   {
     value: "extended",
-    label: "Extended",
-    description: "Stop when the satisfaction threshold is met.",
+    label: "Until useful",
+    description: "Stop when the usefulness threshold is met, within safety limits.",
   },
   {
     value: "always_on",
-    label: "Always on",
-    description: "Keep polling until manually disabled.",
+    label: "Continuous loop",
+    description: "Legacy routine: continue on its cadence until manually disabled.",
   },
 ];
 
@@ -553,6 +604,12 @@ const Settings = () => {
   const [ragStatus, setRagStatus] = useState(null);
 
   const [ragState, setRagState] = useState("loading");
+
+  const [captionStatus, setCaptionStatus] = useState(null);
+
+  const [captionStatusState, setCaptionStatusState] = useState("loading");
+
+  const [persistedCaptionEngine, setPersistedCaptionEngine] = useState(null);
 
   const [celeryView, setCeleryView] = useState("active"); // active | scheduled | reserved | all
 
@@ -779,6 +836,8 @@ const Settings = () => {
     if (value === 'loading') return 'loading';
 
     if (value === 'degraded') return 'loading';
+
+    if (value === 'manual') return 'neutral';
 
     return 'offline';
 
@@ -1031,6 +1090,8 @@ const Settings = () => {
 
     setRagStatus(null);
 
+    setCaptionStatusState("loading");
+
     let apiOk = false;
 
     try {
@@ -1129,6 +1190,22 @@ const Settings = () => {
 
       setRagState("offline");
 
+    }
+
+    try {
+      const captionRes = await axios.get("/api/attachments/caption/status");
+      const captionData =
+        captionRes && typeof captionRes.data === "object" ? captionRes.data : null;
+      if (captionData) {
+        setCaptionStatus(captionData);
+        setCaptionStatusState("loaded");
+      } else {
+        setCaptionStatus(null);
+        setCaptionStatusState("error");
+      }
+    } catch {
+      setCaptionStatus(null);
+      setCaptionStatusState("error");
     }
 
     if (!celeryApplied) {
@@ -1275,6 +1352,8 @@ const Settings = () => {
     realtime_connect_url: "https://api.openai.com/v1/realtime/calls",
 
   vision_model: state.visionModel,
+  image_caption_engine: "local",
+  image_caption_cloud_model: "gpt-5.4-nano",
 
   context_length: state.maxContextLength,
 
@@ -2639,6 +2718,10 @@ const Settings = () => {
 
         ? "warn"
 
+        : status === "manual"
+
+        ? "neutral"
+
         : "err";
 
     return <span className={`status-dot ${tone}`} aria-hidden="true" />;
@@ -2840,6 +2923,11 @@ const Settings = () => {
             "https://api.openai.com/v1/realtime/calls",
 
           vision_model: data.vision_model || "google/paligemma2-3b-pt-224",
+          image_caption_engine: normalizeImageCaptionEngine(
+            data.image_caption_engine,
+          ),
+          image_caption_cloud_model:
+            data.image_caption_cloud_model || "gpt-5.4-nano",
 
           request_timeout: normalizedRequestTimeout,
 
@@ -3034,6 +3122,7 @@ const Settings = () => {
         }));
 
         setSettings(newSettings);
+        setPersistedCaptionEngine(newSettings.image_caption_engine);
         setInitialComparable(buildComparable(newSettings, false, false));
         setInitialized(true);
 
@@ -3670,13 +3759,13 @@ const Settings = () => {
     );
     const autonomyState = backgroundAutonomyLoading
       ? "loading"
-      : autonomy.error
+        : autonomy.error
         ? "offline"
         : autonomy.routine_enabled
           ? "online"
           : autonomy.enabled
             ? "degraded"
-            : "offline";
+            : "manual";
     const autonomySummary = autonomy.error
       ? "Autonomy status unavailable."
       : autonomy.routine_enabled
@@ -5530,6 +5619,80 @@ const Settings = () => {
     ragStatus && typeof ragStatus.embedding_runtime === "object"
       ? ragStatus.embedding_runtime
       : null;
+  const captionDraftEngine = normalizeImageCaptionEngine(
+    settings.image_caption_engine,
+  );
+  const captionStatusEngine = normalizeImageCaptionEngine(
+    captionStatus?.engine,
+    null,
+  );
+  const captionSavedEngine =
+    persistedCaptionEngine || captionStatusEngine || null;
+  const captionEngineHasUnsavedChange =
+    !!captionSavedEngine && captionDraftEngine !== captionSavedEngine;
+  const captionCloudIsPersisted = captionSavedEngine === "cloud";
+  const showCaptionCloudWarning =
+    captionDraftEngine === "cloud" || captionCloudIsPersisted;
+  const captionConfiguredModel =
+    captionStatusState === "loaded"
+      ? String(captionStatus?.configured_model || "").trim()
+      : "";
+  const captionLocalInstalledNotLoaded = Boolean(
+    captionStatusState === "loaded"
+      && captionStatusEngine === "local"
+      && captionStatus?.ready !== true
+      && captionStatus?.local?.installed === true
+      && captionStatus?.local?.can_attempt === true,
+  );
+  const captionStatusTone =
+    captionStatusState === "loading"
+      ? "busy"
+      : captionStatusState === "error"
+        ? "warn"
+        : captionStatusEngine === "off" || captionLocalInstalledNotLoaded
+          ? "idle"
+          : captionStatus?.ready === true
+            ? "ok"
+            : "warn";
+  const captionStatusLabel =
+    captionStatusState === "loading"
+      ? "Checking"
+      : captionStatusState === "error"
+        ? "Status unavailable"
+        : captionStatusEngine === "off"
+          ? "Disabled"
+          : captionLocalInstalledNotLoaded
+            ? "Installed; loads on use"
+            : captionStatus?.ready === true
+              ? "Ready"
+              : "Not ready";
+  let captionReadinessDetail = "";
+  if (captionStatusState === "loaded" && captionStatusEngine === "local") {
+    captionReadinessDetail = formatImageCaptionReadinessReason(
+      captionStatus?.local?.reason,
+    );
+    if (!captionReadinessDetail && captionStatus?.ready !== true) {
+      captionReadinessDetail = "The configured local caption model cannot load yet.";
+    }
+  } else if (captionStatusState === "loaded" && captionStatusEngine === "cloud") {
+    const cloud =
+      captionStatus?.cloud && typeof captionStatus.cloud === "object"
+        ? captionStatus.cloud
+        : {};
+    if (captionStatus?.ready !== true) {
+      if (!cloud.api_url_configured && !cloud.api_key_set) {
+        captionReadinessDetail = "The cloud API URL and key are not configured.";
+      } else if (!cloud.api_url_configured) {
+        captionReadinessDetail = "The cloud API URL is not configured.";
+      } else if (!cloud.api_key_set) {
+        captionReadinessDetail = "The cloud API key is not configured.";
+      } else if (cloud.configured === false) {
+        captionReadinessDetail = "The cloud caption provider is incomplete.";
+      }
+    }
+  } else if (captionStatusState === "loaded" && captionStatusEngine === "off") {
+    captionReadinessDetail = "Automatic captions for saved images are disabled.";
+  }
 
   const fieldTooltips = {
 
@@ -6173,6 +6336,9 @@ const Settings = () => {
       realtime_connect_url: s.realtime_connect_url || "",
 
       vision_model: s.vision_model,
+      image_caption_engine: normalizeImageCaptionEngine(s.image_caption_engine),
+      image_caption_cloud_model:
+        String(s.image_caption_cloud_model || "").trim() || "gpt-5.4-nano",
 
       max_context_length: s.context_length,
 
@@ -6853,6 +7019,9 @@ const Settings = () => {
       realtime_connect_url: settings.realtime_connect_url,
 
       vision_model: settings.vision_model,
+      image_caption_engine: normalizeImageCaptionEngine(settings.image_caption_engine),
+      image_caption_cloud_model:
+        String(settings.image_caption_cloud_model || "").trim() || "gpt-5.4-nano",
 
       max_context_length: settings.context_length,
 
@@ -6892,8 +7061,6 @@ const Settings = () => {
       sae_steering_dry_run: !!settings.sae_steering_dry_run,
       sae_live_inspect_console: !!settings.sae_live_inspect_console,
       background_autonomy_enabled: !!settings.background_autonomy_enabled,
-      background_autonomy_sandbox_processes:
-        settings.background_autonomy_sandbox_processes !== false,
       background_autonomy_mode: normalizeBackgroundAutonomyMode(
         settings.background_autonomy_mode,
       ),
@@ -6921,6 +7088,10 @@ const Settings = () => {
       .post("/api/settings", payload)
 
       .then(() => {
+
+        setPersistedCaptionEngine(
+          normalizeImageCaptionEngine(settings.image_caption_engine),
+        );
 
         setMessage("Settings saved successfully.");
 
@@ -9116,8 +9287,156 @@ const Settings = () => {
                 </div>
               </div>
 
+              <div className="settings-caption-engine">
+                <div className="settings-caption-engine-header">
+                  <div className="settings-heading-with-help">
+                    <h4>Saved image captions</h4>
+                    <SettingsInfoTip
+                      label="About saved image captions"
+                      text="Captioning creates searchable text for saved images. CLIP image indexing is a separate local retrieval step and can continue when automatic captions are off."
+                    />
+                  </div>
+                  <div
+                    className="settings-caption-status"
+                    role="status"
+                    aria-live="polite"
+                  >
+                    <span
+                      className={`settings-caption-status-chip settings-caption-status-chip--${captionStatusTone}`}
+                    >
+                      {captionStatusLabel}
+                    </span>
+                    <span>
+                      Saved engine: {captionSavedEngine
+                        ? IMAGE_CAPTION_ENGINE_LABELS[captionSavedEngine]
+                        : "unknown"}
+                    </span>
+                  </div>
+                </div>
+
+                <fieldset className="settings-caption-engine-fieldset">
+                  <legend>Caption engine</legend>
+                  <div
+                    className="settings-caption-engine-options"
+                    role="group"
+                    aria-label="Saved image caption engine"
+                  >
+                    {IMAGE_CAPTION_ENGINE_OPTIONS.map((option) => (
+                      <button
+                        key={option.value}
+                        type="button"
+                        className={`settings-caption-engine-choice settings-caption-engine-choice--${option.value}`}
+                        aria-pressed={captionDraftEngine === option.value}
+                        aria-label={`${option.label} captioning: ${option.description}`}
+                        title={option.description}
+                        onClick={() =>
+                          commitSettingValue("image_caption_engine", option.value)
+                        }
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                </fieldset>
+
+                {captionEngineHasUnsavedChange && (
+                  <p className="settings-caption-pending-note">
+                    Selected mode is not active until you save Settings.
+                  </p>
+                )}
+
+                {showCaptionCloudWarning && (
+                  <div
+                    id="caption-cloud-privacy-warning"
+                    className="settings-caption-privacy-warning"
+                    role="note"
+                  >
+                    <strong>Image privacy:</strong>{" "}
+                    {captionCloudIsPersisted
+                      ? captionDraftEngine === "cloud"
+                        ? "Cloud captioning is saved. Caption requests send saved image bytes to your configured API provider."
+                        : "Cloud captioning remains active until you save this change; saved image bytes may still be sent to your configured API provider."
+                      : "If you save Cloud/provider, caption requests will send saved image bytes to your configured API provider. It is not active yet."}
+                  </div>
+                )}
+
+                {captionDraftEngine === "cloud" && (
+                  <div className="settings-caption-cloud-model">
+                    <label htmlFor="image-caption-cloud-model">
+                      Cloud caption model
+                      <SettingsInfoTip
+                        label="About the cloud caption model"
+                        text="This model is used only when Cloud/provider is the saved caption engine. It uses the API URL and key configured in Connections."
+                      />
+                    </label>
+                    <input
+                      id="image-caption-cloud-model"
+                      name="image_caption_cloud_model"
+                      value={settings.image_caption_cloud_model || ""}
+                      onChange={handleChange}
+                      list="image-caption-cloud-model-options"
+                      placeholder="gpt-5.4-nano"
+                      aria-label="Cloud caption model"
+                      aria-describedby="caption-cloud-privacy-warning"
+                    />
+                    <datalist id="image-caption-cloud-model-options">
+                      <option value="gpt-5.4-nano" />
+                      {(state.apiModels || [])
+                        .filter((model) => model && model !== "gpt-5.4-nano")
+                        .map((model) => (
+                          <option key={model} value={model} />
+                        ))}
+                    </datalist>
+                  </div>
+                )}
+
+                <div className="settings-caption-runtime-summary">
+                  <span>
+                    Configured model: {captionConfiguredModel || "status unavailable"}
+                  </span>
+                  <span>CLIP indexing: separate, local</span>
+                  {captionStatus?.automatic_downloads === false && (
+                    <span>No automatic model downloads</span>
+                  )}
+                  <SettingsInfoTip
+                    label="About caption readiness"
+                    text="The backend reports installation and actual runtime loading separately. A complete local model can load on the first caption request; Float does not silently download caption-model weights."
+                  />
+                </div>
+
+                {captionReadinessDetail && captionStatus?.ready !== true && (
+                  <p className="settings-caption-readiness-detail">
+                    {captionReadinessDetail}
+                  </p>
+                )}
+                {captionStatusState === "loaded" &&
+                  captionStatusEngine &&
+                  captionSavedEngine &&
+                  captionStatusEngine !== captionSavedEngine && (
+                    <p className="settings-caption-readiness-detail">
+                      Runtime status reports {IMAGE_CAPTION_ENGINE_LABELS[captionStatusEngine]},
+                      while Settings reports {IMAGE_CAPTION_ENGINE_LABELS[captionSavedEngine]}.
+                      Refresh status before relying on automatic captions.
+                    </p>
+                  )}
+
+                <div className="settings-caption-actions">
+                  <Link
+                    className="runtime-inline-btn settings-caption-gallery-link"
+                    to="/knowledge?tab=documents"
+                    title="Open saved images and retry captioning for one selected image. Manual captions are protected."
+                  >
+                    Open gallery to retry one image
+                  </Link>
+                  <SettingsInfoTip
+                    label="About retrying captions"
+                    text="Retry is intentionally per image. Open its caption editor in Knowledge; missing or placeholder captions can be retried without replacing a manual caption."
+                  />
+                </div>
+              </div>
+
               {renderModelField(
-                "Image understanding fallback",
+                "Local caption and fallback model",
                 "vision_model",
                 suggestedVisionModels,
               )}
@@ -9856,13 +10175,18 @@ const Settings = () => {
 
           )}
 
-          <label title="Require confirmation for automated actions">
+          <label
+            htmlFor="settings-approval-level"
+            title="Choose when Float asks before running tools"
+          >
 
-            Approval Level
+            Tool approval
 
           </label>
 
           <select
+
+            id="settings-approval-level"
 
             name="approvalLevel"
 
@@ -9870,11 +10194,13 @@ const Settings = () => {
 
             onChange={handleChange}
 
-            title="Require confirmation for automated actions"
+            title="Choose when Float asks before running tools"
+
+            aria-label="Tool approval mode"
 
           >
 
-            <option value="all">All</option>
+            <option value="all">Review all</option>
 
             <option value="high">High Risk Only</option>
 
@@ -10222,7 +10548,7 @@ const Settings = () => {
           </div>
 
           <div className="settings-section">
-            <h3>Work history</h3>
+            <h3>Activity and write history</h3>
             <label
               className="field-label"
               htmlFor="work-history-retention"
@@ -10258,7 +10584,7 @@ const Settings = () => {
                 to="/work-history"
                 className="icon-btn settings-action-btn"
               >
-                Open work history
+                Open activity
               </Link>
             </div>
             {actionHistoryMessage && <p className="status-note">{actionHistoryMessage}</p>}
@@ -10270,7 +10596,7 @@ const Settings = () => {
                 <h3>Tools</h3>
                 <SettingsInfoTip
                   label="About tool access"
-                  text="Workflow availability controls where a tool appears. Approval controls whether it can run automatically. Expand the catalog only when you need per-tool overrides."
+                  text="Available in controls which chat surfaces can see a tool. Approval requirement affects whether it may run automatically under your global approval setting; higher approval also blocks automatic live-voice use."
                 />
               </div>
               <button
@@ -10452,11 +10778,11 @@ const Settings = () => {
                       )}
                       <div className="tool-browser-policy-grid">
                         <label htmlFor={workflowSelectId}>
-                          <span className="tool-browser-label">Workflow availability</span>
+                          <span className="tool-browser-label">Available in</span>
                           <select
                             id={workflowSelectId}
                             value={policy.workflow}
-                            aria-label={`${entry.display_name || entry.id} workflow availability`}
+                            aria-label={`${entry.display_name || entry.id} availability`}
                             disabled={policySaving}
                             onChange={(event) =>
                               handleToolPolicyChange(entry.id, "workflow", event.target.value)
@@ -10489,10 +10815,10 @@ const Settings = () => {
                         </label>
                         <div className="tool-browser-policy-state">
                           <span className="tool-browser-chip">
-                            Text {policy.workflows.text ? "on" : "off"}
+                            Chat {policy.workflows.text ? "on" : "off"}
                           </span>
                           <span className="tool-browser-chip">
-                            Live {policy.workflows.live ? "on" : "off"}
+                            Live voice {policy.workflows.live ? "on" : "off"}
                           </span>
                           {policy.workflows.live && (
                             <span className="tool-browser-chip">
@@ -10752,8 +11078,9 @@ const Settings = () => {
                 <div>
                   <h2>Background Processing</h2>
                   <p className="settings-card-copy">
-                    Bounded autonomy settings for reflection review, overnight runs,
-                    and separate long-running container checks.
+                    Run bounded routine reflection reviews on a timer. Calendar owns
+                    concrete job schedules, while prompt jobs and worker queues remain
+                    separate and visible in the Agent Console.
                   </p>
                 </div>
               </div>
@@ -10783,15 +11110,15 @@ const Settings = () => {
                     checked={settings.background_autonomy_sandbox_processes !== false}
                     onChange={handleChange}
                   />
-                  <span>Sandbox background processes</span>
+                  <span>Request sandboxing for background processes</span>
                 </label>
 
                 <label
                   className="field-label"
                   htmlFor="background-autonomy-mode"
-                  title="Controls how the background autonomy runner decides when to stop."
+                  title="Compatibility preset for the older reflection supervisor. Calendar owns schedules for new jobs."
                 >
-                  Background autonomy mode
+                  Legacy supervisor preset
                 </label>
                 <select
                   id="background-autonomy-mode"
@@ -10813,12 +11140,17 @@ const Settings = () => {
                         normalizeBackgroundAutonomyMode(settings.background_autonomy_mode),
                     )?.description
                   }
+                  {" "}This older supervisor combines cadence and stopping. New jobs set
+                  schedule in Calendar and patience on the job itself.
                 </p>
 
-                <div className="advanced-grid" style={{ marginTop: 12 }}>
+                <details className="settings-disclosure settings-disclosure--advanced">
+                  <summary>Advanced limits</summary>
+                  <div className="settings-disclosure-body">
+                    <div className="advanced-grid" style={{ marginTop: 12 }}>
                   <label
                     htmlFor="background-runtime-minutes"
-                    title="Default overnight review budget. Extended mode stops by threshold instead."
+                    title="Wall-clock safety budget for one bounded routine session."
                   >
                     Runtime budget (minutes)
                   </label>
@@ -10846,9 +11178,9 @@ const Settings = () => {
 
                   <label
                     htmlFor="background-routine-interval"
-                    title="How often the routine runner wakes up outside basic-test mode."
+                    title="How often the routine review runner wakes up. Concrete scheduled jobs belong in Calendar."
                   >
-                    Routine poll interval (minutes)
+                    Routine cadence (minutes)
                   </label>
                   <input
                     id="background-routine-interval"
@@ -10874,9 +11206,9 @@ const Settings = () => {
 
                   <label
                     htmlFor="background-basic-tick-count"
-                    title="Basic mode tick budget. Default is two checks."
+                    title="Maximum checks when the check-budget stop policy is selected."
                   >
-                    Basic test ticks
+                    Check limit
                   </label>
                   <input
                     id="background-basic-tick-count"
@@ -10891,9 +11223,9 @@ const Settings = () => {
 
                   <label
                     htmlFor="background-basic-tick-minutes"
-                    title="Basic mode interval. Default is five minutes."
+                    title="Spacing between checks in a check-budget session."
                   >
-                    Basic tick interval (minutes)
+                    Check spacing (minutes)
                   </label>
                   <input
                     id="background-basic-tick-minutes"
@@ -10919,7 +11251,7 @@ const Settings = () => {
 
                   <label
                     htmlFor="background-satisfied-threshold"
-                    title="Extended mode stops after a run reaches this usefulness/novelty score."
+                    title="Until-useful stops after a run reaches this usefulness/novelty score."
                   >
                     Satisfied threshold
                   </label>
@@ -10967,7 +11299,9 @@ const Settings = () => {
                     value={settings.background_autonomy_min_priority ?? 0.05}
                     onChange={handleChange}
                   />
-                </div>
+                    </div>
+                  </div>
+                </details>
 
                 <div
                   className="inline-flex"
@@ -11064,10 +11398,6 @@ const Settings = () => {
                   </div>
                 </div>
 
-                <p className="status-note" style={{ marginTop: 10 }}>
-                  Container orchestration and API background-response checks are kept in
-                  a separate opt-in test suite so normal Poetry runs do not stall.
-                </p>
               </div>
             </section>
           )}

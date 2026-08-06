@@ -3,6 +3,7 @@ import React, {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import "../styles/Calendar.css";
@@ -10,6 +11,7 @@ import WeekView from "./WeekView";
 import EventForm from "./EventForm";
 import { GlobalContext } from "../main";
 import axios from "axios";
+import { Link } from "react-router-dom";
 import FilterBar from "./FilterBar";
 import { Line, Rect } from "./Skeleton";
 import {
@@ -17,20 +19,29 @@ import {
   formatStatusLabel,
   isClearedCalendarStatus,
 } from "../utils/calendarPanel";
+import { recurrenceSummary } from "../utils/backgroundJobPolicy";
+import {
+  civilDateKey,
+  dateKeyInTimeZone,
+  formatTimeInTimeZone,
+  zonedInputToDate,
+} from "../utils/zonedDateTime";
 
 const days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 const startOfMonth = (date) => new Date(date.getFullYear(), date.getMonth(), 1);
 
-const formatTimeRange = (event) => {
+const formatTimeRange = (event, timeZone) => {
   if (!event?.startDate) return "All day";
   const start = event.startDate;
   const end = event.endDate;
-  const opts = { hour: "2-digit", minute: "2-digit" };
   if (!end) {
-    return start.toLocaleTimeString([], opts);
+    return formatTimeInTimeZone(start, timeZone);
   }
-  return `${start.toLocaleTimeString([], opts)} - ${end.toLocaleTimeString([], opts)}`;
+  return `${formatTimeInTimeZone(start, timeZone)} - ${formatTimeInTimeZone(
+    end,
+    timeZone,
+  )}`;
 };
 
 const CalendarTab = ({ focusEventId = null }) => {
@@ -41,6 +52,7 @@ const CalendarTab = ({ focusEventId = null }) => {
   const [evtQ, setEvtQ] = useState("");
   const [loading, setLoading] = useState(false);
   const [eventError, setEventError] = useState("");
+  const [occurrenceError, setOccurrenceError] = useState("");
   const [activeEvent, setActiveEvent] = useState(null);
   const [formOpen, setFormOpen] = useState(false);
   const [busyDeleteEventId, setBusyDeleteEventId] = useState("");
@@ -48,8 +60,18 @@ const CalendarTab = ({ focusEventId = null }) => {
   const [ragBusy, setRagBusy] = useState(false);
   const [ragStatus, setRagStatus] = useState(null);
   const [showClearedEvents, setShowClearedEvents] = useState(false);
+  const [calendarOccurrences, setCalendarOccurrences] = useState([]);
+  const [occurrencesReady, setOccurrencesReady] = useState(false);
+  const occurrenceRequestRef = useRef(0);
 
   const { calendarEvents = [] } = state;
+  const displayTimezone = useMemo(
+    () =>
+      (typeof state.userTimezone === "string" && state.userTimezone.trim()) ||
+      Intl.DateTimeFormat().resolvedOptions().timeZone ||
+      "UTC",
+    [state.userTimezone],
+  );
 
   const selectedDate = useMemo(() => {
     const raw = state.selectedCalendarDate;
@@ -120,9 +142,75 @@ const CalendarTab = ({ focusEventId = null }) => {
     }
   }, [normalizeEvent, setState]);
 
+  const loadOccurrences = useCallback(async () => {
+    const requestId = occurrenceRequestRef.current + 1;
+    occurrenceRequestRef.current = requestId;
+    const viewport = buildMonthGridDates(currentMonth);
+    const first =
+      zonedInputToDate(`${civilDateKey(viewport[0])}T00:00:00`, displayTimezone) ||
+      new Date(viewport[0]);
+    const last =
+      zonedInputToDate(
+        `${civilDateKey(viewport[viewport.length - 1])}T23:59:59`,
+        displayTimezone,
+      ) || new Date(viewport[viewport.length - 1]);
+    setOccurrencesReady(false);
+    try {
+      const res = await axios.get("/api/calendar/occurrences", {
+        params: {
+          range_start: Math.floor(first.getTime() / 1000),
+          range_end: Math.floor(last.getTime() / 1000),
+          limit_per_event: 2048,
+          include_inactive: true,
+        },
+      });
+      if (occurrenceRequestRef.current !== requestId) return;
+      const raw = Array.isArray(res?.data?.occurrences)
+        ? res.data.occurrences
+        : [];
+      const recurrenceErrors = Array.isArray(res?.data?.errors) ? res.data.errors : [];
+      const truncated = Array.isArray(res?.data?.truncated) ? res.data.truncated : [];
+      const issueMessages = [];
+      if (recurrenceErrors.length) {
+        issueMessages.push(
+          `Could not expand recurrence for ${recurrenceErrors
+              .map((item) => item?.title || item?.event_id)
+              .filter(Boolean)
+              .join(", ")}. Edit its advanced RRULE.`,
+        );
+      }
+      if (truncated.length) {
+        issueMessages.push(
+          `Showing the first ${truncated[0]?.limit || 2048} occurrences for ${truncated
+            .map((item) => item?.title || item?.event_id)
+            .filter(Boolean)
+            .join(", ")}; narrow the Calendar range to inspect every run.`,
+        );
+      }
+      setOccurrenceError(issueMessages.join(" "));
+      setCalendarOccurrences(
+        raw.map((event) => normalizeEvent(event)).filter((event) => event?.id),
+      );
+      setOccurrencesReady(true);
+    } catch (err) {
+      if (occurrenceRequestRef.current !== requestId) return;
+      console.error("Failed to expand calendar occurrences", err);
+      setCalendarOccurrences([]);
+      setOccurrencesReady(false);
+      setOccurrenceError("Recurring occurrences are unavailable right now.");
+    }
+  }, [currentMonth, displayTimezone, normalizeEvent]);
+
   useEffect(() => {
     loadEvents();
   }, [loadEvents]);
+
+  useEffect(() => {
+    loadOccurrences();
+    return () => {
+      occurrenceRequestRef.current += 1;
+    };
+  }, [loadOccurrences]);
 
   useEffect(() => {
     if (!focusEventId) return;
@@ -144,40 +232,78 @@ const CalendarTab = ({ focusEventId = null }) => {
 
   const filteredEvents = useMemo(() => {
     const needle = (evtQ || "").trim().toLowerCase();
-    if (!needle) return calendarEvents;
-    return calendarEvents.filter((evt) => {
-      const haystack = [evt.summary, evt.title, evt.description, evt.status]
+    const source = occurrencesReady ? calendarOccurrences : calendarEvents;
+    if (!needle) return source;
+    return source.filter((evt) => {
+      const haystack = [evt.summary, evt.title, evt.description, evt.status, evt.rrule]
         .filter(Boolean)
         .join(" ")
         .toLowerCase();
       return haystack.includes(needle);
     });
-  }, [calendarEvents, evtQ]);
+  }, [calendarEvents, calendarOccurrences, evtQ, occurrencesReady]);
 
   const eventDates = useMemo(() => {
     const dates = new Set();
     filteredEvents.forEach((evt) => {
-      if (evt?.startDate) {
-        dates.add(evt.startDate.toDateString());
+      if (evt?.startDate && !isClearedCalendarStatus(evt?.status)) {
+        dates.add(dateKeyInTimeZone(evt.startDate, displayTimezone));
       }
     });
     return dates;
-  }, [filteredEvents]);
+  }, [displayTimezone, filteredEvents]);
 
-  const eventsForSelectedDay = useMemo(() => {
-    const target = selectedDate.toDateString();
+  const scheduledEventsForWeek = useMemo(
+    () => filteredEvents.filter((evt) => !isClearedCalendarStatus(evt?.status)),
+    [filteredEvents],
+  );
+
+  const occurrencesForSelectedDay = useMemo(() => {
+    const target = civilDateKey(selectedDate);
     return filteredEvents
-      .filter((evt) => evt.startDate && evt.startDate.toDateString() === target)
+      .filter(
+        (evt) =>
+          evt.startDate && dateKeyInTimeZone(evt.startDate, displayTimezone) === target,
+      )
       .sort((a, b) => {
         const aTime = a.startDate ? a.startDate.getTime() : 0;
         const bTime = b.startDate ? b.startDate.getTime() : 0;
         return aTime - bTime;
       });
-  }, [filteredEvents, selectedDate]);
+  }, [displayTimezone, filteredEvents, selectedDate]);
+
+  const eventsForSelectedDay = useMemo(() => {
+    const groups = new Map();
+    occurrencesForSelectedDay.forEach((event) => {
+      const sourceId = String(event.source_event_id || event.id);
+      const existing = groups.get(sourceId);
+      if (!existing) {
+        groups.set(sourceId, {
+          ...event,
+          source_event_id: sourceId,
+          occurrenceCount: 1,
+          lastOccurrenceDate: event.startDate,
+        });
+        return;
+      }
+      existing.occurrenceCount += 1;
+      if (
+        event.startDate &&
+        (!existing.lastOccurrenceDate || event.startDate > existing.lastOccurrenceDate)
+      ) {
+        existing.lastOccurrenceDate = event.startDate;
+      }
+    });
+    return [...groups.values()];
+  }, [occurrencesForSelectedDay]);
 
   const activeEventsForSelectedDay = useMemo(
     () =>
-      eventsForSelectedDay.filter((evt) => !isClearedCalendarStatus(evt?.status)),
+      eventsForSelectedDay.filter(
+        (evt) =>
+          !isClearedCalendarStatus(evt?.status) &&
+          String(evt?.status || "").toLowerCase() !== "paused",
+      ),
     [eventsForSelectedDay],
   );
 
@@ -229,6 +355,7 @@ const CalendarTab = ({ focusEventId = null }) => {
 
   const handleRefresh = () => {
     loadEvents();
+    loadOccurrences();
   };
 
   const rehydrateRag = async () => {
@@ -248,9 +375,17 @@ const CalendarTab = ({ focusEventId = null }) => {
   };
 
   const handleEditEvent = (evt) => {
-    setActiveEvent(evt || null);
+    const sourceId = String(evt?.source_event_id || evt?.id || "");
+    const source = calendarEvents.find((event) => String(event.id) === sourceId);
+    setActiveEvent(source || evt || null);
     if (evt?.startDate) {
-      setSelectedDate(evt.startDate);
+      const [year, month, day] = dateKeyInTimeZone(
+        evt.startDate,
+        displayTimezone,
+      )
+        .split("-")
+        .map(Number);
+      setSelectedDate(new Date(year, month - 1, day, 12));
     }
     setFormOpen(true);
   };
@@ -281,16 +416,20 @@ const CalendarTab = ({ focusEventId = null }) => {
 
   const handleSetEventStatus = useCallback(
     async (evt, status) => {
-      if (!evt?.id) return;
-      setBusyStatusEventId(evt.id);
+      const eventId = String(evt?.source_event_id || evt?.id || "");
+      if (!eventId) return;
+      const source =
+        calendarEvents.find((event) => String(event.id) === eventId) || evt;
+      setBusyStatusEventId(eventId);
       setEventError("");
       try {
         await axios.post(
-          `/api/calendar/events/${encodeURIComponent(evt.id)}`,
-          buildEventPayload(evt, { status }),
+          `/api/calendar/events/${encodeURIComponent(eventId)}`,
+          buildEventPayload(source, { id: eventId, status }),
         );
         await loadEvents();
-        if (activeEvent && activeEvent.id === evt.id) {
+        await loadOccurrences();
+        if (activeEvent && activeEvent.id === eventId) {
           setActiveEvent((current) => (current ? { ...current, status } : current));
         }
       } catch (err) {
@@ -300,7 +439,21 @@ const CalendarTab = ({ focusEventId = null }) => {
         setBusyStatusEventId("");
       }
     },
-    [activeEvent, buildEventPayload, loadEvents],
+    [
+      activeEvent,
+      buildEventPayload,
+      calendarEvents,
+      loadEvents,
+      loadOccurrences,
+    ],
+  );
+
+  const pausedEventsForSelectedDay = useMemo(
+    () =>
+      eventsForSelectedDay.filter(
+        (evt) => String(evt?.status || "").toLowerCase() === "paused",
+      ),
+    [eventsForSelectedDay],
   );
 
   const handleDeleteEvent = async (eventId) => {
@@ -311,13 +464,19 @@ const CalendarTab = ({ focusEventId = null }) => {
     try {
       await axios.delete(`/api/calendar/events/${encodeURIComponent(eventId)}`);
       await loadEvents();
+      await loadOccurrences();
       if (activeEvent && activeEvent.id === eventId) {
         setActiveEvent(null);
         setFormOpen(false);
       }
     } catch (err) {
       console.error("Failed to delete calendar event", err);
-      setEventError("Failed to delete event. Please try again.");
+      const detail = err?.response?.data?.detail;
+      setEventError(
+        typeof detail === "string" && detail.trim()
+          ? detail
+          : "Failed to delete event. Please try again.",
+      );
     } finally {
       setBusyDeleteEventId("");
     }
@@ -325,6 +484,7 @@ const CalendarTab = ({ focusEventId = null }) => {
 
   const handleEventSaved = async () => {
     await loadEvents();
+    await loadOccurrences();
     setActiveEvent(null);
     setFormOpen(false);
   };
@@ -339,11 +499,12 @@ const CalendarTab = ({ focusEventId = null }) => {
         body: data,
       });
       await loadEvents();
+      await loadOccurrences();
     } catch (err) {
       console.error(err);
       setEventError("Failed to import Google Calendar data.");
     }
-  }, [loadEvents]);
+  }, [loadEvents, loadOccurrences]);
 
   const handleNewEvent = () => {
     setActiveEvent(null);
@@ -362,6 +523,7 @@ const CalendarTab = ({ focusEventId = null }) => {
           body: formData,
         });
         await loadEvents();
+        await loadOccurrences();
       } catch (err) {
         console.error(err);
         setEventError("Failed to import .ics file.");
@@ -369,15 +531,29 @@ const CalendarTab = ({ focusEventId = null }) => {
         e.target.value = "";
       }
     },
-    [loadEvents],
+    [loadEvents, loadOccurrences],
   );
 
   const renderEventRow = (evt) => {
+    const eventId = String(evt?.source_event_id || evt?.id || "");
     const cleared = isClearedCalendarStatus(evt?.status);
-    const isBusy = busyStatusEventId === evt.id || busyDeleteEventId === evt.id;
+    const normalizedStatus = String(evt?.status || "").toLowerCase();
+    const paused = normalizedStatus === "paused";
+    const hasCurrentRun = ["running", "followup-running", "followup_running"].includes(
+      normalizedStatus,
+    );
+    const isBusy = busyStatusEventId === eventId || busyDeleteEventId === eventId;
+    const recurring = Boolean(evt?.rrule);
+    const denseLabel =
+      evt.occurrenceCount > 1 && evt.lastOccurrenceDate
+        ? `${evt.occurrenceCount} runs · ${formatTimeInTimeZone(
+            evt.startDate,
+            displayTimezone,
+          )}–${formatTimeInTimeZone(evt.lastOccurrenceDate, displayTimezone)}`
+        : null;
     return (
       <li
-        key={evt.id}
+        key={evt.occurrence_id || eventId}
         className={`calendar-event-row${cleared ? " is-cleared" : ""}`}
       >
         <div className="calendar-event-meta">
@@ -387,18 +563,61 @@ const CalendarTab = ({ focusEventId = null }) => {
               {formatStatusLabel(evt.status)}
             </span>
           </div>
-          <div className="calendar-event-time">{formatTimeRange(evt)}</div>
+          <div className="calendar-event-time">
+            {denseLabel || formatTimeRange(evt, displayTimezone)}
+          </div>
+          {recurring ? (
+            <div className="calendar-event-recurrence" title={evt.rrule}>
+              {recurrenceSummary(evt.rrule, evt.timezone)}
+            </div>
+          ) : null}
+          {evt.recurrence_import_warning ? (
+            <div
+              className="calendar-event-recurrence-warning"
+              title={evt.recurrence_import_warning}
+            >
+              Imported exception dates need review
+            </div>
+          ) : null}
         </div>
         <div className="calendar-event-actions">
-          {cleared ? (
+          {paused ? (
+            <button
+              type="button"
+              onClick={() => handleSetEventStatus(evt, "scheduled")}
+              disabled={isBusy}
+              title="Resume future runs in this series"
+            >
+              {busyStatusEventId === eventId ? "Updating..." : "Resume series"}
+            </button>
+          ) : cleared ? (
             <button
               type="button"
               onClick={() => handleSetEventStatus(evt, "pending")}
               disabled={isBusy}
               title="Move this event back into the active list"
             >
-              {busyStatusEventId === evt.id ? "Updating..." : "Reopen"}
+              {busyStatusEventId === eventId ? "Updating..." : "Reopen"}
             </button>
+          ) : recurring ? (
+            <>
+              <button
+                type="button"
+                onClick={() => handleSetEventStatus(evt, "paused")}
+                disabled={isBusy}
+                title="Pause future runs without deleting the series"
+              >
+                {busyStatusEventId === eventId ? "Updating..." : "Pause series"}
+              </button>
+              <button
+                type="button"
+                onClick={() => handleSetEventStatus(evt, "acknowledged")}
+                disabled={isBusy}
+                title="End future occurrences without stopping a run already in progress"
+              >
+                End future series
+              </button>
+            </>
           ) : (
             <>
               <button
@@ -407,7 +626,7 @@ const CalendarTab = ({ focusEventId = null }) => {
                 disabled={isBusy}
                 title="Mark complete without deleting the event"
               >
-                {busyStatusEventId === evt.id ? "Updating..." : "Done"}
+                {busyStatusEventId === eventId ? "Updating..." : "Done"}
               </button>
               <button
                 type="button"
@@ -419,6 +638,15 @@ const CalendarTab = ({ focusEventId = null }) => {
               </button>
             </>
           )}
+          {hasCurrentRun ? (
+            <Link
+              className="calendar-event-activity-link"
+              to="/work-history"
+              title="Open Activity to request a cooperative stop for the current run"
+            >
+              Request current run stop
+            </Link>
+          ) : null}
           <button
             type="button"
             onClick={() => handleEditEvent(evt)}
@@ -429,11 +657,11 @@ const CalendarTab = ({ focusEventId = null }) => {
           </button>
           <button
             type="button"
-            onClick={() => handleDeleteEvent(evt.id)}
+            onClick={() => handleDeleteEvent(eventId)}
             disabled={isBusy}
             title="Delete event"
           >
-            {busyDeleteEventId === evt.id ? "Deleting..." : "Delete"}
+            {busyDeleteEventId === eventId ? "Deleting..." : "Delete"}
           </button>
         </div>
       </li>
@@ -466,6 +694,13 @@ const CalendarTab = ({ focusEventId = null }) => {
           </span>
         }
       />
+      <div className="calendar-workflow-note">
+        <span>
+          Calendar shows when work will run. Current-session work stays in Agent
+          Console; completed run receipts stay in Activity.
+        </span>
+        <Link to="/work-history">Open Activity</Link>
+      </div>
       <div className="calendar">
         <div className="calendar-header">
           <button onClick={prevMonth} type="button" aria-label="Previous month">
@@ -543,7 +778,7 @@ const CalendarTab = ({ focusEventId = null }) => {
                       }}
                     >
                       {date.getDate()}
-                      {eventDates.has(date.toDateString()) && (
+                      {eventDates.has(civilDateKey(date)) && (
                         <span className="event-dot" />
                       )}
                     </div>
@@ -558,7 +793,12 @@ const CalendarTab = ({ focusEventId = null }) => {
             <Rect height={240} />
           </div>
         ) : (
-          <WeekView startDate={selectedDate} />
+          <WeekView
+            startDate={selectedDate}
+            events={scheduledEventsForWeek}
+            onEventClick={handleEditEvent}
+            timeZone={displayTimezone}
+          />
         )}
       </div>
 
@@ -591,7 +831,9 @@ const CalendarTab = ({ focusEventId = null }) => {
             </button>
           </div>
         </div>
-        {eventError && <div className="calendar-error">{eventError}</div>}
+        {(eventError || occurrenceError) && (
+          <div className="calendar-error">{eventError || occurrenceError}</div>
+        )}
         {loading ? (
           <div style={{ padding: 12 }}>
             <Line width="50%" />
@@ -610,6 +852,17 @@ const CalendarTab = ({ focusEventId = null }) => {
                 No active events scheduled for this day.
               </p>
             )}
+
+            {pausedEventsForSelectedDay.length ? (
+              <div className="calendar-paused-section">
+                <p className="calendar-cleared-label">
+                  Paused series ({pausedEventsForSelectedDay.length})
+                </p>
+                <ul className="calendar-events-list calendar-events-list-paused">
+                  {pausedEventsForSelectedDay.map((evt) => renderEventRow(evt))}
+                </ul>
+              </div>
+            ) : null}
 
             {clearedEventsForSelectedDay.length ? (
               <div className="calendar-cleared-section">

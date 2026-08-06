@@ -2,7 +2,7 @@
 
 Purpose: track every open source license used by Float (runtime, dev, and bundled services). This is a living document; complete before launch.
 
-Status note (2026-07-25): dependency versions below are aligned with the direct dependency pins in `pyproject.toml` and `frontend/package.json`, but most licenses are still marked `TBD` until the formal launch audit workflow at the bottom is run.
+Status note (2026-07-09): dependency versions below are aligned with the direct dependency pins in `pyproject.toml` and `frontend/package.json`, but most licenses are still marked `TBD` until the audit workflow at the bottom is run.
 
 ## Project license
 - Float repository: GNU Affero General Public License v3.0 only (see `LICENSE`).
@@ -47,10 +47,10 @@ Status note (2026-07-25): dependency versions below are aligned with the direct 
 | python-dateutil | ^2.9.0 | TBD | runtime |
 | pywebpush | ^1.14.0 | TBD | runtime |
 | python-json-logger | ^2.0.7 | TBD | optional (telemetry) |
-| opentelemetry-exporter-otlp | ^1.39.1 | TBD | optional (telemetry) |
-| opentelemetry-instrumentation-fastapi | ^0.60b1 | TBD | optional (telemetry) |
-| opentelemetry-instrumentation-requests | ^0.60b1 | TBD | optional (telemetry) |
-| opentelemetry-instrumentation-logging | ^0.60b1 | TBD | optional (telemetry) |
+| opentelemetry-exporter-otlp | ^1.27.0 | TBD | optional (telemetry) |
+| opentelemetry-instrumentation-fastapi | ^0.48b0 | TBD | optional (telemetry) |
+| opentelemetry-instrumentation-requests | ^0.48b0 | TBD | optional (telemetry) |
+| opentelemetry-instrumentation-logging | ^0.48b0 | TBD | optional (telemetry) |
 | prometheus-client | ^0.20.0 | TBD | optional (telemetry) |
 | flower | ^2.0.1 | TBD | optional worker monitoring dashboard |
 | scikit-learn | ^1.5.0 | TBD | runtime |
@@ -64,8 +64,6 @@ Status note (2026-07-25): dependency versions below are aligned with the direct 
 | open-clip-torch | 3.2.0 | TBD | runtime vision indexing |
 | torch | 2.10.0 | TBD | runtime inference; wheel index may be CPU or CUDA |
 | torchvision | 0.25.0 | TBD | runtime vision indexing/direct-local |
-| openai | ^2.44.0 | TBD | runtime OpenAI-compatible client |
-| tinker | ^0.23.0 | TBD | runtime Tinker / Inkling provider client |
 
 ## Python dev dependencies
 | Package | Version | License | Notes |

@@ -87,3 +87,75 @@ def test_build_memory_graph_projects_threads_onto_conversation_anchors(monkeypat
     assert projection_links[0]["category"] == "thread"
     assert graph["metadata"]["thread_count"] == 1
     assert graph["metadata"]["thread_projection_count"] == 1
+
+
+def test_build_memory_graph_does_not_cold_start_or_call_remote_embedder(monkeypatch):
+    class ColdRagService:
+        _embedding_encoder = None
+
+        def _embed_text(self, _text):
+            raise AssertionError(
+                "graph rendering must not initialize the configured embedder"
+            )
+
+    monkeypatch.setattr(
+        memory_graph_service,
+        "get_rag_service",
+        lambda raise_http=False: ColdRagService(),
+    )
+
+    graph = memory_graph_service.build_memory_graph(
+        [{"key": "fast_graph", "value": {"topic": "performance"}}]
+    )
+
+    assert graph["metadata"]["embeddings_source"] == "hash_fallback"
+
+
+def test_build_memory_graph_batches_an_already_loaded_encoder(monkeypatch):
+    class LoadedEncoder:
+        def __init__(self):
+            self.calls = 0
+
+        def encode(self, texts):
+            self.calls += 1
+            return [[float(index), 1.0] for index, _text in enumerate(texts, start=1)]
+
+    encoder = LoadedEncoder()
+    rag_service = type("LoadedRagService", (), {"_embedding_encoder": encoder})()
+    monkeypatch.setattr(
+        memory_graph_service,
+        "get_rag_service",
+        lambda raise_http=False: rag_service,
+    )
+
+    graph = memory_graph_service.build_memory_graph(
+        [
+            {"key": "first", "value": "one"},
+            {"key": "second", "value": "two"},
+        ]
+    )
+
+    assert encoder.calls == 1
+    assert graph["metadata"]["embeddings_source"] == "rag_service"
+
+
+def test_build_memory_graph_fast_mode_skips_loaded_encoder(monkeypatch):
+    class LoadedEncoder:
+        def encode(self, _texts):
+            raise AssertionError("fast graph projection must skip model work")
+
+    rag_service = type(
+        "LoadedRagService", (), {"_embedding_encoder": LoadedEncoder()}
+    )()
+    monkeypatch.setattr(
+        memory_graph_service,
+        "get_rag_service",
+        lambda raise_http=False: rag_service,
+    )
+
+    graph = memory_graph_service.build_memory_graph(
+        [{"key": "fast", "value": "projection"}],
+        use_loaded_embeddings=False,
+    )
+
+    assert graph["metadata"]["embeddings_source"] == "hash_fallback"

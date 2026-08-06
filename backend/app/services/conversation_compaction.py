@@ -967,7 +967,7 @@ def write_compaction(
                 compaction["replace"] = bool(replace)
                 if isinstance(context_budget_plan, dict):
                     compaction["budget_plan"] = context_budget_plan
-    conversation_store.save_conversation(target, compacted)
+    conversation_store.replace_conversation_content(target, compacted)
     display_name = str(result.get("proposed_target_conversation_name") or "").strip()
     if display_name:
         try:

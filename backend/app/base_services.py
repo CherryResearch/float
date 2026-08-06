@@ -52,6 +52,7 @@ from app.provider_transports.openai_responses_ws import (
 )
 from app.server_presets import resolve_server_auth_token, server_trust_warning
 from app.utils import blob_store
+from app.utils.attachment_metadata import sanitize_attachment_source_url
 from app.utils.blob_store import get_blob as load_blob
 from app.utils.graph_store import GraphStore
 from app.utils.hardware import gpu_memory_snapshot, system_memory_snapshot
@@ -465,10 +466,10 @@ def _float_local_torch_install_guidance() -> str:
 
 
 from workers.multimodal import (
-    VisionCaptioner,
     is_placeholder_caption,
     placeholder_caption,
     resolve_vision_caption_model,
+    run_shared_vision_captioner,
 )
 
 from . import config as app_config
@@ -577,6 +578,62 @@ def _model_supports_native_images(model_name: Any) -> bool:
     return any(token in normalized for token in _VISION_NATIVE_MODEL_HINTS)
 
 
+_JSON_SCHEMA_MAP_KEYS = {
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+    "patternProperties",
+    "properties",
+}
+_JSON_SCHEMA_SINGLE_KEYS = {
+    "additionalProperties",
+    "contains",
+    "else",
+    "if",
+    "items",
+    "not",
+    "propertyNames",
+    "then",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+}
+_JSON_SCHEMA_LIST_KEYS = {"allOf", "anyOf", "oneOf", "prefixItems"}
+
+
+def _compact_tool_json_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop display-only schema titles without changing validation semantics."""
+
+    compacted: Dict[str, Any] = {}
+    for key, value in schema.items():
+        if key == "title":
+            continue
+        if key in _JSON_SCHEMA_MAP_KEYS and isinstance(value, dict):
+            compacted[key] = {
+                child_name: (
+                    _compact_tool_json_schema(child_schema)
+                    if isinstance(child_schema, dict)
+                    else copy.deepcopy(child_schema)
+                )
+                for child_name, child_schema in value.items()
+            }
+            continue
+        if key in _JSON_SCHEMA_SINGLE_KEYS and isinstance(value, dict):
+            compacted[key] = _compact_tool_json_schema(value)
+            continue
+        if key in _JSON_SCHEMA_LIST_KEYS and isinstance(value, list):
+            compacted[key] = [
+                (
+                    _compact_tool_json_schema(child_schema)
+                    if isinstance(child_schema, dict)
+                    else copy.deepcopy(child_schema)
+                )
+                for child_schema in value
+            ]
+            continue
+        compacted[key] = copy.deepcopy(value)
+    return compacted
+
+
 def _convert_tools_for_openai(
     tools: Sequence[Dict[str, Any]], *, responses_api: bool = False
 ) -> List[Dict[str, Any]]:
@@ -630,7 +687,9 @@ def _convert_tools_for_openai(
                 "type": "object",
                 "properties": dict(params) if isinstance(params, dict) else {},
             }
-        tool_parameters = params or {"type": "object", "properties": {}}
+        tool_parameters = _compact_tool_json_schema(
+            params or {"type": "object", "properties": {}}
+        )
         if responses_api:
             tool_entry = {
                 "type": "function",
@@ -823,7 +882,9 @@ def _extract_attachment_hash(url_value: Any) -> Optional[str]:
     segments = [segment for segment in path.split("/") if segment]
     for idx, segment in enumerate(segments):
         if segment == "attachments" and idx + 1 < len(segments):
-            return segments[idx + 1]
+            candidate = segments[idx + 1]
+            if blob_store.is_canonical_content_hash(candidate):
+                return candidate
     return None
 
 
@@ -869,7 +930,7 @@ def get_capture_service():
     return _get_capture_service()
 
 
-def _read_safe_attachment_path(path_value: Any) -> Optional[bytes]:
+def _resolve_safe_attachment_path(path_value: Any) -> Optional[Path]:
     raw_value = str(path_value or "").strip()
     if not raw_value:
         return None
@@ -930,10 +991,20 @@ def _read_safe_attachment_path(path_value: Any) -> Optional[bytes]:
             continue
         try:
             if target.exists() and target.is_file():
-                return target.read_bytes()
+                return target
         except Exception:
             continue
     return None
+
+
+def _read_safe_attachment_path(path_value: Any) -> Optional[bytes]:
+    target = _resolve_safe_attachment_path(path_value)
+    if target is None:
+        return None
+    try:
+        return target.read_bytes()
+    except Exception:
+        return None
 
 
 def _read_capture_service_path(service: Any, path_value: Any) -> Optional[bytes]:
@@ -977,7 +1048,7 @@ def _resolve_capture_attachment_bytes(
         if raw is not None:
             return raw
 
-    if service is not None and content_hash:
+    if service is not None and blob_store.is_canonical_content_hash(content_hash):
         try:
             target = service.capture_path_for_content_hash(content_hash)
         except Exception:
@@ -990,9 +1061,11 @@ def _resolve_capture_attachment_bytes(
 
 
 def _resolve_attachment_bytes(att: Dict[str, Any]) -> Tuple[Optional[bytes], str]:
+    supplied_hash = str(att.get("content_hash") or att.get("contentHash") or "").strip()
     content_hash = (
-        str(att.get("content_hash") or att.get("contentHash") or "").strip()
-        or _extract_attachment_hash(att.get("url"))
+        supplied_hash
+        if blob_store.is_canonical_content_hash(supplied_hash)
+        else _extract_attachment_hash(att.get("url"))
         or _extract_attachment_hash(att.get("remoteUrl"))
     )
     if content_hash:
@@ -1005,13 +1078,10 @@ def _resolve_attachment_bytes(att: Dict[str, Any]) -> Tuple[Optional[bytes], str
     if raw is not None:
         return raw, "capture"
 
-    for key in ("relative_path", "relativePath", "path"):
-        raw = _read_safe_attachment_path(att.get(key))
-        if raw is not None:
-            return raw, key
-
     if content_hash:
         return None, "missing_blob"
+    if supplied_hash:
+        return None, "invalid_content_hash"
     if (
         att.get("capture_id")
         or att.get("captureId")
@@ -1122,7 +1192,7 @@ class ModelContext:
 
 
 logger = logging.getLogger(__name__)
-MAX_INLINE_ATTACHMENTS = 3
+MAX_INLINE_ATTACHMENTS = 4
 
 
 class LLMService:
@@ -1291,12 +1361,11 @@ class LLMService:
             if not path_value or path_value in seen_keys:
                 continue
             seen_keys.add(path_value)
-            try:
-                _maybe_open_image_bytes(
-                    Path(path_value).read_bytes(), Path(path_value).name
-                )
-            except Exception:
+            raw = _read_safe_attachment_path(path_value)
+            if raw is None:
                 _add_ignored(Path(path_value).name, "missing_file")
+                continue
+            _maybe_open_image_bytes(raw, Path(path_value).name)
 
         return images, ignored
 
@@ -2060,7 +2129,10 @@ class LLMService:
         return 120.0
 
     def _compose_timeout(
-        self, streaming: bool, attempt: int = 0
+        self,
+        streaming: bool,
+        attempt: int = 0,
+        minimum_read_timeout: Optional[float] = None,
     ) -> Tuple[float, float]:
         """Compose connect/read timeout tuple suitable for requests.post."""
 
@@ -2083,6 +2155,11 @@ class LLMService:
             max(connect, backoff_start * (2**backoff_attempt)),
             backoff_end,
         )
+        if minimum_read_timeout is not None:
+            try:
+                progressive = max(progressive, float(minimum_read_timeout))
+            except (TypeError, ValueError):
+                pass
         return (connect, progressive)
 
     def _openai_responses_ws_enabled(self) -> bool:
@@ -2513,6 +2590,10 @@ class LLMService:
         text_parts: List[str] = []
         analysis_trace: List[Dict[str, Any]] = []
         tool_calls_accum: List[Dict[str, Any]] = []
+        responses_function_calls: List[Dict[str, Any]] = []
+        response_function_call_by_output_index: Dict[int, int] = {}
+        response_function_call_by_item_id: Dict[str, int] = {}
+        response_function_call_by_call_id: Dict[str, int] = {}
         finish_reason: Optional[str] = None
         usage: Optional[Dict[str, Any]] = None
         last_message: Optional[Dict[str, Any]] = None
@@ -2613,6 +2694,94 @@ class LLMService:
             item_id = str(item.get("id") or "").strip()
             if item_id:
                 response_item_phase_by_id[item_id] = phase
+
+        def _response_function_call_target(
+            *,
+            output_index: Any = None,
+            item_id: Any = None,
+            call_id: Any = None,
+        ) -> tuple[Dict[str, Any], int]:
+            normalized_item_id = str(item_id or "").strip()
+            normalized_call_id = str(call_id or "").strip()
+            target_index: Optional[int] = None
+            if normalized_call_id:
+                target_index = response_function_call_by_call_id.get(normalized_call_id)
+            if target_index is None and normalized_item_id:
+                target_index = response_function_call_by_item_id.get(normalized_item_id)
+            if target_index is None and isinstance(output_index, int):
+                target_index = response_function_call_by_output_index.get(output_index)
+            if target_index is None:
+                target_index = len(responses_function_calls)
+                responses_function_calls.append({"arguments": ""})
+
+            target = responses_function_calls[target_index]
+            if isinstance(output_index, int):
+                response_function_call_by_output_index[output_index] = target_index
+            if normalized_item_id:
+                target["item_id"] = normalized_item_id
+                response_function_call_by_item_id[normalized_item_id] = target_index
+            if normalized_call_id:
+                target["call_id"] = normalized_call_id
+                response_function_call_by_call_id[normalized_call_id] = target_index
+            return target, target_index
+
+        def _remember_response_function_call(
+            item: Any,
+            output_index: Any = None,
+            *,
+            complete: bool = False,
+        ) -> Optional[Dict[str, Any]]:
+            if not isinstance(item, dict) or item.get("type") != "function_call":
+                return None
+            item_id = str(item.get("id") or "").strip()
+            call_id = str(item.get("call_id") or item_id).strip()
+            target, _ = _response_function_call_target(
+                output_index=output_index,
+                item_id=item_id,
+                call_id=call_id,
+            )
+            name = str(item.get("name") or "").strip()
+            if name:
+                target["name"] = name
+            arguments = item.get("arguments")
+            if isinstance(arguments, str):
+                target["arguments"] = arguments
+            elif isinstance(arguments, dict):
+                target["parsed_args"] = arguments
+            if complete:
+                target["complete"] = True
+            target["response_item"] = dict(item)
+            return target
+
+        def _remember_response_function_arguments(
+            event: Dict[str, Any], *, complete: bool
+        ) -> None:
+            target, target_index = _response_function_call_target(
+                output_index=event.get("output_index"),
+                item_id=event.get("item_id"),
+                call_id=event.get("call_id"),
+            )
+            name = str(event.get("name") or "").strip()
+            if name:
+                target["name"] = name
+            raw_arguments = event.get("arguments") if complete else event.get("delta")
+            if not isinstance(raw_arguments, str):
+                return
+            if complete:
+                target["arguments"] = raw_arguments
+                target["complete"] = True
+            else:
+                current = target.get("arguments")
+                if not isinstance(current, str):
+                    current = ""
+                target["arguments"] = f"{current}{raw_arguments}"
+            if not complete:
+                _emit_tool_delta(
+                    target.get("name"),
+                    target.get("arguments"),
+                    target_index,
+                    raw_arguments,
+                )
 
         def _response_event_phase(event: Dict[str, Any]) -> str:
             phase = (
@@ -2848,15 +3017,23 @@ class LLMService:
                             "response.output_item.added",
                             "response.output_item.done",
                         }:
-                            _remember_response_item(
-                                chunk.get("item"),
-                                chunk.get("output_index"),
+                            response_item = chunk.get("item")
+                            output_index = chunk.get("output_index")
+                            _remember_response_item(response_item, output_index)
+                            _remember_response_function_call(
+                                response_item,
+                                output_index,
+                                complete=lowered == "response.output_item.done",
                             )
                         elif lowered in {
                             "response.content_part.added",
                             "response.content_part.done",
                         }:
                             pass
+                        elif lowered == "response.function_call_arguments.delta":
+                            _remember_response_function_arguments(chunk, complete=False)
+                        elif lowered == "response.function_call_arguments.done":
+                            _remember_response_function_arguments(chunk, complete=True)
                         elif lowered == "response.output_text.delta":
                             delta = chunk.get("delta")
                             if isinstance(delta, dict):
@@ -3145,6 +3322,27 @@ class LLMService:
         if isinstance(final_response_payload, dict) and final_response_payload:
             final_visible_text = _extract_responses_visible_text(final_response_payload)
             final_tool_text = _extract_responses_tool_text(final_response_payload)
+            for function_call in _extract_responses_function_calls(
+                final_response_payload
+            ):
+                response_item = function_call.get("response_item")
+                target = _remember_response_function_call(
+                    response_item,
+                    complete=True,
+                )
+                if target is None:
+                    target, _ = _response_function_call_target(
+                        call_id=function_call.get("call_id")
+                    )
+                    target["complete"] = True
+                name = str(function_call.get("name") or "").strip()
+                if name:
+                    target["name"] = name
+                call_id = str(function_call.get("call_id") or "").strip()
+                if call_id:
+                    target["call_id"] = call_id
+                if "args" in function_call:
+                    target["parsed_args"] = function_call.get("args")
             if final_tool_text and not response_tool_text_parts:
                 response_tool_text_parts.append(final_tool_text)
             if final_visible_text and not text_parts:
@@ -3169,6 +3367,32 @@ class LLMService:
                         parsed_args = args
                 if name:
                     tools_used.append({"name": name, "args": parsed_args})
+
+        for call in responses_function_calls:
+            if not call.get("complete"):
+                continue
+            name = str(call.get("name") or "").strip()
+            if not name:
+                continue
+            if "parsed_args" in call:
+                parsed_args = call.get("parsed_args")
+            else:
+                parsed_args = call.get("arguments") or {}
+                if isinstance(parsed_args, str):
+                    try:
+                        parsed_args = json.loads(parsed_args)
+                    except Exception:
+                        continue
+            if not isinstance(parsed_args, dict):
+                continue
+            tool_record: Dict[str, Any] = {"name": name, "args": parsed_args}
+            call_id = str(call.get("call_id") or "").strip()
+            if call_id:
+                tool_record["call_id"] = call_id
+            response_item = call.get("response_item")
+            if isinstance(response_item, dict):
+                tool_record["response_item"] = response_item
+            tools_used.append(tool_record)
 
         inline_tool_payloads: List[str] = []
         response_tool_text = "".join(response_tool_text_parts).strip()
@@ -3469,6 +3693,42 @@ class LLMService:
         """
         Generate text via an OpenAI-style Chat Completion API.
         """
+
+        def _provider_failure_text(category: str) -> str:
+            messages = {
+                "api_key_missing": "No API key is configured for the model provider.",
+                "model_missing": "No API model is configured for this request.",
+                "timeout": "The model provider timed out before returning a response.",
+                "connection_error": "Float could not connect to the model provider.",
+                "unauthorized": "The model provider rejected the configured credentials.",
+                "endpoint_not_found": "The configured model provider endpoint was not found.",
+                "rate_limited": "The model provider is temporarily rate limited.",
+                "server_error": "The model provider returned a server error.",
+            }
+            return messages.get(
+                category,
+                "The model provider request failed before returning a response.",
+            )
+
+        def _provider_failure_hint(category: str) -> str:
+            hints = {
+                "timeout": (
+                    "Retry the turn. For long reasoning or tool calls, raise the request "
+                    "or stream idle timeout in Settings."
+                ),
+                "connection_error": (
+                    "Verify the provider endpoint is reachable, then retry the turn."
+                ),
+                "unauthorized": "Verify the provider API key in Settings.",
+                "endpoint_not_found": "Verify the provider endpoint and selected model.",
+                "rate_limited": "Wait briefly and retry the turn.",
+                "server_error": "Retry the turn or check the provider service status.",
+            }
+            return hints.get(
+                category,
+                "Verify the API key, endpoint, and model in Settings, or switch modes.",
+            )
+
         tool_executor = kwargs.pop("tool_executor", None)
         native_tool_definitions = kwargs.pop("native_tool_definitions", None)
         attachments_param = kwargs.pop("attachments", None) or []
@@ -3498,11 +3758,15 @@ class LLMService:
         )
         vision_fallback_details: List[Dict[str, Any]] = []
         vision_fallback_seen: Set[str] = set()
-        vision_captioner: Optional[VisionCaptioner] = None
         configured_vision_model = resolve_vision_caption_model(
             str(self.config.get("vision_model") or "").strip(),
             str(os.getenv("VISION_CAPTION_MODEL") or "").strip(),
         )
+        image_caption_engine = (
+            str(self.config.get("image_caption_engine") or "local").strip().lower()
+        )
+        if image_caption_engine not in {"local", "cloud", "off"}:
+            image_caption_engine = "local"
 
         def _coerce_iso_timestamp(metadata: Any) -> Optional[str]:
             if not isinstance(metadata, dict):
@@ -3568,7 +3832,9 @@ class LLMService:
             segments = [segment for segment in path.split("/") if segment]
             for idx, segment in enumerate(segments):
                 if segment == "attachments" and idx + 1 < len(segments):
-                    return segments[idx + 1]
+                    candidate = segments[idx + 1]
+                    if blob_store.is_canonical_content_hash(candidate):
+                        return candidate
             return None
 
         def _ensure_list_content(raw_content: Any) -> List[Dict[str, Any]]:
@@ -3591,8 +3857,11 @@ class LLMService:
         def _inline_image_part(
             att: Dict[str, Any], mime_hint: Optional[str]
         ) -> Optional[Dict[str, Any]]:
-            content_hash = att.get("content_hash") or _extract_hash_from_url(
-                att.get("url")
+            supplied_hash = str(att.get("content_hash") or "").strip()
+            content_hash = (
+                supplied_hash
+                if blob_store.is_canonical_content_hash(supplied_hash)
+                else _extract_hash_from_url(att.get("url"))
             )
             raw, reason = _resolve_attachment_bytes(att)
             if raw is None:
@@ -3617,27 +3886,105 @@ class LLMService:
                 "image_url": {"url": f"data:{mime};base64,{encoded}"},
             }
 
-        def _get_vision_captioner() -> VisionCaptioner:
-            nonlocal vision_captioner
-            if vision_captioner is None:
-                vision_captioner = VisionCaptioner(model=configured_vision_model)
-            return vision_captioner
+        def _canonical_image_reference_details(att: Dict[str, Any]) -> Dict[str, str]:
+            """Return prompt-safe storage facts added by route-side canonical lookup."""
 
-        def _local_vision_fallback_part(att: Dict[str, Any]) -> Dict[str, Any]:
-            label = att.get("name") or "image"
+            if att.get("_canonical_attachment_resolved") is not True:
+                return {}
+            supplied_hash = str(att.get("content_hash") or "").strip()
+            if not blob_store.is_canonical_content_hash(supplied_hash):
+                return {}
+
+            details: Dict[str, str] = {"content_hash": supplied_hash}
+            relative_path = str(
+                att.get("relative_path") or att.get("relativePath") or ""
+            ).strip()
+            if relative_path:
+                try:
+                    if blob_store.resolve_managed_path(relative_path) is not None:
+                        details["relative_path"] = relative_path.replace("\\", "/")
+                except Exception:
+                    pass
+
+            raw_url = str(att.get("url") or "").strip()
+            if raw_url:
+                try:
+                    parsed = urlparse(raw_url)
+                    expected_prefix = f"/api/attachments/{supplied_hash}/"
+                    if (
+                        not parsed.scheme
+                        and not parsed.netloc
+                        and not parsed.query
+                        and not parsed.fragment
+                        and parsed.path.startswith(expected_prefix)
+                    ):
+                        details["url"] = parsed.path
+                except Exception:
+                    pass
+
+            try:
+                source_url = sanitize_attachment_source_url(att.get("source_url"))
+            except ValueError:
+                source_url = ""
+            if source_url:
+                details["source_url"] = source_url
+                recorded_at = str(att.get("source_url_recorded_at") or "").strip()
+                if (
+                    recorded_at
+                    and len(recorded_at) <= 64
+                    and not any(ord(character) < 32 for character in recorded_at)
+                ):
+                    details["source_url_recorded_at"] = recorded_at
+            return details
+
+        def _local_vision_fallback_part(
+            att: Dict[str, Any], attachment_ordinal: int
+        ) -> Dict[str, Any]:
+            label = att.get("display_name") or att.get("name") or "image"
             ref = att.get("url") or att.get("remoteUrl") or ""
-            content_hash = att.get("content_hash") or _extract_hash_from_url(ref)
+            supplied_hash = str(att.get("content_hash") or "").strip()
+            content_hash = (
+                supplied_hash
+                if blob_store.is_canonical_content_hash(supplied_hash)
+                else _extract_hash_from_url(ref)
+            )
             capture_id = str(
                 att.get("capture_id") or att.get("captureId") or ""
             ).strip() or _extract_capture_id(ref)
-            raw, _resolve_reason = _resolve_attachment_bytes(att)
-            caption = ""
+            caption_status = str(att.get("caption_status") or "").strip().lower()
+            stored_caption = str(att.get("caption") or "").strip()
+            caption = (
+                stored_caption
+                if att.get("_canonical_attachment_resolved") is True
+                and caption_status in {"manual", "generated"}
+                and stored_caption
+                and not is_placeholder_caption(stored_caption)
+                and not bool(att.get("placeholder_caption"))
+                else ""
+            )
+            used_stored_caption = bool(caption)
             placeholder = False
-            caption_model = configured_vision_model or "vision-captioner"
-            if raw:
+            caption_model = (
+                str(att.get("caption_model") or "").strip() or "stored-caption"
+                if caption
+                else (
+                    configured_vision_model if image_caption_engine == "local" else None
+                )
+            )
+            raw = None
+            if not caption:
+                raw, _resolve_reason = _resolve_attachment_bytes(att)
+            if not caption and raw and image_caption_engine == "local":
                 try:
-                    result = _get_vision_captioner().run(raw)
-                    caption_model = getattr(vision_captioner, "model", caption_model)
+                    captioner, result = run_shared_vision_captioner(
+                        raw,
+                        model=configured_vision_model,
+                        models_folder=str(
+                            self.config.get("models_folder") or ""
+                        ).strip()
+                        or None,
+                    )
+                    caption_model = getattr(captioner, "model", caption_model)
                     if isinstance(result, str):
                         caption = result
                         placeholder = is_placeholder_caption(caption)
@@ -3677,7 +4024,7 @@ class LLMService:
                 int(existing_detail.get("index"))
                 if isinstance(existing_detail, dict)
                 and isinstance(existing_detail.get("index"), int)
-                else len(vision_fallback_details) + 1
+                else attachment_ordinal
             )
             if detail_key and detail_key not in vision_fallback_seen:
                 vision_fallback_seen.add(detail_key)
@@ -3691,28 +4038,88 @@ class LLMService:
                         "caption": caption,
                         "placeholder": placeholder,
                         "caption_model": caption_model,
+                        "caption_engine": image_caption_engine,
+                        "caption_origin": (
+                            "stored" if used_stored_caption else "generated_for_chat"
+                        ),
                     }
                 )
             if placeholder:
+                if image_caption_engine == "off":
+                    unavailable_reason = "Image caption generation is disabled."
+                elif image_caption_engine == "cloud":
+                    unavailable_reason = (
+                        "Float did not send the image to a separate cloud captioning "
+                        "service as an implicit chat fallback."
+                    )
+                else:
+                    unavailable_reason = (
+                        "Float could not generate a usable local image description."
+                    )
                 text = (
                     "Image delivery notice: The selected model did not receive visual "
-                    f"content for Image {entry_index} ({label}). Float could not generate "
-                    "a usable local image description. Do not infer visual details; tell "
-                    "the user that visual input was unavailable."
+                    f"content for Image {entry_index} ({label}). {unavailable_reason} "
+                    "Do not infer visual details; tell the user that visual input was "
+                    "unavailable."
                 )
             else:
-                prefix = {
-                    "ocr": "Local vision fallback summary. Read visible text cautiously:",
-                    "compare": "Local vision fallback summary for comparison:",
-                    "caption": "Local vision fallback caption:",
-                }.get(vision_workflow, "Local vision fallback summary:")
+                prefix = (
+                    "Saved attachment caption:"
+                    if used_stored_caption
+                    else {
+                        "ocr": (
+                            "Local vision fallback summary. "
+                            "Read visible text cautiously:"
+                        ),
+                        "compare": "Local vision fallback summary for comparison:",
+                        "caption": "Local vision fallback caption:",
+                    }.get(vision_workflow, "Local vision fallback summary:")
+                )
                 text = f"{prefix} Image {entry_index} ({label}): {caption}"
-            if ref:
-                text = f"{text} [{ref}]"
+            canonical_ref = _canonical_image_reference_details(att).get("url")
+            if canonical_ref:
+                text = f"{text} [{canonical_ref}]"
             return {"type": "text", "text": text}
 
+        def _native_image_reference_part(
+            att: Dict[str, Any], attachment_ordinal: int
+        ) -> Dict[str, Any]:
+            label = (
+                str(att.get("display_name") or att.get("name") or "image").strip()
+                or "image"
+            )
+            canonical = _canonical_image_reference_details(att)
+            content_hash = canonical.get("content_hash", "")
+            relative_path = canonical.get("relative_path", "")
+            ref = canonical.get("url", "")
+            source_url = canonical.get("source_url", "")
+            source_url_recorded_at = canonical.get("source_url_recorded_at", "")
+            details = [f"Image {attachment_ordinal} ({label})"]
+            if content_hash:
+                details.append(
+                    f"content_hash={content_hash} (durable attachment/sync id)"
+                )
+            if relative_path:
+                details.append(
+                    "relative_path="
+                    f"{relative_path} (current managed deployment-relative storage path)"
+                )
+            if ref:
+                details.append(f"url={ref} (reconstructable API retrieval route)")
+            if source_url:
+                recorded = (
+                    f", recorded {source_url_recorded_at}"
+                    if source_url_recorded_at
+                    else ""
+                )
+                details.append(
+                    f"source_url={source_url} (recorded external provenance{recorded}; "
+                    "not the durable copy)"
+                )
+            return {"type": "text", "text": "; ".join(details)}
+
         def _attachment_to_part(
-            att: Dict[str, Any], allow_inline_image: bool
+            att: Dict[str, Any], allow_inline_image: bool, attachment_ordinal: int
         ) -> Optional[Dict[str, Any]]:
             att_type = (att.get("type") or "").lower()
             if not att_type:
@@ -3724,8 +4131,8 @@ class LLMService:
                     inline = _inline_image_part(att, att_type)
                     if inline:
                         return inline
-                return _local_vision_fallback_part(att)
-            label = att.get("name") or "attachment"
+                return _local_vision_fallback_part(att, attachment_ordinal)
+            label = att.get("display_name") or att.get("name") or "attachment"
             ref = att.get("url") or att.get("remoteUrl") or ""
             text = f"[Attachment: {label}]".strip()
             if ref:
@@ -3741,22 +4148,45 @@ class LLMService:
                 return []
             slots = inline_slots
             parts: List[Dict[str, Any]] = []
+            attachment_ordinal = 0
             for att in att_list:
                 if not isinstance(att, dict):
                     continue
-                key = att.get("content_hash") or att.get("url") or att.get("name")
+                key = _attachment_identity_key(att)
                 if key:
                     if key in seen_keys:
                         continue
                     seen_keys.add(key)
                 allow_inline = slots is None or slots > 0
-                part = _attachment_to_part(att, allow_inline_image=allow_inline)
+                next_ordinal = attachment_ordinal + 1
+                part = _attachment_to_part(
+                    att,
+                    allow_inline_image=allow_inline,
+                    attachment_ordinal=next_ordinal,
+                )
                 if not part:
                     continue
+                attachment_ordinal = next_ordinal
+                attachment_type = str(att.get("type") or "").strip().lower()
+                if not attachment_type:
+                    attachment_type = str(
+                        mimetypes.guess_type(str(att.get("name") or ""))[0] or ""
+                    ).lower()
+                if attachment_type.startswith("image/"):
+                    # Keep storage and provenance references available even when
+                    # native image delivery falls back to a local caption.
+                    parts.append(_native_image_reference_part(att, attachment_ordinal))
                 if part.get("type") == "image_url" and slots is not None and slots > 0:
                     slots -= 1
                 parts.append(part)
             return parts
+
+        def _attachment_identity_key(att: Any) -> str:
+            if not isinstance(att, dict):
+                return ""
+            return str(
+                att.get("content_hash") or att.get("url") or att.get("name") or ""
+            ).strip()
 
         def _merge_attachments(
             message_dict: Dict[str, Any],
@@ -3837,13 +4267,14 @@ class LLMService:
         if self.mode == "api" and not api_key:
             # Strictly require key for first‑party API mode
             return {
-                "text": f"You said: {prompt}",
+                "text": _provider_failure_text("api_key_missing"),
                 "thought": "",
                 "tools_used": [],
                 "metadata": {
                     "warning": "No API key configured",
                     "category": "api_key_missing",
                     "endpoint": configured_url,
+                    "hint": "Set an API key in Settings or switch modes.",
                 },
             }
         override_model = kwargs.pop("model", None)
@@ -3859,13 +4290,14 @@ class LLMService:
             model = model.strip()
         if not model and not use_server:
             return {
-                "text": f"You said: {prompt}",
+                "text": _provider_failure_text("model_missing"),
                 "thought": "",
                 "tools_used": [],
                 "metadata": {
                     "error": "No model configured",
                     "category": "model_missing",
                     "endpoint": configured_url,
+                    "hint": "Choose an API model in Settings and retry the turn.",
                 },
             }
         supports_native_images = _model_supports_native_images(model)
@@ -3886,7 +4318,14 @@ class LLMService:
             pass
         # Build messages for chat API using Harmony envelope
         messages: List[Dict[str, Any]] = []
-        attachment_seen_keys: Set[str] = set()
+        history_attachment_seen_keys: Set[str] = set()
+        prompt_attachment_keys = {
+            key
+            for key in (
+                _attachment_identity_key(attachment) for attachment in attachment_queue
+            )
+            if key
+        }
         if ctx.system_prompt:
             messages.append(
                 Message.from_role_and_content(Role.SYSTEM, ctx.system_prompt).to_dict()
@@ -3907,10 +4346,20 @@ class LLMService:
             meta_attachments = (
                 metadata.get("attachments") if isinstance(metadata, dict) else None
             )
-            msg_dict, attachment_seen_keys = _merge_attachments(
+            # An explicitly attached current-turn image is authoritative. Do not
+            # let an older occurrence consume it through conversation-wide dedupe.
+            history_attachments = [
+                attachment
+                for attachment in (meta_attachments or [])
+                if not (
+                    _attachment_identity_key(attachment)
+                    and _attachment_identity_key(attachment) in prompt_attachment_keys
+                )
+            ]
+            msg_dict, history_attachment_seen_keys = _merge_attachments(
                 msg_dict,
-                meta_attachments,
-                attachment_seen_keys,
+                history_attachments,
+                history_attachment_seen_keys,
             )
             iso_text = _coerce_iso_timestamp(metadata)
             msg_dict = _inject_timestamp_content(msg_dict, iso_text)
@@ -3938,20 +4387,20 @@ class LLMService:
                     continue
             if attachment_queue:
                 prompt_entry = Message.from_role_and_content(Role.USER, "").to_dict()
-                prompt_entry, attachment_seen_keys = _merge_attachments(
+                prompt_entry, _prompt_attachment_seen_keys = _merge_attachments(
                     prompt_entry,
                     attachment_queue,
-                    attachment_seen_keys,
+                    set(),
                 )
                 attachment_queue = []
                 messages.append(prompt_entry)
         else:
             prompt_entry = Message.from_role_and_content(Role.USER, prompt).to_dict()
             if attachment_queue:
-                prompt_entry, attachment_seen_keys = _merge_attachments(
+                prompt_entry, _prompt_attachment_seen_keys = _merge_attachments(
                     prompt_entry,
                     attachment_queue,
-                    attachment_seen_keys,
+                    set(),
                 )
                 attachment_queue = []
             prompt_entry = _inject_timestamp_content(
@@ -4010,8 +4459,9 @@ class LLMService:
                 {"type": "text", "text": "Consider these images in your answer."}
             )
             for entry in images[:3]:
-                p = Path(str(entry.get("path", "")))
-                if not p.exists() or not p.is_file():
+                raw_path = str(entry.get("path") or "").strip()
+                p = _resolve_safe_attachment_path(raw_path)
+                if p is None:
                     continue
                 try:
                     raw = p.read_bytes()
@@ -4289,6 +4739,9 @@ class LLMService:
             # Keep native Responses tools on the non-streaming path until output-item
             # streaming is normalized into Float's proposal lifecycle.
             streaming_enabled = False
+        responses_non_streaming = bool(
+            url.endswith(suffix_resp) and not streaming_enabled
+        )
         if (
             self._openai_responses_ws_enabled()
             and self.mode == "api"
@@ -4527,7 +4980,15 @@ class LLMService:
                     url,
                     headers=headers,
                     json=payload,
-                    timeout=self._compose_timeout(streaming=False, attempt=attempt),
+                    timeout=self._compose_timeout(
+                        streaming=False,
+                        attempt=attempt,
+                        minimum_read_timeout=(
+                            self.stream_idle_timeout
+                            if responses_non_streaming
+                            else None
+                        ),
+                    ),
                 )
                 if getattr(self, "mode", None) == "server":
                     try:
@@ -4611,12 +5072,9 @@ class LLMService:
                         "status_code": status_code,
                         "category": category,
                         "endpoint": url,
-                        "hint": (
-                            "Provider error or timeout. Verify API key and endpoint in /api/settings, "
-                            "or switch to local mode."
-                        ),
+                        "hint": _provider_failure_hint(category),
                     }
-                    fallback_text = f"You said: {prompt}"
+                    fallback_text = _provider_failure_text(category)
                     if request_id:
                         meta["request_id"] = request_id
                     provider_message = None
@@ -5517,7 +5975,11 @@ class LLMService:
                     else []
                 )
                 for entry in images[:3]:
-                    p = Path(str(entry.get("path", ""))).name
+                    raw_path = str(entry.get("path") or "").strip()
+                    safe_path = _resolve_safe_attachment_path(raw_path)
+                    if safe_path is None:
+                        continue
+                    p = safe_path.name
                     sc = entry.get("score")
                     if sc is not None:
                         context_prompt += f"image: {p} (score {sc})\n"
@@ -5886,15 +6348,15 @@ class MemoryManager:
     def _persist(self) -> None:
         if not self._store_path:
             return
-        snapshot: Dict[str, Any] = {}
-        for key, value in self.store.items():
-            try:
-                key_str = str(key)
-            except Exception:
-                continue
-            snapshot[key_str] = self._prepare_snapshot_item(value)
         with self._persist_lock:
             try:
+                snapshot: Dict[str, Any] = {}
+                for key, value in self.store.items():
+                    try:
+                        key_str = str(key)
+                    except Exception:
+                        continue
+                    snapshot[key_str] = self._prepare_snapshot_item(value)
                 memory_store.save(snapshot, self._store_path)
             except Exception:
                 logger.exception(
@@ -6307,9 +6769,11 @@ class MemoryManager:
         *,
         include_pruned: bool = False,
         touch: bool = False,
+        run_lifecycle_sweep: bool = True,
     ) -> list[tuple[str, dict]]:
         current_time = time.time()
-        self.sweep_lifecycle(current_time)
+        if run_lifecycle_sweep:
+            self.sweep_lifecycle(current_time)
         out: list[tuple[str, dict]] = []
         dirty = False
         for key in sorted(self.store.keys()):

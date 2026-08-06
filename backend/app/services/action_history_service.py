@@ -13,25 +13,21 @@ from uuid import uuid4
 
 from app import config as app_config
 from app.services import threads_service
+from app.services.calendar_jobs import merge_external_calendar_update
 from app.services.instance_sync_service import (
     SYNC_SECTION_LABELS,
     InstanceSyncService,
     _now_iso,
-    _resolve_attachment_target,
     _write_conversation_snapshot,
     _write_settings_snapshot,
 )
 from app.services.rag_provider import get_rag_service, ingest_calendar_event
+from app.services.work_run_projection import delete_calendar_event_with_receipts
+from app.services.work_run_store import WorkRunStore
 from app.tools import calendar as calendar_tools
 from app.tools import local_files
 from app.tools import memory as memory_tools
-from app.utils import (
-    blob_store,
-    calendar_store,
-    conversation_store,
-    memory_store,
-    user_settings,
-)
+from app.utils import calendar_store, conversation_store, memory_store, user_settings
 from app.utils.graph_store import GraphStore
 from app.utils.knowledge_store import KnowledgeStore
 
@@ -117,6 +113,7 @@ def _delete_file_snapshot(path: Path) -> None:
 class ActionHistoryService:
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         cfg = dict(config or {})
+        self.config = cfg
         data_dir = Path(cfg.get("data_dir") or app_config.DEFAULT_DATA_DIR)
         if not data_dir.is_absolute():
             data_dir = (app_config.REPO_ROOT / data_dir).resolve()
@@ -860,7 +857,9 @@ class ActionHistoryService:
             return _file_snapshot(Path(resource_id))
         sync = InstanceSyncService()
         if section == "conversations":
-            payload = sync._conversation_snapshot()  # type: ignore[attr-defined]
+            payload = sync._conversation_snapshot(  # type: ignore[attr-defined]
+                include_runtime_authority=True
+            )
             return next(
                 (
                     record
@@ -969,10 +968,12 @@ class ActionHistoryService:
                 return
             if current_name and target_name and current_name != target_name:
                 conversation_store.delete_conversation(str(current_name))
+            trusted_restore = snapshot.get("_trusted_local_restore") is True
             _write_conversation_snapshot(
                 name=str(snapshot.get("name") or target_name or resource_id),
                 messages=list(snapshot.get("messages") or []),
                 metadata=dict(snapshot.get("metadata") or {}),
+                trusted_restore=trusted_restore,
             )
             return
         if section == "memories":
@@ -1026,7 +1027,10 @@ class ActionHistoryService:
             return
         if section == "calendar":
             if snapshot is None:
-                calendar_store.delete_event(resource_id)
+                delete_calendar_event_with_receipts(
+                    WorkRunStore(self.config),
+                    resource_id,
+                )
                 try:
                     rag = get_rag_service(raise_http=False)
                     if rag:
@@ -1035,7 +1039,11 @@ class ActionHistoryService:
                     pass
                 return
             payload = dict(snapshot.get("payload") or {})
-            calendar_store.save_event(resource_id, payload)
+            payload = calendar_store.update_event(
+                resource_id,
+                lambda existing: merge_external_calendar_update(existing, payload),
+                create=True,
+            )
             try:
                 ingest_calendar_event(resource_id, payload)
             except Exception:
@@ -1050,24 +1058,12 @@ class ActionHistoryService:
             )
 
     def _delete_attachment(self, content_hash: str) -> None:
-        target = _resolve_attachment_target(content_hash)
-        if target is not None and target.exists():
-            try:
-                target.unlink()
-            except Exception:
-                pass
-        meta_path = blob_store.BLOBS_DIR / f"{content_hash}.json"
-        if meta_path.exists():
-            try:
-                meta_path.unlink()
-            except Exception:
-                pass
-        blob_target = blob_store.BLOBS_DIR / content_hash
-        if blob_target.exists():
-            try:
-                blob_target.unlink()
-            except Exception:
-                pass
+        # Import lazily to avoid making the service/routes import cycle eager.
+        # Undoing an attachment create must use the same all-mirror cleanup as
+        # the gallery endpoint; raw unlinks can strand text or CLIP records.
+        from app import routes as routes_module
+
+        routes_module._delete_attachment_canonically(content_hash)
 
     def _build_revert_summary(
         self,
@@ -1130,6 +1126,35 @@ class ActionHistoryService:
             key=lambda item: float(item.get("created_at_ts") or 0.0),
             reverse=True,
         )
+        work_runs: Optional[WorkRunStore] = None
+        for action in ordered_targets:
+            for item in action.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("section") or "") != "calendar":
+                    continue
+                if item.get("before") is not None:
+                    continue
+                event_id = str(item.get("resource_id") or "")
+                if not event_id:
+                    continue
+                if work_runs is None:
+                    work_runs = WorkRunStore(self.config)
+
+                def guard_active_run(
+                    _event: Dict[str, Any], *, current_event_id: str = event_id
+                ) -> None:
+                    if work_runs is None or work_runs.has_active_run(
+                        event_id=current_event_id
+                    ):
+                        raise calendar_store.CalendarEventActiveRunError(
+                            current_event_id
+                        )
+
+                calendar_store.check_event_deletable(
+                    event_id,
+                    guard=guard_active_run,
+                )
         revert_items: List[Dict[str, Any]] = []
         for action in ordered_targets:
             items = [

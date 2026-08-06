@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -50,6 +51,7 @@ def client(tmp_path, monkeypatch):
         sync_store, "LEGACY_SYNC_PATH", tmp_path / "legacy_sync_state.json"
     )
     monkeypatch.setenv("FLOAT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("FLOAT_BACKEND_HOST", "127.0.0.1")
     monkeypatch.setenv(
         "FLOAT_DEPLOYMENT_REGISTRY_PATH",
         str(tmp_path / "machine_deployments.json"),
@@ -86,6 +88,211 @@ def test_mobile_float_state_path_defaults_to_repo_root(monkeypatch):
         _device_sync_routes()._mobile_float_state_path()
         == app_config.REPO_ROOT / ".dev_state.json"
     )
+
+
+def test_lan_visibility_toggle_restarts_launcher_managed_backend(
+    client, tmp_path, monkeypatch
+):
+    state_path = tmp_path / ".dev_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "backend_host": "127.0.0.1",
+                "launcher_running": True,
+                "processes": {
+                    "backend": {
+                        "pid": os.getpid(),
+                        "running": True,
+                        "returncode": None,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FLOAT_DEV_STATE_PATH", str(state_path))
+    scheduled = []
+    monkeypatch.setattr(
+        _device_sync_routes(),
+        "_schedule_launcher_backend_restart",
+        lambda binding: scheduled.append(dict(binding)) or True,
+    )
+
+    response = client.post(
+        "/sync/lan-visibility", json={"enabled": True, "restart": True}
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["enabled"] is True
+    assert payload["active"] is False
+    assert payload["restart_scheduled"] is True
+    assert payload["restart_required"] is False
+    assert scheduled[0]["backend_pid"] == os.getpid()
+    assert client.get("/user-settings").json()["sync_visible_on_lan"] is True
+
+
+def test_lan_visibility_toggle_reports_manual_restart_without_launcher(
+    client, tmp_path, monkeypatch
+):
+    state_path = tmp_path / ".dev_state.json"
+    state_path.write_text(
+        json.dumps({"backend_host": "127.0.0.1", "launcher_running": False}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FLOAT_DEV_STATE_PATH", str(state_path))
+
+    response = client.post(
+        "/sync/lan-visibility", json={"enabled": True, "restart": True}
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["restart_scheduled"] is False
+    assert payload["restart_required"] is True
+    assert "Restart Float" in payload["message"]
+
+
+def test_lan_visibility_toggle_respects_explicit_launcher_binding(
+    client, tmp_path, monkeypatch
+):
+    state_path = tmp_path / ".dev_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "backend_host": "127.0.0.1",
+                "backend_host_locked": True,
+                "launcher_running": True,
+                "processes": {
+                    "backend": {
+                        "pid": os.getpid(),
+                        "running": True,
+                        "returncode": None,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FLOAT_DEV_STATE_PATH", str(state_path))
+
+    response = client.post(
+        "/sync/lan-visibility", json={"enabled": True, "restart": True}
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["restart_scheduled"] is False
+    assert payload["restart_required"] is True
+    assert payload["binding_before"]["binding_locked"] is True
+    assert "explicit bind-host override" in payload["message"]
+
+
+def test_launcher_binding_reports_but_never_restarts_reload_supervisor_parent(
+    client, tmp_path, monkeypatch
+):
+    state_path = tmp_path / ".dev_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "backend_host": "127.0.0.1",
+                "launcher_running": True,
+                "processes": {
+                    "backend": {
+                        "pid": os.getppid(),
+                        "running": True,
+                        "returncode": None,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FLOAT_DEV_STATE_PATH", str(state_path))
+
+    binding = _device_sync_routes()._launcher_backend_binding()
+
+    assert binding["backend_pid_matches_current"] is True
+    assert binding["reload_enabled"] is True
+    assert binding["restart_supported"] is False
+
+
+def test_launcher_binding_prefers_current_environment_over_stale_state(
+    client, tmp_path, monkeypatch
+):
+    state_path = tmp_path / ".dev_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "backend_host": "0.0.0.0",
+                "launcher_running": True,
+                "processes": {
+                    "backend": {"pid": os.getpid(), "running": True},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FLOAT_DEV_STATE_PATH", str(state_path))
+    monkeypatch.setenv("FLOAT_BACKEND_HOST", "127.0.0.1")
+
+    binding = _device_sync_routes()._launcher_backend_binding()
+
+    assert binding["bind_host"] == "127.0.0.1"
+    assert binding["lan_listening"] is False
+
+
+def test_private_interface_binding_is_reported_as_lan_listening(
+    client, tmp_path, monkeypatch
+):
+    from app.utils import device_visibility
+
+    monkeypatch.setenv("FLOAT_BACKEND_HOST", "192.168.1.20")
+    monkeypatch.setattr(device_visibility, "_detect_lan_ips", lambda: ["192.168.1.20"])
+    client.post("/user-settings", json={"sync_visible_on_lan": True})
+
+    overview = client.get("/sync/overview", headers={"host": "localhost:5000"})
+
+    assert overview.status_code == 200
+    access = overview.json()["device_access"]
+    assert access["visibility"]["lan_listening"] is True
+    assert access["visibility"]["lan_state"] == "listening"
+    assert access["advertised_urls"]["lan"] == "http://192.168.1.20:5000"
+    assert access["listener"]["lan_listening"] is True
+
+
+def test_lan_visibility_toggle_does_not_kill_reload_supervisor(
+    client, tmp_path, monkeypatch
+):
+    state_path = tmp_path / ".dev_state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "backend_host": "127.0.0.1",
+                "backend_reload_enabled": True,
+                "launcher_running": True,
+                "processes": {
+                    "backend": {
+                        "pid": os.getpid(),
+                        "running": True,
+                        "returncode": None,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FLOAT_DEV_STATE_PATH", str(state_path))
+
+    response = client.post(
+        "/sync/lan-visibility", json={"enabled": True, "restart": True}
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["restart_scheduled"] is False
+    assert payload["binding_before"]["reload_enabled"] is True
+    assert "backend auto-reload is active" in payload["message"]
 
 
 def test_pairing_offer_accept_registers_device(client):
@@ -224,9 +431,13 @@ def test_sync_overview_reports_visibility_and_urls(client):
     payload = overview.json()
     access = payload["device_access"]
     assert access["visibility"]["lan_enabled"] is True
+    assert access["visibility"]["lan_listening"] is False
+    assert access["visibility"]["lan_state"] == "restart_required"
     assert access["visibility"]["online_supported"] is False
     assert payload["sync_defaults"]["visible_on_lan"] is True
     assert access["advertised_urls"]["local"].endswith(":5000")
+    assert access["advertised_urls"]["lan"] == ""
+    assert access["advertised_urls"]["lan_candidate"]
     assert access["internet_status"] == "coming_soon"
     assert payload["workspaces"]["active_workspace_id"] == "root"
     assert payload["workspaces"]["selected_workspace_ids"] == ["root"]
@@ -536,6 +747,7 @@ def test_sync_overview_advertises_https_when_request_is_https(client, monkeypatc
     from app.utils import device_visibility
 
     monkeypatch.setattr(device_visibility, "_detect_lan_ips", lambda: ["192.168.0.44"])
+    monkeypatch.setenv("FLOAT_BACKEND_HOST", "0.0.0.0")
 
     client.post("/user-settings", json={"sync_visible_on_lan": True})
     overview = client.get(
@@ -552,6 +764,7 @@ def test_sync_overview_prefers_resolvable_hostname_for_lan_url(client, monkeypat
     from app.utils import device_visibility
 
     monkeypatch.setattr(device_visibility, "_detect_lan_ips", lambda: ["192.168.0.44"])
+    monkeypatch.setenv("FLOAT_BACKEND_HOST", "0.0.0.0")
     monkeypatch.setattr(device_visibility.socket, "gethostname", lambda: "Pear")
     monkeypatch.setattr(
         device_visibility,
@@ -1037,7 +1250,9 @@ def test_unpaired_sync_peer_status_reports_reachability_only(client, monkeypatch
     assert payload["workspaces"]["profiles"][0]["id"] == "root"
 
 
-def test_sync_peer_status_updates_moved_url_when_identity_matches(client, monkeypatch):
+def test_sync_peer_status_uses_canonical_saved_identity_for_address_update(
+    client, monkeypatch
+):
     old_pair = {
         "id": "peer-1",
         "label": "Pear",
@@ -1128,7 +1343,12 @@ def test_sync_peer_status_updates_moved_url_when_identity_matches(client, monkey
         "/sync/peer/status",
         json={
             "remote_url": "http://pear.local:61234",
-            "paired_device": old_pair,
+            "paired_device": {
+                **old_pair,
+                "label": "Forged browser label",
+                "remote_public_key": "pk-forged",
+                "remote_device_name": "Forged device",
+            },
             "update_saved_peer": True,
         },
     )
@@ -1142,6 +1362,8 @@ def test_sync_peer_status_updates_moved_url_when_identity_matches(client, monkey
     )
     assert payload["software_comparison"]["state"] == "exact"
     assert payload["paired_device"]["remote_url"] == "http://pear.local:61234"
+    assert payload["paired_device"]["label"] == "Pear"
+    assert payload["paired_device"]["remote_public_key"] == "pk-pear"
     assert payload["paired_device"]["remote_deployment_id"] == ("deployment-pear-1234")
     assert payload["paired_device"]["remote_software"]["build_code"] == "b12"
 
@@ -1156,6 +1378,122 @@ def test_sync_peer_status_updates_moved_url_when_identity_matches(client, monkey
         "display_name": "Pear",
         "workspace_count": 1,
     }
+
+
+def test_sync_peer_status_requires_explicit_saved_id_for_address_update(
+    client, monkeypatch
+):
+    old_pair = {
+        "id": "peer-1",
+        "label": "Pear",
+        "remote_url": "http://pear.local:59185",
+        "scopes": ["sync"],
+    }
+    client.post(
+        "/user-settings",
+        json={
+            "sync_remote_url": old_pair["remote_url"],
+            "sync_saved_peers": [old_pair],
+        },
+    )
+
+    def unexpected_probe(*_args, **_kwargs):
+        raise AssertionError("address update validation must run before probing")
+
+    monkeypatch.setattr(
+        _device_sync_routes(), "_peer_connectivity_status", unexpected_probe
+    )
+    res = client.post(
+        "/sync/peer/status",
+        json={
+            "remote_url": "http://pear.local:61234",
+            "paired_device": {
+                "label": "Browser payload without an id",
+                "remote_url": old_pair["remote_url"],
+            },
+            "update_saved_peer": True,
+        },
+    )
+
+    assert res.status_code == 400
+    assert "peer id" in res.json()["detail"].lower()
+    peer = client.get("/sync/overview").json()["sync_defaults"]["saved_peers"][0]
+    assert peer["remote_url"] == old_pair["remote_url"]
+
+
+def test_sync_peer_status_rejects_unknown_saved_id_for_address_update(
+    client, monkeypatch
+):
+    def unexpected_probe(*_args, **_kwargs):
+        raise AssertionError("unknown saved peers must be rejected before probing")
+
+    monkeypatch.setattr(
+        _device_sync_routes(), "_peer_connectivity_status", unexpected_probe
+    )
+    res = client.post(
+        "/sync/peer/status",
+        json={
+            "remote_url": "http://pear.local:61234",
+            "paired_device": {
+                "id": "missing-peer",
+                "label": "Pear",
+                "remote_url": "http://pear.local:59185",
+            },
+            "update_saved_peer": True,
+        },
+    )
+
+    assert res.status_code == 404
+    assert "no longer exists" in res.json()["detail"].lower()
+
+
+def test_sync_peer_status_does_not_persist_alternate_address_without_update(
+    client, monkeypatch
+):
+    old_pair = {
+        "id": "peer-1",
+        "label": "Pear",
+        "remote_url": "http://pear.local:59185",
+        "scopes": ["sync"],
+        "remote_device_id": "remote-device-1",
+        "public_key": "pk-local",
+        "remote_public_key": "pk-pear",
+        "remote_device_name": "Pear",
+    }
+    client.post(
+        "/user-settings",
+        json={
+            "sync_remote_url": old_pair["remote_url"],
+            "sync_saved_peers": [old_pair],
+        },
+    )
+    monkeypatch.setattr(
+        _device_sync_routes(),
+        "_peer_connectivity_status",
+        lambda remote_url, pairing=None: {
+            "reachable": True,
+            "instance_base": remote_url,
+            "identity": {"public_key": "pk-pear", "display_name": "Pear"},
+            "display_name": "Pear",
+        },
+    )
+
+    res = client.post(
+        "/sync/peer/status",
+        json={
+            "remote_url": "http://pear.local:61234",
+            "paired_device": {**old_pair, "label": "Browser edit"},
+            "update_saved_peer": False,
+        },
+    )
+
+    assert res.status_code == 200
+    assert res.json()["identity_verified"] is True
+    assert "observed_peer" not in res.json()
+    peer = client.get("/sync/overview").json()["sync_defaults"]["saved_peers"][0]
+    assert peer["remote_url"] == old_pair["remote_url"]
+    assert peer["label"] == "Pear"
+    assert peer["last_status_at"] == ""
 
 
 def test_sync_peer_status_anchors_legacy_pair_when_remote_knows_local_device(
@@ -1296,7 +1634,7 @@ def test_sync_peer_status_rejects_legacy_pair_when_remote_does_not_know_local_de
     assert "stable remote identity" in res.json()["detail"]
 
 
-def test_sync_peer_status_rejects_legacy_pair_when_remote_label_differs(
+def test_sync_peer_status_allows_custom_label_for_verified_legacy_pair(
     client, monkeypatch
 ):
     old_pair = {
@@ -1353,8 +1691,10 @@ def test_sync_peer_status_rejects_legacy_pair_when_remote_label_differs(
         },
     )
 
-    assert res.status_code == 409
-    assert "advertised identity label does not match" in res.json()["detail"]
+    assert res.status_code == 200
+    assert res.json()["identity_verified"] is True
+    assert res.json()["paired_device"]["label"] == "Pear_dev"
+    assert res.json()["paired_device"]["remote_url"] == "http://pear.local:61234"
 
 
 def test_sync_peer_status_rejects_moved_url_when_identity_changes(client, monkeypatch):
@@ -1673,13 +2013,25 @@ def test_sync_apply_push_filters_selected_items(client, monkeypatch):
 
     def _fake_ingest(self, snapshot, **_kwargs):
         captured["snapshot"] = snapshot
-        return {"status": "applied", "effective_namespace": None}
+        return {
+            "status": "applied",
+            "effective_namespace": None,
+            "source_label": "Local",
+        }
 
     monkeypatch.setattr(
         _device_sync_routes().RemoteFloatClient, "ingest_snapshot", _fake_ingest
     )
     monkeypatch.setattr(
         _device_sync_routes().RemoteFloatClient, "get_pairing_state", lambda self: {}
+    )
+    monkeypatch.setattr(
+        _device_sync_routes(),
+        "_persist_saved_peer_state",
+        lambda pairing, remote_label=None: captured.update(
+            {"persisted_remote_label": remote_label}
+        )
+        or {**pairing, "remote_device_name": remote_label or ""},
     )
 
     res = client.post(
@@ -1707,6 +2059,7 @@ def test_sync_apply_push_filters_selected_items(client, monkeypatch):
     assert res.status_code == 200
     assert res.json()["data_checkpoint"]["state"] == "synced"
     assert captured["item_selections"] == {"conversations": ["conv-2"]}
+    assert captured["persisted_remote_label"] == "Pear"
     assert [
         record["sync_id"]
         for record in captured["snapshot"]["sections"]["conversations"]

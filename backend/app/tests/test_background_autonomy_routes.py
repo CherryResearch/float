@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -44,6 +45,7 @@ def test_background_autonomy_routes_publish_console_status(tmp_path, monkeypatch
     app.state.background_autonomy_service = autonomy
     app.state.config = {"background_autonomy_enabled": False}
     app.state.agent_console_state = {"agents": {}, "resources": {}}
+    app.state.background_autonomy_wakeup = asyncio.Event()
     set_reflection_service(reflection)
 
     client = TestClient(app)
@@ -79,11 +81,46 @@ def test_background_autonomy_routes_publish_console_status(tmp_path, monkeypatch
     assert saved_settings.json()["background_autonomy_max_runtime_seconds"] == 1800
     assert saved_settings.json()["background_autonomy_basic_tick_count"] == 2
     assert app.state.background_autonomy_service.mode() == "basic"
+    assert app.state.background_autonomy_wakeup.is_set()
+    app.state.background_autonomy_wakeup.clear()
+
+    unchanged = client.post(
+        "/api/settings",
+        json={
+            "background_autonomy_enabled": True,
+            "background_autonomy_sandbox_processes": True,
+            "background_autonomy_mode": "basic",
+            "background_autonomy_max_runtime_seconds": 1800,
+            "background_autonomy_basic_tick_count": 2,
+            "background_autonomy_basic_tick_seconds": 300,
+            "background_autonomy_satisfied_threshold": 0.8,
+        },
+    )
+    assert unchanged.status_code == 200
+    assert app.state.background_autonomy_wakeup.is_set() is False
 
     console = client.get("/api/agents/console")
     assert console.status_code == 200
     agents = {item["id"]: item for item in console.json()["agents"]}
     autonomy_agent = agents["system:background-autonomy"]
     assert autonomy_agent["label"] == "background autonomy"
+    assert autonomy_agent["status"] == "idle"
     assert "1 reflection candidate" in autonomy_agent["summary"]
     assert autonomy_agent["resources"]["candidate_count"] == 1
+    assert autonomy_agent["controls"]["available"] == []
+
+
+def test_background_autonomy_console_agent_reports_running_tick_as_active():
+    from app import routes
+
+    agent = routes._background_autonomy_console_agent(
+        {
+            "enabled": True,
+            "configured_mode": "basic",
+            "state": {"running": True, "last_status": "planned"},
+            "reflection": {},
+            "scheduled_actions": {},
+        }
+    )
+
+    assert agent["status"] == "active"

@@ -452,6 +452,205 @@ def test_chat_rag_respects_text_and_vision_request_toggles(monkeypatch, client):
     assert [m["source"] for m in rag_section["matches"]] == ["image-source"]
 
 
+def test_later_image_recall_injects_canonical_attachment_provenance(
+    monkeypatch, client
+):
+    content_hash = "a" * 64
+    relative_path = f"files/uploads/{content_hash}/sunset.png"
+    api_url = f"/api/attachments/{content_hash}/sunset.png"
+    source_url = "https://images.example.test/sunset.png?view=public"
+
+    class DummyTextRAG:
+        embedding_model = "local:test"
+
+        def query(self, text, top_k=3):
+            return []
+
+        def trace(self, doc_id):
+            assert doc_id == "caption-doc"
+            return {
+                "id": doc_id,
+                "text": "A red sunset above a quiet lake.",
+                "metadata": {
+                    "source": f"image:{content_hash}",
+                    "content_hash": content_hash,
+                    "kind": "image_caption",
+                },
+            }
+
+    class DummyClipRAG:
+        embedding_model = "clip:ViT-B-32"
+        _embedding_encoder = object()
+
+        def query(self, text, top_k=3):
+            return [
+                {
+                    "id": "clip-doc",
+                    "text": "A red sunset above a quiet lake.",
+                    "metadata": {
+                        "caption_doc_id": "caption-doc",
+                        "content_hash": content_hash,
+                        "content_type": "image/png",
+                    },
+                    "score": 0.98,
+                }
+            ]
+
+    descriptor = {
+        "content_hash": content_hash,
+        "filename": "sunset.png",
+        "display_name": "Lake sunset",
+        "folder": "Trips/Coast",
+        "content_type": "image/png",
+        "size": 123,
+        "url": api_url,
+        "relative_path": relative_path,
+        "source_url": source_url,
+        "source_url_recorded_at": "2026-07-29T12:00:00Z",
+        "origin": "upload",
+    }
+    monkeypatch.setattr(routes, "_get_rag_service", lambda: DummyTextRAG())
+    monkeypatch.setattr(
+        routes, "_get_clip_rag_service", lambda *, raise_http=False: DummyClipRAG()
+    )
+    monkeypatch.setattr(
+        routes,
+        "_attachment_public_descriptor",
+        lambda requested_hash: descriptor if requested_hash == content_hash else None,
+    )
+    monkeypatch.setattr(routes.llm_service, "mode", "api", raising=False)
+    monkeypatch.setitem(client.app.state.config, "rag_chat_clip_top_k", 1)
+
+    captured = {}
+
+    def fake_generate(
+        prompt,
+        session_id="default",
+        model=None,
+        attachments=None,
+        context=None,
+        **kwargs,
+    ):
+        captured["context"] = context
+        return {
+            "text": "I found the sunset image.",
+            "thought": "",
+            "tools_used": [],
+            "metadata": {},
+        }
+
+    monkeypatch.setattr(routes.llm_service, "generate", fake_generate)
+
+    response = client.post(
+        "/chat",
+        json={
+            "message": "Recall the sunset image from earlier.",
+            "session_id": "sess-later-image-recall",
+            "use_rag": True,
+            "use_text_rag": False,
+            "use_vision_rag": True,
+        },
+    )
+
+    assert response.status_code == 200
+    context = captured.get("context")
+    assert context is not None
+    model_bound_rag_prompts = [
+        str(message.get("content") or "")
+        for message in context.messages
+        if message.get("role") == "system"
+        and isinstance(message.get("metadata"), dict)
+        and message["metadata"].get("rag")
+    ]
+    assert model_bound_rag_prompts
+    prompt = "\n".join(model_bound_rag_prompts)
+    assert content_hash in prompt
+    assert relative_path in prompt
+    assert api_url in prompt
+    assert source_url in prompt
+    assert "source_url_provenance_log" in prompt
+    assert "never fetched" in prompt
+
+    match_meta = response.json()["metadata"]["rag"]["matches"][0]["metadata"]
+    assert match_meta["display_name"] == "Lake sunset"
+    assert match_meta["folder"] == "Trips/Coast"
+
+
+def test_later_image_recall_does_not_inject_credentialed_source_url(
+    monkeypatch, client
+):
+    content_hash = "b" * 64
+    secret_source_url = "https://images.example.test/photo.png?token=do-not-leak"
+
+    class DummyTextRAG:
+        embedding_model = "local:test"
+
+        def query(self, text, top_k=3):
+            return [
+                {
+                    "id": "caption-doc-secret-url",
+                    "text": "A recalled photo.",
+                    "metadata": {
+                        "source": f"image:{content_hash}",
+                        "content_hash": content_hash,
+                        "content_type": "image/png",
+                    },
+                    "score": 0.98,
+                }
+            ]
+
+        def trace(self, doc_id):
+            return None
+
+    descriptor = {
+        "content_hash": content_hash,
+        "filename": "photo.png",
+        "content_type": "image/png",
+        "size": 123,
+        "url": f"/api/attachments/{content_hash}/photo.png",
+        "relative_path": f"files/uploads/{content_hash}/photo.png",
+        "source_url": secret_source_url,
+    }
+    monkeypatch.setattr(routes, "_get_rag_service", lambda: DummyTextRAG())
+    monkeypatch.setattr(
+        routes, "_get_clip_rag_service", lambda *, raise_http=False: None
+    )
+    monkeypatch.setattr(
+        routes,
+        "_attachment_public_descriptor",
+        lambda requested_hash: descriptor if requested_hash == content_hash else None,
+    )
+    monkeypatch.setattr(routes.llm_service, "mode", "api", raising=False)
+
+    captured = {}
+
+    def fake_generate(prompt, context=None, **kwargs):
+        captured["context"] = context
+        return {"text": "ok", "thought": "", "tools_used": [], "metadata": {}}
+
+    monkeypatch.setattr(routes.llm_service, "generate", fake_generate)
+
+    response = client.post(
+        "/chat",
+        json={
+            "message": "Recall the photo from earlier.",
+            "session_id": "sess-later-image-secret-source",
+            "use_rag": True,
+            "use_text_rag": True,
+            "use_vision_rag": False,
+        },
+    )
+
+    assert response.status_code == 200
+    prompt = "\n".join(
+        str(message.get("content") or "")
+        for message in captured["context"].messages
+        if message.get("role") == "system"
+    )
+    assert content_hash in prompt
+    assert "do-not-leak" not in prompt
+
+
 def test_chat_rag_truncates_metadata_text(monkeypatch, client):
     long_text = "Paris " * 2000
 
@@ -540,7 +739,12 @@ def test_caption_image_stores_caption_and_clip_embedding(monkeypatch, client, tm
         def run(self, data):
             return {"image_caption": "a test image", "placeholder": False}
 
-    monkeypatch.setattr(routes, "VisionCaptioner", DummyCaptioner)
+    dummy_captioner = DummyCaptioner()
+    monkeypatch.setattr(
+        routes,
+        "run_shared_vision_captioner",
+        lambda data, **_kwargs: (dummy_captioner, dummy_captioner.run(data)),
+    )
 
     from app.services import clip_embeddings  # noqa: E402
 
@@ -601,7 +805,12 @@ def test_attachment_caption_updates_reindex_text_and_clip(
         def run(self, data):
             return {"image_caption": "auto caption", "placeholder": False}
 
-    monkeypatch.setattr(routes, "VisionCaptioner", DummyCaptioner)
+    dummy_captioner = DummyCaptioner()
+    monkeypatch.setattr(
+        routes,
+        "run_shared_vision_captioner",
+        lambda data, **_kwargs: (dummy_captioner, dummy_captioner.run(data)),
+    )
 
     from app.services import clip_embeddings  # noqa: E402
 
@@ -649,8 +858,10 @@ def test_attachment_caption_updates_reindex_text_and_clip(
     delete_caption_resp = client.delete(f"/attachments/caption/{content_hash}")
     assert delete_caption_resp.status_code == 200
     refreshed = text_service.trace(doc_id)
-    assert refreshed is not None
-    assert refreshed["text"] == "auto caption"
+    assert refreshed is None
+    deleted_payload = delete_caption_resp.json()
+    assert deleted_payload["caption_status"] == "missing"
+    assert deleted_payload["attachment"]["caption"] == ""
 
 
 def test_attachment_delete_cleans_up_rag_mirrors(monkeypatch, client, tmp_path):
@@ -681,7 +892,12 @@ def test_attachment_delete_cleans_up_rag_mirrors(monkeypatch, client, tmp_path):
         def run(self, data):
             return {"image_caption": "auto caption", "placeholder": False}
 
-    monkeypatch.setattr(routes, "VisionCaptioner", DummyCaptioner)
+    dummy_captioner = DummyCaptioner()
+    monkeypatch.setattr(
+        routes,
+        "run_shared_vision_captioner",
+        lambda data, **_kwargs: (dummy_captioner, dummy_captioner.run(data)),
+    )
 
     from app.services import clip_embeddings  # noqa: E402
 

@@ -128,6 +128,9 @@ def test_graph_store_projects_basic_social_network_fixture(tmp_path):
     assert projection["metadata"]["node_count"] == 7
     assert projection["metadata"]["claim_count"] == 7
     assert projection["metadata"]["link_count"] == 7
+    assert projection["metadata"]["total_node_count"] == 7
+    assert projection["metadata"]["total_claim_count"] == 7
+    assert projection["metadata"]["truncated"] is False
     assert all(node["attributes"] for node in projection["nodes"])
     assert {
         (link["source"], link["target"], link["predicate"])
@@ -141,3 +144,11 @@ def test_graph_store_projects_basic_social_network_fixture(tmp_path):
         ("knowledge:person:self", "knowledge:org:job", "works_at"),
         ("knowledge:person:coworker-ren", "knowledge:org:job", "works_at"),
     }
+
+    limited_projection = store.projection(node_limit=2, claim_limit=1)
+    assert limited_projection["metadata"]["node_count"] == 2
+    assert limited_projection["metadata"]["total_node_count"] == 7
+    assert limited_projection["metadata"]["total_claim_count"] == 7
+    assert limited_projection["metadata"]["nodes_truncated"] is True
+    assert limited_projection["metadata"]["claims_truncated"] is True
+    assert limited_projection["metadata"]["truncated"] is True

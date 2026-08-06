@@ -1,7 +1,18 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { createPortal } from "react-dom";
 import axios from "axios";
 import { useNavigate } from "react-router-dom";
+import Tooltip from "@mui/material/Tooltip";
+import { safeAttachmentSourceUrl } from "../utils/attachmentProvenance";
+import { captionGenerationErrorMessage } from "../utils/mediaCaption";
 import StateInspector from "./StateInspector";
 import "../styles/MediaViewer.css";
 
@@ -74,6 +85,13 @@ const normalizeItems = (items, fallback) => {
         alt: item.alt || "",
         file: item.file || null,
         label: item.label || item.alt || "",
+        filename: item.filename || item.alt || "",
+        displayName: item.displayName || item.display_name || "",
+        folder: item.folder || "",
+        sourceUrl: item.sourceUrl || item.source_url || "",
+        sourceUrlRecordedAt:
+          item.sourceUrlRecordedAt || item.source_url_recorded_at || "",
+        retrievalUrl: item.retrievalUrl || item.url || item.src || "",
         caption: item.caption || "",
         captionModel: item.captionModel || item.caption_model || null,
         size:
@@ -157,6 +175,41 @@ const firstString = (...values) => {
   return "";
 };
 
+const isFloatAttachmentRetrieval = (contentHash, retrievalUrl) => {
+  if (!String(contentHash || "").trim()) return false;
+  const value = String(retrievalUrl || "").trim();
+  return /^\/api\/attachments\/[^/]+\//.test(value)
+    || /^https?:\/\/[^/]+\/api\/attachments\/[^/]+\//i.test(value);
+};
+
+const captionStatusPresentation = (statusValue) => {
+  const status = String(statusValue || "").trim().toLowerCase();
+  const labels = {
+    generated: "auto caption",
+    manual: "manual caption",
+    pending: "caption pending",
+    missing: "caption missing",
+    error: "caption failed",
+    disabled: "captioning off",
+    unavailable: "caption unavailable",
+  };
+  return labels[status] || (status ? `caption ${status}` : "");
+};
+
+const urlHostLabel = (value) => {
+  try {
+    return new URL(value).hostname || value;
+  } catch {
+    return value;
+  }
+};
+
+const captionIsUnavailable = (item = {}, metadata = {}) =>
+  metadata.placeholder_caption === true
+  || item.placeholderCaption === true
+  || firstString(metadata.caption_status, item.captionStatus).toLowerCase()
+    === "placeholder";
+
 const normalizeCaptionTracker = (item = {}, metadata = {}) => ({
   captionStatus: firstString(metadata.caption_status, item.captionStatus),
   captionModel: firstString(metadata.caption_model, item.captionModel),
@@ -192,6 +245,24 @@ const normalizeCaptionTracker = (item = {}, metadata = {}) => ({
 
 export const buildMediaProvenanceRows = (item = {}, metadata = {}) => {
   const tracker = normalizeCaptionTracker(item, metadata);
+  const captionUnavailable =
+    tracker.placeholderCaption
+    || tracker.captionStatus.toLowerCase() === "placeholder";
+  const sourceUrl = safeAttachmentSourceUrl(
+    firstString(metadata.source_url, item.sourceUrl, item.source_url),
+  );
+  const sourceRecordedAt = firstString(
+    metadata.source_url_recorded_at,
+    item.sourceUrlRecordedAt,
+    item.source_url_recorded_at,
+  );
+  const retrievalUrl = firstString(
+    metadata.url,
+    item.retrievalUrl,
+    item.url,
+    item.src,
+  );
+  const contentHash = firstString(item.contentHash, item.content_hash, metadata.content_hash);
   const captionDate =
     tracker.captionUpdatedAt || tracker.captionGeneratedAt || tracker.captionRecordedAt;
   const captionDateLabel = tracker.captionUpdatedAt
@@ -207,8 +278,24 @@ export const buildMediaProvenanceRows = (item = {}, metadata = {}) => {
     .filter(Boolean)
     .join(" | ");
   return [
-    tracker.captionStatus
-      ? { label: "Caption status", value: tracker.captionStatus }
+    sourceUrl
+      ? {
+          label: "Recorded source",
+          value: sourceRecordedAt
+            ? `${sourceUrl} | recorded ${formatUploadedAt(sourceRecordedAt) || sourceRecordedAt}`
+            : sourceUrl,
+        }
+      : null,
+    sourceUrl && isFloatAttachmentRetrieval(contentHash, retrievalUrl)
+      ? { label: "Float retrieval", value: retrievalUrl }
+      : null,
+    tracker.captionStatus || captionUnavailable
+      ? {
+          label: "Caption status",
+          value: captionUnavailable
+            ? "caption unavailable"
+            : captionStatusPresentation(tracker.captionStatus),
+        }
       : null,
     tracker.captionModel
       ? { label: "Caption model", value: tracker.captionModel }
@@ -227,7 +314,6 @@ export const buildMediaProvenanceRows = (item = {}, metadata = {}) => {
         }
       : null,
     tracker.indexWarning ? { label: "Index warning", value: tracker.indexWarning } : null,
-    tracker.placeholderCaption ? { label: "Caption quality", value: "placeholder" } : null,
   ].filter(Boolean);
 };
 
@@ -235,6 +321,7 @@ export const buildMediaStateInspectorRows = (item = {}, metadata = {}) => {
   const tracker = normalizeCaptionTracker(item, metadata);
   const contentHash = firstString(item.contentHash, item.content_hash, metadata.content_hash);
   const source = firstString(
+    safeAttachmentSourceUrl(firstString(metadata.source_url, item.sourceUrl, item.source_url)),
     item.origin,
     metadata.origin,
     item.captureSource,
@@ -251,12 +338,16 @@ export const buildMediaStateInspectorRows = (item = {}, metadata = {}) => {
   ]
     .filter(Boolean)
     .join(" | ");
+  const captionStatusLabel = tracker.placeholderCaption
+    || tracker.captionStatus.toLowerCase() === "placeholder"
+    ? "caption unavailable"
+    : captionStatusPresentation(tracker.captionStatus);
   return [
     { label: "Source", value: source || "attachment metadata" },
     {
       label: "Caption",
       value: [
-        tracker.captionStatus,
+        captionStatusLabel,
         tracker.captionModel ? `model ${tracker.captionModel}` : "",
         captionDate ? formatUploadedAt(captionDate) || captionDate : "",
       ]
@@ -274,14 +365,18 @@ export const buildMediaStateInspectorRows = (item = {}, metadata = {}) => {
   ];
 };
 
-const MediaViewer = ({
-  src,
-  alt = "",
-  showLink = true,
-  file = null,
-  contextItems = null,
-  contextIndex = 0,
-}) => {
+const MediaViewer = forwardRef(function MediaViewer(
+  {
+    src,
+    alt = "",
+    showLink = true,
+    file = null,
+    contextItems = null,
+    contextIndex = 0,
+    onAttachmentChange = null,
+  },
+  ref,
+) {
   const navigate = useNavigate();
   const [open, setOpen] = useState(false);
   const [error, setError] = useState("");
@@ -307,6 +402,7 @@ const MediaViewer = ({
   const [captionModelInfoError, setCaptionModelInfoError] = useState("");
   const [mediaNaturalSize, setMediaNaturalSize] = useState({ width: 0, height: 0 });
   const [viewportBoost, setViewportBoost] = useState({ width: 1, height: 1 });
+  const captionMutationBusy = captionGenerating || captionSaving || captionDeleting;
   const panStartRef = useRef(null);
   const dialogRef = useRef(null);
   const mediaWrapperRef = useRef(null);
@@ -345,7 +441,7 @@ const MediaViewer = ({
     [contextIndex, contextItems, src],
   );
 
-  const resetDialogState = () => {
+  const resetDialogState = useCallback(() => {
     setError("");
     setZoom(1);
     setPan({ x: 0, y: 0 });
@@ -369,13 +465,25 @@ const MediaViewer = ({
     setCaptionModelInfoError("");
     setMediaNaturalSize({ width: 0, height: 0 });
     setViewportBoost({ width: 1, height: 1 });
-  };
+  }, []);
 
-  const openViewer = () => {
+  const openViewer = useCallback((options = {}) => {
     setActiveIndex(computeIndex(viewerItems));
     resetDialogState();
+    if (options?.editCaption === true) {
+      setCaptionEditOpen(true);
+    }
     setOpen(true);
-  };
+  }, [computeIndex, resetDialogState, viewerItems]);
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      open: () => openViewer(),
+      editCaption: () => openViewer({ editCaption: true }),
+    }),
+    [openViewer],
+  );
 
   const closeViewer = useCallback(() => setOpen(false), []);
 
@@ -405,6 +513,7 @@ const MediaViewer = ({
     fileNameFromMedia(activeSrc, activeAlt) ||
     "file";
   const activeAttachmentFilename =
+    activeItem?.filename ||
     fileNameFromSrc(activeSrc) ||
     (activeFile && typeof activeFile.name === "string" ? activeFile.name : "") ||
     fileNameFromMedia(activeSrc, activeAlt);
@@ -418,11 +527,19 @@ const MediaViewer = ({
   const activeOrigin = activeItem?.origin || "";
   const activeRelativePath = activeItem?.relativePath || "";
   const activeCaptureSource = activeItem?.captureSource || "";
+  const activeSourceUrl = safeAttachmentSourceUrl(activeItem?.sourceUrl || "");
+  const activeSourceUrlRecordedAt = activeItem?.sourceUrlRecordedAt || "";
+  const activeRetrievalUrl = activeItem?.retrievalUrl || activeSrc;
+  const activeHasFloatCopy = isFloatAttachmentRetrieval(activeHash, activeRetrievalUrl);
   const activeContextCaption = activeItem?.caption || "";
-  const activeCaptionStatus = activeItem?.captionStatus || "";
+  const activeCaptionStatus =
+    captionMetadata?.caption_status || activeItem?.captionStatus || "";
   const activeIndexStatus = activeItem?.indexStatus || "";
   const activeIndexWarning = activeItem?.indexWarning || "";
-  const activePlaceholderCaption = activeItem?.placeholderCaption === true;
+  const activePlaceholderCaption = captionIsUnavailable(
+    activeItem || {},
+    captionMetadata || {},
+  );
   const provenanceRows = useMemo(
     () => buildMediaProvenanceRows(activeItem || {}, captionMetadata || {}),
     [activeItem, captionMetadata],
@@ -438,7 +555,9 @@ const MediaViewer = ({
     activeCaptureSource ? `capture: ${activeCaptureSource}` : "",
     activeRelativePath ? `path: ${activeRelativePath}` : "",
   ].filter(Boolean);
-  const displayCaption = storedCaption || activeContextCaption;
+  const displayCaption = activePlaceholderCaption
+    ? ""
+    : storedCaption || activeContextCaption;
 
   const getZoomedMediaBounds = useCallback(
     (zoomValue = zoom) => {
@@ -654,6 +773,11 @@ const MediaViewer = ({
       return;
     }
     let active = true;
+    // Clear the previous item's state before loading the next attachment so a
+    // stale caption cannot be displayed or saved against a different hash.
+    setStoredCaption("");
+    setCaptionDraft("");
+    setCaptionMetadata(null);
     setCaptionLoading(true);
     setCaptionError("");
     axios
@@ -661,7 +785,9 @@ const MediaViewer = ({
       .then((res) => {
         if (!active) return;
         const payload = res.data || {};
-        const caption = String(payload.caption || "").trim();
+        const caption = captionIsUnavailable({}, payload)
+          ? ""
+          : String(payload.caption || "").trim();
         setStoredCaption(caption);
         setCaptionDraft(caption);
         setCaptionMetadata(payload);
@@ -767,6 +893,30 @@ const MediaViewer = ({
     try {
       setCaptionGenerating(true);
       setCaptionError("");
+      if (activeHash) {
+        const replaceGenerated =
+          String(activeCaptionStatus || "").trim().toLowerCase() === "generated";
+        const response = await axios.post(
+          `/api/attachments/caption/${encodeURIComponent(activeHash)}/generate`,
+          { replace_generated: replaceGenerated },
+        );
+        const descriptor = response.data?.attachment || response.data || {};
+        const unavailable = captionIsUnavailable({}, descriptor);
+        const caption = unavailable ? "" : String(descriptor.caption || "").trim();
+        setCaptionMetadata(descriptor);
+        setStoredCaption(caption);
+        setCaptionDraft(caption);
+        setCaptionEditOpen(true);
+        if (typeof onAttachmentChange === "function") {
+          onAttachmentChange({ content_hash: activeHash, ...descriptor });
+        }
+        if (unavailable) {
+          setCaptionError(
+            "Automatic captioning is still unavailable. You can write and save a caption manually.",
+          );
+        }
+        return;
+      }
       const blob = await loadActiveBlob();
       const name = fileNameFromMedia(activeSrc, activeAlt);
       const form = new FormData();
@@ -789,25 +939,11 @@ const MediaViewer = ({
           ragClipModel: clipModel || prev?.ragClipModel || "(unset)",
         }));
       }
-      if (activeHash && caption) {
-        try {
-          const saved = await axios.put(`/api/attachments/caption/${encodeURIComponent(activeHash)}`, {
-            caption,
-          });
-          setCaptionMetadata((prev) => ({
-            ...(prev || {}),
-            ...(saved.data || {}),
-          }));
-          setStoredCaption(caption);
-        } catch {
-          // Keep generated caption in the editor even if metadata save fails.
-        }
-      }
       setCaptionDraft(caption);
       setCaptionEditOpen(true);
     } catch (err) {
       console.error("caption generate failed", err);
-      setCaptionError("Caption indexing failed.");
+      setCaptionError(captionGenerationErrorMessage(err));
     } finally {
       setCaptionGenerating(false);
     }
@@ -836,6 +972,15 @@ const MediaViewer = ({
       setStoredCaption(nextCaption);
       setCaptionDraft(nextCaption);
       setCaptionEditOpen(false);
+      if (typeof onAttachmentChange === "function") {
+        onAttachmentChange({
+          content_hash: activeHash,
+          ...(saved.data?.attachment || saved.data || {}),
+          caption: nextCaption,
+          caption_status: "manual",
+          placeholder_caption: false,
+        });
+      }
     } catch (err) {
       console.error("caption save failed", err);
       setCaptionError("Caption save failed.");
@@ -851,6 +996,13 @@ const MediaViewer = ({
       setCaptionEditOpen(false);
       return;
     }
+    if (
+      !window.confirm(
+        "Remove only this caption? The attachment file and image retrieval records will remain.",
+      )
+    ) {
+      return;
+    }
     try {
       setCaptionDeleting(true);
       setCaptionError("");
@@ -863,6 +1015,13 @@ const MediaViewer = ({
       setStoredCaption("");
       setCaptionDraft("");
       setCaptionEditOpen(false);
+      if (typeof onAttachmentChange === "function") {
+        onAttachmentChange({
+          content_hash: activeHash,
+          ...(deleted.data?.attachment || deleted.data || {}),
+          caption: "",
+        });
+      }
     } catch (err) {
       console.error("caption delete failed", err);
       setCaptionError("Caption delete failed.");
@@ -973,14 +1132,14 @@ const MediaViewer = ({
   };
 
   const goPrev = useCallback(() => {
-    if (!hasCarousel) return;
+    if (!hasCarousel || captionMutationBusy) return;
     setActiveIndex((prev) => (prev - 1 + viewerItems.length) % viewerItems.length);
-  }, [hasCarousel, viewerItems.length]);
+  }, [captionMutationBusy, hasCarousel, viewerItems.length]);
 
   const goNext = useCallback(() => {
-    if (!hasCarousel) return;
+    if (!hasCarousel || captionMutationBusy) return;
     setActiveIndex((prev) => (prev + 1) % viewerItems.length);
-  }, [hasCarousel, viewerItems.length]);
+  }, [captionMutationBusy, hasCarousel, viewerItems.length]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -1117,6 +1276,23 @@ const MediaViewer = ({
   const previewExtension = cleanExtension(src);
   const previewKind = classifyMedia(previewExtension);
   const showCaptionEditButton = activeKind === "image" && displayCaption && !captionEditOpen;
+  const replaceGeneratedCaption =
+    String(activeCaptionStatus || "").trim().toLowerCase() === "generated";
+  const activeCaptionStatusLabel = activePlaceholderCaption
+    ? "caption unavailable"
+    : captionStatusPresentation(activeCaptionStatus);
+  const showCaptionIssue =
+    activeKind === "image"
+    && !displayCaption
+    && !captionEditOpen
+    && Boolean(activeCaptionStatusLabel);
+  const captionUnavailableTooltip =
+    activePlaceholderCaption
+    && String(activeIndexStatus || "").trim().toLowerCase() === "indexed"
+      ? "No readable caption was generated. CLIP image retrieval is indexed separately and can still find this image."
+      : activePlaceholderCaption
+        ? "No readable caption was generated. Captioning and CLIP image retrieval are separate; check retrieval details for this image."
+        : `${activeCaptionStatusLabel}. Automatic captioning is separate from CLIP image retrieval.`;
   const zoomPercent = Math.round(zoom * 100);
   const zoomMinPercent = Math.round(ZOOM_MIN * 100);
   const zoomMaxPercent = Math.round(ZOOM_MAX * 100);
@@ -1243,19 +1419,25 @@ const MediaViewer = ({
                       title={
                         showCaptionEditButton
                           ? "Edit stored caption text."
-                          : "Generate and index a retrieval caption, then store a readable caption."
+                          : "Write a caption manually or retry automatic captioning."
                       }
                     >
-                      {showCaptionEditButton ? "edit caption" : "caption image"}
+                      {showCaptionEditButton ? "edit caption" : "add caption"}
                     </button>
                   )}
                   <button
                     type="button"
                     className="viewer-btn"
-                    onClick={() => window.open(activeSrc, "_blank", "noopener,noreferrer")}
-                    title="Open this file directly in a new tab"
+                    onClick={() =>
+                      window.open(activeRetrievalUrl, "_blank", "noopener,noreferrer")
+                    }
+                    title={
+                      activeHasFloatCopy
+                        ? "Open Float's current API retrieval copy in a new tab"
+                        : "Open the current file or source in a new tab"
+                    }
                   >
-                    open file
+                    {activeHasFloatCopy ? "open Float copy" : "open file"}
                   </button>
                   {activeKind === "image" && (
                     <button
@@ -1300,6 +1482,38 @@ const MediaViewer = ({
                   {activeHash ? ` | ${activeHash.slice(0, 12)}...` : ""}
                 </span>
               </div>
+              {activeSourceUrl ? (
+                <div className="viewer-location-links" aria-label="Media locations">
+                  <span>
+                    <strong>Recorded source</strong>
+                    <a
+                      href={activeSourceUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      title={
+                        activeSourceUrlRecordedAt
+                          ? `Recorded ${formatUploadedAt(activeSourceUrlRecordedAt)}; this external page may have changed`
+                          : "Recorded external provenance; this page may have changed"
+                      }
+                    >
+                      {urlHostLabel(activeSourceUrl)}
+                    </a>
+                  </span>
+                  {activeHasFloatCopy ? (
+                    <span>
+                      <strong>Float retrieval</strong>
+                      <a
+                        href={activeRetrievalUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        title="Current API route for Float's saved copy"
+                      >
+                        current API copy
+                      </a>
+                    </span>
+                  ) : null}
+                </div>
+              ) : null}
               {activeStatusDetails.length > 0 && (
                 <div className="viewer-status-note">
                   {activeStatusDetails.join(" | ")}
@@ -1312,6 +1526,7 @@ const MediaViewer = ({
                     className="viewer-nav viewer-nav--prev"
                     aria-label="Previous media"
                     title="Previous item"
+                    disabled={captionMutationBusy}
                     onClick={(event) => {
                       event.stopPropagation();
                       goPrev();
@@ -1344,6 +1559,7 @@ const MediaViewer = ({
                     className="viewer-nav viewer-nav--next"
                     aria-label="Next media"
                     title="Next item"
+                    disabled={captionMutationBusy}
                     onClick={(event) => {
                       event.stopPropagation();
                       goNext();
@@ -1355,10 +1571,17 @@ const MediaViewer = ({
               </div>
               {captionEditOpen && activeKind === "image" && (
                 <div className="viewer-caption-editor">
+                  <div className="viewer-caption-editor-head">
+                    <strong>Image caption</strong>
+                    <span>
+                      Write one manually or retry the configured automatic captioner.
+                    </span>
+                  </div>
                   <textarea
                     value={captionDraft}
                     onChange={(event) => setCaptionDraft(event.target.value)}
-                    placeholder="Write or generate a caption..."
+                    placeholder="Describe this image for search and recall..."
+                    aria-label="Image caption"
                     rows={3}
                   />
                   <div className="viewer-caption-actions">
@@ -1366,16 +1589,26 @@ const MediaViewer = ({
                       type="button"
                       className="viewer-btn"
                       onClick={generateCaption}
-                      disabled={captionGenerating}
-                      title="Generate and index retrieval embeddings, then save a readable caption."
+                      disabled={captionLoading || captionMutationBusy}
+                      title={
+                        replaceGeneratedCaption
+                          ? "Replace this automatic caption with a newly generated one"
+                          : "Retry automatic captioning for a missing or unavailable caption"
+                      }
                     >
-                      {captionGenerating ? "generating..." : "generate"}
+                      {captionGenerating
+                        ? "captioning..."
+                        : activeHash
+                          ? replaceGeneratedCaption
+                            ? "regenerate automatic caption"
+                            : "retry automatic caption"
+                          : "generate automatic caption"}
                     </button>
                     <button
                       type="button"
                       className="viewer-btn"
                       onClick={saveCaption}
-                      disabled={captionSaving || !captionDraft.trim()}
+                      disabled={captionLoading || captionMutationBusy || !captionDraft.trim()}
                       title="Save the current human-readable caption"
                     >
                       {captionSaving ? "saving..." : "save"}
@@ -1384,10 +1617,14 @@ const MediaViewer = ({
                       type="button"
                       className="viewer-btn"
                       onClick={deleteCaption}
-                      disabled={captionDeleting || (!captionDraft.trim() && !storedCaption)}
-                      title="Delete the stored caption for this attachment"
+                      disabled={
+                        captionLoading
+                        || captionMutationBusy
+                        || (!captionDraft.trim() && !storedCaption)
+                      }
+                      title="Remove only the caption; keep the attachment and image retrieval records"
                     >
-                      {captionDeleting ? "deleting..." : "delete"}
+                      {captionDeleting ? "removing..." : "remove caption only"}
                     </button>
                     <button
                       type="button"
@@ -1425,6 +1662,10 @@ const MediaViewer = ({
                       {captionModelInfo.ragClipModel}
                     </div>
                   )}
+                  <div className="viewer-caption-scope-note">
+                    Removing a caption keeps the original file and CLIP image retrieval.
+                    Deleting the whole attachment is a separate gallery action.
+                  </div>
                 </div>
               )}
               {provenanceOpen && activeKind === "image" && (
@@ -1465,13 +1706,11 @@ const MediaViewer = ({
                   </button>
                   <div className="viewer-caption-aside">
                     {activeCaptionStatus && (
-                      <span className="viewer-caption-badge" title={`caption: ${activeCaptionStatus}`}>
-                        {activeCaptionStatus}
-                      </span>
-                    )}
-                    {activePlaceholderCaption && (
-                      <span className="viewer-caption-badge viewer-caption-badge--placeholder">
-                        placeholder
+                      <span
+                        className="viewer-caption-badge"
+                        title={activeCaptionStatusLabel}
+                      >
+                        {activeCaptionStatusLabel}
                       </span>
                     )}
                     {activeHash && (
@@ -1487,6 +1726,36 @@ const MediaViewer = ({
                   </div>
                 </div>
               )}
+              {showCaptionIssue ? (
+                <div className="viewer-caption-empty">
+                  <Tooltip
+                    title={captionUnavailableTooltip}
+                    placement="top"
+                    arrow
+                    enterTouchDelay={0}
+                    leaveTouchDelay={4000}
+                  >
+                    <button
+                      type="button"
+                      className="viewer-caption-badge viewer-caption-badge--placeholder viewer-caption-badge--interactive"
+                      aria-label={`${activeCaptionStatusLabel}. ${captionUnavailableTooltip}`}
+                    >
+                      {activeCaptionStatusLabel}
+                    </button>
+                  </Tooltip>
+                  <button
+                    type="button"
+                    className="viewer-btn viewer-btn--mint"
+                    onClick={() => {
+                      setCaptionError("");
+                      setCaptionDraft("");
+                      setCaptionEditOpen(true);
+                    }}
+                  >
+                    write a caption
+                  </button>
+                </div>
+              ) : null}
               {error && <div className="viewer-error">{error}</div>}
               {captionError && <div className="viewer-error">{captionError}</div>}
               {revealInfo?.path && (
@@ -1534,6 +1803,6 @@ const MediaViewer = ({
       {viewerDialog}
     </div>
   );
-};
+});
 
 export default MediaViewer;

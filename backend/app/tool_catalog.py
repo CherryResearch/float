@@ -6,12 +6,57 @@ single place so the API, tool-help output, and UI can stay aligned.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from app import config as app_config
 from app.tool_specs import BUILTIN_TOOL_SPECS
+
+_PERMISSION_CATEGORY_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_AUTO_APPROVAL_VALUES = frozenset({"", "auto", "none", "never"})
+_SCHEDULED_AUTH_POLICY_ID = "scheduled-tool-auth:v1"
+
+
+def _canonical_digest(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _permission_scopes_from_entry(
+    tool_name: str, entry: Dict[str, Any]
+) -> tuple[str, ...]:
+    """Derive the narrow scheduled-job permission from canonical metadata."""
+
+    origin = str(entry.get("origin") or "custom").strip().lower()
+    category = str(entry.get("category") or "custom").strip().lower()
+    if not _PERMISSION_CATEGORY_RE.fullmatch(category):
+        category = "custom"
+    runtime = entry.get("runtime")
+    runtime = runtime if isinstance(runtime, dict) else {}
+    persistence = entry.get("persistence")
+    persistence = persistence if isinstance(persistence, dict) else {}
+    safety = entry.get("safety")
+    safety = safety if isinstance(safety, dict) else {}
+    risk_level = str(safety.get("risk_level") or "unknown").strip().lower()
+
+    # Runtime-registered tools and generic MCP calls can hide arbitrary effects,
+    # so a read-looking fallback must never widen their background authority.
+    if origin != "builtin" or category == "custom":
+        return ("custom.execute",)
+    if tool_name == "mcp.call" or risk_level == "unknown":
+        return (f"{category}.execute",)
+    operation = "write" if bool(persistence.get("writes_state")) else "read"
+    return (f"{category}.{operation}",)
 
 
 def _entry(
@@ -101,7 +146,7 @@ _BUILTIN_TOOL_CATALOG: Dict[str, Dict[str, Any]] = {
     ),
     "read_capability_docs": _entry(
         category="docs",
-        summary="Read curated Float capability docs such as packaged skills and function descriptions.",
+        summary="Read curated Float capability docs such as packaged skills and feature overviews.",
         description=(
             "Lists, searches, or reads packaged capability docs from curated repo "
             "roots so the model can inspect UI/runtime behavior without broad "
@@ -112,7 +157,6 @@ _BUILTIN_TOOL_CATALOG: Dict[str, Dict[str, Any]] = {
             "read_roots": [
                 "modules/skills/",
                 "data/modules/skills/",
-                "docs/function descriptions/",
                 "docs/feature_overviews/",
             ]
         },
@@ -129,7 +173,6 @@ _BUILTIN_TOOL_CATALOG: Dict[str, Dict[str, Any]] = {
         safety={"risk_level": "low", "default_approval": "auto"},
         can_access=[
             "packaged module skills",
-            "function-description docs",
             "feature overview docs",
             "optional local skill overrides under data/modules/skills",
         ],
@@ -964,6 +1007,64 @@ def get_tool_catalog_entry(tool_name: str) -> Dict[str, Any]:
             "properties": {},
         }
     return entry
+
+
+def permission_scopes_for_tool(tool_name: str) -> tuple[str, ...]:
+    """Return canonical permission scopes for one scheduled tool action.
+
+    Catalog lookup failures deliberately collapse to ``custom.execute``.  A
+    background runner must not infer that an unknown capability is read-only.
+    """
+
+    name = str(tool_name or "").strip()
+    if not name:
+        return ("custom.execute",)
+    try:
+        entry = get_tool_catalog_entry(name)
+    except Exception:
+        return ("custom.execute",)
+    return _permission_scopes_from_entry(name, entry)
+
+
+def scheduled_approval_policy_for_tool(tool_name: str) -> Dict[str, Any]:
+    """Build the fail-closed approval policy used by scheduled actions."""
+
+    name = str(tool_name or "").strip()
+    try:
+        entry = get_tool_catalog_entry(name) if name else {}
+    except Exception:
+        entry = {}
+    if not entry:
+        entry = {
+            "origin": "custom",
+            "category": "custom",
+            "runtime": {},
+            "persistence": {"writes_state": False},
+            "safety": {"risk_level": "unknown", "default_approval": "confirm"},
+        }
+    safety = entry.get("safety")
+    safety = safety if isinstance(safety, dict) else {}
+    approval = str(safety.get("default_approval") or "confirm").strip().lower()
+    risk_level = str(safety.get("risk_level") or "unknown").strip().lower()
+    permission_scopes = _permission_scopes_from_entry(name, entry)
+    digest_payload = {
+        "schema_version": 1,
+        "policy_id": _SCHEDULED_AUTH_POLICY_ID,
+        "tool_name": name or "unknown",
+        "origin": str(entry.get("origin") or "custom").strip().lower(),
+        "category": str(entry.get("category") or "custom").strip().lower(),
+        "risk_level": risk_level,
+        "default_approval": approval,
+        "permission_scopes": list(permission_scopes),
+    }
+    return {
+        "policy_id": _SCHEDULED_AUTH_POLICY_ID,
+        "approval_required": approval not in _AUTO_APPROVAL_VALUES,
+        "default_approval": approval,
+        "risk_level": risk_level,
+        "permission_scopes": permission_scopes,
+        "policy_digest": _canonical_digest(digest_payload),
+    }
 
 
 def get_tool_catalog(available: Optional[Iterable[str]] = None) -> List[Dict[str, Any]]:

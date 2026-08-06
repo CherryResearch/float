@@ -87,6 +87,50 @@ def _simple_embed(text: str) -> list[float]:
     return [byte / 255.0 for byte in digest[:32]]
 
 
+def _coerce_embedding(value: Any) -> list[float]:
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if not isinstance(value, (list, tuple)):
+        return []
+    try:
+        return [float(component) for component in value]
+    except (TypeError, ValueError):
+        return []
+
+
+def _embed_memory_texts(
+    texts: list[str], *, use_loaded_embeddings: bool = True
+) -> tuple[list[list[float]], str]:
+    """Embed graph labels without cold-starting models or making API calls."""
+    if not use_loaded_embeddings:
+        return [_simple_embed(text) for text in texts], "hash_fallback"
+
+    rag_service = get_rag_service(raise_http=False)
+    encoder = getattr(rag_service, "_embedding_encoder", None)
+    encode = getattr(encoder, "encode", None)
+    if callable(encode) and texts:
+        try:
+            batch = encode(texts)
+            if hasattr(batch, "tolist"):
+                batch = batch.tolist()
+            if isinstance(batch, (list, tuple)) and len(batch) == len(texts):
+                vectors = [_coerce_embedding(value) for value in batch]
+                if all(vectors):
+                    return vectors, "rag_service"
+        except Exception:
+            # Visualization loading should never initialize or wait on an embedder.
+            pass
+
+        try:
+            vectors = [_coerce_embedding(encode(text)) for text in texts]
+            if all(vectors):
+                return vectors, "rag_service"
+        except Exception:
+            pass
+
+    return [_simple_embed(text) for text in texts], "hash_fallback"
+
+
 def _as_float(value: Any, default: float = 0.0) -> float:
     try:
         parsed = float(value)
@@ -462,17 +506,13 @@ def build_memory_graph(
     limit: int = DEFAULT_MEMORY_GRAPH_LIMIT,
     focus_key: Optional[str] = None,
     thread_summary: Optional[Dict[str, Any]] = None,
+    use_loaded_embeddings: bool = True,
 ) -> Dict[str, Any]:
     items = _select_memory_items(
         raw_items or [],
         limit=max(1, int(limit or DEFAULT_MEMORY_GRAPH_LIMIT)),
         focus_key=focus_key,
     )
-    rag_service = get_rag_service(raise_http=False)
-    embed_text = getattr(rag_service, "_embed_text", None)
-    if not callable(embed_text):
-        embed_text = _simple_embed
-
     nodes: list[Dict[str, Any]] = []
     links: list[Dict[str, Any]] = []
     anchor_nodes: dict[str, Dict[str, Any]] = {}
@@ -481,7 +521,18 @@ def build_memory_graph(
     item_refs: dict[str, set[tuple[str, str]]] = {}
     candidate_links_by_node: defaultdict[str, list[Dict[str, Any]]] = defaultdict(list)
 
-    for entry in items:
+    similarity_texts = [
+        _memory_similarity_text(str(entry.get("key") or "").strip(), entry)
+        or str(entry.get("key") or "").strip()
+        for entry in items
+    ]
+    embeddings, embeddings_source = _embed_memory_texts(
+        similarity_texts, use_loaded_embeddings=use_loaded_embeddings
+    )
+
+    for entry, similarity_text, embedding in zip(
+        items, similarity_texts, embeddings, strict=True
+    ):
         key = str(entry.get("key") or "").strip()
         if not key:
             continue
@@ -493,8 +544,7 @@ def build_memory_graph(
             for value in values
             if value
         }
-        similarity_text = _memory_similarity_text(key, entry)
-        item_embeddings[node_id] = list(embed_text(similarity_text or key))
+        item_embeddings[node_id] = embedding
         item_tokens[node_id] = _tokenize(similarity_text)
         item_refs[node_id] = flattened_refs
 
@@ -698,12 +748,7 @@ def build_memory_graph(
             str(node.get("label") or "") == str(focus_key or "").strip()
             for node in memory_nodes
         ),
-        "embeddings_source": (
-            "rag_service"
-            if rag_service is not None
-            and callable(getattr(rag_service, "_embed_text", None))
-            else "hash_fallback"
-        ),
+        "embeddings_source": embeddings_source,
         "limitations": [
             "Explicit provenance is inferred from current memory fields/value payloads.",
             "Thread context is projected from the latest threads summary snapshot when available.",

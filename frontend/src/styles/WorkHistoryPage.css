@@ -13,5 +13,567 @@
   align-items: center;
   justify-content: center;
   text-decoration: none;
-  color: var(--color-black);
+  color: var(--color-text);
+}
+
+.work-history-page.settings-container .work-history-page-action {
+  min-height: 38px;
+  margin: 0;
+  padding: 8px 12px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 84%, transparent);
+  border-radius: 10px;
+  background: color-mix(in oklab, var(--glass-tint) 92%, transparent);
+  color: var(--color-text);
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 650;
+}
+
+.work-history-page.settings-container .work-history-page-action--primary {
+  border-color: color-mix(in oklab, var(--color-pear-green) 54%, var(--glass-border) 46%);
+  background: color-mix(in oklab, var(--color-pear-green) 18%, var(--glass-tint) 82%);
+}
+
+.work-history-page.settings-container .work-history-page-action--quiet {
+  background: transparent;
+  color: var(--color-text-muted);
+}
+
+.work-history-page.settings-container .work-history-page-action:hover:not(:disabled),
+.work-history-page.settings-container .work-history-page-action:focus-visible {
+  border-color: color-mix(in oklab, var(--color-pear-green) 58%, var(--glass-border) 42%);
+  color: var(--color-text);
+}
+
+.activity-tabs {
+  border-bottom: 1px solid var(--color-border);
+  display: flex;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.activity-tabs button {
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  padding: 9px 12px;
+}
+
+.activity-tabs button.active {
+  border-bottom-color: var(--color-primary);
+  color: var(--color-text);
+  font-weight: 700;
+}
+
+.activity-tabs .activity-review-tab {
+  color: color-mix(in oklab, var(--color-warning, #b7791f) 76%, var(--color-text) 24%);
+}
+
+.activity-tabs .activity-review-tab.active {
+  border-bottom-color: var(--color-warning, #b7791f);
+  color: var(--color-text);
+}
+
+.activity-surface-note {
+  background: var(--color-background-secondary);
+  border-radius: var(--radius-md);
+  display: grid;
+  gap: 3px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+}
+
+.activity-surface-note span {
+  color: var(--color-text-muted);
+  font-size: 0.84rem;
+}
+
+.activity-run-list {
+  display: grid;
+  gap: 10px;
+}
+
+.activity-run-card {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: 11px 12px;
+}
+
+.activity-run-card.needs-attention {
+  border-color: var(--color-warning, #b7791f);
+}
+
+.activity-run-card.needs-review {
+  border-color: color-mix(in oklab, var(--color-warning, #b7791f) 74%, var(--color-border) 26%);
+  background: color-mix(in oklab, var(--color-warning, #b7791f) 4%, transparent);
+}
+
+.activity-authorization-review {
+  border: 1px solid color-mix(in oklab, var(--color-warning, #b7791f) 52%, var(--color-border) 48%);
+  border-radius: var(--radius-sm);
+  background: color-mix(in oklab, var(--color-background-secondary) 90%, transparent);
+  display: grid;
+  gap: 9px;
+  margin: 10px 0;
+  padding: 10px 11px;
+}
+
+.activity-authorization-heading {
+  align-items: flex-start;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.activity-authorization-heading > div {
+  display: grid;
+  gap: 2px;
+}
+
+.activity-authorization-heading span,
+.activity-authorization-note {
+  color: var(--color-text-muted);
+  font-size: 0.78rem;
+}
+
+.activity-authorization-state {
+  border: 1px solid color-mix(in oklab, var(--color-warning, #b7791f) 52%, transparent);
+  border-radius: 999px;
+  color: var(--color-text) !important;
+  flex: 0 0 auto;
+  font-weight: 700;
+  padding: 3px 8px;
+}
+
+.activity-authorization-scopes {
+  display: grid;
+  font-size: 0.78rem;
+  gap: 3px 9px;
+  grid-template-columns: max-content minmax(0, 1fr);
+  margin: 0;
+}
+
+.activity-authorization-scopes dt {
+  color: var(--color-text-muted);
+  font-weight: 600;
+}
+
+.activity-authorization-scopes dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.activity-authorization-note {
+  margin: 0 !important;
+}
+
+.activity-authorization-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.work-history-page .activity-authorization-actions button,
+.activity-authorization-calendar-link {
+  align-items: center;
+  border: 1px solid var(--color-border);
+  border-radius: 9px;
+  display: inline-flex;
+  font: inherit;
+  font-size: 0.76rem;
+  font-weight: 650;
+  justify-content: center;
+  min-height: 34px;
+  padding: 6px 10px;
+  text-decoration: none;
+}
+
+.work-history-page .activity-authorization-approve {
+  border-color: color-mix(in oklab, var(--color-pear-green) 62%, var(--color-border) 38%);
+  background: color-mix(in oklab, var(--color-pear-green) 20%, var(--glass-tint) 80%);
+  color: var(--color-text);
+}
+
+.work-history-page .activity-authorization-skip,
+.activity-authorization-calendar-link {
+  background: transparent;
+  color: var(--color-text-muted);
+}
+
+.work-history-page .activity-authorization-actions button:not(:disabled),
+.activity-authorization-calendar-link {
+  cursor: pointer;
+}
+
+.work-history-page .activity-authorization-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+.work-history-page .activity-authorization-actions button:focus-visible,
+.activity-authorization-calendar-link:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+.activity-authorization-error {
+  color: var(--color-danger, #a92323);
+  font-size: 0.78rem;
+  font-weight: 650;
+  margin: 0 !important;
+}
+
+.activity-stop-request {
+  align-items: center;
+  border-top: 1px solid color-mix(in oklab, var(--color-border) 82%, transparent);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  justify-content: space-between;
+  margin-top: 10px;
+  padding-top: 9px;
+}
+
+.activity-stop-request > div {
+  display: grid;
+  flex: 1 1 520px;
+  gap: 2px;
+}
+
+.activity-stop-request > div > span {
+  color: var(--color-text-muted);
+  font-size: 0.76rem;
+}
+
+.activity-stop-request strong[role="status"] {
+  color: var(--color-warning, #8a5500);
+}
+
+.work-history-page .activity-stop-request > button {
+  border: 1px solid color-mix(in oklab, var(--color-warning, #b7791f) 48%, var(--color-border) 52%);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--color-text);
+  cursor: pointer;
+  flex: 0 0 auto;
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 650;
+  min-height: 34px;
+  padding: 6px 10px;
+}
+
+.work-history-page .activity-stop-request > button:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--color-warning, #b7791f) 8%, transparent);
+}
+
+.work-history-page .activity-stop-request > button:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+.work-history-page .activity-stop-request > button:disabled {
+  cursor: wait;
+  opacity: 0.52;
+}
+
+.activity-stop-request-error {
+  color: var(--color-danger, #a92323);
+  flex-basis: 100%;
+  font-size: 0.78rem;
+  font-weight: 650;
+  margin: 0 !important;
+}
+
+.activity-run-card .activity-operation-warning {
+  color: var(--color-warning, #8a5500);
+  flex-basis: 100%;
+  font-size: 0.78rem;
+  font-weight: 650;
+  margin: 6px 0 0;
+}
+
+.activity-run-card-header,
+.activity-run-meta {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: space-between;
+}
+
+.activity-run-card-header > div {
+  display: grid;
+  gap: 2px;
+}
+
+.activity-run-card-header > div > span,
+.activity-run-meta {
+  color: var(--color-text-muted);
+  font-size: 0.76rem;
+}
+
+.activity-run-card p {
+  margin: 9px 0;
+  overflow-wrap: anywhere;
+}
+
+.activity-run-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.activity-run-badges span {
+  background: var(--color-background-secondary);
+  border-radius: 999px;
+  color: var(--color-text-muted);
+  font-size: 0.7rem;
+  padding: 3px 7px;
+}
+
+.activity-run-badges span.attention {
+  color: var(--color-warning, #8a5500);
+}
+
+.activity-run-status {
+  border-radius: 999px;
+  background: var(--color-background-secondary);
+  font-size: 0.72rem;
+  padding: 3px 8px;
+  text-transform: capitalize;
+}
+
+.activity-run-status.status-error,
+.activity-run-status.status-failed {
+  color: var(--color-danger, #a92323);
+}
+
+.activity-run-lifecycle {
+  border-top: 1px solid var(--color-border);
+  margin-top: 10px;
+  padding-top: 8px;
+}
+
+.work-history-page .activity-run-lifecycle-toggle {
+  background: transparent;
+  border: 0;
+  color: var(--color-primary);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.78rem;
+  margin: 0;
+  min-height: auto;
+  padding: 2px 0;
+  width: auto;
+}
+
+.work-history-page .activity-run-lifecycle-toggle:hover:not(:disabled) {
+  background: transparent;
+}
+
+.work-history-page .activity-run-lifecycle-toggle:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 3px;
+}
+
+.activity-run-lifecycle-detail {
+  color: var(--color-text-muted);
+  font-size: 0.75rem;
+  margin-top: 7px;
+}
+
+.activity-run-lifecycle-detail section + section {
+  border-top: 1px solid var(--color-border);
+  margin-top: 9px;
+  padding-top: 9px;
+}
+
+.activity-run-lifecycle-detail h3 {
+  color: var(--color-text);
+  font-size: 0.76rem;
+  margin: 0 0 6px;
+}
+
+.activity-run-lifecycle-detail ol {
+  display: grid;
+  gap: 5px;
+  list-style-position: inside;
+  margin: 0;
+  padding: 0;
+}
+
+.activity-run-lifecycle-detail li time {
+  float: right;
+}
+
+.activity-evidence-list > li {
+  background: var(--color-background-secondary);
+  border-radius: var(--radius-sm);
+  list-style: none;
+  padding: 8px 9px;
+}
+
+.activity-evidence-heading {
+  align-items: center;
+  color: var(--color-text);
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+}
+
+.activity-evidence-heading > span {
+  text-transform: capitalize;
+}
+
+.activity-evidence-list dl {
+  display: grid;
+  gap: 3px 8px;
+  grid-template-columns: max-content minmax(0, 1fr);
+  margin: 7px 0 0;
+}
+
+.activity-evidence-list dt {
+  font-weight: 600;
+}
+
+.activity-evidence-list dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.activity-state-delta {
+  color: var(--color-text-muted);
+  font-weight: 600;
+  margin: 7px 0 0;
+}
+
+.activity-state-delta.attention {
+  color: var(--color-warning, #8a5500);
+}
+
+.activity-effect-reconciliation {
+  border-top: 1px solid
+    color-mix(in oklab, var(--color-warning, #b7791f) 44%, var(--color-border) 56%);
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 8px;
+}
+
+.activity-effect-reconciliation > strong {
+  color: var(--color-text);
+  font-size: 0.76rem;
+}
+
+.activity-effect-reconciliation > p {
+  margin: 0;
+}
+
+.activity-effect-reconciliation-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.work-history-page .activity-effect-reconciliation-actions button {
+  border: 1px solid color-mix(in oklab, var(--color-border) 84%, transparent);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--color-text);
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.74rem;
+  font-weight: 650;
+  min-height: 32px;
+  padding: 5px 9px;
+}
+
+.work-history-page .activity-effect-reconciliation-actions button:hover:not(:disabled) {
+  border-color: color-mix(in oklab, var(--color-pear-green) 56%, var(--color-border) 44%);
+  background: color-mix(in oklab, var(--color-pear-green) 10%, transparent);
+}
+
+.work-history-page .activity-effect-reconciliation-actions button:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+.work-history-page .activity-effect-reconciliation-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+.activity-effect-reconciliation-note {
+  color: var(--color-warning, #8a5500);
+  font-weight: 600;
+}
+
+.activity-effect-reconciliation-error {
+  color: var(--color-danger, #a92323);
+  font-weight: 650;
+}
+
+.activity-evidence-error,
+.activity-evidence-limit {
+  margin: 6px 0 0;
+}
+
+.activity-evidence-error {
+  color: var(--color-danger, #a92323);
+}
+
+.activity-evidence-limit {
+  font-style: italic;
+}
+
+.activity-load-older {
+  display: block;
+  margin: 12px auto 0;
+}
+
+@media (max-width: 640px) {
+  .activity-authorization-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .activity-authorization-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .work-history-page .activity-authorization-actions button,
+  .activity-authorization-calendar-link {
+    width: 100%;
+  }
+
+  .activity-effect-reconciliation-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .work-history-page .activity-effect-reconciliation-actions button {
+    width: 100%;
+  }
+
+  .activity-stop-request {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .work-history-page .activity-stop-request > button {
+    width: 100%;
+  }
+
+  .activity-run-lifecycle-detail li time {
+    display: block;
+    float: none;
+    margin-left: 18px;
+  }
 }

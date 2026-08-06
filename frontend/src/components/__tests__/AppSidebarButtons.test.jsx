@@ -1,6 +1,6 @@
 import React from "react";
 import { vi } from "vitest";
-import { render, fireEvent, screen, waitFor } from "@testing-library/react";
+import { act, render, fireEvent, screen, waitFor } from "@testing-library/react";
 import "@testing-library/jest-dom";
 
 const mockState = {
@@ -92,6 +92,7 @@ describe("App sidebar open buttons", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     globalThis.WebSocket = OriginalWebSocket;
   });
 
@@ -99,11 +100,13 @@ describe("App sidebar open buttons", () => {
     const { default: App } = await import("../App");
     render(<App />);
 
-    const leftOpenButton = screen.getByTitle("Show history sidebar");
+    const leftOpenButton = screen.getByRole("button", { name: "Open chat history" });
     fireEvent.click(leftOpenButton);
 
     await waitFor(() =>
-      expect(screen.queryByTitle("Show history sidebar")).not.toBeInTheDocument(),
+      expect(
+        screen.queryByRole("button", { name: "Open chat history" }),
+      ).not.toBeInTheDocument(),
     );
     expect(document.querySelector(".sidebar.left-sidebar")).not.toHaveClass("collapsed");
   });
@@ -112,11 +115,13 @@ describe("App sidebar open buttons", () => {
     const { default: App } = await import("../App");
     render(<App />);
 
-    const leftOpenButton = screen.getByTitle("Show history sidebar");
+    const leftOpenButton = screen.getByRole("button", { name: "Open chat history" });
     fireEvent.pointerDown(leftOpenButton, { button: 0 });
 
     await waitFor(() =>
-      expect(screen.queryByTitle("Show history sidebar")).not.toBeInTheDocument(),
+      expect(
+        screen.queryByRole("button", { name: "Open chat history" }),
+      ).not.toBeInTheDocument(),
     );
     expect(document.querySelector(".sidebar.left-sidebar")).not.toHaveClass("collapsed");
   });
@@ -125,7 +130,7 @@ describe("App sidebar open buttons", () => {
     const { default: App } = await import("../App");
     render(<App />);
 
-    const leftOpenButton = screen.getByTitle("Show history sidebar");
+    const leftOpenButton = screen.getByRole("button", { name: "Open chat history" });
     fireEvent.pointerDown(leftOpenButton, { button: 0 });
     await waitFor(() =>
       expect(document.querySelector(".sidebar.left-sidebar")).not.toHaveClass("collapsed"),
@@ -136,18 +141,22 @@ describe("App sidebar open buttons", () => {
     fireEvent.click(document.body);
 
     expect(document.querySelector(".sidebar.left-sidebar")).not.toHaveClass("collapsed");
-    expect(screen.queryByTitle("Show history sidebar")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Open chat history" }),
+    ).not.toBeInTheDocument();
   });
 
   test("click opens right sidebar in narrow layout", async () => {
     const { default: App } = await import("../App");
     render(<App />);
 
-    const rightOpenButton = screen.getByTitle("Show agent console");
+    const rightOpenButton = screen.getByRole("button", { name: "Open agent console" });
     fireEvent.click(rightOpenButton);
 
     await waitFor(() =>
-      expect(screen.queryByTitle("Show agent console")).not.toBeInTheDocument(),
+      expect(
+        screen.queryByRole("button", { name: "Open agent console" }),
+      ).not.toBeInTheDocument(),
     );
     expect(document.querySelector(".sidebar.right-sidebar")).not.toHaveClass("collapsed");
   });
@@ -156,7 +165,7 @@ describe("App sidebar open buttons", () => {
     const { default: App } = await import("../App");
     render(<App />);
 
-    fireEvent.click(screen.getByTitle("Show history sidebar"));
+    fireEvent.click(screen.getByRole("button", { name: "Open chat history" }));
     await waitFor(() =>
       expect(document.querySelector(".sidebar.left-sidebar")).not.toHaveClass("collapsed"),
     );
@@ -166,7 +175,7 @@ describe("App sidebar open buttons", () => {
     await waitFor(() =>
       expect(document.querySelector(".sidebar.left-sidebar")).toHaveClass("collapsed"),
     );
-    expect(screen.getByTitle("Show history sidebar")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open chat history" })).toBeInTheDocument();
   });
 
   test("settings route uses the inner settings scroll shell", async () => {
@@ -183,9 +192,28 @@ describe("App sidebar open buttons", () => {
     const { default: App } = await import("../App");
     render(<App />);
 
-    expect(screen.getByTitle("Show history sidebar")).toBeInTheDocument();
-    expect(screen.getByTitle("Show agent console")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open chat history" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open agent console" })).toBeInTheDocument();
     expect(document.querySelector(".sidebar.left-sidebar")).toHaveClass("collapsed");
     expect(document.querySelector(".sidebar.right-sidebar")).toHaveClass("collapsed");
+  });
+
+  test("desktop hover leaves collapsed sidebars closed", async () => {
+    vi.useFakeTimers();
+    const { default: App } = await import("../App");
+    render(<App />);
+    const leftOpenButton = screen.getByRole("button", { name: "Open chat history" });
+    const rightOpenButton = screen.getByRole("button", { name: "Open agent console" });
+
+    window.innerWidth = 1920;
+    window.innerHeight = 1080;
+    fireEvent.mouseEnter(leftOpenButton);
+    fireEvent.mouseEnter(rightOpenButton);
+    act(() => {
+      vi.advanceTimersByTime(1200);
+    });
+
+    expect(leftOpenButton).toBeInTheDocument();
+    expect(rightOpenButton).toBeInTheDocument();
   });
 });

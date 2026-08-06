@@ -350,7 +350,7 @@ export const apiWrapper = new Proxy(
               ? "Request failed (502). The backend or dev proxy was unavailable for a moment."
               : err?.message) ||
             "API request failed";
-          return { error: detail };
+          return { error: detail, status };
         }
       };
     },

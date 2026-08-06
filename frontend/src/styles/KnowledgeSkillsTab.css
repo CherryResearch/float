@@ -75,6 +75,21 @@
   margin-top: 0;
 }
 
+.knowledge-skills-refresh-group {
+  display: grid;
+  flex: 0 0 min(280px, 34%);
+  gap: 5px;
+  justify-items: end;
+}
+
+.knowledge-skills-refresh-group small {
+  max-width: 280px;
+  color: var(--color-text-muted);
+  font-size: 0.7rem;
+  line-height: 1.35;
+  text-align: right;
+}
+
 .knowledge-skills-summary,
 .knowledge-skills-meta {
   display: flex;
@@ -102,6 +117,16 @@
 .knowledge-skills-meta strong {
   color: var(--color-text);
   font-weight: 700;
+}
+
+.knowledge-skills-summary > span.is-pending,
+.knowledge-skills-editor-label .is-pending,
+.knowledge-skills-module-toggle small.is-pending {
+  color: color-mix(in oklab, var(--color-warning, #d39b42) 80%, var(--color-text) 20%);
+}
+
+.knowledge-skills-summary > span.is-saved {
+  color: color-mix(in oklab, var(--color-pear) 65%, var(--color-text-muted) 35%);
 }
 
 .knowledge-skills-message {
@@ -237,7 +262,8 @@
 .knowledge-skills-card select:focus-visible,
 .knowledge-skills-card input:focus-visible,
 .knowledge-skills-card textarea:focus-visible,
-.knowledge-skills-disclosure summary:focus-visible {
+.knowledge-skills-disclosure summary:focus-visible,
+.knowledge-skills-lifecycle summary:focus-visible {
   outline: 2px solid color-mix(in oklab, var(--color-pear) 72%, white 28%);
   outline-offset: 2px;
 }
@@ -245,6 +271,40 @@
 .knowledge-skills-tab .icon-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.knowledge-skills-tab .knowledge-skills-action.is-primary {
+  border-color: color-mix(in oklab, var(--color-pear) 62%, var(--glass-border) 38%);
+  background: color-mix(in oklab, var(--color-pear) 24%, var(--glass-tint) 76%);
+  color: color-mix(in oklab, var(--color-text) 90%, var(--color-pear) 10%);
+}
+
+.knowledge-skills-tab .knowledge-skills-action.is-primary:hover:not(:disabled) {
+  border-color: color-mix(in oklab, var(--color-pear) 78%, var(--glass-border) 22%);
+  background: color-mix(in oklab, var(--color-pear) 32%, var(--glass-tint) 68%);
+}
+
+.knowledge-skills-tab .knowledge-skills-action.is-quiet {
+  border-color: color-mix(in oklab, var(--glass-border) 62%, transparent);
+  background: transparent;
+  color: var(--color-text-muted);
+}
+
+.knowledge-skills-tab .knowledge-skills-action.is-quiet:hover:not(:disabled) {
+  border-color: color-mix(in oklab, var(--color-pear) 38%, var(--glass-border) 62%);
+  background: color-mix(in oklab, var(--color-pear) 7%, transparent);
+  color: var(--color-text);
+}
+
+.knowledge-skills-tab .knowledge-skills-action.is-danger {
+  border-color: color-mix(in oklab, var(--color-danger, #c85757) 44%, var(--glass-border) 56%);
+  background: color-mix(in oklab, var(--color-danger, #c85757) 9%, var(--glass-tint) 91%);
+  color: color-mix(in oklab, var(--color-danger, #c85757) 78%, var(--color-text) 22%);
+}
+
+.knowledge-skills-tab .knowledge-skills-action.is-danger:hover:not(:disabled) {
+  border-color: color-mix(in oklab, var(--color-danger, #c85757) 68%, var(--glass-border) 32%);
+  background: color-mix(in oklab, var(--color-danger, #c85757) 15%, var(--glass-tint) 85%);
 }
 
 .knowledge-skills-disclosure {
@@ -298,10 +358,23 @@
   line-height: 1.4;
 }
 
-.knowledge-skills-profile-list article > div span {
+.knowledge-skills-profile-flags {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.knowledge-skills-profile-flags em {
+  padding: 2px 6px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 72%, transparent);
+  border-radius: 999px;
   color: var(--color-pear);
-  font-size: 0.68rem;
+  font-size: 0.63rem;
+  font-style: normal;
   font-weight: 700;
+  letter-spacing: 0.02em;
   text-transform: uppercase;
 }
 
@@ -311,6 +384,10 @@
   margin: 14px 0 0;
   padding: 0;
   border: 0;
+}
+
+.knowledge-skills-fieldset-help {
+  margin: 0 0 3px;
 }
 
 .knowledge-skills-module-row {
@@ -324,7 +401,12 @@
   border: 1px solid color-mix(in oklab, var(--glass-border) 70%, transparent);
   border-radius: 10px;
   background: color-mix(in oklab, var(--glass-tint) 82%, transparent);
-  cursor: pointer;
+  cursor: default;
+}
+
+.knowledge-skills-module-row.is-inspected {
+  border-color: color-mix(in oklab, var(--color-pear) 44%, var(--glass-border) 56%);
+  box-shadow: inset 3px 0 0 color-mix(in oklab, var(--color-pear) 64%, transparent);
 }
 
 .knowledge-skills-module-row > span > span:last-child {
@@ -343,6 +425,24 @@
   flex-wrap: wrap;
 }
 
+.knowledge-skills-module-inspect {
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.knowledge-skills-module-inspect:focus-visible {
+  border-radius: 5px;
+  outline: 2px solid color-mix(in oklab, var(--color-pear) 72%, white 28%);
+  outline-offset: 3px;
+}
+
 .knowledge-skills-module-title em,
 .knowledge-skills-module-title small {
   padding: 2px 6px;
@@ -354,7 +454,21 @@
   font-weight: 600;
 }
 
-.knowledge-skills-module-row input {
+.knowledge-skills-modules .knowledge-skills-module-toggle {
+  display: grid;
+  min-width: 112px;
+  gap: 5px;
+  margin: 0;
+  justify-items: end;
+  color: var(--color-text-muted);
+  font-size: 0.69rem;
+  font-weight: 650;
+  line-height: 1.25;
+  text-align: right;
+  cursor: pointer;
+}
+
+.knowledge-skills-module-toggle input {
   width: 18px;
   height: 18px;
   margin: 2px 0 0;
@@ -428,6 +542,21 @@
   margin: 4px 0 8px;
 }
 
+.knowledge-skills-ownership-note {
+  margin: 0;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 66%, transparent);
+  border-radius: 10px;
+  background: color-mix(in oklab, var(--glass-tint) 80%, transparent);
+  color: var(--color-text-muted);
+  font-size: 0.76rem;
+  line-height: 1.42;
+}
+
+.knowledge-skills-ownership-note strong {
+  color: var(--color-text);
+}
+
 .knowledge-skills-new {
   margin-top: 6px;
   padding: 11px;
@@ -446,7 +575,8 @@
   line-height: 1.35;
 }
 
-.knowledge-skills-new .knowledge-skills-inline-error {
+.knowledge-skills-new .knowledge-skills-inline-error,
+.knowledge-skills-lifecycle-grid .knowledge-skills-inline-error {
   color: var(--color-danger, #c85757);
   font-weight: 650;
 }
@@ -487,6 +617,79 @@
 .knowledge-skills-path code,
 .knowledge-skills-help code {
   font-size: 0.76rem;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.knowledge-skills-lifecycle {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid color-mix(in oklab, var(--glass-border) 62%, transparent);
+}
+
+.knowledge-skills-lifecycle > summary {
+  width: fit-content;
+  min-height: 40px;
+  padding: 9px 4px;
+  color: var(--color-text);
+  font-size: 0.82rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.knowledge-skills-lifecycle > .knowledge-skills-help {
+  margin: 0 0 10px;
+}
+
+.knowledge-skills-lifecycle-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  align-items: start;
+}
+
+.knowledge-skills-lifecycle-grid > section {
+  display: grid;
+  min-width: 0;
+  height: fit-content;
+  align-self: start;
+  align-content: start;
+  gap: 7px;
+  padding: 11px;
+  border: 1px solid color-mix(in oklab, var(--glass-border) 66%, transparent);
+  border-radius: 11px;
+  background: color-mix(in oklab, var(--glass-tint) 78%, transparent);
+}
+
+.knowledge-skills-lifecycle-grid h4,
+.knowledge-skills-lifecycle-grid p,
+.knowledge-skills-lifecycle-grid small {
+  margin: 0;
+}
+
+.knowledge-skills-lifecycle-grid h4 {
+  color: var(--color-text);
+  font-size: 0.82rem;
+}
+
+.knowledge-skills-lifecycle-grid small {
+  min-height: 2.7em;
+  color: var(--color-text-muted);
+  font-size: 0.72rem;
+  line-height: 1.35;
+}
+
+.knowledge-skills-lifecycle-grid input[type="file"] {
+  width: 100%;
+  min-width: 0;
+  color: var(--color-text-muted);
+  font-size: 0.76rem;
+}
+
+.knowledge-skills-lifecycle-grid .icon-btn {
+  width: fit-content;
+  min-height: 40px;
+  margin: 2px 0 0;
 }
 
 @media (max-width: 900px) {
@@ -519,11 +722,54 @@
     min-height: 44px;
   }
 
+  .knowledge-skills-refresh-group {
+    width: 100%;
+    max-width: none;
+    justify-items: stretch;
+  }
+
+  .knowledge-skills-refresh-group small {
+    max-width: none;
+    text-align: left;
+  }
+
+  .knowledge-skills-view-tabs {
+    display: grid;
+    width: 100%;
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .knowledge-skills-view-tabs button {
+    min-height: 44px;
+  }
+
+  .knowledge-skills-module-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .knowledge-skills-module-toggle {
+    width: 100%;
+    min-height: 38px;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: center;
+    justify-items: start;
+    text-align: left;
+  }
+
+  .knowledge-skills-module-toggle input {
+    width: 22px;
+    height: 22px;
+  }
+
   .knowledge-skills-actions {
     align-items: stretch;
   }
 
   .knowledge-skills-editor textarea {
     min-height: 240px;
+  }
+
+  .knowledge-skills-lifecycle-grid {
+    grid-template-columns: 1fr;
   }
 }

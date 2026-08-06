@@ -236,6 +236,8 @@ def _candidate_auth_env_names(
     host = _host(base_url)
     if host == "tinker.thinkingmachines.dev" or host.endswith(".thinkingmachines.dev"):
         yield "TINKER_API_KEY"
+    elif host == "api.x.ai" or host.endswith(".api.x.ai"):
+        yield "XAI_API_KEY"
     elif host == "generativelanguage.googleapis.com":
         yield "GEMINI_API_KEY"
         yield "GOOGLE_API_KEY"

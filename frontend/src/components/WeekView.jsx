@@ -1,8 +1,13 @@
 import React, { useState } from "react";
 import "../styles/WeekView.css";
 import FilterBar from "./FilterBar";
+import {
+  civilDateKey,
+  dateKeyInTimeZone,
+  hourInTimeZone,
+} from "../utils/zonedDateTime";
 
-const WeekView = ({ startDate }) => {
+const WeekView = ({ startDate, events = [], onEventClick, timeZone = "" }) => {
   const weekStart = new Date(startDate);
   weekStart.setDate(startDate.getDate() - startDate.getDay());
 
@@ -20,7 +25,7 @@ const WeekView = ({ startDate }) => {
   const [noteQ, setNoteQ] = useState("");
 
   const openModal = (date, hour, noteIndex = null) => {
-    const dateStr = date.toISOString().split("T")[0];
+    const dateStr = civilDateKey(date);
     const note =
       noteIndex !== null && notes[dateStr] ? notes[dateStr][noteIndex] : null;
     setForm({
@@ -59,10 +64,38 @@ const WeekView = ({ startDate }) => {
     return list.filter((n) => String(n.text || "").toLowerCase().includes(q));
   };
 
+  const eventsForSlot = (date, hour) => {
+    const q = (noteQ || "").toLowerCase();
+    const grouped = new Map();
+    (Array.isArray(events) ? events : []).forEach((event) => {
+      const start = event?.startDate instanceof Date ? event.startDate : null;
+      if (
+        !start ||
+        dateKeyInTimeZone(start, timeZone) !== civilDateKey(date) ||
+        hourInTimeZone(start, timeZone) !== hour
+      ) {
+        return;
+      }
+      const haystack = [event.summary, event.title, event.description]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      if (q && !haystack.includes(q)) return;
+      const key = String(event.source_event_id || event.id || event.occurrence_id);
+      const current = grouped.get(key);
+      if (current) {
+        current.count += 1;
+      } else {
+        grouped.set(key, { ...event, count: 1 });
+      }
+    });
+    return [...grouped.values()];
+  };
+
   return (
     <div className="week-view">
       <FilterBar
-        searchPlaceholder="Filter notes…"
+        searchPlaceholder="Filter events or notes…"
         searchValue={noteQ}
         onSearch={setNoteQ}
       />
@@ -86,14 +119,42 @@ const WeekView = ({ startDate }) => {
             <tr key={h}>
               <td className="hour-label">{`${h}:00`}</td>
               {days.map((d) => {
-                const dateStr = d.toISOString().split("T")[0];
+                const dateStr = civilDateKey(d);
                 const slotNotes = notesForSlot(dateStr, h);
+                const slotEvents = eventsForSlot(d, h);
                 return (
                   <td
                     key={dateStr}
                     className="week-cell"
                     onClick={() => openModal(d, h)}
                   >
+                    {slotEvents.map((event) => (
+                      <button
+                        type="button"
+                        key={event.occurrence_id || event.source_event_id || event.id}
+                        className={`week-event${
+                          String(event?.status || "").toLowerCase() === "paused"
+                            ? " is-paused"
+                            : ""
+                        }`}
+                        onClick={(clickEvent) => {
+                          clickEvent.stopPropagation();
+                          onEventClick?.(event);
+                        }}
+                        title={event.rrule || event.description || event.summary}
+                        aria-label={`${event.summary || event.title || event.id}${
+                          String(event?.status || "").toLowerCase() === "paused"
+                            ? ", paused"
+                            : ""
+                        }`}
+                      >
+                        {event.summary || event.title || event.id}
+                        {String(event?.status || "").toLowerCase() === "paused"
+                          ? " (Paused)"
+                          : ""}
+                        {event.count > 1 ? ` · ${event.count} runs` : ""}
+                      </button>
+                    ))}
                     {slotNotes.map((n, i) => (
                       <div
                         key={i}

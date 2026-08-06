@@ -5,6 +5,8 @@ from fastapi import FastAPI
 
 logger = logging.getLogger(__name__)
 
+_DISABLED_RECHECK_SECONDS = 30.0
+
 
 def _get_service(app: FastAPI):
     service = getattr(app.state, "background_autonomy_service", None)
@@ -33,7 +35,13 @@ async def _publish_tick(app: FastAPI, result: dict) -> None:
                 "id": result.get("id"),
                 "status": result.get("status"),
                 "agent_status": (
-                    "error" if result.get("status") == "error" else "active"
+                    "error"
+                    if result.get("status") == "error"
+                    else (
+                        "active"
+                        if result.get("status") in {"busy", "running"}
+                        else "idle"
+                    )
                 ),
                 "agent_id": "system:background-autonomy",
                 "agent_label": "background autonomy",
@@ -50,30 +58,62 @@ async def _publish_tick(app: FastAPI, result: dict) -> None:
         logger.debug("Failed to publish background autonomy tick", exc_info=True)
 
 
+def _get_wakeup_event(app: FastAPI) -> asyncio.Event:
+    wakeup = getattr(app.state, "background_autonomy_wakeup", None)
+    if isinstance(wakeup, asyncio.Event):
+        return wakeup
+    wakeup = asyncio.Event()
+    app.state.background_autonomy_wakeup = wakeup
+    return wakeup
+
+
+async def _wait_for_wakeup(wakeup: asyncio.Event, timeout: float) -> bool:
+    """Wait until configuration changes or the next supervisor poll is due."""
+
+    if wakeup.is_set():
+        wakeup.clear()
+        return True
+    try:
+        await asyncio.wait_for(wakeup.wait(), timeout=max(0.0, float(timeout)))
+        return True
+    except asyncio.TimeoutError:
+        return False
+    finally:
+        wakeup.clear()
+
+
 async def background_autonomy_runner(app: FastAPI) -> None:
-    """Optional long-running loop for bounded autonomous background reflection."""
+    """Supervise bounded background reflection across live config changes."""
 
     service = _get_service(app)
-    if not service.routine_enabled():
-        logger.info("Background autonomy runner disabled")
-        return
-
-    mode = service.mode()
-    service.start_session(mode)
-    interval = service.current_interval_seconds()
-    logger.info(
-        "Background autonomy runner active (mode=%s poll=%.1fs)",
-        mode,
-        interval,
-    )
+    wakeup = _get_wakeup_event(app)
+    active_mode = None
     try:
         while True:
+            if not service.routine_enabled():
+                if active_mode is not None:
+                    logger.info("Background autonomy runner disabled")
+                active_mode = None
+                await _wait_for_wakeup(wakeup, _DISABLED_RECHECK_SECONDS)
+                continue
+
+            mode = service.mode()
+            if active_mode != mode:
+                service.start_session(mode)
+                active_mode = mode
+                logger.info(
+                    "Background autonomy runner active (mode=%s poll=%.1fs)",
+                    mode,
+                    service.current_interval_seconds(),
+                )
+
             if service.should_stop_session(mode):
                 logger.info(
-                    "Background autonomy runner stopped (%s)",
+                    "Background autonomy runner idle at stop condition (%s)",
                     service.status(app).get("session", {}).get("stop_reason"),
                 )
-                return
+                await _wait_for_wakeup(wakeup, _DISABLED_RECHECK_SECONDS)
+                continue
             try:
                 result = await asyncio.to_thread(service.tick, app, mode=mode)
                 await _publish_tick(app, result)
@@ -86,9 +126,8 @@ async def background_autonomy_runner(app: FastAPI) -> None:
                     "Background autonomy runner reached stop condition (%s)",
                     service.status(app).get("session", {}).get("stop_reason"),
                 )
-                return
             interval = service.current_interval_seconds()
-            await asyncio.sleep(interval)
+            await _wait_for_wakeup(wakeup, interval)
     except asyncio.CancelledError:  # pragma: no cover - shutdown path
         logger.info("Background autonomy runner cancelled")
         raise

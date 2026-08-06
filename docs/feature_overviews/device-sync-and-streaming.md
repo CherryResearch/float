@@ -1,9 +1,11 @@
-device sync and streaming is the planned layer that would let float feel continuous across more than one device. The basic idea is that calendars, knowledge, and live sessions should not stay trapped on one machine if the user wants float to move with them.
+# Device sync and streaming
 
-In plain language, this is the feature that would let a desktop, laptop, or other personal device share state and sometimes share a live session too. It matters because float is designed as a persistent assistant, and persistence feels incomplete if it breaks every time the user changes devices.
+Device sync is the alpha layer that lets Float move selected state between trusted personal devices. Conversations, memories, knowledge, graph rows, attachments, Calendar items, and workspace preferences can be previewed and reviewed before a pull or send is applied.
 
-The trusted-device sync slice is real enough to treat as an alpha preview now, not just a hidden roadmap note, but the broader streaming and multi-device story is still unfinished. Current limits are mostly around copy polish, workspace ergonomics, and the fact that this is not yet a background-sync or generic public-gateway system.
+Pairing records identity and trust separately from the current connection address. A saved peer can be checked at a new private LAN or Tailnet address only when its fingerprint still matches, and Float does not silently persist an unverified alternate address. Preview receipts are scoped to the selected peer, workspaces, sections, and item choices; drift or a stale receipt requires a fresh preview before apply.
 
-The 2026-04-12 Cherry consolidation pass exposed a few concrete sync/documentation gaps that should stay visible in this feature area: imported/manual image captions need to be preserved atomically against delayed background caption jobs, generated captions need quality guards before replacing existing captions, CLIP dependency/index state needs clearer surfacing, and conversation import counts should explain the difference between API-visible conversation JSON files and metadata-only sidecars on disk.
+Incoming pushes remain reviewable unless the receiver explicitly enables auto-accept. Cancellation records intent but does not claim rollback for remote work that already completed. Calendar deletion through Sync fails closed while the event or its durable Activity ledger still reports active work, and terminal retained run history is projected before the source event is removed.
+
+The broader multi-device story is still unfinished. Sync is reviewed and user-triggered rather than continuous background replication, address continuity uses stored fingerprint equality rather than a signed challenge-response, public internet exposure is out of scope, and live-session streaming remains separate from the data-sync contract.
 
 The public references for the current shipped surface are `README.md`, `docs/data_directory.md`, and `docs/api_reference.md`.

@@ -558,11 +558,6 @@ body.dark-mode .ai-msg {
   font-weight: 700;
 }
 
-.message-actions .message-state-inspector .state-inspector-panel {
-  top: auto;
-  bottom: calc(100% + 6px);
-}
-
 .tts-progress {
   display: inline-flex;
   align-items: center;
@@ -1462,6 +1457,14 @@ body.dark-mode .scroll-to-bottom-btn {
   pointer-events: none;
 }
 
+.input-alert-stack.input-alert-stack-floating {
+  position: fixed;
+  right: auto;
+  bottom: auto;
+  width: min(calc(100vw - 24px), 980px);
+  z-index: 3620;
+}
+
 .input-error {
   position: relative;
   width: min(100%, 760px);
@@ -1926,6 +1929,15 @@ body.dark-mode .composer-resize-edge::before {
   backdrop-filter: blur(16px) saturate(150%);
   -webkit-backdrop-filter: blur(16px) saturate(150%);
   z-index: 4;
+}
+
+.attach-popover.attach-popover-floating {
+  position: fixed;
+  right: auto;
+  bottom: auto;
+  --input-action-size: 29px;
+  --input-action-gap: 6px;
+  z-index: 3610;
 }
 
 .attach-trigger.is-open {
@@ -2444,7 +2456,8 @@ body.dark-mode .input-actions .send-btn.is-stopping {
   }
 }
 
-.input-actions .action-icon {
+.input-actions .action-icon,
+.attach-popover .action-icon {
   width: var(--input-action-size);
   height: var(--input-action-size);
   padding: 0;
@@ -2460,17 +2473,20 @@ body.dark-mode .input-actions .send-btn.is-stopping {
   box-shadow: 0 10px 24px color-mix(in oklab, var(--theme-c1-shadow) 22%, transparent);
 }
 
-.input-actions .action-icon.visual-stream-toggle.is-live-option {
+.input-actions .action-icon.visual-stream-toggle.is-live-option,
+.attach-popover .action-icon.visual-stream-toggle.is-live-option {
   position: relative;
 }
 
-.input-actions .action-icon.visual-stream-toggle.is-live-option.is-off {
+.input-actions .action-icon.visual-stream-toggle.is-live-option.is-off,
+.attach-popover .action-icon.visual-stream-toggle.is-live-option.is-off {
   color: color-mix(in oklab, var(--color-lavender) 74%, var(--color-text-muted) 26%);
   background: color-mix(in oklab, var(--color-lavender) 12%, transparent);
   box-shadow: 0 0 0 1px color-mix(in oklab, var(--color-lavender) 20%, transparent);
 }
 
-.input-actions .action-icon.visual-stream-toggle.is-live-option.is-off::after {
+.input-actions .action-icon.visual-stream-toggle.is-live-option.is-off::after,
+.attach-popover .action-icon.visual-stream-toggle.is-live-option.is-off::after {
   content: "";
   position: absolute;
   width: 20px;
@@ -2480,13 +2496,15 @@ body.dark-mode .input-actions .send-btn.is-stopping {
   border-radius: 999px;
 }
 
-.input-actions .action-icon.visual-stream-toggle.is-live-option.is-on {
+.input-actions .action-icon.visual-stream-toggle.is-live-option.is-on,
+.attach-popover .action-icon.visual-stream-toggle.is-live-option.is-on {
   color: color-mix(in oklab, var(--color-accent) 82%, var(--color-success-dark) 18%);
   background: color-mix(in oklab, var(--color-accent) 16%, transparent);
   box-shadow: 0 0 0 1px color-mix(in oklab, var(--color-accent) 28%, transparent);
 }
 
-body.dark-mode .input-actions .action-icon.visual-stream-toggle.is-live-option.is-on {
+body.dark-mode .input-actions .action-icon.visual-stream-toggle.is-live-option.is-on,
+body.dark-mode .attach-popover .action-icon.visual-stream-toggle.is-live-option.is-on {
   color: color-mix(in oklab, var(--color-lavender) 78%, var(--color-primary) 22%);
   background: color-mix(in oklab, var(--color-primary) 22%, transparent);
   box-shadow: 0 0 0 1px color-mix(in oklab, var(--color-primary) 32%, transparent);
@@ -2600,6 +2618,8 @@ body.dark-mode .input-actions .stop-chip {
 }
 
 .camera-capture-panel {
+  position: relative;
+  z-index: 6;
   margin-top: 6px;
   margin-bottom: 8px;
   border: 1px solid var(--glass-border);
@@ -2628,6 +2648,7 @@ body.dark-mode .input-actions .stop-chip {
   left: 0;
   right: 0;
   pointer-events: none;
+  z-index: 2;
 }
 
 .camera-capture-overlay-top {
@@ -2874,6 +2895,7 @@ body.dark-mode .open-entry-btn {
 
 body.dark-mode .chat-settings-trigger,
 body.dark-mode .input-actions .action-icon,
+body.dark-mode .attach-popover .action-icon,
 body.dark-mode .close-entry {
   border-color: color-mix(in oklab, var(--theme-c2-med) 36%, var(--glass-border) 64%);
   background:
@@ -2915,6 +2937,11 @@ body.dark-mode .input-actions .composer-action-row-top {
     --input-action-gap: 4px;
     --input-send-size: 36px;
   }
+  .attach-popover.attach-popover-floating {
+    right: auto;
+    --input-action-size: 26px;
+    --input-action-gap: 4px;
+  }
   .user-msg,
   .ai-msg {
     max-width: 88%;
@@ -2923,11 +2950,16 @@ body.dark-mode .input-actions .composer-action-row-top {
     width: min(98vw, calc(100vw - 10px));
   }
   .input-actions .action-icon,
+  .attach-popover .action-icon,
   .input-actions .send-btn {
     width: var(--input-action-size);
     height: var(--input-action-size);
   }
   .input-actions .action-icon {
+    min-width: var(--input-action-size);
+    min-height: var(--input-action-size);
+  }
+  .attach-popover .action-icon {
     min-width: var(--input-action-size);
     min-height: var(--input-action-size);
   }

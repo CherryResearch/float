@@ -8,6 +8,7 @@ import time
 from typing import Any, Dict, Optional
 
 from app.schemas import CalendarEvent
+from app.services.calendar_jobs import merge_external_calendar_update
 from app.services.rag_provider import ingest_calendar_event
 from app.utils import calendar_store, verify_signature
 from app.utils.time_resolution import resolve_temporal_value, resolve_timezone_name
@@ -342,7 +343,15 @@ def _save_task_event(args: Dict[str, Any]) -> Dict[str, Any]:
         status=_normalize_status(args.get("status")),
     ).model_dump(exclude_none=True)
 
-    calendar_store.save_event(event_id, event_payload)
+    def merge_task_update(existing: Dict[str, Any]) -> Dict[str, Any]:
+        incoming = dict(event_payload)
+        if existing and not incoming.get("actions"):
+            incoming.pop("actions", None)
+        return merge_external_calendar_update(existing, incoming)
+
+    event_payload = calendar_store.update_event(
+        event_id, merge_task_update, create=True
+    )
     try:
         ingest_calendar_event(event_id, event_payload)
     except Exception:

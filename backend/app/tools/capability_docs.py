@@ -1,8 +1,9 @@
 """Curated runtime documentation lookup for Float capability docs.
 
 This tool sits between lean tool metadata and unrestricted file reads. It
-exposes packaged skills and implementation-facing docs from curated roots so
-the model can research UI/runtime behavior without broad filesystem access.
+exposes packaged skills and curated docs from roots available in the current
+installation so the model can research UI/runtime behavior without broad
+filesystem access.
 """
 
 from __future__ import annotations
@@ -294,16 +295,18 @@ def read_capability_docs(
 
     if normalized_action == "list":
         docs = _all_docs(normalized_scope)[:normalized_limit]
+        roots = {
+            "skills": [str(repo_skills_root()), str(local_skills_root())],
+            "feature_overviews": str(_feature_overviews_root()),
+        }
+        if _function_descriptions_root().is_dir():
+            roots["function_descriptions"] = str(_function_descriptions_root())
         return {
             "action": "list",
             "scope": normalized_scope,
             "count": len(docs),
             "docs": docs,
-            "roots": {
-                "skills": [str(repo_skills_root()), str(local_skills_root())],
-                "function_descriptions": str(_function_descriptions_root()),
-                "feature_overviews": str(_feature_overviews_root()),
-            },
+            "roots": roots,
         }
 
     if normalized_action == "search":

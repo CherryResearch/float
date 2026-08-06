@@ -20,6 +20,7 @@ backend/logs/
 *.log
 backend/.chroma/
 backend/models/
+/models/
 
 # IDE-specific files
 .idea/
