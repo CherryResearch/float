@@ -20,6 +20,129 @@ def _pin_default_workflow_settings(monkeypatch, tmp_path, enabled_modules=None):
     )
 
 
+def _record_embedded_scope(conv_store, session_id="sess", message_id="m1"):
+    messages = conv_store.load_conversation(session_id)
+    message = next(
+        item
+        for item in messages
+        if isinstance(item, dict) and item.get("id") == message_id
+    )
+    scope = (message.get("metadata") or {}).get("capability_scope")
+    conv_store.merge_metadata(
+        session_id,
+        {
+            "server_runtime_receipts": {
+                "messages": {
+                    message_id: {
+                        "continuation_trust": "server",
+                        "capability_scope": scope,
+                    }
+                }
+            }
+        },
+    )
+
+
+def _record_server_continuation(
+    conv_store,
+    routes,
+    app,
+    *,
+    session_id,
+    message_id,
+    tools,
+):
+    """Seed the server-owned facts that a real tool continuation requires."""
+
+    messages = conv_store.load_conversation(session_id)
+    message = next(
+        item
+        for item in messages
+        if isinstance(item, dict) and item.get("id") == message_id
+    )
+    metadata = message.get("metadata") or {}
+    scope = metadata.get("capability_scope") if isinstance(metadata, dict) else None
+    if scope is None:
+        from app.workflow_scope import build_capability_scope
+
+        workflow = metadata.get("workflow") if isinstance(metadata, dict) else None
+        if isinstance(workflow, dict):
+            workflow_name = str(workflow.get("name") or "default")
+            modules = list(workflow.get("modules") or [])
+        else:
+            workflow_name = str(workflow or "default")
+            modules = []
+        scope = build_capability_scope(
+            workflow=workflow_name,
+            channel="text",
+            modules=modules,
+            tool_definitions=routes._registered_prompt_tool_definitions(
+                app,
+                allow_computer_capture=True,
+            ),
+        )
+    conv_store.merge_metadata(
+        session_id,
+        {
+            "server_runtime_receipts": {
+                "messages": {
+                    message_id: {
+                        "continuation_trust": "server",
+                        "capability_scope": scope,
+                    }
+                }
+            }
+        },
+    )
+
+    registry = getattr(app.state, "pending_tools", None)
+    if not isinstance(registry, dict):
+        registry = {}
+        app.state.pending_tools = registry
+    terminal_statuses = {
+        "invoked",
+        "denied",
+        "error",
+        "cancelled",
+        "timeout",
+        "scheduled",
+    }
+    saved_tools = message.get("tools") if isinstance(message.get("tools"), list) else []
+    saved_by_id = {
+        str(tool.get("id") or tool.get("request_id") or "").strip(): tool
+        for tool in saved_tools
+        if isinstance(tool, dict)
+    }
+    for tool in tools:
+        request_id = str(tool.get("id") or tool.get("request_id") or "").strip()
+        assert request_id, "continuation fixtures need a server request id"
+        recorded_tool = saved_by_id.get(request_id) or tool
+        status = str(recorded_tool.get("status") or "").strip().lower()
+        assert (
+            status in terminal_statuses
+        ), "continuation fixtures must record a terminal server tool result"
+        registry[request_id] = {
+            **dict(recorded_tool),
+            "id": request_id,
+            "session_id": session_id,
+            "message_id": message_id,
+            "chain_id": message_id,
+            "server_recorded": True,
+        }
+
+
+def _post_recorded_continuation(client, conv_store, routes, *, json):
+    _record_server_continuation(
+        conv_store,
+        routes,
+        client.app,
+        session_id=json["session_id"],
+        message_id=json["message_id"],
+        tools=json.get("tools") or [],
+    )
+    return client.post("/chat/continue", json=json)
+
+
 def test_chat_continue_registers_tool_proposals(monkeypatch, tmp_path):
     monkeypatch.setenv("FLOAT_CONV_DIR", str(tmp_path))
     conv_store = importlib.import_module("app.utils.conversation_store")
@@ -28,8 +151,8 @@ def test_chat_continue_registers_tool_proposals(monkeypatch, tmp_path):
     conv_store.save_conversation(
         "sess",
         [
-            {"role": "user", "text": "hello"},
-            {"role": "ai", "text": "thinking..."},
+            {"id": "m1:user", "role": "user", "text": "hello"},
+            {"id": "m1", "role": "ai", "text": "thinking..."},
         ],
     )
 
@@ -66,8 +189,10 @@ def test_chat_continue_registers_tool_proposals(monkeypatch, tmp_path):
     app = importlib.import_module("app.main").app
     app.state.pending_tools = {}
     client = TestClient(app)
-    resp = client.post(
-        "/chat/continue",
+    resp = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
         json={
             "session_id": "sess",
             "message_id": "m1",
@@ -151,8 +276,10 @@ def test_chat_continue_new_inline_tool_request_stays_pending(monkeypatch, tmp_pa
     app = importlib.import_module("app.main").app
     app.state.pending_tools = {}
     client = TestClient(app)
-    resp = client.post(
-        "/chat/continue",
+    resp = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
         json={
             "session_id": "sess",
             "message_id": "m1",
@@ -234,15 +361,16 @@ def test_chat_continue_missing_mode_defaults_to_configured_api_not_service_mode(
         fail_provider_resolution,
     )
 
-    original_mode = getattr(routes.llm_service, "mode", "api")
-    routes.llm_service.mode = "local"
-
     app = importlib.import_module("app.main").app
     app.state.pending_tools = {}
     app.state.config["mode"] = "api"
+    original_mode = getattr(routes.llm_service, "mode", "api")
+    routes.llm_service.mode = "local"
     client = TestClient(app)
-    resp = client.post(
-        "/chat/continue",
+    resp = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
         json={
             "session_id": "sess",
             "message_id": "m1",
@@ -319,8 +447,10 @@ def test_chat_continue_missing_mode_prefers_saved_message_mode_hint(
     app.state.pending_tools = {}
     app.state.config["mode"] = "api"
     client = TestClient(app)
-    resp = client.post(
-        "/chat/continue",
+    resp = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
         json={
             "session_id": "sess",
             "message_id": "m1",
@@ -383,8 +513,10 @@ def test_chat_continue_unresolved_loop_returns_minimal_error_note(
     app = importlib.import_module("app.main").app
     app.state.pending_tools = {}
     client = TestClient(app)
-    resp = client.post(
-        "/chat/continue",
+    resp = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
         json={
             "session_id": "sess",
             "message_id": "m1",
@@ -457,8 +589,10 @@ def test_chat_continue_ignores_repeated_tool_requests_with_text(monkeypatch, tmp
     app = importlib.import_module("app.main").app
     app.state.pending_tools = {}
     client = TestClient(app)
-    resp = client.post(
-        "/chat/continue",
+    resp = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
         json={
             "session_id": "sess",
             "message_id": "m1",
@@ -529,8 +663,10 @@ def test_chat_continue_drops_tool_turn_residue_from_context_and_persistence(
     app = importlib.import_module("app.main").app
     app.state.pending_tools = {}
     client = TestClient(app)
-    resp = client.post(
-        "/chat/continue",
+    resp = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
         json={
             "session_id": "sess",
             "message_id": "m1",
@@ -603,14 +739,24 @@ def test_chat_continue_local_provider_resolution_error_updates_message(
     app = importlib.import_module("app.main").app
     app.state.pending_tools = {}
     client = TestClient(app)
-    resp = client.post(
-        "/chat/continue",
+    resp = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
         json={
             "session_id": "sess",
             "message_id": "m1",
             "mode": "local",
             "model": "lmstudio",
-            "tools": [],
+            "tools": [
+                {
+                    "id": "tool-provider-1",
+                    "name": "recall",
+                    "args": {"key": "provider-test"},
+                    "result": {"status": "invoked", "ok": True},
+                    "status": "invoked",
+                }
+            ],
         },
     )
 
@@ -627,7 +773,7 @@ def test_chat_continue_local_provider_resolution_error_updates_message(
     assert "No model is loaded for lmstudio" in (ai.get("text") or "")
 
     registry = getattr(client.app.state, "pending_tools", {})
-    assert registry == {}
+    assert registry["tool-provider-1"]["status"] == "invoked"
 
 
 def test_chat_continue_local_provider_target_skips_reasoning_controls(
@@ -682,8 +828,10 @@ def test_chat_continue_local_provider_target_skips_reasoning_controls(
     app = importlib.import_module("app.main").app
     app.state.pending_tools = {}
     client = TestClient(app)
-    resp = client.post(
-        "/chat/continue",
+    resp = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
         json={
             "session_id": "sess",
             "message_id": "m1",
@@ -731,6 +879,11 @@ def test_chat_continue_does_not_requeue_resolved_tool_errors(monkeypatch, tmp_pa
     from app import routes
     from app.base_services import ModelContext
 
+    _pin_default_workflow_settings(
+        monkeypatch,
+        tmp_path,
+        enabled_modules=["computer_use"],
+    )
     routes.llm_service.contexts = {"default": ModelContext(system_prompt="")}
 
     def fake_generate(
@@ -766,8 +919,10 @@ def test_chat_continue_does_not_requeue_resolved_tool_errors(monkeypatch, tmp_pa
     app = importlib.import_module("app.main").app
     app.state.pending_tools = {}
     client = TestClient(app)
-    resp = client.post(
-        "/chat/continue",
+    resp = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
         json={
             "session_id": "sess",
             "message_id": "m1",
@@ -844,8 +999,10 @@ def test_chat_continue_unresolved_loop_shows_recall_not_found_suggestions(
     app = importlib.import_module("app.main").app
     app.state.pending_tools = {}
     client = TestClient(app)
-    resp = client.post(
-        "/chat/continue",
+    resp = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
         json={
             "session_id": "sess",
             "message_id": "m1",
@@ -919,8 +1076,10 @@ def test_chat_continue_unresolved_loop_returns_minimal_text(monkeypatch, tmp_pat
     app = importlib.import_module("app.main").app
     app.state.pending_tools = {}
     client = TestClient(app)
-    resp = client.post(
-        "/chat/continue",
+    resp = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
         json={
             "session_id": "sess",
             "message_id": "m1",
@@ -996,8 +1155,10 @@ def test_chat_continue_passes_recalled_image_attachments_to_generate(
     app = importlib.import_module("app.main").app
     app.state.pending_tools = {}
     client = TestClient(app)
-    resp = client.post(
-        "/chat/continue",
+    resp = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
         json={
             "session_id": "sess",
             "message_id": "m1",
@@ -1050,6 +1211,120 @@ def test_chat_continue_passes_recalled_image_attachments_to_generate(
     assert resp.json()["message"] == "I found the cat photos."
 
 
+def test_chat_continue_keeps_user_images_authoritative_over_recall_matches(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("FLOAT_CONV_DIR", str(tmp_path))
+    conv_store = importlib.import_module("app.utils.conversation_store")
+    importlib.reload(conv_store)
+
+    user_attachment = {
+        "name": "current.png",
+        "type": "image/png",
+        "url": "/api/attachments/current-hash/current.png",
+        "content_hash": "current-hash",
+    }
+    conv_store.save_conversation(
+        "sess",
+        [
+            {
+                "id": "m1:user",
+                "role": "user",
+                "text": "remember these attached images",
+                "attachments": [user_attachment],
+            },
+            {"id": "m1", "role": "ai", "text": "Requested tool recall."},
+        ],
+    )
+
+    from app import routes
+    from app.base_services import ModelContext
+
+    routes.llm_service.contexts = {"default": ModelContext(system_prompt="")}
+    captured = {"attachments": [], "contexts": []}
+
+    def fake_generate(
+        prompt,
+        session_id=None,
+        model=None,
+        attachments=None,
+        context=None,
+        **kwargs,
+    ):
+        captured["attachments"].append(attachments)
+        captured["contexts"].append(context)
+        if len(captured["attachments"]) == 1:
+            return {
+                "text": "",
+                "thought": "",
+                "tools_used": [],
+                "metadata": {"finish_reason": "stop"},
+            }
+        return {
+            "text": "I described the attached image.",
+            "thought": "",
+            "tools_used": [],
+            "metadata": {},
+        }
+
+    monkeypatch.setattr(routes.llm_service, "generate", fake_generate)
+
+    app = importlib.import_module("app.main").app
+    app.state.pending_tools = {}
+    client = TestClient(app)
+    response = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
+        json={
+            "session_id": "sess",
+            "message_id": "m1",
+            "tools": [
+                {
+                    "id": "tool-1",
+                    "name": "recall",
+                    "args": {"key": "images", "include_images": True},
+                    "result": {
+                        "image_matches": [
+                            {
+                                "attachment": {
+                                    "name": "unrelated.png",
+                                    "type": "image/png",
+                                    "url": "/api/attachments/unrelated-hash/unrelated.png",
+                                    "content_hash": "unrelated-hash",
+                                }
+                            }
+                        ]
+                    },
+                    "status": "invoked",
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(captured["attachments"]) == 2
+    assert all(
+        len(attachments) == 1
+        and attachments[0].get("name") == "current.png"
+        and attachments[0].get("type") == "image/png"
+        for attachments in captured["attachments"]
+    )
+    assert all(
+        all(attachment.get("name") != "unrelated.png" for attachment in attachments)
+        for attachments in captured["attachments"]
+    )
+    assert all(
+        any(
+            (message.get("metadata") or {}).get("tool_image_scope")
+            == "current_user_attachments"
+            for message in context.messages
+            if isinstance(message, dict)
+        )
+        for context in captured["contexts"]
+    )
+
+
 def test_chat_continue_extracts_nested_attachment_value_and_sets_signature(
     monkeypatch, tmp_path
 ):
@@ -1092,8 +1367,10 @@ def test_chat_continue_extracts_nested_attachment_value_and_sets_signature(
     app = importlib.import_module("app.main").app
     app.state.pending_tools = {}
     client = TestClient(app)
-    resp = client.post(
-        "/chat/continue",
+    resp = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
         json={
             "session_id": "sess",
             "message_id": "m1",
@@ -1129,6 +1406,9 @@ def test_chat_continue_extracts_nested_attachment_value_and_sets_signature(
         }
     ]
     assert resp.json()["metadata"]["tool_continue_signature"]
+    assert resp.json()["metadata"]["tool_continue_signature_sha256"].startswith(
+        "sha256:"
+    )
 
 
 def test_chat_continue_same_tool_signature_is_idempotent(monkeypatch, tmp_path):
@@ -1190,7 +1470,12 @@ def test_chat_continue_same_tool_signature_is_idempotent(monkeypatch, tmp_path):
         ],
     }
 
-    first = client.post("/chat/continue", json=payload)
+    first = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
+        json=payload,
+    )
     second = client.post("/chat/continue", json=payload)
     semantic_repeat = client.post(
         "/chat/continue",
@@ -1207,10 +1492,10 @@ def test_chat_continue_same_tool_signature_is_idempotent(monkeypatch, tmp_path):
 
     assert first.status_code == 200
     assert second.status_code == 200
-    assert semantic_repeat.status_code == 200
+    assert semantic_repeat.status_code == 409
     assert calls["count"] == 1
     assert second.json()["message"] == "Saved once."
-    assert semantic_repeat.json()["message"] == "Saved once."
+    assert "saved terminal proposal" in semantic_repeat.json()["detail"]
     saved = conv_store.load_conversation("sess")
     saved_entry = next(
         item for item in saved if isinstance(item, dict) and item.get("id") == "m1"
@@ -1220,6 +1505,7 @@ def test_chat_continue_same_tool_signature_is_idempotent(monkeypatch, tmp_path):
     assert saved_entry["metadata"].get("tool_response_pending") is None
     assert saved_entry["metadata"].get("tool_continue_signature")
     assert saved_entry["metadata"].get("tool_continue_semantic_signature")
+    assert saved_entry["metadata"].get("tool_continue_signature_sha256")
 
 
 def test_chat_continue_unresolved_loop_summarizes_mixed_tool_states(
@@ -1270,8 +1556,10 @@ def test_chat_continue_unresolved_loop_summarizes_mixed_tool_states(
     app = importlib.import_module("app.main").app
     app.state.pending_tools = {}
     client = TestClient(app)
-    resp = client.post(
-        "/chat/continue",
+    resp = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
         json={
             "session_id": "sess",
             "message_id": "m1",
@@ -1357,8 +1645,10 @@ def test_chat_continue_includes_structured_tool_outcome_prompt(monkeypatch, tmp_
     app = importlib.import_module("app.main").app
     app.state.pending_tools = {}
     client = TestClient(app)
-    resp = client.post(
-        "/chat/continue",
+    resp = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
         json={
             "session_id": "sess",
             "message_id": "m1",
@@ -1366,7 +1656,7 @@ def test_chat_continue_includes_structured_tool_outcome_prompt(monkeypatch, tmp_
             "tools": [
                 {
                     "id": "tool-1",
-                    "name": "tool_help",
+                    "name": "help",
                     "args": {
                         "tool_name": "",
                         "detail": "brief",
@@ -1434,7 +1724,10 @@ def test_chat_continue_includes_structured_tool_outcome_prompt(monkeypatch, tmp_
     assert "Summary:" in tool_prompt
     assert "Tool result data:" in tool_prompt
     assert '"total_count": 34' in tool_prompt
-    assert '"more_tools": 12' in tool_prompt
+    assert '"more_tools": 8' in tool_prompt
+    assert '"memory.save"' not in tool_prompt
+    assert '"create_event"' not in tool_prompt
+    assert '"open_url"' not in tool_prompt
     assert '"actionable_targets"' in tool_prompt
     assert '"highlighted_tools"' in tool_prompt
     assert '"name": "write_file"' in tool_prompt
@@ -1709,7 +2002,7 @@ def test_tool_events_prompt_text_preserves_file_memory_compat_suggestions():
     assert '"did_you_mean": [' in text
     assert '"write_file"' in text
     assert '"remember"' in text
-    assert '"memory.save"' in text
+    assert '"memory.save"' not in text
     assert '"required_args"' in text
     assert '"content"' in text
     assert '"path"' in text
@@ -1847,7 +2140,7 @@ def test_chat_continue_retries_discovery_only_persistence_claim(monkeypatch, tmp
                 "thought": "",
                 "tools_used": [
                     {
-                        "name": "tool_help",
+                        "name": "help",
                         "status": "invoked",
                         "args": {"tool_name": "remember"},
                         "result": {"status": "invoked", "ok": True},
@@ -1877,8 +2170,10 @@ def test_chat_continue_retries_discovery_only_persistence_claim(monkeypatch, tmp
     app = importlib.import_module("app.main").app
     app.state.pending_tools = {}
     client = TestClient(app)
-    resp = client.post(
-        "/chat/continue",
+    resp = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
         json={
             "session_id": "sess",
             "message_id": "m1",
@@ -1886,7 +2181,7 @@ def test_chat_continue_retries_discovery_only_persistence_claim(monkeypatch, tmp
             "tools": [
                 {
                     "id": "tool-1",
-                    "name": "tool_help",
+                    "name": "help",
                     "args": {"tool_name": "remember"},
                     "result": {
                         "status": "invoked",
@@ -1952,7 +2247,7 @@ def test_chat_continue_retries_discovery_only_file_persistence(monkeypatch, tmp_
                 "thought": "",
                 "tools_used": [
                     {
-                        "name": "tool_help",
+                        "name": "help",
                         "status": "invoked",
                         "args": {"tool_name": "write_file"},
                         "result": {"status": "invoked", "ok": True},
@@ -1991,8 +2286,10 @@ def test_chat_continue_retries_discovery_only_file_persistence(monkeypatch, tmp_
     app = importlib.import_module("app.main").app
     app.state.pending_tools = {}
     client = TestClient(app)
-    resp = client.post(
-        "/chat/continue",
+    resp = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
         json={
             "session_id": "sess",
             "message_id": "m1",
@@ -2000,7 +2297,7 @@ def test_chat_continue_retries_discovery_only_file_persistence(monkeypatch, tmp_
             "tools": [
                 {
                     "id": "tool-1",
-                    "name": "tool_help",
+                    "name": "help",
                     "args": {
                         "tool_name": "write_file",
                         "detail": "rich",
@@ -2104,8 +2401,10 @@ def test_chat_continue_retries_failed_file_write_after_discovery(monkeypatch, tm
     app = importlib.import_module("app.main").app
     app.state.pending_tools = {}
     client = TestClient(app)
-    resp = client.post(
-        "/chat/continue",
+    resp = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
         json={
             "session_id": "sess",
             "message_id": "m1",
@@ -2186,8 +2485,10 @@ def test_chat_continue_strips_inline_tool_markers_from_saved_reply(
     app = importlib.import_module("app.main").app
     app.state.pending_tools = {}
     client = TestClient(app)
-    resp = client.post(
-        "/chat/continue",
+    resp = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
         json={
             "session_id": "sess",
             "message_id": "m1",
@@ -2278,8 +2579,10 @@ def test_chat_continue_stops_when_target_has_later_messages(monkeypatch, tmp_pat
     app = importlib.import_module("app.main").app
     app.state.pending_tools = {}
     client = TestClient(app)
-    resp = client.post(
-        "/chat/continue",
+    resp = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
         json={
             "session_id": "sess",
             "message_id": "m1",
@@ -2314,6 +2617,43 @@ def test_chat_continue_stops_when_target_has_later_messages(monkeypatch, tmp_pat
     assert later_user.get("text") == "later request"
 
 
+def test_chat_continue_rejects_invalid_saved_capability_scope(monkeypatch, tmp_path):
+    monkeypatch.setenv("FLOAT_CONV_DIR", str(tmp_path))
+    conv_store = importlib.import_module("app.utils.conversation_store")
+    importlib.reload(conv_store)
+    conv_store.save_conversation(
+        "sess",
+        [
+            {"id": "m1:user", "role": "user", "text": "hello"},
+            {
+                "id": "m1",
+                "role": "ai",
+                "text": "Requested tool recall.",
+                "metadata": {
+                    "capability_scope": {
+                        "version": 99,
+                        "workflow": "default",
+                        "channel": "text",
+                        "modules": [],
+                        "tool_names": ["recall"],
+                        "tool_catalog_sha256": "0" * 64,
+                    }
+                },
+            },
+        ],
+    )
+    _record_embedded_scope(conv_store)
+
+    app = importlib.import_module("app.main").app
+    response = TestClient(app).post(
+        "/chat/continue",
+        json={"session_id": "sess", "message_id": "m1", "tools": []},
+    )
+
+    assert response.status_code == 409
+    assert "saved tool catalog scope" in response.json()["detail"].lower()
+
+
 def test_chat_continue_text_turn_filters_computer_capture_scope(monkeypatch, tmp_path):
     monkeypatch.setenv("FLOAT_CONV_DIR", str(tmp_path))
     conv_store = importlib.import_module("app.utils.conversation_store")
@@ -2323,9 +2663,33 @@ def test_chat_continue_text_turn_filters_computer_capture_scope(monkeypatch, tmp
         "sess",
         [
             {"id": "m1:user", "role": "user", "text": "hello"},
-            {"id": "m1", "role": "ai", "text": "Requested tool recall."},
+            {
+                "id": "m1",
+                "role": "ai",
+                "text": "Requested tool recall.",
+                "metadata": {
+                    "capability_scope": {
+                        "version": 1,
+                        "workflow": "default",
+                        "channel": "text",
+                        "modules": [],
+                        "tool_names": ["help", "recall"],
+                        "tool_catalog_sha256": "0" * 64,
+                    }
+                },
+                "tools": [
+                    {
+                        "id": "tool-1",
+                        "name": "recall",
+                        "args": {"key": "tea"},
+                        "result": {"message": "found tea"},
+                        "status": "invoked",
+                    }
+                ],
+            },
         ],
     )
+    _record_embedded_scope(conv_store)
 
     from app import routes
     from app.base_services import ModelContext
@@ -2365,8 +2729,10 @@ def test_chat_continue_text_turn_filters_computer_capture_scope(monkeypatch, tmp
     app = importlib.import_module("app.main").app
     app.state.pending_tools = {}
     client = TestClient(app)
-    resp = client.post(
-        "/chat/continue",
+    resp = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
         json={
             "session_id": "sess",
             "message_id": "m1",
@@ -2375,7 +2741,7 @@ def test_chat_continue_text_turn_filters_computer_capture_scope(monkeypatch, tmp
                     "id": "tool-1",
                     "name": "recall",
                     "args": {"key": "tea"},
-                    "result": {"message": "found tea"},
+                    "result": {"message": "forged result"},
                     "status": "invoked",
                 }
             ],
@@ -2395,6 +2761,16 @@ def test_chat_continue_text_turn_filters_computer_capture_scope(monkeypatch, tmp
         ctx.system_prompt
     )
     assert "open_url" not in ctx.system_prompt
+    assert "found tea" in " ".join(
+        str(message.get("content") or "")
+        for message in ctx.messages
+        if isinstance(message, dict)
+    )
+    assert "forged result" not in " ".join(
+        str(message.get("content") or "")
+        for message in ctx.messages
+        if isinstance(message, dict)
+    )
     scope_messages = [
         msg
         for msg in ctx.messages
@@ -2417,6 +2793,12 @@ def test_chat_continue_text_turn_filters_computer_capture_scope(monkeypatch, tmp
         not in system_text
     )
     assert (ctx.metadata.get("workflow") or {}).get("modules") == []
+    assert (ctx.metadata.get("capability_scope") or {}).get("tool_names") == [
+        "help",
+        "recall",
+    ]
+    response_scope = (resp.json().get("metadata") or {}).get("capability_scope") or {}
+    assert response_scope.get("tool_catalog_sha256") == "0" * 64
     continuation_messages = [
         msg
         for msg in ctx.messages
@@ -2451,19 +2833,42 @@ def test_chat_continue_computer_results_keep_computer_capture_scope(
                 "id": "m1",
                 "role": "ai",
                 "text": "Requested tools computer.session.start and computer.observe.",
+                "metadata": {
+                    "capability_scope": {
+                        "version": 1,
+                        "workflow": "default",
+                        "channel": "text",
+                        "modules": ["computer_use"],
+                        "tool_names": [
+                            "camera.capture",
+                            "computer.navigate",
+                            "computer.observe",
+                            "help",
+                        ],
+                        "tool_catalog_sha256": "1" * 64,
+                    }
+                },
+                "tools": [
+                    {
+                        "id": "tool-1",
+                        "name": "computer.observe",
+                        "args": {"session_id": "desktop"},
+                        "result": {"message": "Captured desktop view."},
+                        "status": "invoked",
+                    }
+                ],
             },
         ],
     )
+    _record_embedded_scope(conv_store)
 
     from app import routes
     from app.base_services import ModelContext
 
-    _pin_default_workflow_settings(
-        monkeypatch, tmp_path, enabled_modules=["computer_use"]
-    )
+    _pin_default_workflow_settings(monkeypatch, tmp_path)
     tool_defs = [
         {"name": "help", "description": "help", "parameters": {}},
-        {"name": "open_url", "description": "open", "parameters": {}},
+        {"name": "computer.navigate", "description": "open", "parameters": {}},
         {"name": "computer.observe", "description": "observe", "parameters": {}},
         {"name": "camera.capture", "description": "capture", "parameters": {}},
     ]
@@ -2494,8 +2899,10 @@ def test_chat_continue_computer_results_keep_computer_capture_scope(
     app = importlib.import_module("app.main").app
     app.state.pending_tools = {}
     client = TestClient(app)
-    resp = client.post(
-        "/chat/continue",
+    resp = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
         json={
             "session_id": "sess",
             "message_id": "m1",
@@ -2543,6 +2950,9 @@ def test_chat_continue_computer_results_keep_computer_capture_scope(
         in system_text
     )
     assert (ctx.metadata.get("workflow") or {}).get("modules") == ["computer_use"]
+    assert (ctx.metadata.get("capability_scope") or {}).get("modules") == [
+        "computer_use"
+    ]
 
 
 def test_turn_system_messages_dedupe_by_key():
@@ -2591,14 +3001,14 @@ def test_effective_system_prompt_appends_json_tool_call_hint():
         response_format=None,
     )
 
-    assert "Tool discovery: use `help`, `tool_help`, or `tool_info`" in prompt
+    assert "Tool discovery: use `help` or `tool_info`" in prompt
     assert "call that target tool next" in prompt
     assert (
         'Tool call syntax for this turn: emit direct JSON only in the form {"tool":"<exact_tool_name>","args":{...}}'
         in prompt
     )
     assert '{"tool":"list_dir","args":{"path":"."}}' in prompt
-    assert "<|channel|>commentary to=tool_help" not in prompt
+    assert "<|channel|>commentary to=help" not in prompt
 
 
 def test_effective_system_prompt_appends_harmony_tool_call_hint():
@@ -2609,20 +3019,20 @@ def test_effective_system_prompt_appends_harmony_tool_call_hint():
         response_format="harmony",
     )
 
-    assert "Tool discovery: use `help`, `tool_help`, or `tool_info`" in prompt
+    assert "Tool discovery: use `help` or `tool_info`" in prompt
     assert (
         "Tool call syntax for this turn: emit Harmony tool calls only in the form "
         "<|channel|>commentary to=<exact_tool_name> <|constrain|>json <|message|>{...}; "
-        "for example, <|channel|>commentary to=tool_help <|constrain|>json <|message|>{}."
+        "for example, <|channel|>commentary to=help <|constrain|>json <|message|>{}."
     ) in prompt
-    assert '{"tool":"tool_help","args":{}}' not in prompt
+    assert '{"tool":"help","args":{}}' not in prompt
 
 
-def test_effective_system_prompt_keeps_empty_menu_guidance_when_base_mentions_tool_help():
+def test_effective_system_prompt_keeps_empty_menu_guidance_when_base_mentions_help():
     from app import routes
 
     prompt = routes._effective_system_prompt(
-        "Use tool_help and tool_info when tool choice or schema is unclear.",
+        "Use help and tool_info when tool choice or schema is unclear.",
         response_format=None,
     )
 
@@ -2633,7 +3043,7 @@ def test_effective_system_prompt_appends_available_tool_summary_before_syntax():
     from app import routes
 
     prompt = routes._effective_system_prompt(
-        "Base prompt with tool_help and tool_info when tool choice is unclear.",
+        "Base prompt with help and tool_info when tool choice is unclear.",
         response_format=None,
         tools=[
             {
@@ -2739,9 +3149,9 @@ def test_effective_system_prompt_dedupes_existing_tool_call_hints():
     )
 
     assert prompt.count("Tool call syntax for this turn:") == 1
-    assert '{"tool":"tool_help","args":{}}' in prompt
+    assert '{"tool":"help","args":{}}' in prompt
     assert '{"tool":"list_dir","args":{"path":"."}}' in prompt
-    assert "<|channel|>commentary to=tool_help" not in prompt
+    assert "<|channel|>commentary to=help" not in prompt
 
 
 def test_route_response_format_uses_harmony_only_for_gpt_oss():
@@ -2839,8 +3249,10 @@ def test_chat_continue_api_forwards_openai_metadata(monkeypatch, tmp_path):
     app = importlib.import_module("app.main").app
     app.state.pending_tools = {}
     client = TestClient(app)
-    resp = client.post(
-        "/chat/continue",
+    resp = _post_recorded_continuation(
+        client,
+        conv_store,
+        routes,
         json={
             "session_id": "sess",
             "message_id": "m1",

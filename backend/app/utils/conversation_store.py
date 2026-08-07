@@ -1,10 +1,12 @@
+import copy
 import json  # Standard library for JSON operations
 import os  # Standard library for environment and file paths
 import re
 import shutil
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 from uuid import uuid4
 
 # Determine a stable project root so that the conversations directory is
@@ -20,6 +22,14 @@ from uuid import uuid4
 # started with the working directory set to ``backend``.
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+
+SERVER_RUNTIME_RECEIPTS_KEY = "server_runtime_receipts"
+CLIENT_SAVED_TOOL_MARKER = "client_saved_untrusted"
+CONTINUATION_TRUST_KEY = "continuation_trust"
+CONTINUATION_TRUST_INVALIDATED = "invalidated"
+CONTINUATION_TRUST_SERVER = "server"
+_METADATA_LOCK = threading.RLock()
+_MUTATION_STATE = threading.local()
 
 
 def _resolve_path(value: str) -> Path:
@@ -54,6 +64,14 @@ def _migrate_legacy_conversations(*, legacy_dir: Path, target_dir: Path) -> None
         candidates = [path for path in legacy_dir.rglob("*.json") if path.is_file()]
         if not candidates:
             return
+        # Copy metadata first so transcript migration can replace any legacy
+        # runtime receipts with explicit invalidation tombstones afterwards.
+        candidates.sort(
+            key=lambda path: (
+                0 if path.name.endswith(".meta.json") else 1,
+                path.as_posix(),
+            )
+        )
         target_dir.mkdir(parents=True, exist_ok=True)
         for src in candidates:
             try:
@@ -64,16 +82,75 @@ def _migrate_legacy_conversations(*, legacy_dir: Path, target_dir: Path) -> None
             if dest.exists():
                 continue
             dest.parent.mkdir(parents=True, exist_ok=True)
+            if src.name.endswith(".meta.json"):
+                try:
+                    metadata = json.loads(src.read_text(encoding="utf-8"))
+                    if isinstance(metadata, dict):
+                        # Runtime receipts are local execution authority, not
+                        # portable data. Transcript migration below installs
+                        # explicit invalidation tombstones for copied IDs.
+                        metadata.pop(SERVER_RUNTIME_RECEIPTS_KEY, None)
+                        with dest.open("w", encoding="utf-8") as handle:
+                            json.dump(metadata, handle, indent=2)
+                except Exception:
+                    # Metadata is optional. Fail closed instead of copying a
+                    # sidecar whose runtime authority could not be sanitized.
+                    pass
+                continue
+            copied = False
             try:
                 shutil.copy2(str(src), str(dest))
+                copied = True
             except Exception:
                 try:
                     shutil.copyfile(str(src), str(dest))
+                    copied = True
                 except Exception:
                     continue
+            if copied:
+                _invalidate_migrated_message_ids(dest)
     except Exception:
         # Never block module import on migration failures.
         return
+
+
+def _invalidate_migrated_message_ids(transcript_path: Path) -> None:
+    """Mark copied legacy message IDs as non-continuable in their sidecar."""
+
+    try:
+        messages = json.loads(transcript_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if not isinstance(messages, list):
+        return
+    invalidated = {
+        message_id: {
+            CONTINUATION_TRUST_KEY: CONTINUATION_TRUST_INVALIDATED,
+            "reason": "legacy_migration",
+        }
+        for message in messages
+        if isinstance(message, dict)
+        and (message_id := str(message.get("id") or "").strip())
+    }
+    if not invalidated:
+        return
+
+    meta_path = transcript_path.with_suffix(".meta.json")
+    with _METADATA_LOCK:
+        metadata: Dict[str, Any] = {}
+        if meta_path.exists():
+            try:
+                loaded = json.loads(meta_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    metadata = loaded
+            except Exception:
+                # A corrupt legacy sidecar carries no trusted authority.
+                metadata = {}
+        metadata.pop(SERVER_RUNTIME_RECEIPTS_KEY, None)
+        metadata[SERVER_RUNTIME_RECEIPTS_KEY] = {"messages": invalidated}
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        with meta_path.open("w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2)
 
 
 DEV_MODE = os.getenv("FLOAT_DEV_MODE", "false").lower() == "true"
@@ -271,24 +348,26 @@ def _prune_empty_dirs(start: Path) -> None:
 
 
 def _load_meta(name: str) -> Dict[str, Any]:
-    meta_fp = _meta_path(name)
-    if not meta_fp.exists():
+    with _METADATA_LOCK:
+        meta_fp = _meta_path(name)
+        if not meta_fp.exists():
+            return {}
+        try:
+            with meta_fp.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
         return {}
-    try:
-        with meta_fp.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, dict):
-                return data
-    except Exception:
-        pass
-    return {}
 
 
 def _write_meta(name: str, meta: Dict[str, Any]) -> None:
-    meta_fp = _meta_path(name)
-    meta_fp.parent.mkdir(parents=True, exist_ok=True)
-    with meta_fp.open("w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
+    with _METADATA_LOCK:
+        meta_fp = _meta_path(name)
+        meta_fp.parent.mkdir(parents=True, exist_ok=True)
+        with meta_fp.open("w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
 
 
 def _infer_timestamp(name: str) -> str:
@@ -303,35 +382,36 @@ def _infer_timestamp(name: str) -> str:
 
 
 def _ensure_metadata(name: str) -> Dict[str, Any]:
-    meta = _load_meta(name)
-    if not isinstance(meta, dict):
-        meta = {}
-    changed = False
-    if not meta.get("id"):
-        meta["id"] = str(uuid4())
-        changed = True
-    if not meta.get("created_at"):
-        meta["created_at"] = _infer_timestamp(name)
-        changed = True
-    if not meta.get("updated_at"):
-        meta["updated_at"] = meta["created_at"]
-        changed = True
-    display = meta.get("display_name")
-    if not display:
-        meta["display_name"] = _humanize_session_name(name)
-        changed = True
-    if "auto_title_applied" not in meta:
-        meta["auto_title_applied"] = False
-        changed = True
-    if "manual_title" not in meta:
-        meta["manual_title"] = False
-        changed = True
-    if meta.get("name") != name:
-        meta["name"] = name
-        changed = True
-    if changed:
-        _write_meta(name, meta)
-    return meta
+    with _METADATA_LOCK:
+        meta = _load_meta(name)
+        if not isinstance(meta, dict):
+            meta = {}
+        changed = False
+        if not meta.get("id"):
+            meta["id"] = str(uuid4())
+            changed = True
+        if not meta.get("created_at"):
+            meta["created_at"] = _infer_timestamp(name)
+            changed = True
+        if not meta.get("updated_at"):
+            meta["updated_at"] = meta["created_at"]
+            changed = True
+        display = meta.get("display_name")
+        if not display:
+            meta["display_name"] = _humanize_session_name(name)
+            changed = True
+        if "auto_title_applied" not in meta:
+            meta["auto_title_applied"] = False
+            changed = True
+        if "manual_title" not in meta:
+            meta["manual_title"] = False
+            changed = True
+        if meta.get("name") != name:
+            meta["name"] = name
+            changed = True
+        if changed:
+            _write_meta(name, meta)
+        return meta
 
 
 def get_metadata(name: str) -> Dict[str, Any]:
@@ -347,13 +427,14 @@ def set_display_name(
     manual: Optional[bool] = None,
 ) -> None:
     """Persist a human-friendly display name for a conversation."""
-    meta = _ensure_metadata(name)
-    meta["display_name"] = display_name
-    if auto_generated is not None:
-        meta["auto_title_applied"] = bool(auto_generated)
-    if manual is not None:
-        meta["manual_title"] = bool(manual)
-    _write_meta(name, meta)
+    with _METADATA_LOCK:
+        meta = _ensure_metadata(name)
+        meta["display_name"] = display_name
+        if auto_generated is not None:
+            meta["auto_title_applied"] = bool(auto_generated)
+        if manual is not None:
+            meta["manual_title"] = bool(manual)
+        _write_meta(name, meta)
 
 
 def merge_metadata(name: str, updates: Dict[str, Any]) -> Dict[str, Any]:
@@ -368,11 +449,12 @@ def merge_metadata(name: str, updates: Dict[str, Any]) -> Dict[str, Any]:
                 merged[key] = value
         return merged
 
-    meta = _ensure_metadata(name)
-    if isinstance(updates, dict):
-        meta = _merge(meta, updates)
-        _write_meta(name, meta)
-    return meta
+    with _METADATA_LOCK:
+        meta = _ensure_metadata(name)
+        if isinstance(updates, dict):
+            meta = _merge(meta, updates)
+            _write_meta(name, meta)
+        return meta
 
 
 def list_conversations(
@@ -461,22 +543,18 @@ def load_conversation(name: str) -> List[Dict[str, Any]]:
 
 def get_or_create_conversation_id(name: str) -> str:
     """Return a stable UUID for a conversation name, creating it if missing."""
-    meta = _ensure_metadata(name)
-    conv_id = meta.get("id")
-    if conv_id:
-        return str(conv_id)
-    conv_id = str(uuid4())
-    meta["id"] = conv_id
-    _write_meta(name, meta)
-    return conv_id
+    with _METADATA_LOCK:
+        meta = _ensure_metadata(name)
+        conv_id = meta.get("id")
+        if conv_id:
+            return str(conv_id)
+        conv_id = str(uuid4())
+        meta["id"] = conv_id
+        _write_meta(name, meta)
+        return conv_id
 
 
 def save_conversation(name: str, messages: List[Dict[str, Any]]) -> None:
-    # Ensure sidecar id exists
-    meta = _ensure_metadata(name)
-    fp = _path(name)
-    fp.parent.mkdir(parents=True, exist_ok=True)
-
     def _serialize(obj: Any) -> Any:
         if isinstance(obj, bytes):
             return obj.decode("utf-8", errors="replace")
@@ -484,12 +562,166 @@ def save_conversation(name: str, messages: List[Dict[str, Any]]) -> None:
             f"Object of type {obj.__class__.__name__} is not JSON serializable"
         )
 
-    with fp.open("w", encoding="utf-8") as f:
-        json.dump(messages, f, indent=2, default=_serialize)
-    meta["updated_at"] = _now_iso()
-    meta.setdefault("created_at", meta["updated_at"])
-    meta["message_count"] = len(messages)
-    _write_meta(name, meta)
+    with _METADATA_LOCK:
+        # Keep the sidecar read-modify-write atomic with transcript saves so a
+        # concurrent runtime-receipt merge cannot be overwritten by stale meta.
+        meta = _ensure_metadata(name)
+        fp = _path(name)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        with fp.open("w", encoding="utf-8") as f:
+            json.dump(messages, f, indent=2, default=_serialize)
+        message_ids = {
+            str(message.get("id") or "").strip()
+            for message in messages
+            if isinstance(message, dict) and str(message.get("id") or "").strip()
+        }
+        receipts = meta.get(SERVER_RUNTIME_RECEIPTS_KEY)
+        receipt_messages = (
+            receipts.get("messages") if isinstance(receipts, dict) else None
+        )
+        if isinstance(receipt_messages, dict):
+            retained_receipts = {
+                key: value
+                for key, value in receipt_messages.items()
+                if str(key).strip() in message_ids
+            }
+            if retained_receipts:
+                next_receipts = dict(receipts)
+                next_receipts["messages"] = retained_receipts
+                meta[SERVER_RUNTIME_RECEIPTS_KEY] = next_receipts
+            else:
+                meta.pop(SERVER_RUNTIME_RECEIPTS_KEY, None)
+        meta["updated_at"] = _now_iso()
+        meta.setdefault("created_at", meta["updated_at"])
+        meta["message_count"] = len(messages)
+        _write_meta(name, meta)
+
+
+def mutate_conversation(
+    name: str,
+    mutation: Callable[[List[Dict[str, Any]]], Optional[List[Dict[str, Any]]]],
+) -> List[Dict[str, Any]]:
+    """Atomically load, mutate, and save one conversation in this process.
+
+    ``mutation`` receives the current mutable message list while the store's
+    process-wide re-entrant lock is held. It may mutate that list in place and
+    return ``None``, or return a replacement list. The normal save path remains
+    responsible for metadata timestamps, counts, and runtime-receipt pruning.
+    Re-entrant calls for the same conversation share the outer mutation's
+    working list and are saved once by the outermost call. Other nested store
+    calls are safe because the process-wide lock is an ``RLock``.
+    """
+
+    with _METADATA_LOCK:
+        active = getattr(_MUTATION_STATE, "conversations", None)
+        if active is None:
+            active = {}
+            _MUTATION_STATE.conversations = active
+        mutation_key = str(_path(name).resolve())
+        active_messages = active.get(mutation_key)
+        if active_messages is not None:
+            replacement = mutation(active_messages)
+            if replacement is not None:
+                if not isinstance(replacement, list):
+                    raise TypeError("conversation mutation must return a list or None")
+                if replacement is not active_messages:
+                    active_messages[:] = replacement
+            return active_messages
+
+        messages = load_conversation(name)
+        active[mutation_key] = messages
+        try:
+            replacement = mutation(messages)
+            if replacement is not None:
+                if not isinstance(replacement, list):
+                    raise TypeError("conversation mutation must return a list or None")
+                if replacement is not messages:
+                    messages[:] = replacement
+            save_conversation(name, messages)
+            return messages
+        finally:
+            active.pop(mutation_key, None)
+            if not active:
+                delattr(_MUTATION_STATE, "conversations")
+
+
+def save_conversation_with_metadata(
+    name: str,
+    messages: List[Dict[str, Any]],
+    metadata_updates: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Save transcript + sidecar as one in-process, fail-closed transaction.
+
+    The sidecar is written first. An interruption can therefore leave a stale
+    receipt for a missing message (which cannot be continued), never a live
+    assistant message without its scope/invalidation receipt.
+    """
+
+    with _METADATA_LOCK:
+        merge_metadata(name, metadata_updates)
+        save_conversation(name, messages)
+        return _ensure_metadata(name)
+
+
+def replace_conversation_content(
+    name: str,
+    messages: List[Dict[str, Any]],
+) -> None:
+    """Replace a transcript without carrying runnable runtime authority across.
+
+    Imports and compaction outputs are useful conversation content, but their
+    embedded scopes and tool events are not live receipts for the destination
+    conversation.  Sanitize those fields and clear the destination sidecar in
+    the same store operation so alternate writers cannot accidentally retain
+    stale model/tool authority.
+    """
+
+    sanitized: List[Dict[str, Any]] = []
+    for raw_message in messages if isinstance(messages, list) else []:
+        if not isinstance(raw_message, dict):
+            sanitized.append(copy.deepcopy(raw_message))
+            continue
+        message = copy.deepcopy(raw_message)
+        metadata = message.get("metadata")
+        if isinstance(metadata, dict):
+            metadata = dict(metadata)
+            metadata.pop("capability_scope", None)
+            if metadata:
+                message["metadata"] = metadata
+            else:
+                message.pop("metadata", None)
+        tools = message.get("tools")
+        if isinstance(tools, list):
+            sanitized_tools: List[Any] = []
+            for raw_tool in tools:
+                if not isinstance(raw_tool, dict):
+                    sanitized_tools.append(copy.deepcopy(raw_tool))
+                    continue
+                tool = copy.deepcopy(raw_tool)
+                tool.pop("server_recorded", None)
+                tool[CLIENT_SAVED_TOOL_MARKER] = True
+                sanitized_tools.append(tool)
+            message["tools"] = sanitized_tools
+        sanitized.append(message)
+
+    invalidated_messages: Dict[str, Dict[str, str]] = {}
+    for message in sanitized:
+        if not isinstance(message, dict):
+            continue
+        message_id = str(message.get("id") or "").strip()
+        if message_id:
+            invalidated_messages[message_id] = {
+                CONTINUATION_TRUST_KEY: CONTINUATION_TRUST_INVALIDATED,
+                "reason": "transcript_replacement",
+            }
+
+    with _METADATA_LOCK:
+        meta = _ensure_metadata(name)
+        meta.pop(SERVER_RUNTIME_RECEIPTS_KEY, None)
+        if invalidated_messages:
+            meta[SERVER_RUNTIME_RECEIPTS_KEY] = {"messages": invalidated_messages}
+        _write_meta(name, meta)
+        save_conversation(name, sanitized)
 
 
 def _build_context_snapshot_ref(
@@ -552,17 +784,18 @@ def save_context_snapshot(
     fp.parent.mkdir(parents=True, exist_ok=True)
     with fp.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
-    meta = _ensure_metadata(name)
-    refs = [
-        ref
-        for ref in list_context_snapshot_refs(name)
-        if str(ref.get("id") or "").strip() != snapshot_id
-    ]
-    refs.append(_build_context_snapshot_ref(name, payload, fp))
-    refs.sort(key=lambda item: str(item.get("created_at") or ""))
-    meta["context_snapshots"] = refs[-max_refs:]
-    meta["active_context_snapshot_id"] = snapshot_id
-    _write_meta(name, meta)
+    with _METADATA_LOCK:
+        meta = _ensure_metadata(name)
+        refs = [
+            ref
+            for ref in list_context_snapshot_refs(name)
+            if str(ref.get("id") or "").strip() != snapshot_id
+        ]
+        refs.append(_build_context_snapshot_ref(name, payload, fp))
+        refs.sort(key=lambda item: str(item.get("created_at") or ""))
+        meta["context_snapshots"] = refs[-max_refs:]
+        meta["active_context_snapshot_id"] = snapshot_id
+        _write_meta(name, meta)
     return payload
 
 
@@ -594,69 +827,82 @@ def delete_conversation(name: str) -> None:
 
 
 def rename_conversation(old: str, new: str) -> None:
-    meta_payload = _load_meta(old)
-    old_base = _normalize_name(old).split("/")[-1]
-    new_base = _normalize_name(new).split("/")[-1]
-    old_p = _path(old)
-    new_p = _path(new)
-    old_meta = _meta_path(old)
-    new_meta = _meta_path(new)
-    old_snapshots = _context_snapshot_dir(old)
-    new_snapshots = _context_snapshot_dir(new)
-    new_p.parent.mkdir(parents=True, exist_ok=True)
-    if old_p.exists():
-        old_p.rename(new_p)
-        _prune_empty_dirs(old_p.parent)
-    new_meta.parent.mkdir(parents=True, exist_ok=True)
-    if old_meta.exists():
-        old_meta.rename(new_meta)
-    if old_snapshots.exists():
-        new_snapshots.parent.mkdir(parents=True, exist_ok=True)
+    with _METADATA_LOCK:
+        meta_payload = _load_meta(old)
+        old_base = _normalize_name(old).split("/")[-1]
+        new_base = _normalize_name(new).split("/")[-1]
+        old_p = _path(old)
+        new_p = _path(new)
+        old_meta = _meta_path(old)
+        new_meta = _meta_path(new)
+        old_snapshots = _context_snapshot_dir(old)
+        new_snapshots = _context_snapshot_dir(new)
+        if any(path.exists() for path in (new_p, new_meta, new_snapshots)):
+            raise FileExistsError(f"Conversation destination already exists: {new}")
+
+        moved: List[tuple[Path, Path]] = []
         try:
-            if new_snapshots.exists():
-                shutil.rmtree(new_snapshots)
-            old_snapshots.rename(new_snapshots)
+            new_p.parent.mkdir(parents=True, exist_ok=True)
+            new_meta.parent.mkdir(parents=True, exist_ok=True)
+            new_snapshots.parent.mkdir(parents=True, exist_ok=True)
+            if old_meta.exists():
+                old_meta.rename(new_meta)
+                moved.append((new_meta, old_meta))
+            if old_p.exists():
+                old_p.rename(new_p)
+                moved.append((new_p, old_p))
+            if old_snapshots.exists():
+                old_snapshots.rename(new_snapshots)
+                moved.append((new_snapshots, old_snapshots))
         except Exception:
-            pass
-    if isinstance(meta_payload, dict):
-        refs = meta_payload.get("context_snapshots")
-        if isinstance(refs, list):
-            updated_refs: List[Dict[str, Any]] = []
-            old_snapshot_prefix = (
-                _context_snapshot_dir(old).relative_to(CONV_DIR).as_posix()
+            for destination, source in reversed(moved):
+                try:
+                    if destination.exists() and not source.exists():
+                        destination.rename(source)
+                except Exception:
+                    pass
+            raise
+
+        _prune_empty_dirs(old_p.parent)
+        if isinstance(meta_payload, dict):
+            refs = meta_payload.get("context_snapshots")
+            if isinstance(refs, list):
+                updated_refs: List[Dict[str, Any]] = []
+                old_snapshot_prefix = (
+                    _context_snapshot_dir(old).relative_to(CONV_DIR).as_posix()
+                )
+                new_snapshot_prefix = (
+                    _context_snapshot_dir(new).relative_to(CONV_DIR).as_posix()
+                )
+                for item in refs:
+                    if not isinstance(item, dict):
+                        continue
+                    ref = dict(item)
+                    raw_path = str(ref.get("path") or "").strip()
+                    if raw_path.startswith(old_snapshot_prefix):
+                        ref["path"] = raw_path.replace(
+                            old_snapshot_prefix,
+                            new_snapshot_prefix,
+                            1,
+                        )
+                    ref["conversation_id"] = new
+                    updated_refs.append(ref)
+                meta_payload["context_snapshots"] = updated_refs
+            _write_meta(new, meta_payload)
+        if meta_payload and old_base == new_base:
+            display_name = meta_payload.get("display_name") or new_base
+            auto_generated = meta_payload.get("auto_title_applied")
+            manual = meta_payload.get("manual_title")
+            set_display_name(
+                new,
+                display_name,
+                auto_generated=auto_generated,
+                manual=manual,
             )
-            new_snapshot_prefix = (
-                _context_snapshot_dir(new).relative_to(CONV_DIR).as_posix()
+        else:
+            set_display_name(
+                new,
+                new_base or new,
+                auto_generated=False,
+                manual=True,
             )
-            for item in refs:
-                if not isinstance(item, dict):
-                    continue
-                ref = dict(item)
-                raw_path = str(ref.get("path") or "").strip()
-                if raw_path.startswith(old_snapshot_prefix):
-                    ref["path"] = raw_path.replace(
-                        old_snapshot_prefix,
-                        new_snapshot_prefix,
-                        1,
-                    )
-                ref["conversation_id"] = new
-                updated_refs.append(ref)
-            meta_payload["context_snapshots"] = updated_refs
-        _write_meta(new, meta_payload)
-    if meta_payload and old_base == new_base:
-        display_name = meta_payload.get("display_name") or new_base
-        auto_generated = meta_payload.get("auto_title_applied")
-        manual = meta_payload.get("manual_title")
-        set_display_name(
-            new,
-            display_name,
-            auto_generated=auto_generated,
-            manual=manual,
-        )
-    else:
-        set_display_name(
-            new,
-            new_base or new,
-            auto_generated=False,
-            manual=True,
-        )

@@ -2,24 +2,10 @@ import React, { useContext, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import axios from "axios";
 import ActionListEditor from "./ActionListEditor";
+import BackgroundJobFields from "./BackgroundJobFields";
 import { GlobalContext } from "../main";
-
-const toLocalInputValue = (date) => {
-  if (!date || Number.isNaN(date.getTime())) return "";
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  const hour = String(date.getHours()).padStart(2, "0");
-  const minute = String(date.getMinutes()).padStart(2, "0");
-  return `${year}-${month}-${day}T${hour}:${minute}`;
-};
-
-const fromInputValue = (value) => {
-  if (!value) return null;
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return null;
-  return parsed;
-};
+import { normalizeBackgroundJobPolicy } from "../utils/backgroundJobPolicy";
+import { dateToZonedInput, zonedInputToDate } from "../utils/zonedDateTime";
 
 const slugify = (value) =>
   (value || "")
@@ -33,12 +19,12 @@ const getNoteValue = (notes, key) =>
     ? notes.find((note) => note?.id === key)?.content || ""
     : "";
 
-const getReviewInput = (notes) => {
+const getReviewInput = (notes, timezone) => {
   const raw = getNoteValue(notes, "review");
   if (!raw) return "";
   const parsed = new Date(raw);
   if (Number.isNaN(parsed.getTime())) return "";
-  return toLocalInputValue(parsed);
+  return dateToZonedInput(parsed, timezone);
 };
 
 const timezones = (() => {
@@ -86,6 +72,9 @@ const EventForm = ({
   const [review, setReview] = useState("");
   const [timezone, setTimezone] = useState(defaultTz);
   const [rrule, setRrule] = useState("");
+  const [backgroundJob, setBackgroundJob] = useState(() =>
+    normalizeBackgroundJobPolicy(),
+  );
   const [durationMin, setDurationMin] = useState(60);
   const [status, setStatus] = useState("pending");
   const [endActive, setEndActive] = useState(false);
@@ -110,6 +99,7 @@ const EventForm = ({
 
   useEffect(() => {
     if (!isOpen) return;
+    const nextTimezone = event?.timezone || defaultTz;
     const base = new Date(anchorDate);
     base.setMinutes(base.getMinutes(), 0, 0);
     const derivedDuration =
@@ -137,15 +127,16 @@ const EventForm = ({
     setActionsValidation({ ok: true, errors: [] });
     setStart(
       event?.startDate
-        ? toLocalInputValue(event.startDate)
-        : toLocalInputValue(base),
+        ? dateToZonedInput(event.startDate, nextTimezone)
+        : dateToZonedInput(base, nextTimezone),
     );
-    setEnd(event?.endDate ? toLocalInputValue(event.endDate) : "");
-    setReview(getReviewInput(notes));
+    setEnd(event?.endDate ? dateToZonedInput(event.endDate, nextTimezone) : "");
+    setReview(getReviewInput(notes, nextTimezone));
     setEndActive(Boolean(event?.endDate));
-    setReviewActive(Boolean(getReviewInput(notes)));
-    setTimezone(event?.timezone || defaultTz);
+    setReviewActive(Boolean(getReviewInput(notes, nextTimezone)));
+    setTimezone(nextTimezone);
     setRrule(event?.rrule || "");
+    setBackgroundJob(normalizeBackgroundJobPolicy(event?.background_job));
     setDurationMin(derivedDuration);
     setStatus(event?.status || "pending");
     setShowAdvanced(false);
@@ -209,16 +200,16 @@ const EventForm = ({
       setError("Please provide an event name.");
       return;
     }
-    const startDate = fromInputValue(start);
+    const startDate = zonedInputToDate(start, timezone);
     if (!startDate) {
       setError("Start time is invalid.");
       return;
     }
-    let endDate = fromInputValue(end);
+    let endDate = zonedInputToDate(end, timezone);
     if ((!end || !endDate) && durationMin > 0) {
       endDate = new Date(startDate.getTime() + durationMin * 60000);
     }
-    const reviewDate = review ? fromInputValue(review) : null;
+    const reviewDate = review ? zonedInputToDate(review, timezone) : null;
     const baseNotes = Array.isArray(event?.notes) ? [...event.notes] : [];
     const filteredNotes = baseNotes.filter(
       (note) => note && !["description", "actions", "review"].includes(note.id),
@@ -242,11 +233,21 @@ const EventForm = ({
     const payload = {
       id: id || slugify(title) || `evt-${Date.now()}`,
       title: title.trim(),
-      description: description.trim() || undefined,
+      description: description.trim() || null,
       actions: Array.isArray(actions) ? actions : [],
+      background_job:
+        Array.isArray(actions) && actions.length
+          ? {
+              ...normalizeBackgroundJobPolicy(backgroundJob),
+              ownership: {
+                ...normalizeBackgroundJobPolicy(backgroundJob).ownership,
+                calendar_event_id: id || slugify(title) || undefined,
+              },
+            }
+          : null,
       start_time: Math.floor(startDate.getTime() / 1000),
-      end_time: endDate ? Math.floor(endDate.getTime() / 1000) : undefined,
-      rrule: rrule || undefined,
+      end_time: endDate ? Math.floor(endDate.getTime() / 1000) : null,
+      rrule: rrule || null,
       timezone,
       status,
       notes: filteredNotes,
@@ -290,7 +291,8 @@ const EventForm = ({
           aria-label="Close event editor"
           onClick={onCancel}
         >
-          ×
+          <span aria-hidden="true">×</span>
+          <span>Close</span>
         </button>
         <div className="event-popup-header">
           <input
@@ -398,6 +400,16 @@ const EventForm = ({
             </div>
           </div>
 
+          <BackgroundJobFields
+            rrule={rrule}
+            onRruleChange={setRrule}
+            policy={backgroundJob}
+            onPolicyChange={setBackgroundJob}
+            startValue={start}
+            timezone={timezone}
+            showExecutionPolicy={Array.isArray(actions) && actions.length > 0}
+          />
+
           {actionsOpen && (
             <ActionListEditor
               actions={actions}
@@ -459,15 +471,6 @@ const EventForm = ({
               </select>
             </label>
             <label>
-              <span>Recurrence (RRULE)</span>
-              <input
-                type="text"
-                value={rrule}
-                onChange={(evt) => setRrule(evt.target.value)}
-                placeholder="FREQ=WEEKLY;INTERVAL=1"
-              />
-            </label>
-            <label>
               <span>Fallback duration (minutes)</span>
               <input
                 type="number"
@@ -489,6 +492,7 @@ const EventForm = ({
                 <option value="pending">pending</option>
                 <option value="scheduled">scheduled</option>
                 <option value="prompted">prompted</option>
+                <option value="paused">paused</option>
                 <option value="acknowledged">acknowledged</option>
                 <option value="skipped">skipped</option>
               </select>

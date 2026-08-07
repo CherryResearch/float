@@ -206,9 +206,14 @@ def test_release_snapshot_writes_separate_build_receipt(tmp_path, monkeypatch):
     assert saved == receipt
 
 
-def test_release_snapshot_excludes_test_for_internal_bakeoff_runner():
-    relative = "backend/app/services/tests/test_threads_embedding_bakeoff_eval.py"
-
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "backend/app/services/tests/test_threads_embedding_bakeoff_eval.py",
+        "backend/app/tests/test_tool_confusion_api_eval.py",
+    ],
+)
+def test_release_snapshot_excludes_tests_for_internal_eval_runners(relative):
     assert create_release_snapshot.is_relative_excluded(relative)
     assert not create_release_snapshot.is_manifest_relative_path(relative)
 

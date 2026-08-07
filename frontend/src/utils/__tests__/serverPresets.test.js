@@ -30,14 +30,21 @@ describe("server presets", () => {
     expect(preset).not.toHaveProperty("api_key");
   });
 
-  it("warns for user-entered xAI endpoints and routed Grok models", () => {
+  it("warns for xAI presets and Grok models reached through another router", () => {
     const base = {
-      server_preset_id: "",
-      server_presets: [],
+      server_preset_id: "xai-grok",
+      server_presets: [
+        {
+          id: "xai-grok",
+          name: "xAI / Grok",
+          provider: "xai",
+          base_url: "https://api.x.ai/v1",
+        },
+      ],
       server_url: "https://api.x.ai/v1",
     };
 
-    expect(selectedServerPreset(base)).toBeNull();
+    expect(selectedServerPreset(base)?.provider).toBe("xai");
     expect(serverTrustWarning(base)).toBe(GROK_TRUST_WARNING);
     expect(
       serverTrustWarning({
@@ -48,7 +55,8 @@ describe("server presets", () => {
     expect(
       serverTrustWarning({
         ...base,
-        server_url: "https://router.example.test/v1",
+        server_preset_id: "",
+        server_presets: [],
         transformer_model: "x-ai/grok-custom",
       }),
     ).toBe(GROK_TRUST_WARNING);

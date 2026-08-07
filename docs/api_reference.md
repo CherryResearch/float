@@ -1,6 +1,6 @@
 # Float API Reference
 
-Updated: 2026-07-16
+Updated: 2026-08-06
 
 This is a curated reference for the current local FastAPI surface. Most routes are mounted under `/api`; root health probes also exist at `/` and `/health`.
 
@@ -81,10 +81,10 @@ Current built-in tool metadata lives in `backend/app/tool_catalog.py`; current c
 | `/api/computer/sessions/{session_id}` | `GET` / `DELETE` | Inspect or stop a computer-use session. |
 | `/api/computer/screenshots/{filename}` | `GET` | Serve a captured computer-use screenshot. |
 | `/api/captures` | `GET` | List transient captures from camera/computer/screen sources. |
-| `/api/captures/upload` | `POST` | Upload a capture into transient capture storage. |
+| `/api/captures/upload` | `POST` | Upload a non-empty PNG/JPEG/GIF/WebP capture into transient storage. Declared MIME must match the raster signature; SVG and disguised active content are rejected. |
 | `/api/captures/{capture_id}` | `GET` / `DELETE` | Inspect or delete a capture. |
-| `/api/captures/{capture_id}/content` | `GET` | Serve capture content. |
-| `/api/captures/{capture_id}/promote` | `POST` | Promote a transient capture into durable attachment/knowledge storage. |
+| `/api/captures/{capture_id}/content` | `GET` | Serve a capture with `nosniff`; only verified safe raster content is inline, while legacy/unknown/mismatched content is sandboxed and downloaded. |
+| `/api/captures/{capture_id}/promote` | `POST` | Promote a transient capture into durable attachment storage and queue the same caption/text-RAG/CLIP lifecycle as an attachment upload. Fresh jobs are deduplicated and stalled legacy promotions remain retryable. The model-facing `capture.promote` tool uses this same path. |
 
 ## Memory, Knowledge, RAG, And Attachments
 
@@ -111,13 +111,16 @@ Current built-in tool metadata lives in `backend/app/tool_catalog.py`; current c
 | `/api/knowledge/trace/{doc_id}` | `GET` | Fetch full normalized text/metadata for auditing a retrieved match. |
 | `/api/knowledge/file/{doc_id}` | `GET` | Serve a local file only when it resolves inside the managed data/files area. |
 | `/api/knowledge/reveal/{doc_id}` | `GET` | Reveal/open a safe local knowledge source location. |
-| `/api/attachments/upload` | `POST` | Upload an attachment. |
-| `/api/attachments` | `GET` | List attachments. |
-| `/api/attachments/rag/rehydrate` | `POST` | Caption/reindex image attachments. |
-| `/api/attachments/caption/{content_hash}` | `GET` / `PUT` / `DELETE` | Read, set, or clear an attachment caption. |
+| `/api/attachments/upload` | `POST` | Upload an attachment. The optional `source_url` form field records passive, potentially stale HTTP(S) provenance; Float does not fetch it and rejects URLs carrying userinfo, signed-query, or fragment credentials. |
+| `/api/attachments` | `GET` | List attachment descriptors, including the durable content hash, current managed relative path, reconstructable Float retrieval URL, and optional recorded source URL. |
+| `/api/attachments/{content_hash}/metadata` | `GET` / `PATCH` | Read or update mutable display name, logical gallery folder, and passive source URL metadata. Hash, physical filename/path, and origin are immutable; API hashes are exactly 64 lowercase hexadecimal characters. |
+| `/api/attachments/rag/rehydrate` | `POST` | Caption/reindex image attachments, optionally restricted by content hash. Results distinguish processed images, generated versus unavailable captions, and failures. With the saved cloud lane this operation can send eligible image bytes to the configured provider; the gallery asks again before a bulk run. |
+| `/api/attachments/caption/status` | `GET` | Report the saved caption engine plus local installation, dependency, loaded/verified, and first-attempt capability state without downloading a model, loading large weights merely for status, or contacting the provider. |
+| `/api/attachments/caption/{content_hash}/generate` | `POST` | Retry one missing/placeholder caption. Manual captions are protected; generated captions require explicit replacement. |
+| `/api/attachments/caption/{content_hash}` | `GET` / `PUT` / `DELETE` | Read, set, or clear an attachment caption. Clearing keeps the file and rebuilds local image retrieval without calling a caption provider. |
 | `/api/attachments/reveal/{content_hash}` | `GET` | Reveal/open a safe local attachment location. |
-| `/api/attachments/{content_hash}/{filename}` | `GET` | Serve attachment content. |
-| `/api/attachments/{content_hash}` | `DELETE` | Delete an attachment. |
+| `/api/attachments/{content_hash}/{filename}` | `GET` | Serve attachment content with `nosniff`; only the explicit safe media allowlist is inline, while active/unknown types are sandboxed downloads. |
+| `/api/attachments/{content_hash}` | `DELETE` | Delete an attachment plus canonical, text-RAG, and CLIP retrieval records, including namespaced sync mirrors. Partial mirror cleanup leaves a visible retryable tombstone. Deletion invalidates queued index generations so delayed work cannot resurrect metadata or retrieval records. |
 
 SQLite is the canonical knowledge/memory store. Chroma is the default retrieval mirror. Weaviate is optional and exposed through `/api/weaviate/status`, `/api/weaviate/start`, and `/api/knowledge/import/weaviate`.
 
@@ -146,13 +149,22 @@ Conversation sidecar metadata can exist without a matching conversation JSON fil
 | Endpoint | Method | Purpose |
 | --- | --- | --- |
 | `/api/calendar/events` | `GET` | List calendar events/tasks. |
-| `/api/calendar/events/{event_id}` | `GET` / `POST` / `DELETE` | Read, update, or delete one event/task. |
+| `/api/calendar/events/{event_id}` | `GET` / `POST` / `DELETE` | Read, update, or delete one event/task. Delete preserves Activity receipts and returns `409` while a run is active. |
+| `/api/calendar/occurrences` | `GET` | Expand stored events over a bounded viewport using the scheduled runner's timezone-aware recurrence rules. |
+| `/api/calendar/runs` | `GET` | List the Calendar subset of the durable device-local Activity ledger. Supports event/status filters plus `limit`/`offset`, and receipts remain after their source event is deleted. |
 | `/api/calendar/events/{event_id}/prompt` | `POST` | Prompt/review one event. |
 | `/api/calendar/events/{event_id}/run` | `POST` | Manually run an event action. |
+| `/api/calendar/events/{event_id}/actions/{action_id}/authorization` | `POST` | Approve once or deny one exact occurrence-bound scheduled action request. Decisions are local, digest-bound, and invalidated by relevant edits. |
+| `/api/calendar/events/{event_id}/actions/{action_id}/cancel` | `POST` | Request cooperative cancellation for one exact run. A request made after uncertain dispatch preserves reconciliation state instead of claiming rollback. |
 | `/api/calendar/import/google` | `POST` | Import Google Calendar payloads. |
 | `/api/calendar/import/ics` | `POST` | Import ICS calendar payloads. |
 | `/api/calendar/reminders/flush` | `POST` | Flush due reminder prompts after launch/reconnect. |
 | `/api/calendar/rag/rehydrate` | `POST` | Reindex calendar events into RAG. |
+| `/api/work/runs` | `GET` | List durable Calendar and reflection Activity receipts. Supports source/job filters and `limit`/`offset`; the top-level `count` is the current filtered receipt count and is not promised to share one SQLite snapshot with the returned page. Each receipt's `event_count` counts lifecycle rows, while `attempt_count` and `effect_count` count indexed child snapshots. Retained legacy rows are backfilled idempotently. |
+| `/api/work/runs/{receipt_id}/events` | `GET` | Lazily inspect one receipt's append-only status/phase/recovery transitions. `count` is the current lifecycle-row count and paging uses `limit`/`offset`, `has_more`, and `next_offset`. Rows are metadata-only and exclude prompts, summaries, arguments, and raw results. |
+| `/api/work/runs/{receipt_id}/attempts` | `GET` | Lazily inspect current indexed provider-attempt snapshots for one receipt, including retry/error categories, retry links, checkpoint/effect-watermark digests, state-delta certainty, and each attempt's internal `transition_count`. Response `count` counts attempt snapshots, not their internal transitions. Prompt bodies, raw provider responses, raw error messages, and checkpoint contents are excluded. |
+| `/api/work/runs/{receipt_id}/effects` | `GET` | Lazily inspect each effect's current redacted snapshot and internal `transition_count`, including `intent`/`dispatched`/`acknowledged`/`confirmed`/`unknown`/`not_dispatched` status, scope, replay policy, certainty, permission/approval metadata, digests, and remote operation ids when available. Response `count` counts effect snapshots, not internal transitions. Tool arguments and raw results are excluded; append-only transition rows remain internal. `acknowledged` with `reported_success` records a non-error tool return; `confirmed` is reserved for independent remote-state reconciliation. |
+| `/api/work/runs/{receipt_id}/effects/{effect_id}/reconcile` | `POST` | Record `confirm_applied` or `confirm_no_change` for one uncertain effect without replaying it, then project Activity and Calendar state. This is a user-directed receipt, not independent remote verification. |
 | `/api/tasks/` | `POST` | Create a task through the shared task surface. |
 | `/api/tasks/{task_id}` | `GET` | Read task state. |
 | `/api/notify` | `POST` | Add a local notification. |
@@ -160,6 +172,8 @@ Conversation sidecar metadata can exist without a matching conversation JSON fil
 | `/api/stream/notifications` | `GET` | SSE notifications stream. |
 | `/api/push/public-key` | `GET` | Web-push public key. |
 | `/api/push/subscribe`, `/api/push/unsubscribe`, `/api/push/test` | `POST` | Web-push subscription management and test. |
+
+Provider-attempt and effect snapshots currently originate from the scheduled-action runner only. Other chat, reflection, delegated-agent, and worker paths can have receipts without these child records.
 
 ## Settings, Themes, Models, And Providers
 
@@ -170,6 +184,13 @@ Conversation sidecar metadata can exist without a matching conversation JSON fil
 | `/api/themes` | `GET` / `POST` | List or save user-created themes. |
 | `/api/themes/{theme_id}` | `DELETE` | Delete a user theme. |
 | `/api/workflows/catalog` | `GET` | Read built-in workflow profile metadata. |
+| `/api/workflows/skills` | `GET` | List packaged skill documents and local overrides with source, ownership, and linked-module metadata. |
+| `/api/workflows/skills/{skill_id}` | `GET` / `PUT` / `DELETE` | Read, save, or remove one local skill override. Create-only saves reject collisions and removing an override restores the packaged fallback when present. |
+| `/api/workflows/skills/{skill_id}/duplicate-preview` | `POST` | Prepare an audited create-only duplicate draft without writing a file. |
+| `/api/workflows/skills/import-preview` | `POST` | Parse imported Markdown/text as an audited create-only draft without writing it. |
+| `/api/workflows/skills/{skill_id}/rename` | `POST` | Rename one unlinked local-only skill document without replacing another id. |
+| `/api/workflows/skills/{skill_id}/export` | `GET` | Export the active skill Markdown. |
+| `/api/workflows/skills/{skill_id}/draft` | `POST` | Request an audited reflection proposal that remains unsaved until the user explicitly saves it. |
 | `/api/openai/models` | `GET` | Cached provider inventory plus `selectable_models`, lifecycle `catalog`, and optional persisted-selection `migration`; accepts `selected_model` and `include_non_chat`. |
 | `/api/llm/provider/status` | `GET` | Managed local provider runtime status. |
 | `/api/llm/provider/models` | `GET` | Managed local provider model inventory. |
@@ -205,6 +226,7 @@ Current API defaults focus on OpenAI `chat-latest` (`GPT latest (...)` in the UI
 | `/api/pairing/offers` | `POST` | Create a pairing offer. |
 | `/api/pairing/offers/accept` | `POST` | Accept a pairing offer. |
 | `/api/sync/overview` | `GET` | Sync visibility, pairings, workspace profiles, data revision/checkpoint state, recent deployment metadata events, ledger-chain health, and review state. |
+| `/api/sync/lan-visibility` | `POST` | Enable or disable private-network sync and, when Float owns the launcher, restart only the backend on the same port so the saved visibility state matches the real listener. Returns whether the listener is active, restarting, or needs a manual Float restart. |
 | `/api/sync/events` | `GET` | List this deployment's content-free software/data event ledger. Supports `limit` and optional `event_type`; returns hash-chain verification state. |
 | `/api/sync/pair` | `POST` | Pair with another Float instance. |
 | `/api/sync/peer/status` | `POST` | Probe paired peer reachability. |
@@ -215,5 +237,6 @@ Current API defaults focus on OpenAI `chat-latest` (`GPT latest (...)` in the UI
 | `/api/sync/plan` | `POST` | Local preview of pull/push changes using a peer/workspace-scoped common ancestor when available. |
 | `/api/sync/apply` | `POST` | Apply selected sync changes and record a successful data checkpoint for later creation/edit/deletion/conflict classification. |
 | `/api/sync/reviews/{review_id}/approve`, `/reject` | `POST` | Approve or reject inbound push review items. |
+| `/api/sync/operations/{operation_id}/cancel` | `POST` | Record cancellation intent for one sync operation; completed remote work is not rolled back implicitly. |
 
 Sync covers conversations, memories, knowledge, graph rows, attachments, calendar files, and workspace preferences. It is an alpha trusted-device flow, not a public gateway or background-sync system.

@@ -6,9 +6,11 @@ import logging
 import os
 import secrets
 import shutil
+import signal
 import socket
 import subprocess
 import textwrap
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -43,7 +45,11 @@ from app.utils.device_registry import (
     touch_device,
     update_device,
 )
-from app.utils.device_visibility import advertised_device_access, candidate_device_urls
+from app.utils.device_visibility import (
+    advertised_device_access,
+    candidate_device_urls,
+    is_lan_binding_host,
+)
 from app.utils.http_client import http_session
 from app.utils.rendezvous_store import accept_offer as accept_rendezvous_offer
 from app.utils.rendezvous_store import create_offer as create_rendezvous_offer
@@ -316,6 +322,20 @@ def _load_saved_peers() -> List[Dict[str, Any]]:
     return peers
 
 
+def _saved_peer_by_id(peer_id: Any) -> Optional[Dict[str, Any]]:
+    needle = str(peer_id or "").strip()
+    if not needle:
+        return None
+    return next(
+        (
+            peer
+            for peer in _load_saved_peers()
+            if str(peer.get("id") or "").strip() == needle
+        ),
+        None,
+    )
+
+
 def _sync_ownership_summary(
     settings: Dict[str, Any],
     access: Dict[str, Any],
@@ -371,6 +391,8 @@ def _sync_ownership_summary(
         "private_network_only": True,
         "inbound_visibility": {
             "lan_enabled": lan_enabled,
+            "lan_listening": bool(visibility.get("lan_listening")),
+            "lan_state": str(visibility.get("lan_state") or "unknown"),
             "online_requested": online_requested,
             "online_supported": online_supported,
         },
@@ -1256,7 +1278,8 @@ def _annotate_peer_identity(
     if not expected_key:
         remote_device_id = str(pair.get("remote_device_id") or "").strip()
         local_public_key = str(pair.get("public_key") or "").strip()
-        expected_label = str(pair.get("label") or "").strip().lower()
+        # A friendly local label is editable and is not remote identity evidence.
+        expected_label = str(pair.get("remote_device_name") or "").strip().lower()
         observed_labels = {
             str(identity.get("display_name") or status.get("display_name") or "")
             .strip()
@@ -1554,6 +1577,11 @@ class MobileFloatServePayload(BaseModel):
     serve_port: int = MOBILE_FLOAT_DEFAULT_SERVE_PORT
 
 
+class LanVisibilityPayload(BaseModel):
+    enabled: bool
+    restart: bool = True
+
+
 class PairDeviceRevokePayload(BaseModel):
     paired_device: Dict[str, Any]
     remove_local_pair: bool = True
@@ -1794,22 +1822,48 @@ async def sync_pair(payload: PairDevicePayload, request: Request):
 
 @router.post("/sync/peer/status")
 async def sync_peer_status(payload: SyncPeerStatusPayload):
+    pairing = None
+    saved_pairing = None
+    raw_paired_device = (
+        payload.paired_device if isinstance(payload.paired_device, dict) else None
+    )
+    explicit_peer_id = str((raw_paired_device or {}).get("id") or "").strip()
+    if payload.update_saved_peer and not explicit_peer_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Saved peer id is required to update a moved address.",
+        )
+    if raw_paired_device is not None:
+        saved_pairing = _saved_peer_by_id(explicit_peer_id)
+        if saved_pairing is not None:
+            pairing = saved_pairing
+        elif payload.update_saved_peer:
+            raise HTTPException(
+                status_code=404,
+                detail="Saved peer no longer exists. Refresh the device list and try again.",
+            )
+        else:
+            requested_pairing = _coerce_saved_peer(raw_paired_device)
+            if requested_pairing is None:
+                raise HTTPException(
+                    status_code=400, detail="Saved peer payload is invalid."
+                )
+            pairing = requested_pairing
     operation = _begin_sync_operation(
         kind="check",
         remote_url=payload.remote_url,
         operation_id=payload.operation_id,
         operation_owner=payload.operation_owner,
-        paired_device=payload.paired_device,
+        paired_device=pairing,
         sections=[],
         workspace_mode="",
         metadata={"update_saved_peer": bool(payload.update_saved_peer)},
     )
     try:
-        pairing = _coerce_saved_peer(payload.paired_device or {})
         status = _peer_connectivity_status(payload.remote_url, pairing)
         status = _annotate_peer_identity(status, pairing)
-        persisted_observation = None
-        if pairing is not None and status.get("identity_verified"):
+        observed_pair = None
+        if saved_pairing is not None and status.get("identity_verified"):
             remote_status = (
                 status.get("deployment_status")
                 if isinstance(status.get("deployment_status"), dict)
@@ -1826,15 +1880,15 @@ async def sync_peer_status(payload: SyncPeerStatusPayload):
                 else (status.get("identity") or {}).get("software")
             )
             observed_pair = {
-                **pairing,
+                **saved_pairing,
                 "remote_public_key": (
                     (status.get("identity") or {}).get("public_key")
-                    or pairing.get("remote_public_key")
+                    or saved_pairing.get("remote_public_key")
                     or ""
                 ),
                 "remote_device_name": status.get("display_name")
                 or status.get("hostname")
-                or pairing.get("remote_device_name")
+                or saved_pairing.get("remote_device_name")
                 or "",
                 "remote_deployment_id": (
                     remote_data.get("deployment_id")
@@ -1845,10 +1899,6 @@ async def sync_peer_status(payload: SyncPeerStatusPayload):
                 "remote_data": _coerce_observed_data(remote_data),
                 "last_status_at": datetime.now(tz=timezone.utc).isoformat(),
             }
-            persisted_observation = _persist_saved_peer_state(
-                observed_pair,
-                remote_label=observed_pair.get("remote_device_name"),
-            )
         if payload.update_saved_peer:
             if pairing is None:
                 raise HTTPException(
@@ -1862,7 +1912,7 @@ async def sync_peer_status(payload: SyncPeerStatusPayload):
                     or "Remote identity was not verified.",
                 )
             next_pair = {
-                **(persisted_observation or pairing),
+                **(observed_pair or pairing),
                 "remote_url": status["instance_base"],
                 "remote_public_key": (
                     (status.get("identity") or {}).get("public_key")
@@ -1878,18 +1928,22 @@ async def sync_peer_status(payload: SyncPeerStatusPayload):
                 next_pair,
                 remote_label=next_pair.get("remote_device_name"),
             )
-            if persisted:
-                status["paired_device"] = persisted
-                settings = user_settings.load_settings()
-                if (
-                    str(settings.get("sync_remote_url") or "").strip()
-                    == str(pairing.get("remote_url") or "").strip()
-                ):
-                    user_settings.save_settings(
-                        {"sync_remote_url": persisted["remote_url"]}
-                    )
-        elif persisted_observation:
-            status["observed_peer"] = persisted_observation
+            if persisted is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Saved peer was removed while its address was being verified. Refresh and try again.",
+                )
+            status["paired_device"] = persisted
+        elif observed_pair and (
+            str(status.get("instance_base") or "").strip()
+            == str(saved_pairing.get("remote_url") or "").strip()
+        ):
+            persisted_observation = _persist_saved_peer_state(
+                observed_pair,
+                remote_label=observed_pair.get("remote_device_name"),
+            )
+            if persisted_observation:
+                status["observed_peer"] = persisted_observation
         _finish_sync_operation(
             operation,
             status="completed",
@@ -2885,6 +2939,88 @@ def _load_mobile_float_state() -> Dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _launcher_backend_binding(state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = state if isinstance(state, dict) else _load_mobile_float_state()
+    processes = payload.get("processes")
+    processes = processes if isinstance(processes, dict) else {}
+    backend = processes.get("backend")
+    backend = backend if isinstance(backend, dict) else {}
+    # The current process environment is authoritative; launcher state is only
+    # a fallback for status reads made outside a managed backend process.
+    bind_host = str(
+        os.getenv("FLOAT_BACKEND_HOST") or payload.get("backend_host") or ""
+    ).strip()
+    normalized_host = bind_host.strip("[]").lower()
+    binding_known = bool(normalized_host)
+    lan_listening = is_lan_binding_host(normalized_host)
+    backend_pid = backend.get("pid")
+    try:
+        backend_pid = int(backend_pid)
+    except (TypeError, ValueError):
+        backend_pid = 0
+    launcher_running = bool(payload.get("launcher_running"))
+    backend_running = bool(backend.get("running"))
+    current_pid = os.getpid()
+    current_parent_pid = os.getppid()
+    # Uvicorn's reload worker is a child of the launcher-owned process. The
+    # parent match is useful diagnostic evidence, but only the current API
+    # process is safe for this endpoint to terminate directly.
+    backend_pid_is_current = backend_pid > 0 and backend_pid == current_pid
+    backend_pid_is_parent = backend_pid > 0 and backend_pid == current_parent_pid
+    backend_pid_matches_current = backend_pid_is_current or backend_pid_is_parent
+    binding_locked = bool(payload.get("backend_host_locked"))
+    reload_enabled = bool(payload.get("backend_reload_enabled")) or (
+        backend_pid_is_parent and "backend_reload_enabled" not in payload
+    )
+    restart_supported = (
+        launcher_running
+        and backend_running
+        and backend_pid_is_current
+        and not binding_locked
+        and not reload_enabled
+    )
+    current_process_binding_known = bool(os.getenv("FLOAT_BACKEND_HOST"))
+    return {
+        "bind_host": bind_host,
+        "binding_known": binding_known,
+        "lan_listening": lan_listening
+        and (backend_running or current_process_binding_known),
+        "launcher_running": launcher_running,
+        "backend_running": backend_running,
+        "backend_pid": backend_pid,
+        "current_pid": current_pid,
+        "current_parent_pid": current_parent_pid,
+        "backend_pid_matches_current": backend_pid_matches_current,
+        "binding_locked": binding_locked,
+        "reload_enabled": reload_enabled,
+        "restart_supported": restart_supported,
+    }
+
+
+def _terminate_launcher_backend(backend_pid: int) -> None:
+    os.kill(int(backend_pid), signal.SIGTERM)
+
+
+def _schedule_launcher_backend_restart(binding: Dict[str, Any]) -> bool:
+    backend_pid = int(binding.get("backend_pid") or 0)
+    if not binding.get("restart_supported") or backend_pid <= 0:
+        return False
+
+    def terminate() -> None:
+        try:
+            _terminate_launcher_backend(backend_pid)
+        except Exception:
+            logger.warning(
+                "Failed to restart the launcher-managed backend for LAN binding",
+                exc_info=True,
+            )
+
+    timer = threading.Timer(0.35, terminate)
+    timer.daemon = True
+    timer.start()
+    return True
+
+
 def _coerce_port(value: Any) -> Optional[int]:
     try:
         port = int(value)
@@ -3066,6 +3202,59 @@ async def mobile_float_serve_status(serve_port: Optional[int] = None):
     return _mobile_float_serve_status(_mobile_float_serve_port(serve_port))
 
 
+@router.post("/sync/lan-visibility")
+async def set_lan_visibility(request: Request, payload: LanVisibilityPayload):
+    """Persist LAN access and restart the launcher-managed backend if needed."""
+
+    _require_local_control(request)
+    enabled = bool(payload.enabled)
+    user_settings.save_settings({"sync_visible_on_lan": enabled})
+    before = _launcher_backend_binding()
+    binding_matches = bool(before.get("lan_listening")) == enabled
+    restart_scheduled = False
+    if payload.restart and not binding_matches:
+        restart_scheduled = _schedule_launcher_backend_restart(before)
+    restart_required = not binding_matches and not restart_scheduled
+    if binding_matches:
+        message = (
+            "LAN visibility is on and Float is listening on the private network."
+            if enabled
+            else "LAN visibility is off and Float is listening on this device only."
+        )
+    elif restart_scheduled:
+        message = (
+            "Restarting Float's backend with LAN listening on."
+            if enabled
+            else "Restarting Float's backend in device-only mode."
+        )
+    else:
+        if before.get("binding_locked"):
+            message = (
+                "LAN visibility was saved, but this launcher has an explicit bind-host "
+                "override. Restart Float without --backend-host, --lan, or --no-lan "
+                "to let this control manage the listener."
+            )
+        elif before.get("reload_enabled"):
+            message = (
+                "LAN visibility was saved, but backend auto-reload is active. "
+                "Restart Float without --dev to let this control restart the listener."
+            )
+        else:
+            message = (
+                "LAN visibility was saved. Restart Float to begin listening on the private network."
+                if enabled
+                else "LAN visibility was saved. Restart Float to stop the private-network listener."
+            )
+    return {
+        "enabled": enabled,
+        "active": binding_matches,
+        "restart_scheduled": restart_scheduled,
+        "restart_required": restart_required,
+        "binding_before": before,
+        "message": message,
+    }
+
+
 @router.post("/sync/mobile-serve/start")
 async def mobile_float_serve_start(payload: MobileFloatServePayload):
     serve_port = _mobile_float_serve_port(payload.serve_port)
@@ -3160,6 +3349,16 @@ async def sync_overview(request: Request):
     )
     workspace_state = _workspace_state_summary(settings)
     access = advertised_device_access(request)
+    launcher_binding = _launcher_backend_binding()
+    access["listener"] = {
+        "bind_host": launcher_binding.get("bind_host") or "",
+        "binding_known": bool(launcher_binding.get("binding_known")),
+        "lan_listening": bool(launcher_binding.get("lan_listening")),
+        "launcher_running": bool(launcher_binding.get("launcher_running")),
+        "restart_supported": bool(launcher_binding.get("restart_supported")),
+        "binding_locked": bool(launcher_binding.get("binding_locked")),
+        "reload_enabled": bool(launcher_binding.get("reload_enabled")),
+    }
     saved_peers = []
     for peer in _load_saved_peers():
         remote_deployment_id = str(peer.get("remote_deployment_id") or "").strip()
@@ -4107,7 +4306,7 @@ async def sync_apply(request: Request, payload: SyncApplyRequest):
                 )
             persisted_pair = _persist_saved_peer_state(
                 pair_state,
-                remote_label=remote_result.get("source_label"),
+                remote_label=peer_label,
             )
             remote_status = str(remote_result.get("status") or "").strip().lower()
             data_checkpoint = {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import random
 import re
@@ -15,10 +16,14 @@ from app import config as app_config
 from app.models import ModelContext
 from app.services.conversation_compaction import build_compaction, message_text
 from app.services.rag_provider import get_rag_service, try_ingest_text
+from app.services.work_run_projection import reflection_run_receipt
+from app.services.work_run_store import WorkRunStore
 from app.utils import calendar_store, conversation_store
 
 JsonDict = Dict[str, Any]
 LlmGenerate = Callable[..., Any]
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_ECHO_DAMPING = 0.25
 DEFAULT_EXPLORATION_TEMPERATURE = 0.45
@@ -305,11 +310,13 @@ class ReflectionService:
         *,
         llm_generate: Optional[LlmGenerate] = None,
         now_fn: Callable[[], float] = _now,
+        work_run_store: Optional[WorkRunStore] = None,
     ) -> None:
         self.config = dict(config or {})
         self.path = reflection_store_path(self.config)
         self.llm_generate = llm_generate
         self.now = now_fn
+        self.work_run_store = work_run_store
         self._ensure_schema()
 
     def _connect(self) -> sqlite3.Connection:
@@ -489,21 +496,28 @@ class ReflectionService:
                 task["runs"] = self.list_runs(str(task.get("id") or ""), limit=10)
         return tasks
 
-    def list_runs(self, task_id: str = "", *, limit: int = 50) -> List[JsonDict]:
+    def list_runs(
+        self,
+        task_id: str = "",
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> List[JsonDict]:
         safe_limit = max(1, min(200, _safe_int(limit, 50)))
+        safe_offset = max(0, _safe_int(offset, 0))
         params: list[Any] = []
         where = ""
         if task_id:
             where = "WHERE task_id = ?"
             params.append(str(task_id))
-        params.append(safe_limit)
+        params.extend((safe_limit, safe_offset))
         with self._connect() as conn:
             rows = conn.execute(
                 f"""
                 SELECT payload FROM reflection_runs
                 {where}
                 ORDER BY created_at DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
                 params,
             ).fetchall()
@@ -674,8 +688,27 @@ class ReflectionService:
                 ),
             )
             conn.commit()
+        self._record_work_run(task, run)
         self._mirror_reflection_note(task, run)
         return run
+
+    def _record_work_run(self, task: JsonDict, run: JsonDict) -> None:
+        """Project one compact reflection receipt into the shared work ledger."""
+
+        if self.work_run_store is None:
+            return
+        try:
+            self.work_run_store.upsert(
+                reflection_run_receipt(task, run), source="reflection"
+            )
+        except Exception:
+            # The canonical reflection row is already committed. A future
+            # Activity read can backfill this receipt if the ledger is busy.
+            logger.warning(
+                "Could not record reflection run %s in the work ledger",
+                run.get("id"),
+                exc_info=True,
+            )
 
     def _save_tick(self, tick: JsonDict) -> None:
         with self._connect() as conn:
@@ -1202,8 +1235,8 @@ class ReflectionService:
                 "reduce tension. Return concise plain text with: current best "
                 "synthesis, what changed, remaining uncertainty, whether another "
                 "pass is worth it, and whether this should surface to the user. "
-                "If a child-subchat control tool is available, use it only to "
-                "return to the parent chat or request more time."
+                "This reflection pass has no tool access. Do not claim that you "
+                "saved, changed, delegated, or executed anything."
             )
         ctx = ModelContext(
             system_prompt=system_prompt,

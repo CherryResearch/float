@@ -2,7 +2,7 @@
 :root {
   --topbar-control-width: clamp(104px, 12vw, 140px);
   --topbar-mode-chip-width: 84px; /* widest mode label: "server" */
-  --topbar-approval-chip-width: 52px; /* widest approval label: "high" */
+  --topbar-approval-chip-width: 92px; /* widest approval label: "high risk only" */
 }
 
 .topbar-appbar {
@@ -330,7 +330,7 @@ body.dark-mode .chip:hover {
   :root {
     --topbar-control-width: clamp(80px, 42vw, 104px);
     --topbar-mode-chip-width: 72px;
-    --topbar-approval-chip-width: 48px;
+    --topbar-approval-chip-width: 86px;
   }
   .topbar-content { min-height: var(--topbar-height); height: auto; padding: 4px 10px; gap: 4px; }
   .topbar-left { gap: 8px; }

@@ -37,7 +37,7 @@ const SCOPE_ROW_HELP =
 const REMOTE_URL_HELP =
   "Use the other Float instance's reachable URL. The host or port can change; Float treats the saved device fingerprint as identity and the URL as a reachability hint.";
 const LAN_VISIBILITY_HELP =
-  "Allow private-network devices to pair, request sync tokens, and pull or push data from this Float instance. Public internet sync is not supported yet.";
+  "Allow private-network devices to pair and sync, and change Float's real backend listener. Launcher-managed sessions restart the backend on the same port to apply this safely; public internet sync remains unsupported.";
 const MOBILE_FLOAT_HELP =
   "Expose the current Float dev server over Tailscale Serve for tailnet devices.";
 const ONLINE_VISIBILITY_HELP =
@@ -317,8 +317,21 @@ const coerceSavedPeers = (value) =>
         .filter((entry) => entry.remote_url)
     : [];
 
-const extractSyncError = (error, fallback) =>
-  error?.response?.data?.detail || error?.message || fallback;
+const extractSyncError = (error, fallback, { remote = false } = {}) => {
+  const rawDetail = error?.response?.data?.detail || error?.message;
+  const detail = typeof rawDetail === "string" ? rawDetail.trim() : "";
+  if (!detail) return fallback;
+  if (
+    /HTTP(?:S)?ConnectionPool|NameResolutionError|Max retries exceeded|getaddrinfo failed|ECONNREFUSED|ENOTFOUND|Network Error/i.test(
+      detail,
+    )
+  ) {
+    return remote
+      ? `${fallback} Check the remote address and make sure the other Float instance is running and reachable.`
+      : `${fallback} Check that this Float instance is running and reachable.`;
+  }
+  return detail;
+};
 
 const isSyncRequestCancelled = (error, controller) => {
   const abortedReason = controller?.signal?.aborted ? controller.signal.reason : null;
@@ -580,11 +593,19 @@ const summarizeRequestedSections = (sections) =>
   Array.isArray(sections) && sections.length ? sections.join(", ") : "all sections";
 
 const describePeerStatus = (peer, options = {}) => {
-  if (peer?.remote_device_id && options?.reachable) {
+  if (peer?.remote_device_id && options?.addressDirty) {
+    return { key: "pending", label: "new address unverified" };
+  }
+  if (peer?.remote_device_id && options?.reachable && options?.identityVerified) {
     return { key: "connected", label: "connected" };
   }
+  if (peer?.remote_device_id && options?.checked) {
+    return options?.reachable
+      ? { key: "unreachable", label: "identity not verified" }
+      : { key: "unreachable", label: "trusted, check failed" };
+  }
   if (peer?.remote_device_id) {
-    return { key: "paired", label: "paired" };
+    return { key: "trusted", label: "trusted, not checked" };
   }
   return { key: "saved", label: "saved address - not paired" };
 };
@@ -675,7 +696,13 @@ const describeSyncOwnershipTargetNote = (summary) => {
 };
 
 const SyncLabelText = ({ text, tooltip }) => (
-  <span className="knowledge-sync-label-inline" title={tooltip || undefined}>
+  <span
+    className="knowledge-sync-label-inline"
+    title={tooltip || undefined}
+    data-tooltip={tooltip || undefined}
+    tabIndex={tooltip ? 0 : undefined}
+    aria-label={tooltip ? `${text}. ${tooltip}` : undefined}
+  >
     {text}
   </span>
 );
@@ -727,6 +754,7 @@ const KnowledgeSyncTab = () => {
   const [mobileServeStatus, setMobileServeStatus] = useState(null);
   const [mobileServeBusy, setMobileServeBusy] = useState("");
   const [reviewBusyId, setReviewBusyId] = useState("");
+  const [reviewBusyAction, setReviewBusyAction] = useState("");
   const [pruneLegacyBusy, setPruneLegacyBusy] = useState(false);
   const [peerStatusBusy, setPeerStatusBusy] = useState(false);
   const [peerStatus, setPeerStatus] = useState(null);
@@ -787,23 +815,35 @@ const KnowledgeSyncTab = () => {
       workspaceMode,
     ],
   );
-  const selectedPeerConnected =
+  const selectedPeerStatusMatches =
     !!selectedPeer &&
     !remoteAddressDirty &&
+    peerStatus !== null &&
+    syncRemoteUrl.trim() === String(selectedPeer.remote_url || "").trim();
+  const selectedPeerConnected =
+    selectedPeerStatusMatches &&
     !!selectedPeer.remote_device_id &&
     !!peerStatus?.reachable &&
-    syncRemoteUrl.trim() === String(selectedPeer.remote_url || "").trim();
+    !!peerStatus?.identity_verified;
+  const selectedPeerState = describePeerStatus(selectedPeer, {
+    addressDirty: remoteAddressDirty,
+    checked: selectedPeerStatusMatches,
+    identityVerified: !!peerStatus?.identity_verified,
+    reachable: !!peerStatus?.reachable,
+  });
+  const selectedPeerIdentityLabel =
+    selectedPeer?.label
+    || peerStatus?.display_name
+    || selectedPeer?.remote_device_name
+    || "saved device";
   const selectedPeerConnectionLabel = selectedPeerConnected
-    ? `Connected to ${
-        peerStatus?.display_name
-        || selectedPeer?.remote_device_name
-        || selectedPeer?.label
-        || "paired device"
-      }`
+    ? `Connected to ${selectedPeerIdentityLabel}`
     : selectedPeer?.remote_device_id
-      ? `Paired with ${
-          selectedPeer?.remote_device_name || selectedPeer?.label || "saved device"
-        }`
+      ? selectedPeerStatusMatches
+        ? peerStatus?.reachable
+          ? `Trusted ${selectedPeerIdentityLabel}; identity not verified`
+          : `Trusted ${selectedPeerIdentityLabel}; last check failed`
+        : `Trusted ${selectedPeerIdentityLabel}; not checked`
       : "No active remote";
   const recentSyncActions = useMemo(() => syncHistory.slice(0, 8), [syncHistory]);
   const activeSyncLabel = syncActionBusy || (syncBusy ? "preview" : "");
@@ -964,6 +1004,8 @@ const KnowledgeSyncTab = () => {
         setActiveWorkspaceId(activeId);
         setSelectedWorkspaceIds(selectedIds);
         setSavedPeers(peers);
+        setPeerStatus(null);
+        setPeerStatusBusy(false);
         setSelectedPeerId(match?.id || "");
         setTargetLabel(match?.label || "");
         setTargetScopes(match?.scopes || ["sync"]);
@@ -1264,11 +1306,15 @@ const KnowledgeSyncTab = () => {
     setRemoteTargetWorkspaceId("root");
     setSyncPreview(null);
     setSyncPreviewPlanKey("");
+    setPeerStatus(null);
+    setPeerStatusBusy(false);
     setMessage("");
   };
 
   const selectSavedPeer = (peer, nextMessage = "") => {
     if (!peer) return;
+    setPeerStatus(null);
+    setPeerStatusBusy(false);
     setSelectedPeerId(peer.id);
     setTargetLabel(peer.label);
     setTargetScopes(normalizePeerScopes(peer.scopes));
@@ -1332,11 +1378,20 @@ const KnowledgeSyncTab = () => {
     setVisibilityBusy("lan");
     setMessage("");
     try {
-      await persistSyncPreferences(
-        { sync_visible_on_lan: !!nextValue },
-        nextValue ? "LAN visibility enabled." : "LAN visibility disabled.",
+      const response = await axios.post("/api/sync/lan-visibility", {
+        enabled: !!nextValue,
+        restart: true,
+      });
+      const result = response?.data || {};
+      setMessage(
+        result.message
+          || (nextValue ? "LAN visibility enabled." : "LAN visibility disabled."),
       );
       setRefreshToken((value) => value + 1);
+      if (result.restart_scheduled) {
+        window.setTimeout(() => setRefreshToken((value) => value + 1), 2200);
+        window.setTimeout(() => setRefreshToken((value) => value + 1), 5200);
+      }
     } catch (error) {
       setSyncVisibleOnLan(previous);
       setMessage(extractSyncError(error, "Failed to update LAN visibility."));
@@ -1513,16 +1568,32 @@ const KnowledgeSyncTab = () => {
           mergePairedDeviceRecord(updatedPeer);
           setSyncRemoteUrl(updatedPeer.remote_url);
           setMessage(`Verified ${updatedPeer.label}; saved URL updated.`);
+        } else if (nextStatus?.reachable && nextStatus?.identity_verified) {
+          setMessage(
+            `Connected to ${selectedPeer?.label || nextStatus.display_name || nextStatus.hostname || "remote device"}.`,
+          );
+        } else if (nextStatus?.reachable) {
+          setMessage("The address responded, but its identity was not verified as this saved device.");
         }
       }
       return nextStatus;
     } catch (error) {
+      const detail = extractSyncError(
+        error,
+        "Remote device is not reachable right now.",
+        { remote: true },
+      );
       const nextStatus = {
         reachable: false,
-        error: extractSyncError(error, "Remote device is not reachable right now."),
+        error: detail,
       };
       if (syncRemoteUrlRef.current === remoteUrl) {
         setPeerStatus(nextStatus);
+        setMessage(
+          remoteAddressDirty && selectedPeer
+            ? `Could not verify ${remoteUrl}. Saved address remains ${selectedPeer.remote_url}. ${detail}`
+            : detail,
+        );
       }
       return nextStatus;
     } finally {
@@ -1582,6 +1653,8 @@ const KnowledgeSyncTab = () => {
       setPeerStatus((prev) => ({
         ...(prev || {}),
         reachable: true,
+        identity_verified: true,
+        identity_state: "verified",
         display_name: String(previewPayload?.remote?.display_name || "").trim(),
         hostname: String(previewPayload?.remote?.hostname || "").trim(),
         instance_base: String(previewPayload?.remote?.base_url || remoteUrl).trim(),
@@ -1611,9 +1684,11 @@ const KnowledgeSyncTab = () => {
       finishSyncProgress(requestId, {
         detail: "Preview failed.",
         progress: 0,
-        note: extractSyncError(error, "Failed to preview instance sync."),
+        note: extractSyncError(error, "Failed to preview instance sync.", { remote: true }),
       });
-      setMessage(extractSyncError(error, "Failed to preview instance sync."));
+      setMessage(
+        extractSyncError(error, "Failed to preview instance sync.", { remote: true }),
+      );
     } finally {
       setSyncBusy(false);
     }
@@ -1746,6 +1821,7 @@ const KnowledgeSyncTab = () => {
           direction === "push"
             ? "Failed to push data to the remote Float instance."
             : "Failed to pull data from the remote Float instance.",
+          { remote: true },
         ),
       });
       setMessage(
@@ -1754,6 +1830,7 @@ const KnowledgeSyncTab = () => {
           direction === "push"
             ? "Failed to push data to the remote Float instance."
             : "Failed to pull data from the remote Float instance.",
+          { remote: true },
         ),
       );
     } finally {
@@ -1839,7 +1916,7 @@ const KnowledgeSyncTab = () => {
         setMessage("Pairing completed, but the returned device record was incomplete.");
       }
     } catch (error) {
-      setMessage(extractSyncError(error, "Failed to pair devices."));
+      setMessage(extractSyncError(error, "Failed to pair devices.", { remote: true }));
     } finally {
       setPairBusy(false);
     }
@@ -1855,7 +1932,9 @@ const KnowledgeSyncTab = () => {
       setRefreshToken((value) => value + 1);
       setMessage(`Updated remote trust for ${peer.label}.`);
     } catch (error) {
-      setMessage(extractSyncError(error, "Failed to update remote trust."));
+      setMessage(
+        extractSyncError(error, "Failed to update remote trust.", { remote: true }),
+      );
     } finally {
       setPairSyncBusy(false);
     }
@@ -1908,7 +1987,9 @@ const KnowledgeSyncTab = () => {
       setRefreshToken((value) => value + 1);
       setMessage(`Revoked ${peer.label} remotely and removed the pair locally.`);
     } catch (error) {
-      setMessage(extractSyncError(error, "Failed to revoke remote pair."));
+      setMessage(
+        extractSyncError(error, "Failed to revoke remote pair.", { remote: true }),
+      );
     } finally {
       setPairSyncBusy(false);
     }
@@ -1917,7 +1998,10 @@ const KnowledgeSyncTab = () => {
   const approvePendingReview = async (review) => {
     if (!review?.id) return;
     setReviewBusyId(review.id);
-    setMessage("");
+    setReviewBusyAction("approve");
+    setMessage(
+      `Applying sync from ${review.source_label || "remote device"}... This can take a moment while local indexes refresh.`,
+    );
     try {
       const res = await axios.post(`/api/sync/reviews/${encodeURIComponent(review.id)}/approve`, {});
       const resultSections = res?.data?.result?.sections || {};
@@ -1927,13 +2011,15 @@ const KnowledgeSyncTab = () => {
       setMessage(extractSyncError(error, "Failed to approve incoming push."));
     } finally {
       setReviewBusyId("");
+      setReviewBusyAction("");
     }
   };
 
   const rejectPendingReview = async (review) => {
     if (!review?.id) return;
     setReviewBusyId(review.id);
-    setMessage("");
+    setReviewBusyAction("reject");
+    setMessage(`Rejecting sync from ${review.source_label || "remote device"}...`);
     try {
       await axios.post(`/api/sync/reviews/${encodeURIComponent(review.id)}/reject`, {});
       setMessage(`Rejected push from ${review.source_label}.`);
@@ -1942,6 +2028,7 @@ const KnowledgeSyncTab = () => {
       setMessage(extractSyncError(error, "Failed to reject incoming push."));
     } finally {
       setReviewBusyId("");
+      setReviewBusyAction("");
     }
   };
 
@@ -2182,8 +2269,23 @@ const KnowledgeSyncTab = () => {
     .map(([role, count]) => `${role}: ${count}`)
     .join(" | ");
   const deviceAccess = overview?.device_access || {};
+  const lanVisibility = deviceAccess?.visibility || {};
+  const lanListener = deviceAccess?.listener || {};
   const advertisedUrls = deviceAccess?.advertised_urls || {};
   const lanUrl = String(advertisedUrls?.lan || "").trim();
+  const lanCandidateUrl = String(advertisedUrls?.lan_candidate || "").trim();
+  const lanListening = lanVisibility?.lan_listening === true;
+  const lanReady = !!syncVisibleOnLan && lanListening;
+  const lanStatusLabel = lanReady
+    ? "listening"
+    : syncVisibleOnLan
+      ? visibilityBusy === "lan"
+        ? "restarting"
+        : "restart needed"
+      : lanListening
+        ? "stopping"
+        : "off";
+  const lanStatusTone = lanReady ? "on" : syncVisibleOnLan || lanListening ? "pending" : "off";
   const internetUrl = String(advertisedUrls?.internet || "").trim();
   const localWorkspaceProfiles = coerceWorkspaceProfiles(workspaceProfiles);
   const remoteWorkspaceState =
@@ -2309,7 +2411,17 @@ const KnowledgeSyncTab = () => {
     return total + pullDeletes + pushDeletes;
   }, 0);
   const selectedPeerLabel =
-    String(selectedPeer?.remote_device_name || selectedPeer?.label || "").trim() || "remote device";
+    String(
+      selectedPeer?.label
+      || peerStatus?.display_name
+      || selectedPeer?.remote_device_name
+      || "",
+    ).trim() || "remote device";
+  const peerCheckActionLabel = peerStatusBusy
+    ? "Checking..."
+    : remoteAddressDirty
+      ? "Check and save new address"
+      : "Check remote";
   const previewIsCurrent =
     !!syncPreview && !!syncPreviewPlanKey && syncPreviewPlanKey === currentSyncPlanKey;
   const canPreviewSync =
@@ -2373,7 +2485,11 @@ const KnowledgeSyncTab = () => {
             Name this device, pair another device, preview the diff, then pull or push.
           </p>
         </div>
-        <button type="button" className="icon-btn" onClick={() => setRefreshToken((value) => value + 1)}>
+        <button
+          type="button"
+          className="icon-btn knowledge-sync-action--quiet"
+          onClick={() => setRefreshToken((value) => value + 1)}
+        >
           Refresh
         </button>
       </div>
@@ -2397,14 +2513,10 @@ const KnowledgeSyncTab = () => {
           </div>
           <span
             className={`knowledge-sync-target-status is-${
-              selectedPeerConnected ? "connected" : selectedPeer?.remote_device_id ? "paired" : "saved"
+              selectedPeer ? selectedPeerState.key : "saved"
             }`}
           >
-            {selectedPeerConnected
-              ? "connected now"
-              : selectedPeer?.remote_device_id
-                ? "paired"
-                : "pair required"}
+            {selectedPeer ? selectedPeerState.label : "pair required"}
           </span>
         </div>
         <label className="field-label" htmlFor="sync-active-peer">
@@ -2443,16 +2555,16 @@ const KnowledgeSyncTab = () => {
           {remoteAddressDirty ? (
             <button
               type="button"
-              className="icon-btn"
+              className="icon-btn knowledge-sync-action--quiet"
               onClick={checkPeerStatus}
               disabled={peerStatusBusy}
             >
-              {peerStatusBusy ? "Verifying..." : "Verify device and address"}
+              {peerCheckActionLabel}
             </button>
           ) : null}
           <button
             type="button"
-            className="icon-btn"
+            className="icon-btn knowledge-sync-action--primary"
             onClick={previewSync}
             disabled={!canPreviewSync}
           >
@@ -2460,7 +2572,7 @@ const KnowledgeSyncTab = () => {
           </button>
           <button
             type="button"
-            className="icon-btn"
+            className="icon-btn knowledge-sync-action--secondary"
             onClick={() => applySync("pull")}
             disabled={!previewIsCurrent || !selectedPullItemCount || !!syncActionBusy}
             title={!previewIsCurrent ? "Preview required" : undefined}
@@ -2469,7 +2581,7 @@ const KnowledgeSyncTab = () => {
           </button>
           <button
             type="button"
-            className="icon-btn"
+            className="icon-btn knowledge-sync-action--secondary"
             onClick={() => applySync("push")}
             disabled={!previewIsCurrent || !selectedPushItemCount || !!syncActionBusy}
             title={!previewIsCurrent ? "Preview required" : undefined}
@@ -2606,7 +2718,7 @@ const KnowledgeSyncTab = () => {
               {syncProgress.active ? (
                 <button
                   type="button"
-                  className="icon-btn"
+                  className="icon-btn knowledge-sync-action--danger"
                   onClick={cancelActiveSync}
                   title="Record cancel intent and stop waiting on the current sync request."
                   aria-label={`Stop ${activeSyncLabel || "sync"} request`}
@@ -2750,8 +2862,8 @@ const KnowledgeSyncTab = () => {
         </section>
       ) : null}
 
-      <div className="knowledge-sync-grid">
-        <section className="knowledge-sync-card">
+      <div className="knowledge-sync-grid knowledge-sync-dashboard-grid">
+        <section className="knowledge-sync-card knowledge-sync-card--deployment">
           <div className="knowledge-sync-section-head">
             <h4>
               <SyncLabelText
@@ -2820,7 +2932,7 @@ const KnowledgeSyncTab = () => {
           </div>
         </section>
 
-        <section className="knowledge-sync-card">
+        <section className="knowledge-sync-card knowledge-sync-card--current-device">
           <div className="knowledge-sync-section-head">
             <h4>
               <SyncLabelText
@@ -3120,8 +3232,8 @@ const KnowledgeSyncTab = () => {
               <div className="knowledge-sync-visibility-header">
                 <div className="knowledge-sync-section-stack">
                   <strong>Visible on LAN</strong>
-                  <span className={`knowledge-sync-visibility-badge ${syncVisibleOnLan ? "is-on" : "is-off"}`}>
-                    {syncVisibleOnLan ? "on" : "off"}
+                  <span className={`knowledge-sync-visibility-badge is-${lanStatusTone}`}>
+                    {lanStatusLabel}
                   </span>
                 </div>
                 <input
@@ -3132,13 +3244,25 @@ const KnowledgeSyncTab = () => {
                 />
               </div>
               <div className="knowledge-sync-url-stack">
-                <span className="knowledge-sync-url-label">LAN URL</span>
-                <code>{lanUrl || "Unable to detect a LAN URL from this session."}</code>
+                <span className="knowledge-sync-url-label">
+                  {lanReady ? "Listening at" : "Candidate LAN URL"}
+                </span>
+                <code>{lanUrl || lanCandidateUrl || "Unable to detect a LAN URL from this session."}</code>
               </div>
               <span className="status-note">
-                {syncVisibleOnLan
-                  ? "This device can accept private-network connections."
-                  : "Turn this on before another device connects."}
+                {lanReady
+                  ? "The backend is bound to the private network and paired devices may connect."
+                  : syncVisibleOnLan
+                    ? lanListener?.binding_locked
+                      ? "The preference is on, but an explicit launcher bind-host override controls this session. Restart Float without a host or LAN override to let this switch manage the listener."
+                      : lanListener?.reload_enabled
+                        ? "The preference is on, but backend auto-reload is active. Restart Float without --dev to let this switch manage the listener."
+                      : lanListener?.restart_supported
+                        ? "The preference is on, but the listener has not restarted yet. Float should reconnect on the same port."
+                        : "The preference is on, but this session is not launcher-managed. Restart Float to begin listening on LAN."
+                    : lanListening
+                      ? "Turning this off restarts the backend in device-only mode."
+                      : "Turn this on to restart the backend with private-network listening."}
               </span>
             </label>
             <div className="knowledge-sync-visibility-card" title={MOBILE_FLOAT_HELP}>
@@ -3249,13 +3373,13 @@ const KnowledgeSyncTab = () => {
               type="button"
               className="icon-btn"
               onClick={createPairingOffer}
-              disabled={pairBusy || !syncVisibleOnLan}
+              disabled={pairBusy || !lanReady}
               title={PAIRING_CODE_HELP}
             >
               {pairBusy ? "Creating..." : "Generate pairing code"}
             </button>
-            {!syncVisibleOnLan ? (
-              <span className="status-note">Enable LAN visibility before inviting another device.</span>
+            {!lanReady ? (
+              <span className="status-note">Start the LAN listener before inviting another device.</span>
             ) : null}
             {localPairOffer ? (
               <div className="knowledge-sync-section-stack">
@@ -3266,7 +3390,7 @@ const KnowledgeSyncTab = () => {
           </div>
         </section>
 
-        <section className="knowledge-sync-card">
+        <section className="knowledge-sync-card knowledge-sync-card--connection">
           <div className="knowledge-sync-section-head">
             <h4>{selectedPeerId ? "Edit connection" : "Connection setup"}</h4>
             {selectedPeerId ? (
@@ -3303,7 +3427,7 @@ const KnowledgeSyncTab = () => {
           />
           {remoteAddressDirty ? (
             <p className="status-note">
-              Address change. Verify the device and address to update this pair if the saved fingerprint matches; pair again if it is a different Float instance.
+              Address change. Check the new address; if the saved fingerprint matches, Float updates this connection automatically. A failed check leaves the saved address unchanged.
             </p>
           ) : null}
           {syncRemoteUrl.trim() ? (
@@ -3340,7 +3464,7 @@ const KnowledgeSyncTab = () => {
                     disabled={peerStatusBusy}
                     title={CHECK_REMOTE_HELP}
                   >
-                    {peerStatusBusy ? "Verifying..." : "Verify device and address"}
+                    {peerCheckActionLabel}
                   </button>
                 </div>
               </div>
@@ -3587,7 +3711,16 @@ const KnowledgeSyncTab = () => {
                 !remoteAddressDirty &&
                 !!peerStatus?.reachable &&
                 syncRemoteUrl.trim() === String(peer.remote_url || "").trim();
-              const peerState = describePeerStatus(peer, { reachable: peerReachable });
+              const peerChecked =
+                peer.id === selectedPeerId &&
+                !remoteAddressDirty &&
+                peerStatus !== null &&
+                syncRemoteUrl.trim() === String(peer.remote_url || "").trim();
+              const peerState = describePeerStatus(peer, {
+                checked: peerChecked,
+                identityVerified: peerChecked && !!peerStatus?.identity_verified,
+                reachable: peerReachable,
+              });
               return (
                 <article
                   key={peer.id}
@@ -3999,9 +4132,10 @@ const KnowledgeSyncTab = () => {
                     <div className="knowledge-sync-actions">
                       <button
                         type="button"
-                        className="icon-btn"
+                        className="icon-btn knowledge-sync-action--warning"
                         onClick={() => revertSyncAction(action)}
                         disabled={undoSyncBusyId === action.id}
+                        title="Revert the local changes recorded for this sync action."
                       >
                         {undoSyncBusyId === action.id ? "Undoing..." : "Undo local sync"}
                       </button>
@@ -4055,22 +4189,30 @@ const KnowledgeSyncTab = () => {
                   {review.device_name ? <span>device {review.device_name}</span> : null}
                   {review.device_id ? <span>id {review.device_id.slice(0, 8)}</span> : null}
                 </div>
+                {reviewBusyId === review.id && reviewBusyAction === "approve" ? (
+                  <p className="status-note" role="status">
+                    Applying sync from {review.source_label || "remote device"}. This can take a
+                    moment while local indexes refresh.
+                  </p>
+                ) : null}
                 <div className="knowledge-sync-actions">
                   <button
                     type="button"
-                    className="icon-btn"
+                    className="icon-btn knowledge-sync-action--primary"
                     onClick={() => approvePendingReview(review)}
                     disabled={reviewBusyId === review.id}
+                    title="Approve and apply this incoming push."
                   >
-                    {reviewBusyId === review.id ? "Applying..." : "Approve"}
+                    {reviewBusyId === review.id && reviewBusyAction === "approve" ? "Applying..." : "Approve"}
                   </button>
                   <button
                     type="button"
-                    className="icon-btn"
+                    className="icon-btn knowledge-sync-action--danger"
                     onClick={() => rejectPendingReview(review)}
                     disabled={reviewBusyId === review.id}
+                    title="Reject this incoming push without applying it."
                   >
-                    Reject
+                    {reviewBusyId === review.id && reviewBusyAction === "reject" ? "Rejecting..." : "Reject"}
                   </button>
                 </div>
               </article>
@@ -4130,7 +4272,13 @@ const KnowledgeSyncTab = () => {
                     </div>
                     <span className="knowledge-sync-device-id">id {device.id.slice(0, 8)}</span>
                   </div>
-                  <button type="button" className="icon-btn" onClick={() => revokeInboundDevice(device)}>
+                  <button
+                    type="button"
+                    className="icon-btn knowledge-sync-action--danger"
+                    onClick={() => revokeInboundDevice(device)}
+                    title={`Remove local trust for ${device.name}.`}
+                    aria-label={`Revoke trust for ${device.name}`}
+                  >
                     Revoke
                   </button>
                 </div>
@@ -4168,9 +4316,11 @@ const KnowledgeSyncTab = () => {
               </div>
               <button
                 type="button"
-                className="icon-btn"
+                className="icon-btn knowledge-sync-action--danger"
                 onClick={pruneLegacyDevices}
                 disabled={pruneLegacyBusy}
+                title="Remove unverified legacy device records from this instance."
+                aria-label={`Prune ${visibleLegacyInboundDevices.length} unverified legacy device ${visibleLegacyInboundDevices.length === 1 ? "record" : "records"}`}
               >
                 {pruneLegacyBusy ? "Cleaning..." : `Prune ${visibleLegacyInboundDevices.length}`}
               </button>

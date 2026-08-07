@@ -16,9 +16,12 @@ import time
 import threading
 import textwrap
 import zipfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
-from typing import Any, Dict, Iterable, List, Optional, Literal, Union
+from functools import lru_cache
+from types import MappingProxyType
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Literal, Union
 
 import socket
 from urllib.parse import quote, urlparse
@@ -33,7 +36,6 @@ from app.agent_workflows import (
     build_workflow_metadata,
     controls_for_status,
     merge_agent_payload,
-    append_handoff_note,
 )
 from app import tools
 from app.agents.engine import get_engine
@@ -52,6 +54,9 @@ from app.services import (
     TTSService,
     get_capture_service,
     get_computer_service,
+)
+from app.services.attachment_promotion_service import (
+    promote_capture_to_attachment,
 )
 from app.services import (
     ModelContext as ServiceContext,
@@ -72,8 +77,50 @@ from app.services.rag_provider import (
     update_cached_config as _update_rag_config,
 )
 from app.services import privacy_filter_service
+from app.services.calendar_jobs import (
+    bump_actions_for_event_control_change,
+    coerce_epoch_seconds,
+    external_control_revision,
+    expand_events,
+    merge_client_action_definitions,
+    normalize_background_job,
+    normalize_permission_scopes,
+    recurrence_error,
+)
+from app.services.scheduled_action_authorization import (
+    AUTHORIZATION_APPROVED_ONCE,
+    AUTHORIZATION_DENIED,
+    AuthorizationConflictError,
+    AuthorizationNotFoundError,
+    AuthorizationPermissionError,
+    ScheduledActionAuthorizationError,
+    apply_authorization_decision,
+    invalidate_event_authorizations_for_edit,
+)
+from app.services.scheduled_action_cancellation import (
+    ScheduledActionCancellationConflict,
+    ScheduledActionCancellationNotFound,
+    request_scheduled_action_cancellation,
+)
+from app.services.work_run_reconciliation import (
+    CalendarActionNotFound,
+    WorkEffectNotFound,
+    WorkEffectReconciliationConflict,
+    apply_reconciliation_to_calendar_event,
+    reconcile_work_effect,
+)
+from app.services.work_run_projection import (
+    delete_calendar_event_with_receipts,
+    project_calendar_event,
+    reflection_run_receipt,
+)
+from app.services.work_run_store import WorkRunStore
+from app.tool_catalog import permission_scopes_for_tool
 from app.services.model_inventory_service import (
     responses_api_base as _responses_api_base,
+)
+from app.provider_transports.openai_responses_ws import (
+    extract_response_text as _extract_responses_visible_text,
 )
 from app.routes_graph import router as graph_router
 from app.routers import device_sync as device_sync_routes
@@ -113,6 +160,15 @@ from app.utils.device_visibility import (
     is_trusted_frontend_proxy,
 )
 from app.utils.attachment_media import build_attachment_media_descriptor
+from app.utils.attachment_metadata import (
+    attachment_index_generation_is_active,
+    attachment_metadata_lock,
+    delete_attachment_metadata,
+    mutate_attachment_metadata,
+    read_attachment_metadata,
+    sanitize_attachment_source_url as _validate_attachment_source_url,
+    write_attachment_metadata,
+)
 from app.utils.device_registry import (
     decode_device_token,
     get_device,
@@ -138,19 +194,33 @@ from app.utils.hardware import torch_cuda_diagnostics
 from app.utils.tokenizer import CustomTokenizer
 from app.workflow_profiles import (
     CLIENT_RESOLUTION_TOOLS,
+    SkillConflictError,
+    SkillStorageError,
     capture_policy_prompt,
     continue_transition_allowed,
     delete_local_skill_doc,
+    get_skill_entry,
+    module_catalog_snapshot,
     normalize_module_id,
+    normalize_module_id_from_catalog,
     normalize_skill_id,
+    rename_local_skill_doc,
     resolve_modules,
+    resolve_foreground_workflow_name,
     resolve_workflow_name,
     resolve_workflow_profile,
     skill_catalog_payload,
     skill_doc_payload,
+    tool_enabled_by_modules,
+    validate_new_skill_id,
     workflow_catalog_payload,
     workflow_prompt,
     write_local_skill_doc,
+)
+from app.workflow_scope import (
+    build_capability_scope,
+    filter_tool_definitions_for_scope,
+    normalize_capability_scope,
 )
 from app.tool_policies import (
     WORKFLOW_LIVE,
@@ -161,6 +231,11 @@ from app.tool_policies import (
     tool_allowed_in_workflow,
     tool_auto_invokable_in_workflow,
     tool_policy_payload,
+)
+from app.tool_names import (
+    MODEL_HIDDEN_COMPATIBILITY_NAMES,
+    TOOL_NAME_ALIASES,
+    normalize_tool_name,
 )
 from app.services.conversation_compaction import (
     build_compaction,
@@ -272,16 +347,37 @@ from app.utils.metrics import (
 from app.services import memory_graph_service, threads_service
 from config import load_model_catalog
 from workers.multimodal import (
-    VisionCaptioner,
+    get_shared_vision_captioner,
     is_low_quality_generated_caption,
     is_placeholder_caption,
     normalize_generated_caption,
     placeholder_caption,
+    resolve_installed_vision_caption_model,
     resolve_vision_caption_model,
+    resolve_vision_caption_runtime_model,
+    run_shared_vision_captioner,
 )
 from services.weaviate_client import autostart_weaviate
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_context_message_metadata(value: Any) -> Dict[str, Any]:
+    metadata = dict(value) if isinstance(value, dict) else {}
+    if isinstance(metadata.get("attachments"), list):
+        metadata["attachments"] = _enrich_attachment_references(metadata["attachments"])
+    # The context image cache is server-owned; client paths are never accepted.
+    metadata.pop("images", None)
+    return metadata
+
+
+def _sanitize_context_metadata_value(key: Any, value: Any) -> Any:
+    normalized_key = str(key or "").strip().lower()
+    if normalized_key == "images":
+        return []
+    if normalized_key == "attachments" and isinstance(value, list):
+        return _enrich_attachment_references(value)
+    return value
 
 
 def _context_schema_to_service_context(context: Any) -> ServiceContext:
@@ -304,11 +400,12 @@ def _context_schema_to_service_context(context: Any) -> ServiceContext:
     messages = []
     for message in data.get("messages") or []:
         item = _item_dict(message)
+        message_metadata = _sanitize_context_message_metadata(item.get("metadata"))
         messages.append(
             {
                 "role": item.get("role") or "",
                 "content": item.get("content") or "",
-                "metadata": item.get("metadata") or {},
+                "metadata": message_metadata,
             }
         )
 
@@ -324,7 +421,12 @@ def _context_schema_to_service_context(context: Any) -> ServiceContext:
             }
         )
 
-    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    metadata = (
+        dict(data.get("metadata")) if isinstance(data.get("metadata"), dict) else {}
+    )
+    # Client context must not turn an arbitrary local path into visual input.
+    # Server-owned recent attachments are rehydrated through their content hashes.
+    metadata.pop("images", None)
     return ServiceContext(
         system_prompt=str(data.get("system_prompt") or ""),
         messages=messages,
@@ -401,19 +503,19 @@ _terminate_proc = model_download_service.terminate_proc
 _COMMON_TOOL_NAME_HINTS = {
     "memory": ["remember", "recall"],
     "memories": ["remember", "recall"],
-    "memory.read": ["recall", "remember", "memory.save"],
-    "memory.recall": ["recall", "remember", "memory.save"],
-    "memory.search": ["recall", "remember", "memory.save"],
-    "memory.store": ["remember", "recall", "memory.save"],
-    "memory.write": ["remember", "recall", "memory.save"],
-    "memory.remember": ["remember", "recall", "memory.save"],
+    "memory.read": ["recall", "remember"],
+    "memory.recall": ["recall", "remember"],
+    "memory.search": ["recall", "remember"],
+    "memory.store": ["remember", "recall"],
+    "memory.write": ["remember", "recall"],
+    "memory.remember": ["remember", "recall"],
     "shell": ["shell.exec"],
     "patch": ["patch.apply"],
     "mcp": ["mcp.call"],
-    "open.url": ["computer.navigate", "open_url"],
-    "browser.open": ["computer.navigate", "open_url"],
-    "tool": ["help", "tool_help", "tool_info"],
-    "tools": ["help", "tool_help", "tool_info"],
+    "open.url": ["computer.navigate"],
+    "browser.open": ["computer.navigate"],
+    "tool": ["help", "tool_info"],
+    "tools": ["help", "tool_info"],
 }
 
 # In-memory notification buffer (recent only)
@@ -427,25 +529,6 @@ def _notifications_buffer():
 
 _MAX_AGENT_HISTORY = 120
 _TOOL_PLACEHOLDER_RE = re.compile(r"\[\[tool_call:\d+\]\]")
-_TOOL_NAME_ALIASES = {
-    "camera": "camera.capture",
-    "memory.read": "recall",
-    "memory.recall": "recall",
-    "memory.search": "recall",
-    "memory.store": "remember",
-    "memory.write": "remember",
-    "memory.remember": "remember",
-    "open.url": "computer.navigate",
-    "browser.open": "computer.navigate",
-    "shell": "shell.exec",
-    "patch": "patch.apply",
-    "mcp": "mcp.call",
-    "writefile": "write_file",
-    "readfile": "read_file",
-    "listdir": "list_dir",
-    "tool": "help",
-    "tools": "help",
-}
 _RESPONSE_FAILURE_METADATA_KEYS = (
     "error",
     "attempts",
@@ -721,8 +804,11 @@ def _get_capture_service(app) -> CaptureService:
     return service
 
 
-def _capture_policy_settings() -> Dict[str, Any]:
-    settings_payload = user_settings.load_settings()
+def _capture_policy_settings(
+    settings_payload: Mapping[str, Any] | None = None,
+) -> Dict[str, Any]:
+    if settings_payload is None:
+        settings_payload = user_settings.load_settings()
     try:
         retention_days = max(
             0, int(settings_payload.get("capture_retention_days") or 7)
@@ -776,12 +862,12 @@ def _privacy_route_target_model(config_payload: Any) -> str:
 def _privacy_route_check_for_message(
     message: Any,
     *,
-    settings_payload: Dict[str, Any] | None,
+    settings_payload: Mapping[str, Any] | None,
     mode_used: str | None,
     requested_model: str | None,
     config_payload: Dict[str, Any] | None = None,
 ) -> Optional[Dict[str, Any]]:
-    settings_data = settings_payload if isinstance(settings_payload, dict) else {}
+    settings_data = settings_payload if isinstance(settings_payload, Mapping) else {}
     if (
         _normalize_privacy_route_mode(
             settings_data.get("privacy_filter_route_private_mode")
@@ -860,8 +946,11 @@ def _default_enabled_modules() -> List[str]:
     return [str(item).strip() for item in (modules or []) if str(item).strip()]
 
 
-def _approval_level_setting() -> str:
-    settings_payload = user_settings.load_settings()
+def _approval_level_setting(
+    settings_payload: Mapping[str, Any] | None = None,
+) -> str:
+    if settings_payload is None:
+        settings_payload = user_settings.load_settings()
     return str(settings_payload.get("approval_level") or "all").strip().lower() or "all"
 
 
@@ -892,12 +981,37 @@ def _computer_request_config(
 def _workflow_request_config(
     workflow_name: Optional[str],
     requested_modules: Optional[List[str]] = None,
+    *,
+    include_global_modules: bool = True,
+    settings_payload: Mapping[str, Any] | None = None,
+    module_catalog: Iterable[Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
-    resolved_name = resolve_workflow_name(workflow_name or _default_workflow_name())
+    settings = settings_payload
+    if settings is None:
+        try:
+            loaded_settings = user_settings.load_settings()
+        except Exception:
+            loaded_settings = {}
+        settings = loaded_settings if isinstance(loaded_settings, Mapping) else {}
+    resolved_name = resolve_foreground_workflow_name(
+        workflow_name or resolve_workflow_name(settings.get("default_workflow"))
+    )
+    raw_configured_modules = settings.get("enabled_workflow_modules")
+    configured_modules = (
+        [
+            str(item).strip()
+            for item in (raw_configured_modules or [])
+            if str(item).strip()
+        ]
+        if include_global_modules
+        and isinstance(raw_configured_modules, (list, tuple, set))
+        else []
+    )
     modules = resolve_modules(
         resolved_name,
-        list(_default_enabled_modules()) + list(requested_modules or []),
+        list(configured_modules) + list(requested_modules or []),
         include_workflow_defaults=False,
+        module_catalog=module_catalog,
     )
     return {
         "name": resolved_name,
@@ -1081,6 +1195,72 @@ def _lookup_message_workflow(
             return name or None
         return None
     return None
+
+
+_SERVER_RUNTIME_RECEIPTS_KEY = conversation_store.SERVER_RUNTIME_RECEIPTS_KEY
+_CLIENT_SAVED_TOOL_MARKER = conversation_store.CLIENT_SAVED_TOOL_MARKER
+_CONTINUATION_TRUST_KEY = conversation_store.CONTINUATION_TRUST_KEY
+_CONTINUATION_TRUST_INVALIDATED = conversation_store.CONTINUATION_TRUST_INVALIDATED
+_CONTINUATION_TRUST_SERVER = conversation_store.CONTINUATION_TRUST_SERVER
+_CAPABILITY_SCOPE_PENDING_KEY = "capability_scope_pending"
+
+
+def _server_message_runtime_receipt(
+    session_id: Optional[str],
+    message_id: Optional[str],
+) -> Dict[str, Any]:
+    session_key = str(session_id or "").strip()
+    message_key = str(message_id or "").strip()
+    if not session_key or not message_key:
+        return {}
+    try:
+        metadata = conversation_store.get_metadata(session_key)
+    except Exception:
+        return {}
+    receipts = metadata.get(_SERVER_RUNTIME_RECEIPTS_KEY)
+    messages = receipts.get("messages") if isinstance(receipts, dict) else None
+    receipt = messages.get(message_key) if isinstance(messages, dict) else None
+    return dict(receipt) if isinstance(receipt, dict) else {}
+
+
+def _lookup_message_capability_scope(
+    session_id: Optional[str],
+    message_id: Optional[str],
+) -> tuple[bool, Optional[Dict[str, Any]]]:
+    if not session_id or not message_id:
+        return False, None
+    receipt = _server_message_runtime_receipt(session_id, message_id)
+    if receipt.get(_CONTINUATION_TRUST_KEY) == _CONTINUATION_TRUST_INVALIDATED:
+        return True, None
+    if (
+        receipt.get(_CONTINUATION_TRUST_KEY) == _CONTINUATION_TRUST_SERVER
+        and "capability_scope" in receipt
+    ):
+        return True, normalize_capability_scope(receipt.get("capability_scope"))
+    if receipt:
+        return True, None
+    try:
+        conversation = conversation_store.load_conversation(session_id)
+    except Exception:
+        return False, None
+    for message in conversation if isinstance(conversation, list) else []:
+        if not isinstance(message, dict) or message.get("id") != message_id:
+            continue
+        metadata = message.get("metadata")
+        if isinstance(metadata, dict) and (
+            "capability_scope" in metadata
+            or metadata.get(_CAPABILITY_SCOPE_PENDING_KEY) is True
+        ):
+            # Scope-bearing transcripts created before server receipts existed
+            # must be regenerated; accepting the browser copy would make it
+            # possible for autosave to widen the model's tool authority.
+            return True, None
+        # A saved assistant turn without a server-owned receipt is legacy or
+        # client-authored content, not executable continuation authority.
+        # Users can keep and read the turn, but must regenerate it before a
+        # tool result may re-enter the model context.
+        return True, None
+    return False, None
 
 
 def _build_action_context(
@@ -1588,6 +1768,7 @@ def _rehydrate_pending_tool(app, request_id: str) -> dict[str, Any] | None:
                 "message_id": message_id,
                 "chain_id": chain_id,
                 "status": status,
+                "origin": event.get("origin"),
             }
     # Fallback: search persisted conversations for a matching tool event.
     try:
@@ -1610,6 +1791,8 @@ def _rehydrate_pending_tool(app, request_id: str) -> dict[str, Any] | None:
                 continue
             for tool in reversed(tools):
                 if not isinstance(tool, dict):
+                    continue
+                if tool.get(_CLIENT_SAVED_TOOL_MARKER):
                     continue
                 event_id = tool.get("id") or tool.get("request_id")
                 if event_id is None or str(event_id) != request_id_str:
@@ -1637,6 +1820,7 @@ def _rehydrate_pending_tool(app, request_id: str) -> dict[str, Any] | None:
                     "message_id": message_id,
                     "chain_id": chain_id,
                     "status": status,
+                    "origin": tool.get("origin"),
                 }
     return None
 
@@ -1659,9 +1843,17 @@ def _rehydrate_terminal_tool(
         "timeout",
         "scheduled",
     }
+    session_key = str(session_id or "").strip()
+    message_key = str(message_id or "").strip()
 
-    def _terminal_record(event: Any) -> dict[str, Any] | None:
+    def _terminal_record(
+        event: Any,
+        *,
+        require_embedded_context: bool = False,
+    ) -> dict[str, Any] | None:
         if not isinstance(event, dict):
+            return None
+        if event.get(_CLIENT_SAVED_TOOL_MARKER):
             return None
         event_id = event.get("id") or event.get("request_id")
         if event_id is None or str(event_id) != request_id_str:
@@ -1670,6 +1862,15 @@ def _rehydrate_terminal_tool(
         if status not in terminal_statuses:
             return None
         record = dict(event)
+        if require_embedded_context:
+            record_session = str(record.get("session_id") or "").strip()
+            if session_key and record_session != session_key:
+                return None
+            record_message = str(
+                record.get("message_id") or record.get("chain_id") or ""
+            ).strip()
+            if message_key and record_message != message_key:
+                return None
         record["id"] = request_id_str
         record["status"] = status
         return record
@@ -1686,12 +1887,10 @@ def _rehydrate_terminal_tool(
                 if not isinstance(events, list):
                     continue
                 for event in reversed(events):
-                    record = _terminal_record(event)
+                    record = _terminal_record(event, require_embedded_context=True)
                     if record is not None:
                         return record
 
-    session_key = str(session_id or "").strip()
-    message_key = str(message_id or "").strip()
     if not session_key:
         return None
     try:
@@ -1711,6 +1910,17 @@ def _rehydrate_terminal_tool(
         for event in reversed(tool_events):
             record = _terminal_record(event)
             if record is not None:
+                saved_message_id = str(
+                    message.get("id")
+                    or message.get("message_id")
+                    or message.get("chain_id")
+                    or ""
+                ).strip()
+                record["session_id"] = session_key
+                record["message_id"] = saved_message_id
+                record["chain_id"] = str(
+                    message.get("chain_id") or saved_message_id
+                ).strip()
                 return record
     return None
 
@@ -1886,24 +2096,61 @@ def _apply_conversation_privacy_filter(
 def _append_conversation_entry(session_id: str, entry: Dict[str, Any]) -> None:
     """Append a conversation entry to the on-disk history (best-effort)."""
     try:
-        existing = conversation_store.load_conversation(session_id)
-        if not isinstance(existing, list):
-            existing = []
         entry_id = entry.get("id") if isinstance(entry, dict) else None
-        replaced_existing = False
-        if entry_id is not None:
-            for idx in range(len(existing) - 1, -1, -1):
-                item = existing[idx]
-                if not isinstance(item, dict):
-                    continue
-                if item.get("id") != entry_id:
-                    continue
-                existing[idx] = entry
-                replaced_existing = True
-                break
-        if not replaced_existing:
-            existing.append(entry)
-        conversation_store.save_conversation(session_id, existing)
+        entry_role = (
+            str(entry.get("role") or "").strip().lower()
+            if isinstance(entry, dict)
+            else ""
+        )
+        if isinstance(entry, dict) and entry_role in {"ai", "assistant"}:
+            entry_metadata = entry.get("metadata")
+            entry_metadata = (
+                dict(entry_metadata) if isinstance(entry_metadata, dict) else {}
+            )
+            if "capability_scope" not in entry_metadata:
+                entry_metadata[_CAPABILITY_SCOPE_PENDING_KEY] = True
+            entry["metadata"] = entry_metadata
+        metadata = entry.get("metadata") if isinstance(entry, dict) else None
+        runtime_receipt: Optional[Dict[str, Any]] = None
+        normalized_entry_scope = (
+            normalize_capability_scope(metadata.get("capability_scope"))
+            if isinstance(metadata, dict) and "capability_scope" in metadata
+            else None
+        )
+        if normalized_entry_scope is not None:
+            runtime_receipt = {
+                _CONTINUATION_TRUST_KEY: _CONTINUATION_TRUST_SERVER,
+                "capability_scope": copy.deepcopy(normalized_entry_scope),
+            }
+        elif isinstance(entry, dict) and entry_role in {"ai", "assistant"} and entry_id:
+            runtime_receipt = {
+                _CONTINUATION_TRUST_KEY: _CONTINUATION_TRUST_INVALIDATED,
+                "reason": "capability_scope_pending",
+            }
+
+        def _mutate(existing: List[Dict[str, Any]]) -> None:
+            replaced_existing = False
+            if entry_id is not None:
+                for idx in range(len(existing) - 1, -1, -1):
+                    item = existing[idx]
+                    if not isinstance(item, dict) or item.get("id") != entry_id:
+                        continue
+                    existing[idx] = entry
+                    replaced_existing = True
+                    break
+            if not replaced_existing:
+                existing.append(entry)
+            if runtime_receipt is not None and entry_id:
+                conversation_store.merge_metadata(
+                    session_id,
+                    {
+                        _SERVER_RUNTIME_RECEIPTS_KEY: {
+                            "messages": {str(entry_id): runtime_receipt}
+                        }
+                    },
+                )
+
+        existing = conversation_store.mutate_conversation(session_id, _mutate)
         _apply_conversation_privacy_filter(session_id, existing)
     except Exception:
         # Persistence issues should never surface to the primary chat flow.
@@ -1917,46 +2164,171 @@ def _update_conversation_entry(
 ) -> None:
     """Merge updates into a stored conversation entry (best-effort)."""
     try:
-        conv = conversation_store.load_conversation(session_id)
-        if not isinstance(conv, list):
-            return
-        target = None
-        for item in reversed(conv):
-            if isinstance(item, dict) and item.get("id") == message_id:
-                target = item
-                break
-        if target is None:
-            return
-        for key, value in updates.items():
-            if value is None:
-                continue
-            if key == "metadata" and isinstance(value, dict):
-                existing_meta = target.get("metadata")
-                if isinstance(existing_meta, dict):
-                    merged_meta = dict(existing_meta)
+        updated_metadata = updates.get("metadata")
+        runtime_receipt: Optional[Dict[str, Any]] = None
+        normalized_updated_scope = (
+            normalize_capability_scope(updated_metadata.get("capability_scope"))
+            if isinstance(updated_metadata, dict)
+            and "capability_scope" in updated_metadata
+            else None
+        )
+        if normalized_updated_scope is not None:
+            runtime_receipt = {
+                _CONTINUATION_TRUST_KEY: _CONTINUATION_TRUST_SERVER,
+                "capability_scope": copy.deepcopy(normalized_updated_scope),
+            }
+        found = False
+
+        def _mutate(conv: List[Dict[str, Any]]) -> None:
+            nonlocal found
+            target = next(
+                (
+                    item
+                    for item in reversed(conv)
+                    if isinstance(item, dict) and item.get("id") == message_id
+                ),
+                None,
+            )
+            if target is None:
+                return
+            found = True
+            for key, value in updates.items():
+                if value is None:
+                    continue
+                if key == "metadata" and isinstance(value, dict):
+                    existing_meta = target.get("metadata")
+                    merged_meta = (
+                        dict(existing_meta) if isinstance(existing_meta, dict) else {}
+                    )
+                    if (
+                        value.get("status") == "complete"
+                        and not value.get("error")
+                        and not value.get("empty_response")
+                    ):
+                        for meta_key in _RESPONSE_FAILURE_METADATA_KEYS:
+                            merged_meta.pop(meta_key, None)
+                    for meta_key, meta_value in value.items():
+                        if meta_value is None:
+                            merged_meta.pop(meta_key, None)
+                        else:
+                            merged_meta[meta_key] = meta_value
+                    if normalize_capability_scope(merged_meta.get("capability_scope")):
+                        merged_meta.pop(_CAPABILITY_SCOPE_PENDING_KEY, None)
+                    target["metadata"] = merged_meta
+                elif key == "thought_trace" and isinstance(value, list):
+                    target["thought_trace"] = value
                 else:
-                    merged_meta = {}
-                if (
-                    value.get("status") == "complete"
-                    and not value.get("error")
-                    and not value.get("empty_response")
-                ):
-                    for meta_key in _RESPONSE_FAILURE_METADATA_KEYS:
-                        merged_meta.pop(meta_key, None)
-                for meta_key, meta_value in value.items():
-                    if meta_value is None:
-                        merged_meta.pop(meta_key, None)
-                    else:
-                        merged_meta[meta_key] = meta_value
-                target["metadata"] = merged_meta
-            elif key == "thought_trace" and isinstance(value, list):
-                target["thought_trace"] = value
-            else:
-                target[key] = value
-        conversation_store.save_conversation(session_id, conv)
+                    target[key] = value
+            if runtime_receipt is not None:
+                conversation_store.merge_metadata(
+                    session_id,
+                    {
+                        _SERVER_RUNTIME_RECEIPTS_KEY: {
+                            "messages": {message_id: runtime_receipt}
+                        }
+                    },
+                )
+
+        conv = conversation_store.mutate_conversation(session_id, _mutate)
+        if not found:
+            return
         _apply_conversation_privacy_filter(session_id, conv)
     except Exception:
         pass
+
+
+def _replace_latest_conversation_pair(
+    session_id: str,
+    message_id: str,
+    user_entry: Dict[str, Any],
+    assistant_entry: Dict[str, Any],
+) -> bool:
+    """Atomically replace the latest persisted user/assistant pair.
+
+    Regeneration is speculative until a usable response exists.  This helper
+    performs the only transcript write for that speculative turn, and refuses
+    to overwrite anything if the target pair stopped being latest meanwhile.
+    """
+
+    user_message_id = f"{message_id}:user"
+    replaced = False
+    assistant_metadata = assistant_entry.get("metadata")
+    normalized_scope = (
+        normalize_capability_scope(assistant_metadata.get("capability_scope"))
+        if isinstance(assistant_metadata, dict)
+        else None
+    )
+    runtime_receipt: Dict[str, Any] = (
+        {
+            _CONTINUATION_TRUST_KEY: _CONTINUATION_TRUST_SERVER,
+            "capability_scope": copy.deepcopy(normalized_scope),
+        }
+        if normalized_scope is not None
+        else {
+            _CONTINUATION_TRUST_KEY: _CONTINUATION_TRUST_INVALIDATED,
+            "reason": "regenerated_without_capability_scope",
+        }
+    )
+
+    def _mutate(conv: List[Dict[str, Any]]) -> None:
+        nonlocal replaced
+        if len(conv) < 2:
+            return
+        saved_user = conv[-2]
+        saved_assistant = conv[-1]
+        if not isinstance(saved_user, dict) or not isinstance(saved_assistant, dict):
+            return
+        if (
+            str(saved_user.get("id") or "").strip() != user_message_id
+            or str(saved_user.get("role") or "").strip().lower() != "user"
+            or str(saved_assistant.get("id") or "").strip() != message_id
+            or str(saved_assistant.get("role") or "").strip().lower()
+            not in {"ai", "assistant"}
+        ):
+            return
+        # Invalidate executable authority before replacing content. If the
+        # transcript write fails, the old turn remains readable but cannot be
+        # continued under a scope created for the attempted regeneration.
+        conversation_store.merge_metadata(
+            session_id,
+            {
+                _SERVER_RUNTIME_RECEIPTS_KEY: {
+                    "messages": {
+                        message_id: {
+                            _CONTINUATION_TRUST_KEY: _CONTINUATION_TRUST_INVALIDATED,
+                            "reason": "regeneration_commit_in_progress",
+                        }
+                    }
+                }
+            },
+        )
+        conv[-2:] = [copy.deepcopy(user_entry), copy.deepcopy(assistant_entry)]
+        replaced = True
+
+    updated = conversation_store.mutate_conversation(session_id, _mutate)
+    if replaced:
+        try:
+            conversation_store.merge_metadata(
+                session_id,
+                {
+                    _SERVER_RUNTIME_RECEIPTS_KEY: {
+                        "messages": {message_id: runtime_receipt}
+                    }
+                },
+            )
+        except Exception:
+            logger.warning(
+                "Regenerated turn persisted without continuation authority",
+                exc_info=True,
+            )
+        try:
+            _apply_conversation_privacy_filter(session_id, updated)
+        except Exception:
+            logger.debug(
+                "Conversation privacy metadata refresh failed after regeneration",
+                exc_info=True,
+            )
+    return replaced
 
 
 def _mark_conversation_message_error_if_pending(
@@ -2029,6 +2401,7 @@ def _append_tool_event_to_conversation(
     request_id: str | None = None,
     model: str | None = None,
     mode: str | None = None,
+    origin: str | None = None,
 ) -> None:
     """Append a tool event to a message in the saved conversation.
 
@@ -2036,58 +2409,64 @@ def _append_tool_event_to_conversation(
     returns silently. Adds/creates a ``tools`` array on the message.
     """
     try:
-        conv = conversation_store.load_conversation(session_id)
-        if not isinstance(conv, list):
-            return
-        target = None
-        for m in conv:
-            if isinstance(m, dict) and m.get("id") == message_id:
-                target = m
-                break
-        if not target:
-            return
-        tools = target.get("tools")
-        if not isinstance(tools, list):
-            tools = []
-            target["tools"] = tools
-        entry: Dict[str, Any] | None = None
-        if request_id:
-            for item in tools:
-                if isinstance(item, dict) and item.get("id") == request_id:
-                    entry = item
-                    break
-        if entry is None:
-            entry = {"id": request_id} if request_id else {}
-            tools.append(entry)
-        entry.update(
-            {
-                "name": name,
-                "args": args or {},
-                "result": result,
-                "status": status,
-                "timestamp": time.time(),
-            }
-        )
-        if model:
-            entry["model"] = model
-        if mode:
-            entry["mode"] = mode
-        conversation_store.save_conversation(session_id, conv)
+
+        def _mutate(conv: List[Dict[str, Any]]) -> None:
+            target = next(
+                (
+                    message
+                    for message in conv
+                    if isinstance(message, dict) and message.get("id") == message_id
+                ),
+                None,
+            )
+            if not target:
+                return
+            tools = target.get("tools")
+            if not isinstance(tools, list):
+                tools = []
+                target["tools"] = tools
+            entry: Dict[str, Any] | None = None
+            if request_id:
+                entry = next(
+                    (
+                        item
+                        for item in tools
+                        if isinstance(item, dict) and item.get("id") == request_id
+                    ),
+                    None,
+                )
+            if entry is None:
+                entry = {"id": request_id} if request_id else {}
+                tools.append(entry)
+            entry.update(
+                {
+                    "name": name,
+                    "args": args or {},
+                    "result": result,
+                    "status": status,
+                    "timestamp": time.time(),
+                    "server_recorded": True,
+                    "session_id": session_id,
+                    "message_id": message_id,
+                    "chain_id": message_id,
+                }
+            )
+            entry.pop(_CLIENT_SAVED_TOOL_MARKER, None)
+            if model:
+                entry["model"] = model
+            if mode:
+                entry["mode"] = mode
+            if origin:
+                entry["origin"] = origin
+
+        conversation_store.mutate_conversation(session_id, _mutate)
     except Exception:
         # Don't let audit persistence affect primary flow
         pass
 
 
 def _normalize_tool_name(name: Any) -> str:
-    normalized = ""
-    if isinstance(name, str):
-        normalized = name.strip()
-    else:
-        try:
-            normalized = str(name or "").strip()
-        except Exception:
-            normalized = ""
-    return _TOOL_NAME_ALIASES.get(normalized, normalized)
+    return normalize_tool_name(name)
 
 
 def _scrub_tool_placeholder_text(value: Any) -> str:
@@ -2172,6 +2551,65 @@ def _tool_signature(name: str, args: Dict[str, Any]) -> Optional[str]:
     except Exception:
         args_key = str(args or {})
     return f"{normalized_name}:{args_key}"
+
+
+_DEFAULT_MEMORY_WRITES_PER_TURN_LIMIT = 8
+_MEMORY_WRITE_TOOL_NAMES = {"remember", "memory.save"}
+_MEMORY_WRITE_RETRYABLE_STATUSES = {"error", "timeout", "cancelled"}
+
+
+def _memory_write_identity(name: Any, args: Any) -> Optional[str]:
+    """Return the durable memory effect affected by one write proposal.
+
+    Attachment provenance takes precedence so alias keys cannot save the same
+    image repeatedly. Otherwise Float's real case-sensitive memory key is used.
+    """
+
+    normalized_name = _normalize_tool_name(name)
+    if normalized_name not in _MEMORY_WRITE_TOOL_NAMES:
+        return None
+    candidate = args if isinstance(args, dict) else {}
+    value = candidate.get("value", candidate.get("text"))
+    try:
+        value_text = json.dumps(value, sort_keys=True, ensure_ascii=False)
+    except Exception:
+        value_text = str(value or "")
+    attachment_hashes = sorted(
+        set(
+            re.findall(
+                r"(?:content_hash[\"'\s:=]+|/api/attachments/)([0-9a-fA-F]{64})(?:\b|/)",
+                value_text,
+            )
+        )
+    )
+    if attachment_hashes:
+        return "remember-attachment:" + ",".join(
+            content_hash.lower() for content_hash in attachment_hashes
+        )
+    key = candidate.get("key")
+    if not isinstance(key, str) or not key.strip():
+        return None
+    memory_key = key.strip()
+    return f"remember:{memory_key}"
+
+
+def _is_memory_write_tool(name: Any) -> bool:
+    return _normalize_tool_name(name) in _MEMORY_WRITE_TOOL_NAMES
+
+
+def _memory_writes_per_turn_limit(app: Any) -> int:
+    config = getattr(getattr(app, "state", None), "config", None)
+    raw_limit = (
+        config.get(
+            "memory_writes_per_turn_limit", _DEFAULT_MEMORY_WRITES_PER_TURN_LIMIT
+        )
+        if isinstance(config, dict)
+        else _DEFAULT_MEMORY_WRITES_PER_TURN_LIMIT
+    )
+    try:
+        return max(1, min(64, int(raw_limit)))
+    except (TypeError, ValueError):
+        return _DEFAULT_MEMORY_WRITES_PER_TURN_LIMIT
 
 
 def _tool_hint_from_args(args: Dict[str, Any]) -> Optional[str]:
@@ -2349,6 +2787,25 @@ def _inline_tools_need_result_continuation(tools_used: Any, metadata: Any) -> bo
     return seen_read_tool
 
 
+def _resolved_tools_need_result_continuation(tools_used: Any, text: Any) -> bool:
+    """Keep a terminal tool-only response recoverable through the HTTP reply."""
+
+    if not isinstance(tools_used, list) or not tools_used:
+        return False
+    if _tools_require_resolution(tools_used):
+        return False
+    raw_text = text if isinstance(text, str) else str(text or "")
+    visible_text = _scrub_tool_placeholder_text(raw_text)
+    if not visible_text:
+        return True
+    normalized = visible_text.strip().lower()
+    if _TOOL_PLACEHOLDER_RE.search(raw_text) and normalized == "response":
+        return True
+    return normalized == "tool results are available." or normalized.startswith(
+        "tool results:"
+    )
+
+
 def _compact_tool_result_text(value: Any, limit: int = 160) -> Optional[str]:
     text = str(value or "").strip()
     if not text:
@@ -2378,7 +2835,6 @@ def _balanced_name_preview(names: list[str], *, limit: int = 8) -> list[str]:
 _ACTIONABLE_DISCOVERY_TOOL_ORDER = (
     "write_file",
     "remember",
-    "memory.save",
     "read_file",
     "list_dir",
     "recall",
@@ -2471,7 +2927,7 @@ def _discovery_name_candidates_from_result_payload(result_value: Any) -> list[st
 
     def add_name(value: Any) -> None:
         name = _normalize_tool_name(value)
-        if not name or name in seen:
+        if not name or name in seen or name in _UNADVERTISED_MODEL_TOOL_ALIASES:
             return
         seen.add(name)
         names.append(name)
@@ -2495,7 +2951,7 @@ def _discovery_name_candidates_from_result_payload(result_value: Any) -> list[st
             for value in ("write_file", "read_file", "list_dir"):
                 add_name(value)
         if "memory" in family_names:
-            for value in ("remember", "memory.save", "recall"):
+            for value in ("remember", "recall"):
                 add_name(value)
         if "calendar" in family_names:
             for value in ("create_task", "list_tasks"):
@@ -2521,7 +2977,7 @@ def _discovery_name_candidates_from_result_payload(result_value: Any) -> list[st
                 for value in ("write_file", "read_file", "list_dir"):
                     add_name(value)
             if "memory" in family_names:
-                for value in ("remember", "memory.save", "recall"):
+                for value in ("remember", "recall"):
                     add_name(value)
             if "calendar" in family_names:
                 for value in ("create_task", "list_tasks"):
@@ -2890,7 +3346,7 @@ def _tool_recovery_hint_payload(
         "failed_call": f"{call_text} -> {compact_error}",
         "recovery_tool": "help",
         "recovery_args": recovery_args,
-        "recovery_message": "Call help or tool_help with {} for a tool list; add failed_* only if you want this error echoed as a compact breadcrumb.",
+        "recovery_message": "Call help with {} for a tool list; add failed_* only if you want this error echoed as a compact breadcrumb.",
     }
 
 
@@ -2911,7 +3367,11 @@ def _tool_prompt_result_excerpt(tool_name: str, result_value: Any) -> Optional[s
         )
         count_value = wrapped.get("count") if isinstance(wrapped, dict) else None
         total_count = wrapped.get("total_count") if isinstance(wrapped, dict) else None
-        names = _tool_names_from_result_payload(result_value)
+        names = [
+            name
+            for name in _tool_names_from_result_payload(result_value)
+            if name not in _UNADVERTISED_MODEL_TOOL_ALIASES
+        ]
         query = wrapped.get("query") if isinstance(wrapped, dict) else None
         detail = (
             str(query.get("detail") or "").strip().lower()
@@ -2991,7 +3451,11 @@ def _tool_menu_prompt_payload(
     total_count = wrapped.get("total_count")
     if isinstance(total_count, int) and total_count >= 0:
         payload["total_count"] = total_count
-    names = _tool_names_from_result_payload(result_value)
+    names = [
+        name
+        for name in _tool_names_from_result_payload(result_value)
+        if name not in _UNADVERTISED_MODEL_TOOL_ALIASES
+    ]
     if names:
         name_limit = len(names) if payload.get("detail") == "names" else 8
         preview = names[:name_limit]
@@ -3038,6 +3502,7 @@ def _tool_menu_prompt_payload(
             _normalize_tool_name(item)
             for item in suggestions
             if _normalize_tool_name(item)
+            and _normalize_tool_name(item) not in _UNADVERTISED_MODEL_TOOL_ALIASES
         ]
         if cleaned_suggestions:
             payload["did_you_mean"] = cleaned_suggestions[:6]
@@ -3533,36 +3998,103 @@ def _is_computer_capture_tool_name(name: Any) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class _TurnToolFilterSnapshot:
+    settings_payload: Mapping[str, Any]
+    enabled_modules: tuple[str, ...]
+    module_catalog: tuple[Dict[str, Any], ...]
+    rejected_tool_names: frozenset[str]
+    catalog_available: bool
+
+
+def _turn_tool_filter_snapshot_with_modules(
+    snapshot: _TurnToolFilterSnapshot,
+    enabled_modules: Iterable[str],
+) -> _TurnToolFilterSnapshot:
+    """Bind one captured catalog/settings view to the resolved turn scope."""
+
+    return _TurnToolFilterSnapshot(
+        settings_payload=snapshot.settings_payload,
+        enabled_modules=tuple(
+            str(item).strip() for item in enabled_modules if str(item).strip()
+        ),
+        module_catalog=snapshot.module_catalog,
+        rejected_tool_names=snapshot.rejected_tool_names,
+        catalog_available=snapshot.catalog_available,
+    )
+
+
+def _capture_turn_tool_filter_snapshot(
+    *,
+    verified_enabled_modules: Iterable[str] | None = None,
+) -> _TurnToolFilterSnapshot:
+    try:
+        loaded_settings = user_settings.load_settings()
+    except Exception:
+        loaded_settings = {}
+    if not isinstance(loaded_settings, Mapping):
+        loaded_settings = {}
+    settings_payload = MappingProxyType(copy.deepcopy(dict(loaded_settings)))
+    if verified_enabled_modules is None:
+        configured_modules = settings_payload.get("enabled_workflow_modules")
+        if not isinstance(configured_modules, (list, tuple, set)):
+            configured_modules = []
+    else:
+        configured_modules = list(verified_enabled_modules)
+    try:
+        module_catalog, rejected_module_tools = module_catalog_snapshot()
+    except Exception:
+        return _TurnToolFilterSnapshot(
+            settings_payload=settings_payload,
+            enabled_modules=tuple(
+                str(item).strip() for item in configured_modules if str(item).strip()
+            ),
+            module_catalog=(),
+            rejected_tool_names=frozenset(),
+            catalog_available=False,
+        )
+    return _TurnToolFilterSnapshot(
+        settings_payload=settings_payload,
+        enabled_modules=tuple(
+            str(item).strip() for item in configured_modules if str(item).strip()
+        ),
+        module_catalog=tuple(copy.deepcopy(module_catalog)),
+        rejected_tool_names=frozenset(rejected_module_tools),
+        catalog_available=True,
+    )
+
+
 def _filter_turn_tool_definitions(
     tool_definitions: Any,
     *,
     allow_computer_capture: bool,
+    tool_filter_snapshot: _TurnToolFilterSnapshot | None = None,
 ) -> list[Any]:
     if not isinstance(tool_definitions, list):
         return []
-    try:
-        settings_payload = user_settings.load_settings()
-    except Exception:
-        settings_payload = {}
+    snapshot = tool_filter_snapshot or _capture_turn_tool_filter_snapshot()
+    if not snapshot.catalog_available:
+        return []
+
+    def _available_for_turn(tool: Any) -> bool:
+        if not isinstance(tool, dict):
+            return True
+        return tool_allowed_in_workflow(
+            tool.get("name"), WORKFLOW_TEXT, snapshot.settings_payload
+        ) and tool_enabled_by_modules(
+            tool.get("name"),
+            snapshot.enabled_modules,
+            module_catalog=snapshot.module_catalog,
+            rejected_tool_names=snapshot.rejected_tool_names,
+        )
+
     if allow_computer_capture:
-        return [
-            tool
-            for tool in tool_definitions
-            if not isinstance(tool, dict)
-            or tool_allowed_in_workflow(
-                tool.get("name"), WORKFLOW_TEXT, settings_payload
-            )
-        ]
+        return [tool for tool in tool_definitions if _available_for_turn(tool)]
     filtered: list[Any] = []
     for tool in tool_definitions:
-        if not isinstance(tool, dict):
-            filtered.append(tool)
+        if not _available_for_turn(tool):
             continue
-        if not tool_allowed_in_workflow(
-            tool.get("name"), WORKFLOW_TEXT, settings_payload
-        ):
-            continue
-        if _is_computer_capture_tool_name(tool.get("name")):
+        if isinstance(tool, dict) and _is_computer_capture_tool_name(tool.get("name")):
             continue
         filtered.append(tool)
     return filtered
@@ -3580,13 +4112,16 @@ _PROMPT_TOOL_PRIORITY = {
             "create_task",
             "list_tasks",
             "help",
-            "tool_help",
             "tool_info",
-            "memory.save",
             "search_web",
         )
     )
 }
+
+# These names remain registered so saved conversations and older clients can
+# still call them.  They are compatibility handles, not separate capabilities,
+# so exposing them beside the preferred name makes tool choice ambiguous.
+_UNADVERTISED_MODEL_TOOL_ALIASES = dict(MODEL_HIDDEN_COMPATIBILITY_NAMES)
 
 
 def _prompt_tool_sort_key(tool: Any) -> tuple[int, str]:
@@ -3604,17 +4139,129 @@ def _merge_prompt_tool_definitions(*groups: Any) -> list[Any]:
             continue
         for tool in group:
             name = _tool_definition_name(tool)
-            if not name or name in seen:
+            if not name or name in seen or name in _UNADVERTISED_MODEL_TOOL_ALIASES:
                 continue
             seen.add(name)
             merged.append(tool)
     return merged
 
 
+_PROVIDER_FUNCTION_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_PROVIDER_FUNCTION_NAME_MAX_LENGTH = 64
+
+
+def _provider_native_tool_definitions(
+    definitions: Any,
+) -> tuple[list[Any], dict[str, str]]:
+    """Return readable provider-safe names plus their canonical Float mapping."""
+
+    if not isinstance(definitions, list):
+        return [], {}
+    canonical_names = [_tool_definition_name(item) for item in definitions]
+    unchanged_names = {
+        name
+        for name in canonical_names
+        if name
+        and len(name) <= _PROVIDER_FUNCTION_NAME_MAX_LENGTH
+        and _PROVIDER_FUNCTION_NAME_RE.fullmatch(name)
+        and "-" not in name
+    }
+
+    slug_by_canonical: dict[str, str] = {}
+    slug_counts: dict[str, int] = {}
+    for canonical in canonical_names:
+        if not canonical or canonical in unchanged_names:
+            continue
+        slug = re.sub(r"[^A-Za-z0-9]+", "_", canonical).strip("_").lower()
+        slug = slug or "tool"
+        slug = slug[:_PROVIDER_FUNCTION_NAME_MAX_LENGTH].rstrip("_") or "tool"
+        slug_by_canonical[canonical] = slug
+        slug_counts[slug] = slug_counts.get(slug, 0) + 1
+
+    used_names = set(unchanged_names)
+    canonical_by_provider: dict[str, str] = {}
+    prepared: list[Any] = []
+    for definition, canonical in zip(definitions, canonical_names):
+        if not canonical or not isinstance(definition, dict):
+            prepared.append(definition)
+            continue
+        raw_target = definition
+        if not raw_target.get("name") and isinstance(raw_target.get("function"), dict):
+            raw_target = raw_target["function"]
+        raw_name = str(raw_target.get("name") or "").strip()
+        if canonical in unchanged_names:
+            if raw_name == canonical:
+                prepared.append(definition)
+            else:
+                cloned = copy.deepcopy(definition)
+                target = cloned
+                if not target.get("name") and isinstance(target.get("function"), dict):
+                    target = target["function"]
+                target["name"] = canonical
+                prepared.append(cloned)
+            continue
+
+        slug = slug_by_canonical[canonical]
+        collision = slug in used_names or slug_counts.get(slug, 0) > 1
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        provider_name = "" if collision else slug
+        if collision:
+            for digest_chars in (8, 12, 16, 24, 32):
+                suffix = f"_{digest[:digest_chars]}"
+                slug_budget = max(
+                    1,
+                    _PROVIDER_FUNCTION_NAME_MAX_LENGTH - len(suffix),
+                )
+                candidate = f"{slug[:slug_budget].rstrip('_')}{suffix}"
+                if candidate not in used_names:
+                    provider_name = candidate
+                    break
+            if not provider_name:
+                for attempt in range(100):
+                    fallback_digest = hashlib.sha256(
+                        f"{canonical}:{attempt}".encode("utf-8")
+                    ).hexdigest()
+                    candidate = f"tool_{fallback_digest[:59]}"
+                    if candidate not in used_names:
+                        provider_name = candidate
+                        break
+        if not provider_name:
+            raise ValueError(f"Could not allocate a provider-safe name for {canonical}")
+
+        cloned = copy.deepcopy(definition)
+        target = cloned
+        if not target.get("name") and isinstance(target.get("function"), dict):
+            target = target["function"]
+        target["name"] = provider_name
+        canonical_by_provider[provider_name] = canonical
+        used_names.add(provider_name)
+        prepared.append(cloned)
+    return prepared, canonical_by_provider
+
+
+def _restore_provider_tool_names(
+    response: Any, canonical_by_provider: Dict[str, str]
+) -> Any:
+    if not isinstance(response, dict) or not canonical_by_provider:
+        return response
+    tools_used = response.get("tools_used")
+    if not isinstance(tools_used, list):
+        return response
+    for tool in tools_used:
+        if not isinstance(tool, dict):
+            continue
+        provider_name = str(tool.get("name") or "").strip()
+        canonical = canonical_by_provider.get(provider_name)
+        if canonical:
+            tool["name"] = canonical
+    return response
+
+
 def _registered_prompt_tool_definitions(
     app: Any,
     *,
     allow_computer_capture: bool,
+    tool_filter_snapshot: _TurnToolFilterSnapshot | None = None,
 ) -> list[Any]:
     try:
         from app.tool_specs import get_tool_specs as _get_specs
@@ -3632,20 +4279,28 @@ def _registered_prompt_tool_definitions(
     filtered = _filter_turn_tool_definitions(
         specs,
         allow_computer_capture=allow_computer_capture,
+        tool_filter_snapshot=tool_filter_snapshot,
     )
-    return sorted(filtered, key=_prompt_tool_sort_key)
+    advertised = _merge_prompt_tool_definitions(filtered)
+    return sorted(advertised, key=_prompt_tool_sort_key)
 
 
 def _workflow_modules_for_turn(
     modules: Any,
     *,
     allow_computer_capture: bool,
+    module_catalog: Iterable[Dict[str, Any]] | None = None,
 ) -> list[str]:
     if not isinstance(modules, list):
         return []
     active: list[str] = []
+    catalog = list(module_catalog) if module_catalog is not None else None
     for module_name in modules:
-        normalized = normalize_module_id(str(module_name or "").strip())
+        normalized = (
+            normalize_module_id_from_catalog(module_name, catalog)
+            if catalog is not None
+            else normalize_module_id(str(module_name or "").strip())
+        )
         if not normalized:
             continue
         if (
@@ -3752,9 +4407,9 @@ def _disabled_workflow_modules_note(module_ids: Iterable[str]) -> str:
     return (
         f"The user appears to be asking for capabilities from disabled workflow "
         f"module(s): {labels_text}. Do not claim tools from disabled modules are "
-        "available this turn. If helpful, use `tool_help` and "
+        "available this turn. If helpful, use `help` and "
         "`read_capability_docs` to explain what the module can do, then ask the "
-        f"user to enable the relevant module in Settings.{docs_text}"
+        f"user to enable the relevant module in Knowledge > Skills.{docs_text}"
     )
 
 
@@ -3910,14 +4565,12 @@ def _available_tools_prompt_section(
         if line:
             lines.append(line)
     if omitted:
-        lines.append(
-            f"- ... {omitted} more tool(s). Use `tool_help` for the full list."
-        )
+        lines.append(f"- ... {omitted} more tool(s). Use `help` for the full list.")
     lines.append(_AVAILABLE_TOOLS_PROMPT_FOOTER)
     section = "\n".join(lines)
     if len(section) > max_chars:
         section = section[: max(0, max_chars - 80)].rstrip()
-        section += "\n- ... capped. Use `tool_help` for the full current tool list."
+        section += "\n- ... capped. Use `help` for the full current tool list."
         section += f"\n{_AVAILABLE_TOOLS_PROMPT_FOOTER}"
     return section
 
@@ -4018,6 +4671,11 @@ def _existing_tool_signatures_for_message(
         for tool in message.get("tools") or []:
             if not isinstance(tool, dict):
                 continue
+            if (
+                tool.get(_CLIENT_SAVED_TOOL_MARKER)
+                or tool.get("server_recorded") is not True
+            ):
+                continue
             status = str(tool.get("status") or "").strip().lower()
             if status in {"denied", "error", "cancelled", "timeout"}:
                 continue
@@ -4030,6 +4688,193 @@ def _existing_tool_signatures_for_message(
     return signatures
 
 
+def _existing_memory_write_state_for_message(
+    app, session_id: str | None, message_id: str | None
+) -> tuple[set[str], set[str], int]:
+    """Return memory effects, distinct records, and attached-image count."""
+
+    normalized_session = str(session_id or "").strip()
+    normalized_message = str(message_id or "").strip()
+    identities: set[str] = set()
+    record_tokens: set[str] = set()
+    image_attachment_count = 0
+    if not normalized_session or not normalized_message:
+        return identities, record_tokens, image_attachment_count
+
+    def _record(record: Any, *, require_server_receipt: bool = False) -> None:
+        if not isinstance(record, dict):
+            return
+        if require_server_receipt and (
+            record.get(_CLIENT_SAVED_TOOL_MARKER)
+            or record.get("server_recorded") is not True
+        ):
+            return
+        status = _tool_resolution_status(record.get("status"))
+        if status in _MEMORY_WRITE_RETRYABLE_STATUSES:
+            return
+        name = _normalize_tool_name(record.get("name"))
+        if not _is_memory_write_tool(name):
+            return
+        args = record.get("args") if isinstance(record.get("args"), dict) else {}
+        identity = _memory_write_identity(name, args)
+        if identity:
+            identities.add(identity)
+        request_id = str(record.get("id") or record.get("request_id") or "").strip()
+        fallback = _tool_signature(name, args)
+        token = request_id or fallback
+        if token:
+            record_tokens.add(token)
+
+    registry = getattr(app.state, "pending_tools", None)
+    if isinstance(registry, dict):
+        for record_id, record in registry.items():
+            if not isinstance(record, dict):
+                continue
+            if str(record.get("session_id") or "").strip() != normalized_session:
+                continue
+            record_message = str(
+                record.get("message_id") or record.get("chain_id") or ""
+            ).strip()
+            if record_message != normalized_message:
+                continue
+            candidate = dict(record)
+            candidate.setdefault("id", record_id)
+            _record(candidate)
+
+    try:
+        conversation = conversation_store.load_conversation(normalized_session)
+    except Exception:
+        conversation = []
+    for message in conversation if isinstance(conversation, list) else []:
+        if not isinstance(message, dict):
+            continue
+        saved_message_id = str(message.get("id") or "").strip()
+        if saved_message_id == f"{normalized_message}:user":
+            image_attachment_count = sum(
+                1
+                for attachment in message.get("attachments") or []
+                if _is_image_attachment_payload(attachment)
+            )
+            continue
+        if saved_message_id != normalized_message:
+            continue
+        for tool in message.get("tools") or []:
+            _record(tool, require_server_receipt=True)
+    return identities, record_tokens, image_attachment_count
+
+
+def _tool_registry_ids_for_message(
+    app, session_id: str | None, message_id: str | None
+) -> set[str]:
+    normalized_session = str(session_id or "").strip()
+    normalized_message = str(message_id or "").strip()
+    if not normalized_session or not normalized_message:
+        return set()
+    registry = getattr(app.state, "pending_tools", None)
+    if not isinstance(registry, dict):
+        return set()
+    return {
+        str(record_id)
+        for record_id, record in registry.items()
+        if isinstance(record, dict)
+        and str(record.get("session_id") or "").strip() == normalized_session
+        and str(record.get("message_id") or record.get("chain_id") or "").strip()
+        == normalized_message
+    }
+
+
+def _discard_tool_registry_records(app, record_ids: Iterable[str]) -> None:
+    registry = getattr(app.state, "pending_tools", None)
+    if not isinstance(registry, dict):
+        return
+    for record_id in set(record_ids):
+        registry.pop(record_id, None)
+
+
+def _unresolved_tool_proposals_for_message(
+    app,
+    session_id: str | None,
+    message_id: str | None,
+    saved_message: Optional[Dict[str, Any]] = None,
+) -> list[str]:
+    """Return pending/proposed tool ids which must be resolved before regen."""
+
+    normalized_session = str(session_id or "").strip()
+    normalized_message = str(message_id or "").strip()
+    unresolved: list[str] = []
+    registry = getattr(app.state, "pending_tools", None)
+    if isinstance(registry, dict):
+        for record_id, record in registry.items():
+            if not isinstance(record, dict):
+                continue
+            if str(record.get("session_id") or "").strip() != normalized_session:
+                continue
+            if (
+                str(record.get("message_id") or record.get("chain_id") or "").strip()
+                != normalized_message
+            ):
+                continue
+            if _tool_resolution_status(record.get("status")) in {
+                "pending",
+                "proposed",
+            }:
+                unresolved.append(str(record_id))
+
+    if isinstance(saved_message, dict):
+        for tool in saved_message.get("tools") or []:
+            if not isinstance(tool, dict):
+                continue
+            if _tool_resolution_status(tool.get("status")) not in {
+                "pending",
+                "proposed",
+            }:
+                continue
+            label = str(tool.get("id") or tool.get("name") or "saved tool").strip()
+            if label and label not in unresolved:
+                unresolved.append(label)
+    return unresolved
+
+
+def _registered_tool_conversation_entries(
+    app,
+    tools: Any,
+    *,
+    session_id: str,
+    message_id: str,
+) -> list[Dict[str, Any]]:
+    """Build fresh persisted tool facts from newly registered proposals."""
+
+    if not isinstance(tools, list):
+        return []
+    registry = getattr(app.state, "pending_tools", None)
+    entries: list[Dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        record_id = str(tool.get("id") or "").strip()
+        record = registry.get(record_id) if isinstance(registry, dict) else None
+        entry = dict(record) if isinstance(record, dict) else dict(tool)
+        entry.update(
+            {
+                "id": record_id or entry.get("id"),
+                "name": _normalize_tool_name(entry.get("name") or tool.get("name")),
+                "args": (
+                    entry.get("args") if isinstance(entry.get("args"), dict) else {}
+                ),
+                "status": _tool_resolution_status(
+                    entry.get("status") or tool.get("status")
+                ),
+                "server_recorded": True,
+                "session_id": session_id,
+                "message_id": message_id,
+                "chain_id": message_id,
+                "timestamp": time.time(),
+            }
+        )
+        entries.append(entry)
+    return entries
+
+
 async def _register_tool_proposals(
     request: Request,
     *,
@@ -4039,6 +4884,12 @@ async def _register_tool_proposals(
     model: str | None,
     mode: str | None,
     default_agent: str | None,
+    force_tool_review: bool = False,
+    allowed_tool_names: Optional[Iterable[str]] = None,
+    proposal_origin: Optional[str] = None,
+    ignore_existing_signatures: bool = False,
+    persist_events: bool = True,
+    defer_auto_decisions: bool = False,
 ) -> list[dict[str, Any]]:
     if not isinstance(tools, list) or not tools:
         return []
@@ -4060,8 +4911,30 @@ async def _register_tool_proposals(
     approval_level = (
         str(settings_payload.get("approval_level") or "all").strip().lower() or "all"
     )
-    known_signatures = _existing_tool_signatures_for_message(
-        request.app, session_id, message_id
+    known_signatures = (
+        set()
+        if ignore_existing_signatures
+        else _existing_tool_signatures_for_message(request.app, session_id, message_id)
+    )
+    (
+        known_memory_write_keys,
+        memory_write_records,
+        image_attachment_count,
+    ) = _existing_memory_write_state_for_message(request.app, session_id, message_id)
+    if ignore_existing_signatures:
+        known_memory_write_keys = set()
+        memory_write_records = set()
+    memory_write_limit = _memory_writes_per_turn_limit(request.app)
+    if image_attachment_count:
+        memory_write_limit = min(memory_write_limit, image_attachment_count)
+    allowed_names = (
+        {
+            _normalize_tool_name(name)
+            for name in allowed_tool_names
+            if _normalize_tool_name(name)
+        }
+        if allowed_tool_names is not None
+        else None
     )
 
     for tool in tools:
@@ -4076,6 +4949,12 @@ async def _register_tool_proposals(
             continue
         tool_name = _normalize_tool_name(tool.get("name"))
         if not tool_name:
+            continue
+        if allowed_names is not None and tool_name not in allowed_names:
+            logger.info(
+                "Suppressed tool proposal %s because it is outside the saved turn scope",
+                tool_name,
+            )
             continue
         if not tool_allowed_in_workflow(tool_name, WORKFLOW_TEXT, settings_payload):
             logger.info(
@@ -4093,10 +4972,31 @@ async def _register_tool_proposals(
                 message_id,
             )
             continue
+        memory_write_key = _memory_write_identity(tool_name, tool_args)
+        if memory_write_key and memory_write_key in known_memory_write_keys:
+            logger.info(
+                "Suppressed repeated memory write for key=%s session=%s message=%s",
+                memory_write_key,
+                session_id,
+                message_id,
+            )
+            continue
+        if (
+            _is_memory_write_tool(tool_name)
+            and len(memory_write_records) >= memory_write_limit
+        ):
+            logger.warning(
+                "Suppressed memory write above per-turn limit=%s session=%s message=%s",
+                memory_write_limit,
+                session_id,
+                message_id,
+            )
+            continue
 
         proposal_id = str(uuid4())
         server_auto_decide = bool(
-            approval_allows_auto_for_tool(
+            not force_tool_review
+            and approval_allows_auto_for_tool(
                 approval_level,
                 tool_name,
                 settings_payload,
@@ -4118,21 +5018,31 @@ async def _register_tool_proposals(
                 not server_auto_decide and _tool_resolution_notifications_enabled()
             ),
         }
+        if proposal_origin:
+            record["origin"] = proposal_origin
         registry[proposal_id] = record
         if signature:
             known_signatures.add(signature)
+        if _is_memory_write_tool(tool_name):
+            memory_write_records.add(proposal_id)
+            if memory_write_key:
+                known_memory_write_keys.add(memory_write_key)
 
         tool_payload = dict(tool)
         tool_payload["id"] = proposal_id
         tool_payload["name"] = tool_name
         tool_payload["args"] = tool_args
         tool_payload["status"] = "proposed"
-        if approval_allows_auto_for_tool(approval_level, tool_name, settings_payload):
+        if proposal_origin:
+            tool_payload["origin"] = proposal_origin
+        if not force_tool_review and approval_allows_auto_for_tool(
+            approval_level, tool_name, settings_payload
+        ):
             tool_payload["approval"] = "auto"
         emitted.append(tool_payload)
 
         try:
-            if session_id and message_id:
+            if persist_events and session_id and message_id:
                 _append_tool_event_to_conversation(
                     session_id,
                     message_id,
@@ -4143,6 +5053,7 @@ async def _register_tool_proposals(
                     model=model,
                     mode=mode,
                     request_id=proposal_id,
+                    origin=proposal_origin,
                 )
         except Exception:
             pass
@@ -4162,6 +5073,7 @@ async def _register_tool_proposals(
                     "model": model,
                     "mode": mode,
                     "server_auto_decide": server_auto_decide,
+                    "origin": proposal_origin,
                 },
                 default_agent=default_agent,
             )
@@ -4183,7 +5095,7 @@ async def _register_tool_proposals(
             message_id=message_id,
             request_id=proposal_id,
         )
-        if server_auto_decide:
+        if server_auto_decide and not defer_auto_decisions:
             try:
                 auto_result = await decide_tool(
                     request,
@@ -4216,9 +5128,67 @@ async def _register_tool_proposals(
             item
             for item in emitted
             if str(item.get("status") or "").strip().lower() == "proposed"
+            and not (defer_auto_decisions and item.get("approval") == "auto")
         ],
     )
     return emitted
+
+
+async def _resolve_deferred_auto_proposals(
+    request: Request,
+    proposals: Any,
+    *,
+    session_id: str,
+    message_id: str,
+) -> list[dict[str, Any]]:
+    """Resolve auto-approved proposals after a regenerated turn is committed."""
+
+    if not isinstance(proposals, list):
+        return []
+    registry = getattr(request.app.state, "pending_tools", None)
+    for proposal in proposals:
+        if not isinstance(proposal, dict):
+            continue
+        request_id = str(proposal.get("id") or "").strip()
+        record = registry.get(request_id) if isinstance(registry, dict) else None
+        if not isinstance(record, dict) or not record.get("server_auto_decide"):
+            continue
+        if _tool_resolution_status(record.get("status")) not in {
+            "pending",
+            "proposed",
+        }:
+            continue
+        try:
+            auto_result = await decide_tool(
+                request,
+                ToolDecision(
+                    request_id=request_id,
+                    decision="accept",
+                    args=(
+                        record.get("args")
+                        if isinstance(record.get("args"), dict)
+                        else {}
+                    ),
+                    name=str(record.get("name") or proposal.get("name") or ""),
+                    session_id=session_id,
+                    message_id=message_id,
+                    chain_id=message_id,
+                ),
+            )
+            resolved_status = str(auto_result.get("status") or "").strip().lower()
+            if resolved_status:
+                proposal["status"] = resolved_status
+            if "result" in auto_result:
+                proposal["result"] = auto_result.get("result")
+        except Exception:
+            logger.warning(
+                "Deferred auto-approval failed for tool %s (session=%s message=%s)",
+                record.get("name"),
+                session_id,
+                message_id,
+                exc_info=True,
+            )
+    return proposals
 
 
 def _tool_resolution_notifications_enabled() -> bool:
@@ -4466,12 +5436,161 @@ def _get_clip_rag_service(*, raise_http: bool = True):
     return service
 
 
-def _persist_calendar_event(event_id: str, event_payload: dict) -> None:
-    calendar_store.save_event(event_id, event_payload)
+def _persist_calendar_event(event_id: str, event_payload: dict) -> Dict[str, Any]:
+    """Merge an imported event without erasing local execution state."""
+
+    runtime_fields = {
+        "actions",
+        "background_job",
+        "run_history",
+        "notes",
+        "last_prompt_dispatched",
+        "last_triggered",
+    }
+
+    def merge_import(existing: Dict[str, Any]) -> Dict[str, Any]:
+        merged = dict(event_payload)
+        if existing:
+            for field in runtime_fields:
+                if field in existing:
+                    merged[field] = existing[field]
+            merged["status"] = existing.get("status", merged.get("status"))
+        merged["id"] = event_id
+        bump_actions_for_event_control_change(existing, merged)
+        invalidate_event_authorizations_for_edit(existing, merged)
+        return merged
+
+    stored = calendar_store.update_event(event_id, merge_import, create=True)
     try:
-        _ingest_calendar_event(event_id, event_payload)
+        _ingest_calendar_event(event_id, stored)
     except Exception:
         pass
+    return stored
+
+
+def _attach_scheduled_tool_to_event(
+    *,
+    event_id: str,
+    request_id: str,
+    name: Optional[str],
+    args: Dict[str, Any],
+    prompt: Optional[str],
+    conversation_mode: Optional[str],
+    session_id: Optional[str],
+    message_id: Optional[str],
+    chain_id: Optional[str],
+    user: str,
+) -> Dict[str, Any]:
+    """Atomically attach one runnable action to its calendar event."""
+
+    def attach(existing: Dict[str, Any]) -> Dict[str, Any]:
+        event = dict(existing)
+        event.setdefault("id", event_id)
+        if not event.get("title"):
+            event["title"] = f"Schedule tool: {name or 'tool'}"
+        actions = event.get("actions")
+        actions = list(actions) if isinstance(actions, list) else []
+        action_definition: Dict[str, Any] = {
+            "id": request_id,
+            "request_id": request_id,
+            "kind": "tool",
+            "name": name,
+            "args": args,
+            "scheduled_event_id": event_id,
+            "scheduled_for": event.get("start_time"),
+            "session_id": session_id,
+            "message_id": message_id,
+            "chain_id": chain_id,
+            "user": user,
+            "updated_at": time.time(),
+        }
+        if conversation_mode:
+            action_definition["conversation_mode"] = conversation_mode
+            if conversation_mode == "new_chat":
+                if session_id:
+                    action_definition["origin_session_id"] = session_id
+                if message_id:
+                    action_definition["origin_message_id"] = message_id
+                action_definition.pop("session_id", None)
+                action_definition.pop("message_id", None)
+                action_definition.pop("chain_id", None)
+        if prompt:
+            action_definition["prompt"] = prompt
+
+        match_index: Optional[int] = None
+        for index, item in enumerate(actions):
+            if not isinstance(item, dict):
+                continue
+            item_id = item.get("request_id") or item.get("id")
+            if item_id is not None and str(item_id) == request_id:
+                match_index = index
+                break
+        if match_index is None:
+            merged_action = merge_client_action_definitions([], [action_definition])[0]
+            actions.append(merged_action)
+        else:
+            merged_action = merge_client_action_definitions(
+                [actions[match_index]], [action_definition]
+            )[0]
+            if prompt == "":
+                merged_action.pop("prompt", None)
+            actions[match_index] = merged_action
+        event["actions"] = actions
+
+        background_job = event.get("background_job")
+        background_job = (
+            dict(background_job) if isinstance(background_job, dict) else {}
+        )
+        execution = background_job.get("execution")
+        execution = dict(execution) if isinstance(execution, dict) else {}
+        configured_scopes = normalize_permission_scopes(
+            execution.get("permissions", [])
+        )
+        required_scopes = permission_scopes_for_tool(name or "")
+        execution["permissions"] = sorted({*configured_scopes, *required_scopes})
+        background_job["execution"] = execution
+        event["background_job"] = background_job
+        normalized_background_job = normalize_background_job(event_id, event)
+        if normalized_background_job is not None:
+            event["background_job"] = normalized_background_job
+
+        tool_json = json.dumps(
+            {"tool": name or "tool", "args": args},
+            indent=2,
+            ensure_ascii=False,
+        )
+        description = event.get("description")
+        replace_description = (
+            not isinstance(description, str) or not description.strip()
+        )
+        if not replace_description:
+            try:
+                parsed = json.loads(description)
+            except Exception:
+                parsed = None
+            replace_description = (
+                isinstance(parsed, dict) and "tool" in parsed and "args" in parsed
+            )
+        if replace_description:
+            event["description"] = tool_json
+        if not any(
+            isinstance(item, dict)
+            and str(item.get("status") or "").strip().lower() == "running"
+            for item in actions
+        ):
+            event["status"] = "scheduled"
+        bump_actions_for_event_control_change(existing, event)
+        invalidate_event_authorizations_for_edit(existing, event)
+        return event
+
+    stored = calendar_store.update_event(event_id, attach, create=False)
+    if not stored:
+        raise KeyError(f"calendar event not found: {event_id}")
+    try:
+        _ingest_calendar_event(event_id, stored)
+    except Exception:
+        pass
+    return stored
 
 
 _CALENDAR_STATUS_ALIASES = {
@@ -4529,6 +5648,7 @@ def _build_provider_tool_executor(
     workflow_name: Optional[str],
     model: Optional[str],
     mode: Optional[str],
+    canonical_tool_names: Optional[Dict[str, str]] = None,
 ):
     """Return a sync tool executor for provider-managed agent loops."""
 
@@ -4570,7 +5690,9 @@ def _build_provider_tool_executor(
                 raw_args = {}
         if not isinstance(raw_args, dict):
             raw_args = {}
-        tool_name = _normalize_tool_name(call_payload.get("name"))
+        raw_tool_name = str(call_payload.get("name") or "").strip()
+        canonical_name = (canonical_tool_names or {}).get(raw_tool_name, raw_tool_name)
+        tool_name = _normalize_tool_name(canonical_name)
         call_id = str(call_payload.get("call_id") or "").strip() or None
         if not tool_name:
             return _denied(tool_name, raw_args, "Tool call did not include a name")
@@ -5540,6 +6662,26 @@ ALLOWED_UPLOAD_TYPES = {
     "video/webm",
 }
 
+SAFE_RASTER_IMAGE_TYPES = {
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+}
+
+
+def _sniff_safe_raster_image_type(data: bytes) -> Optional[str]:
+    """Return a browser-safe raster type when the file signature is recognized."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
 
 @router.get("/stream/thoughts")
 async def stream_thoughts(request: Request):
@@ -5736,7 +6878,7 @@ async def add_message(
     Add a message to the context.
     """
     context = llm_service.get_context(context_id)
-    context.add_message(role, content, metadata)
+    context.add_message(role, content, _sanitize_context_message_metadata(metadata))
     return {"status": "success", "context": context.to_dict()}
 
 
@@ -5761,7 +6903,7 @@ async def set_metadata(context_id: str, key: str, value: Any):
     Set metadata in the context.
     """
     context = llm_service.get_context(context_id)
-    context.set_metadata(key, value)
+    context.set_metadata(key, _sanitize_context_metadata_value(key, value))
     return {"status": "success", "context": context.to_dict()}
 
 
@@ -5916,9 +7058,9 @@ async def generate(request: Request, payload: GenerateRequest = Body(...)):
             llm_service.set_context(
                 _context_schema_to_service_context(payload.context), session_id
             )
-        inline_attachments = [
-            att.model_dump(exclude_none=True) for att in payload.attachments or []
-        ]
+        inline_attachments = _enrich_attachment_references(
+            [att.model_dump(exclude_none=True) for att in payload.attachments or []]
+        )
         try:
             log_timeline_message(
                 session_id=session_id,
@@ -5930,9 +7072,11 @@ async def generate(request: Request, payload: GenerateRequest = Body(...)):
                     "mode": mode_used,
                     "model_requested": payload.model,
                     "model_resolved": effective_model,
-                    "provider": provider_target.get("provider")
-                    if isinstance(provider_target, dict)
-                    else None,
+                    "provider": (
+                        provider_target.get("provider")
+                        if isinstance(provider_target, dict)
+                        else None
+                    ),
                 },
             )
         except Exception:
@@ -6060,30 +7204,38 @@ async def generate(request: Request, payload: GenerateRequest = Body(...)):
                 response_meta.setdefault("server_url", provider_target.get("base_url"))
                 response_meta.setdefault(
                     "provider_runtime",
-                    provider_target.get("runtime")
-                    if isinstance(provider_target.get("runtime"), dict)
-                    else {},
+                    (
+                        provider_target.get("runtime")
+                        if isinstance(provider_target.get("runtime"), dict)
+                        else {}
+                    ),
                 )
             mismatch_error = _apply_model_mismatch_error(
                 response_meta,
                 mode=mode_used,
-                provider=provider_target.get("provider")
-                if isinstance(provider_target, dict)
-                else None,
+                provider=(
+                    provider_target.get("provider")
+                    if isinstance(provider_target, dict)
+                    else None
+                ),
             )
             if mismatch_error:
                 response["text"] = mismatch_error
             usage_stats = _normalize_usage_counts(
-                response_meta.get("usage")
-                if isinstance(response_meta.get("usage"), dict)
-                else None,
+                (
+                    response_meta.get("usage")
+                    if isinstance(response_meta.get("usage"), dict)
+                    else None
+                ),
                 payload.prompt or "",
                 response.get("text") or "",
             )
             merged_usage = _merge_usage(
-                response_meta.get("usage")
-                if isinstance(response_meta.get("usage"), dict)
-                else None,
+                (
+                    response_meta.get("usage")
+                    if isinstance(response_meta.get("usage"), dict)
+                    else None
+                ),
                 usage_stats,
             )
             if merged_usage is not None:
@@ -6352,6 +7504,17 @@ async def workflows_catalog():
 
 class WorkflowSkillDocPayload(BaseModel):
     body: str
+    create_only: bool = False
+
+
+class WorkflowSkillTargetPayload(BaseModel):
+    target_id: str
+
+
+class WorkflowSkillImportPreviewPayload(BaseModel):
+    filename: str
+    body: str
+    target_id: str = ""
 
 
 class WorkflowSkillDraftPayload(BaseModel):
@@ -6369,7 +7532,10 @@ async def workflows_skill_doc(skill_id: str):
     normalized = normalize_skill_id(skill_id)
     if not normalized:
         raise HTTPException(status_code=400, detail="Invalid skill id")
-    payload = skill_doc_payload(normalized, include_body=True)
+    try:
+        payload = skill_doc_payload(normalized, include_body=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if payload is None:
         raise HTTPException(status_code=404, detail="Skill doc not found")
     return payload
@@ -6384,7 +7550,15 @@ async def workflows_skill_doc_save(skill_id: str, payload: WorkflowSkillDocPaylo
     if len(body) > 120_000:
         raise HTTPException(status_code=413, detail="Skill doc is too large")
     try:
-        return write_local_skill_doc(normalized, body)
+        return write_local_skill_doc(
+            normalized,
+            body,
+            create_only=bool(payload.create_only),
+        )
+    except SkillConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except SkillStorageError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -6396,8 +7570,131 @@ async def workflows_skill_doc_delete(skill_id: str):
         raise HTTPException(status_code=400, detail="Invalid skill id")
     try:
         return delete_local_skill_doc(normalized)
+    except SkillStorageError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/workflows/skills/{skill_id}/duplicate-preview")
+async def workflows_skill_duplicate_preview(
+    skill_id: str,
+    payload: WorkflowSkillTargetPayload,
+):
+    normalized = normalize_skill_id(skill_id)
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Invalid skill id")
+    try:
+        source = get_skill_entry(normalized, include_body=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if source is None:
+        raise HTTPException(status_code=404, detail="Skill doc not found")
+    try:
+        target_id = validate_new_skill_id(payload.target_id)
+        document = skill_doc_payload(target_id, include_body=True)
+    except SkillConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if document is None:
+        raise HTTPException(status_code=400, detail="Invalid target skill id")
+    return {
+        "status": "drafted",
+        "source_id": normalized,
+        "target_id": target_id,
+        "document": document,
+        "proposal": {
+            "body": str(source.get("body") or ""),
+            "source": "duplicate",
+            "requires_user_save": True,
+            "save_mode": "create_only",
+        },
+        "audit": {"wrote_skill_file": False},
+    }
+
+
+@router.post("/workflows/skills/import-preview")
+async def workflows_skill_import_preview(payload: WorkflowSkillImportPreviewPayload):
+    filename = PureWindowsPath(str(payload.filename or "").strip()).name
+    if not filename or Path(filename).suffix.casefold() not in {
+        ".md",
+        ".markdown",
+        ".txt",
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail="Skill import filename must identify a Markdown or text file.",
+        )
+    body = str(payload.body or "")
+    if len(body) > 120_000:
+        raise HTTPException(status_code=413, detail="Skill doc is too large")
+    requested_target = str(payload.target_id or "").strip() or Path(filename).stem
+    try:
+        target_id = validate_new_skill_id(requested_target)
+        document = skill_doc_payload(target_id, include_body=True)
+    except SkillConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if document is None:
+        raise HTTPException(status_code=400, detail="Invalid target skill id")
+    return {
+        "status": "drafted",
+        "target_id": target_id,
+        "document": document,
+        "proposal": {
+            "body": body,
+            "source": "import",
+            "requires_user_save": True,
+            "save_mode": "create_only",
+        },
+        "audit": {"wrote_skill_file": False},
+    }
+
+
+@router.post("/workflows/skills/{skill_id}/rename")
+async def workflows_skill_rename(
+    skill_id: str,
+    payload: WorkflowSkillTargetPayload,
+):
+    normalized = normalize_skill_id(skill_id)
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Invalid skill id")
+    try:
+        document = rename_local_skill_doc(normalized, payload.target_id)
+    except SkillConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except SkillStorageError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "status": "renamed",
+        "old_id": normalized,
+        "new_id": str(document.get("id") or ""),
+        "document": document,
+    }
+
+
+@router.get("/workflows/skills/{skill_id}/export")
+async def workflows_skill_export(skill_id: str):
+    normalized = normalize_skill_id(skill_id)
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Invalid skill id")
+    try:
+        entry = get_skill_entry(normalized, include_body=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Skill doc not found")
+    return PlainTextResponse(
+        str(entry.get("body") or ""),
+        media_type="text/markdown",
+        headers={
+            "Content-Disposition": f'attachment; filename="{normalized}.md"',
+        },
+    )
 
 
 @router.post("/workflows/skills/{skill_id}/draft")
@@ -6411,7 +7708,10 @@ async def workflows_skill_doc_draft(
     normalized = normalize_skill_id(skill_id)
     if not normalized:
         raise HTTPException(status_code=400, detail="Invalid skill id")
-    current = skill_doc_payload(normalized, include_body=True)
+    try:
+        current = skill_doc_payload(normalized, include_body=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if current is None:
         raise HTTPException(status_code=400, detail="Invalid skill id")
     active = current.get("active") if isinstance(current.get("active"), dict) else {}
@@ -6510,17 +7810,22 @@ async def captures_upload(
     source: str = Form(default="camera"),
     sensitivity: Optional[str] = Form(default=None),
 ):
-    if not str(file.content_type or "").lower().startswith("image/"):
-        raise HTTPException(status_code=400, detail="Only image captures are supported")
-    data = await file.read()
+    content_type = str(file.content_type or "").strip().lower()
+    if content_type not in SAFE_RASTER_IMAGE_TYPES:
+        raise HTTPException(status_code=400, detail="Unsupported image type")
+    data = await file.read(MAX_UPLOAD_SIZE + 1)
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file")
     if len(data) > MAX_UPLOAD_SIZE:
         raise HTTPException(status_code=400, detail="File too large")
+    if _sniff_safe_raster_image_type(data) != content_type:
+        raise HTTPException(status_code=400, detail="Invalid image data")
     service = _get_capture_service(request.app)
     descriptor = service.create_capture_from_bytes(
         data,
         filename=Path(file.filename or "capture.png").name,
         source=str(source or "camera").strip().lower() or "camera",
-        content_type=str(file.content_type or "image/png"),
+        content_type=content_type,
         capture_source=str(source or "camera").strip().lower() or "camera",
         sensitivity=sensitivity,
     )
@@ -6539,10 +7844,30 @@ async def capture_get(request: Request, capture_id: str):
 @router.get("/captures/{capture_id}/content")
 async def capture_content(request: Request, capture_id: str):
     service = _get_capture_service(request.app)
+    capture = service.get_capture(capture_id)
     target = service.capture_path(capture_id)
-    if target is None:
+    if capture is None or target is None:
         raise HTTPException(status_code=404, detail="Capture not found")
-    return FileResponse(target)
+    media_type = (
+        str(capture.get("content_type") or "application/octet-stream").strip().lower()
+        or "application/octet-stream"
+    )
+    headers = {"X-Content-Type-Options": "nosniff"}
+    try:
+        with target.open("rb") as handle:
+            detected_type = _sniff_safe_raster_image_type(handle.read(16))
+    except OSError:
+        detected_type = None
+    if media_type not in SAFE_RASTER_IMAGE_TYPES or detected_type != media_type:
+        headers["Content-Security-Policy"] = "sandbox; default-src 'none'"
+        return FileResponse(
+            path=str(target),
+            media_type=media_type,
+            filename=Path(str(capture.get("filename") or target.name)).name,
+            content_disposition_type="attachment",
+            headers=headers,
+        )
+    return FileResponse(path=str(target), media_type=media_type, headers=headers)
 
 
 @router.post("/captures/{capture_id}/promote")
@@ -6553,76 +7878,35 @@ async def capture_promote(
     background_tasks: BackgroundTasks,
 ):
     service = _get_capture_service(request.app)
-    capture = service.get_capture(capture_id)
-    if capture is None:
-        raise HTTPException(status_code=404, detail="Capture not found")
-    existing_ref = capture.get("attachment_ref")
-    if isinstance(existing_ref, dict) and existing_ref.get("content_hash"):
-        promoted = service.mark_promoted(
+    try:
+        promotion = promote_capture_to_attachment(
+            service,
             capture_id,
-            attachment_ref=existing_ref,
-            memory_refs=list(payload.memory_refs or []),
+            metadata_root=BLOBS_DIR,
+            memory_refs=payload.memory_refs,
+            caption_engine=_configured_image_caption_engine(
+                getattr(request.app.state, "config", None)
+            ),
         )
-        return {"capture": promoted, "attachment": existing_ref}
-    target = service.capture_path(capture_id)
-    if target is None:
-        raise HTTPException(status_code=404, detail="Capture not found")
-    data = target.read_bytes()
-    filename = str(capture.get("filename") or target.name).strip() or target.name
-    content_type = (
-        str(capture.get("content_type") or "image/png").strip() or "image/png"
-    )
-    asset_info = put_asset(
-        data,
-        filename=filename,
-        origin="captured",
-    )
-    content_hash = asset_info["content_hash"]
-    url = f"/api/attachments/{content_hash}/{filename}"
-    indexed_at = _utc_now_compact_iso()
-    uploaded_at = indexed_at
-    _write_attachment_meta(
-        content_hash,
-        {
-            "filename": filename,
-            "content_type": content_type,
-            "size": len(data),
-            "uploaded_at": uploaded_at,
-            "origin": "captured",
-            "relative_path": asset_info.get("relative_path"),
-            "path": asset_info.get("path"),
-            "capture_source": capture.get("capture_source") or capture.get("source"),
-            "capture_id": capture_id,
-            "capture_sensitivity": capture.get("sensitivity"),
-            "caption_status": "pending",
-            "index_status": "indexing",
-        },
-    )
-    background_tasks.add_task(
-        _index_uploaded_attachment,
-        request.app,
-        data,
-        filename=filename,
-        content_type=content_type,
-        url=url,
-        content_hash=content_hash,
-    )
-    attachment_ref = {
-        "content_hash": content_hash,
-        "filename": filename,
-        "content_type": content_type,
-        "size": len(data),
-        "url": url,
-        "uploaded_at": uploaded_at,
-        "origin": "captured",
-        "relative_path": asset_info.get("relative_path"),
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Capture not found") from exc
+    if promotion.index_request is not None:
+        index_request = promotion.index_request
+        background_tasks.add_task(
+            _index_uploaded_attachment,
+            request.app,
+            index_request.data,
+            filename=index_request.filename,
+            content_type=index_request.content_type,
+            url=index_request.url,
+            content_hash=index_request.content_hash,
+            started_at=index_request.started_at,
+            index_generation=index_request.index_generation,
+        )
+    return {
+        "capture": promotion.capture,
+        "attachment": promotion.attachment,
     }
-    promoted = service.mark_promoted(
-        capture_id,
-        attachment_ref=attachment_ref,
-        memory_refs=list(payload.memory_refs or []),
-    )
-    return {"capture": promoted, "attachment": attachment_ref}
 
 
 @router.delete("/captures/{capture_id}")
@@ -6636,26 +7920,157 @@ async def capture_delete(request: Request, capture_id: str):
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: Request, chat_request: ChatRequest):
+    session_name = chat_request.session_id or "default"
+    message_id = chat_request.message_id or str(uuid4())
+    chat_request.message_id = message_id
+    lock = _chat_continue_lock_for(session_name, message_id)
+    async with lock:
+        return await _chat_locked(request, chat_request)
+
+
+async def _chat_locked(request: Request, chat_request: ChatRequest):
     """
     Endpoint for handling chat messages with context support.
     """
+    session_name = chat_request.session_id or "default"
+    message_id = str(chat_request.message_id or "").strip()
+    saved_conversation = conversation_store.load_conversation(session_name)
+    if not isinstance(saved_conversation, list):
+        saved_conversation = []
+    existing_message_ids = {
+        str(entry.get("id") or "").strip()
+        for entry in saved_conversation
+        if isinstance(entry, dict) and str(entry.get("id") or "").strip()
+    }
+    message_id_exists = (
+        message_id in existing_message_ids
+        or f"{message_id}:user" in existing_message_ids
+    )
+    regeneration_history: Optional[List[Dict[str, Any]]] = None
+    regeneration_original_context: Optional[ServiceContext] = None
+    regeneration_old_registry_ids: set[str] = set()
+    regeneration_new_registry_ids: set[str] = set()
+    regeneration_committed = False
+    if message_id_exists and not chat_request.regenerate:
+        raise HTTPException(
+            status_code=409,
+            detail="Message id already exists. Retry the turn with a new message id.",
+        )
+    if chat_request.regenerate:
+        user_message_id = f"{message_id}:user"
+        assistant_index = next(
+            (
+                index
+                for index in range(len(saved_conversation) - 1, -1, -1)
+                if isinstance(saved_conversation[index], dict)
+                and str(saved_conversation[index].get("id") or "").strip() == message_id
+                and str(saved_conversation[index].get("role") or "").strip().lower()
+                in {"ai", "assistant"}
+            ),
+            None,
+        )
+        user_index = next(
+            (
+                index
+                for index in range(len(saved_conversation) - 1, -1, -1)
+                if isinstance(saved_conversation[index], dict)
+                and str(saved_conversation[index].get("id") or "").strip()
+                == user_message_id
+                and str(saved_conversation[index].get("role") or "").strip().lower()
+                == "user"
+            ),
+            None,
+        )
+        latest_pair = bool(
+            user_index is not None
+            and assistant_index is not None
+            and user_index + 1 == assistant_index
+            and assistant_index == len(saved_conversation) - 1
+        )
+        if not latest_pair:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Only the latest saved user and assistant turn can be regenerated. "
+                    "Reload the conversation before retrying."
+                ),
+            )
+        saved_assistant = saved_conversation[assistant_index]
+        unresolved_tools = _unresolved_tool_proposals_for_message(
+            request.app,
+            session_name,
+            message_id,
+            saved_assistant if isinstance(saved_assistant, dict) else None,
+        )
+        if unresolved_tools:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Resolve or deny the pending tool request before regenerating "
+                    "this turn: " + ", ".join(unresolved_tools)
+                ),
+            )
+        regeneration_old_registry_ids = _tool_registry_ids_for_message(
+            request.app,
+            session_name,
+            message_id,
+        )
+        regeneration_history = [
+            entry
+            for entry in saved_conversation[:user_index]
+            if isinstance(entry, dict)
+        ]
+    chat_request.message_id = message_id
     try:
         mode_used = _resolve_request_mode(request, chat_request.mode)
-        session_name = chat_request.session_id or "default"
         session_id = conversation_store.get_or_create_conversation_id(session_name)
-        message_id = chat_request.message_id or str(uuid4())
-        chat_request.message_id = message_id
         # Create or get context (use provided context if present)
         if chat_request.context:
             llm_service.set_context(
                 _context_schema_to_service_context(chat_request.context), session_name
             )
         context = llm_service.get_context(session_name)
+        # A regeneration must not feed the superseded answer (or its user prompt)
+        # back into the model. Rebuild from the saved prefix even when a live
+        # in-memory context already exists for this session.
+        if regeneration_history is not None:
+            regeneration_original_context = ServiceContext(
+                system_prompt=context.system_prompt,
+                messages=copy.deepcopy(list(context.messages)),
+                tools=copy.deepcopy(list(context.tools)),
+                metadata=copy.deepcopy(dict(context.metadata)),
+            )
+            rebuilt_context = ServiceContext(
+                system_prompt=context.system_prompt,
+                messages=[],
+                tools=list(context.tools),
+                metadata=dict(context.metadata),
+            )
+            for entry in regeneration_history:
+                role = entry.get("role")
+                text = _sanitize_context_message_text(
+                    entry.get("text") or entry.get("content")
+                )
+                saved_attachments = (
+                    entry.get("attachments")
+                    if isinstance(entry.get("attachments"), list)
+                    else []
+                )
+                saved_attachments = _enrich_attachment_references(saved_attachments)
+                if not role or (not text and not saved_attachments):
+                    continue
+                meta = entry.get("metadata") or {}
+                meta = dict(meta) if isinstance(meta, dict) else {}
+                if saved_attachments:
+                    meta.setdefault("attachments", saved_attachments)
+                if entry.get("rag"):
+                    meta.setdefault("rag", {"matches": entry["rag"]})
+                rebuilt_context.add_message(role, text or "", metadata=meta)
+            context = rebuilt_context
         # Rehydrate context from persisted conversation if empty
-        if not context.messages:
+        elif not context.messages:
             try:
-                history = conversation_store.load_conversation(session_name)
-                for entry in history:
+                for entry in saved_conversation:
                     role = entry.get("role")
                     text = _sanitize_context_message_text(
                         entry.get("text") or entry.get("content")
@@ -6666,6 +8081,7 @@ async def chat(request: Request, chat_request: ChatRequest):
                         and isinstance(entry.get("attachments"), list)
                         else []
                     )
+                    saved_attachments = _enrich_attachment_references(saved_attachments)
                     if not role or (not text and not saved_attachments):
                         continue
                     meta = entry.get("metadata") or {}
@@ -6679,9 +8095,12 @@ async def chat(request: Request, chat_request: ChatRequest):
             except Exception:
                 pass
 
-        incoming_attachments = [
-            att.model_dump(exclude_none=True) for att in chat_request.attachments or []
-        ]
+        incoming_attachments = _enrich_attachment_references(
+            [
+                att.model_dump(exclude_none=True)
+                for att in chat_request.attachments or []
+            ]
+        )
         vision_workflow = _normalize_vision_workflow(chat_request.vision_workflow)
         (
             effective_attachments,
@@ -6731,11 +8150,20 @@ async def chat(request: Request, chat_request: ChatRequest):
             "timestamp": now_ts,
             "iso_timestamp": iso_timestamp,
         }
+        turn_tool_filter_snapshot = _capture_turn_tool_filter_snapshot()
         workflow_config = _workflow_request_config(
             chat_request.workflow,
             chat_request.modules,
+            settings_payload=turn_tool_filter_snapshot.settings_payload,
+            module_catalog=turn_tool_filter_snapshot.module_catalog,
         )
-        capture_policy = _capture_policy_settings()
+        turn_tool_filter_snapshot = _turn_tool_filter_snapshot_with_modules(
+            turn_tool_filter_snapshot,
+            workflow_config["modules"],
+        )
+        capture_policy = _capture_policy_settings(
+            turn_tool_filter_snapshot.settings_payload
+        )
         metadata["workflow"] = {
             "name": workflow_config["name"],
             "modules": list(workflow_config["modules"]),
@@ -6787,7 +8215,7 @@ async def chat(request: Request, chat_request: ChatRequest):
             return candidate
 
         rag_top_k = _coerce_int(cfg.get("rag_chat_top_k"), 3, min_value=0)
-        rag_clip_top_k = _coerce_int(cfg.get("rag_chat_clip_top_k"), 0, min_value=0)
+        rag_clip_top_k = _coerce_int(cfg.get("rag_chat_clip_top_k"), 2, min_value=0)
         rag_match_chars = _coerce_int(
             cfg.get("rag_chat_match_chars"), 1200, min_value=0
         )
@@ -6844,6 +8272,114 @@ async def chat(request: Request, chat_request: ChatRequest):
             if any(_is_image_attachment_payload(item) for item in attachments or []):
                 return True
             return _message_mentions_visual_context(message)
+
+        def _is_recalled_image_metadata(meta: Dict[str, Any]) -> bool:
+            if not isinstance(meta, dict):
+                return False
+            content_type = str(
+                meta.get("content_type") or meta.get("type") or ""
+            ).lower()
+            return bool(
+                content_type.startswith("image/")
+                or str(meta.get("retrieved_via") or "").lower() == "clip"
+                or str(meta.get("kind") or "").lower()
+                in {"image", "image_caption", "image_embedding"}
+                or str(meta.get("source") or "").lower().startswith("image:")
+            )
+
+        def _enrich_recalled_image_metadata(
+            meta: Dict[str, Any],
+        ) -> Dict[str, Any]:
+            candidate = dict(meta) if isinstance(meta, dict) else {}
+            if not _is_recalled_image_metadata(candidate):
+                return candidate
+            supplied_hash = str(candidate.get("content_hash") or "").strip()
+            api_hash_match = re.search(
+                r"/api/attachments/([a-f0-9]{64})(?:/|$)",
+                str(candidate.get("url") or ""),
+            )
+            has_durable_hint = bool(supplied_hash or api_hash_match)
+            canonical = _enrich_attachment_reference(candidate)
+            if canonical.get("_canonical_attachment_resolved") is True:
+                # Retrieval metadata is an internal record, not raw client input.
+                # Preserve its source/ranking fields while replacing all durable
+                # storage claims with the current canonical descriptor.
+                for key in (
+                    "content_hash",
+                    "filename",
+                    "url",
+                    "relative_path",
+                    "source_url",
+                    "source_url_recorded_at",
+                    "origin",
+                    "path",
+                ):
+                    candidate.pop(key, None)
+                candidate.update(canonical)
+                return candidate
+            if has_durable_hint:
+                # A stale or forged storage reference must not become a model/UI
+                # link merely because it was present in a retrieval backend.
+                for key in (
+                    "content_hash",
+                    "url",
+                    "relative_path",
+                    "source_url",
+                    "source_url_recorded_at",
+                    "path",
+                ):
+                    candidate.pop(key, None)
+            return candidate
+
+        def _safe_recalled_source_url(value: Any) -> str:
+            """Keep passive provenance out of prompts when it may carry secrets."""
+
+            try:
+                source_url = _sanitize_attachment_source_url(value)
+            except ValueError:
+                return ""
+            if not source_url:
+                return ""
+            parsed = urlparse(source_url)
+            if parsed.username or parsed.password:
+                return ""
+            if re.search(
+                r"(?:^|&)(?:access[_-]?token|api[_-]?key|auth|authorization|"
+                r"credential|password|secret|signature|sig|token)=",
+                parsed.query,
+                flags=re.IGNORECASE,
+            ):
+                return ""
+            return source_url
+
+        def _recalled_image_prompt_reference(meta: Dict[str, Any]) -> str:
+            enriched = _enrich_recalled_image_metadata(meta)
+            if not _is_recalled_image_metadata(enriched):
+                return ""
+            content_hash = str(enriched.get("content_hash") or "").lower()
+            if not re.fullmatch(r"[a-f0-9]{64}", content_hash):
+                return ""
+
+            values: Dict[str, str] = {"content_hash": content_hash}
+            relative_path = str(enriched.get("relative_path") or "").strip()
+            if relative_path:
+                values["relative_path"] = relative_path
+
+            api_url = str(enriched.get("url") or "").strip()
+            expected_prefix = f"/api/attachments/{content_hash}/"
+            if not api_url.startswith(expected_prefix):
+                filename = Path(str(enriched.get("filename") or content_hash)).name
+                api_url = expected_prefix + quote(filename)
+            values["float_api_url"] = api_url
+
+            source_url = _safe_recalled_source_url(enriched.get("source_url"))
+            if source_url:
+                values["source_url_provenance_log"] = source_url
+            payload = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+            return (
+                "[recalled image attachment; source_url_provenance_log is "
+                f"recorded only, may be stale, and is never fetched: {payload}]"
+            )
 
         retrieval_request_event = None
         rag_progress_operation_id = ""
@@ -6984,7 +8520,7 @@ async def chat(request: Request, chat_request: ChatRequest):
                     return cloned
 
                 workspace_recall_profiles = load_workspace_state(
-                    user_settings.load_settings()
+                    dict(turn_tool_filter_snapshot.settings_payload)
                 )[0]
 
                 def _workspace_recall_candidates(
@@ -7249,7 +8785,6 @@ async def chat(request: Request, chat_request: ChatRequest):
                     and str(getattr(clip_service, "embedding_model", ""))
                     .lower()
                     .startswith("clip:")
-                    and getattr(clip_service, "_embedding_encoder", None) is not None
                 )
                 if clip_ready:
                     raw_clip = (
@@ -7289,10 +8824,16 @@ async def chat(request: Request, chat_request: ChatRequest):
                             "content_hash",
                             "content_type",
                             "url",
+                            "relative_path",
+                            "display_name",
+                            "folder",
+                            "source_url",
+                            "source_url_recorded_at",
                         ):
                             if key in meta and key not in merged_meta:
                                 merged_meta[key] = meta[key]
                         merged_meta["retrieved_via"] = "clip"
+                        merged_meta = _enrich_recalled_image_metadata(merged_meta)
                         if _blocked(merged_meta):
                             continue
                         clip_matches.append(
@@ -7385,6 +8926,8 @@ async def chat(request: Request, chat_request: ChatRequest):
                         if isinstance(match.get("metadata"), dict)
                         else {}
                     )
+                    meta = _enrich_recalled_image_metadata(meta)
+                    match["metadata"] = meta
                     if _blocked(meta):
                         continue
                     match_id = str(match.get("id") or "")
@@ -7544,6 +9087,7 @@ async def chat(request: Request, chat_request: ChatRequest):
                     meta = {}
                 else:
                     meta = dict(meta)
+                meta = _enrich_recalled_image_metadata(meta)
                 meta = _sanitize_knowledge_metadata_for_api(meta)
                 source = _sanitize_knowledge_source_for_api(
                     (meta.get("source") or match.get("source") or f"doc-{idx}"),
@@ -7571,7 +9115,12 @@ async def chat(request: Request, chat_request: ChatRequest):
                         "metadata": meta,
                     }
                 )
-                rag_lines.append(f"{idx}. {snippet}")
+                image_reference = _recalled_image_prompt_reference(meta)
+                rag_lines.append(
+                    f"{idx}. {image_reference} {snippet}"
+                    if image_reference
+                    else f"{idx}. {snippet}"
+                )
             rag_prompt_text = (
                 prompt_header
                 + _truncate_block("\n".join(rag_lines), rag_prompt_max_chars)
@@ -7618,22 +9167,33 @@ async def chat(request: Request, chat_request: ChatRequest):
             user_entry["attachments"] = incoming_attachments
         if rag_metadata:
             user_entry["rag"] = rag_metadata
-        _append_conversation_entry(session_name, user_entry)
-        try:
-            log_timeline_message(
-                session_id=session_name,
-                message_id=user_entry["id"],
-                role="user",
-                text=chat_request.message,
-                source="chat",
-                metadata={
-                    "mode": mode_used,
-                    "model_requested": chat_request.model,
-                    "vision_workflow": vision_workflow,
-                },
-            )
-        except Exception:
-            pass
+        if regeneration_history is None:
+            _append_conversation_entry(session_name, user_entry)
+        user_timeline_logged = False
+
+        def _log_user_timeline_after_persistence() -> None:
+            nonlocal user_timeline_logged
+            if user_timeline_logged:
+                return
+            try:
+                log_timeline_message(
+                    session_id=session_name,
+                    message_id=user_entry["id"],
+                    role="user",
+                    text=chat_request.message,
+                    source="chat",
+                    metadata={
+                        "mode": mode_used,
+                        "model_requested": chat_request.model,
+                        "vision_workflow": vision_workflow,
+                    },
+                )
+                user_timeline_logged = True
+            except Exception:
+                pass
+
+        if regeneration_history is None:
+            _log_user_timeline_after_persistence()
         assistant_placeholder = {
             "id": message_id,
             "role": "ai",
@@ -7647,15 +9207,15 @@ async def chat(request: Request, chat_request: ChatRequest):
             "timestamp": now_ts,
             "iso_timestamp": iso_timestamp,
         }
-        _append_conversation_entry(session_name, assistant_placeholder)
+        if regeneration_history is None:
+            _append_conversation_entry(session_name, assistant_placeholder)
 
-        settings_payload = user_settings.load_settings()
         tools_disabled_for_turn = _turn_explicitly_disallows_tools(chat_request.message)
         if tools_disabled_for_turn:
             metadata["tools_disabled_for_turn"] = True
         privacy_route = _privacy_route_check_for_message(
             chat_request.message,
-            settings_payload=settings_payload,
+            settings_payload=turn_tool_filter_snapshot.settings_payload,
             mode_used=mode_used,
             requested_model=chat_request.model,
             config_payload=request.app.state.config,
@@ -7669,7 +9229,21 @@ async def chat(request: Request, chat_request: ChatRequest):
                 model=chat_request.model,
                 mode=mode_used,
                 default_agent=message_id or session_name,
+                force_tool_review=chat_request.force_tool_review,
+                proposal_origin="privacy_preflight",
+                ignore_existing_signatures=regeneration_history is not None,
+                persist_events=regeneration_history is None,
+                defer_auto_decisions=regeneration_history is not None,
             )
+            if regeneration_history is not None:
+                regeneration_new_registry_ids.update(
+                    _tool_registry_ids_for_message(
+                        request.app,
+                        session_name,
+                        message_id,
+                    )
+                    - regeneration_old_registry_ids
+                )
             if tools_used_response:
                 text = _pending_tool_placeholder_text(tools_used_response)
                 metadata_update = dict(assistant_placeholder.get("metadata") or {})
@@ -7690,18 +9264,99 @@ async def chat(request: Request, chat_request: ChatRequest):
                         "mode": mode_used,
                     }
                 )
+                privacy_modules = _workflow_modules_for_turn(
+                    workflow_config["modules"],
+                    allow_computer_capture=False,
+                    module_catalog=turn_tool_filter_snapshot.module_catalog,
+                )
+                if tools_disabled_for_turn:
+                    privacy_modules = []
+                privacy_tool_definitions = (
+                    []
+                    if tools_disabled_for_turn
+                    else _merge_prompt_tool_definitions(
+                        _registered_prompt_tool_definitions(
+                            request.app,
+                            allow_computer_capture=False,
+                            tool_filter_snapshot=turn_tool_filter_snapshot,
+                        ),
+                        _filter_turn_tool_definitions(
+                            context.tools,
+                            allow_computer_capture=False,
+                            tool_filter_snapshot=turn_tool_filter_snapshot,
+                        ),
+                    )
+                )
+                metadata_update["capability_scope"] = build_capability_scope(
+                    workflow=workflow_config["name"],
+                    channel=WORKFLOW_TEXT,
+                    modules=privacy_modules,
+                    tool_definitions=privacy_tool_definitions,
+                )
+                metadata_update["workflow"] = {
+                    "name": workflow_config["name"],
+                    "modules": privacy_modules,
+                }
                 _append_user_turn_to_context()
                 llm_service.set_context(context, session_name)
-                _update_conversation_entry(
-                    session_name,
-                    message_id,
-                    {
+                if regeneration_history is not None:
+                    assistant_entry = {
+                        **assistant_placeholder,
                         "text": text,
                         "metadata": metadata_update,
                         "updated_at": time.time(),
                         "iso_timestamp": iso_timestamp,
-                    },
-                )
+                    }
+                    registered_entries = _registered_tool_conversation_entries(
+                        request.app,
+                        tools_used_response,
+                        session_id=session_name,
+                        message_id=message_id,
+                    )
+                    if registered_entries:
+                        assistant_entry["tools"] = registered_entries
+                    regeneration_committed = _replace_latest_conversation_pair(
+                        session_name,
+                        message_id,
+                        user_entry,
+                        assistant_entry,
+                    )
+                    if not regeneration_committed:
+                        _discard_tool_registry_records(
+                            request.app, regeneration_new_registry_ids
+                        )
+                        if regeneration_original_context is not None:
+                            llm_service.set_context(
+                                regeneration_original_context, session_name
+                            )
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "The conversation changed while this turn was being "
+                                "regenerated. Reload before retrying."
+                            ),
+                        )
+                    _discard_tool_registry_records(
+                        request.app, regeneration_old_registry_ids
+                    )
+                    _log_user_timeline_after_persistence()
+                    tools_used_response = await _resolve_deferred_auto_proposals(
+                        request,
+                        tools_used_response,
+                        session_id=session_name,
+                        message_id=message_id,
+                    )
+                else:
+                    _update_conversation_entry(
+                        session_name,
+                        message_id,
+                        {
+                            "text": text,
+                            "metadata": metadata_update,
+                            "updated_at": time.time(),
+                            "iso_timestamp": iso_timestamp,
+                        },
+                    )
                 return ChatResponse(
                     message=text,
                     thought="",
@@ -7743,7 +9398,10 @@ async def chat(request: Request, chat_request: ChatRequest):
         active_workflow_modules = _workflow_modules_for_turn(
             workflow_config["modules"],
             allow_computer_capture=computer_tools_allowed,
+            module_catalog=turn_tool_filter_snapshot.module_catalog,
         )
+        if tools_disabled_for_turn:
+            active_workflow_modules = []
         response_format = _resolve_route_response_format(
             chat_request.response_format,
             harmony_enabled=_config_allows_harmony_for_model(
@@ -7766,6 +9424,7 @@ async def chat(request: Request, chat_request: ChatRequest):
                 else _filter_turn_tool_definitions(
                     context.tools,
                     allow_computer_capture=computer_tools_allowed,
+                    tool_filter_snapshot=turn_tool_filter_snapshot,
                 )
             ),
             metadata=dict(context.metadata),
@@ -7777,6 +9436,7 @@ async def chat(request: Request, chat_request: ChatRequest):
                 _registered_prompt_tool_definitions(
                     request.app,
                     allow_computer_capture=computer_tools_allowed,
+                    tool_filter_snapshot=turn_tool_filter_snapshot,
                 ),
                 generation_ctx.tools,
             )
@@ -7796,7 +9456,13 @@ async def chat(request: Request, chat_request: ChatRequest):
             _add_turn_system_message(
                 generation_ctx,
                 "tool_approval",
-                _turn_tool_approval_note(_approval_level_setting()),
+                _turn_tool_approval_note(
+                    "all"
+                    if chat_request.force_tool_review
+                    else _approval_level_setting(
+                        turn_tool_filter_snapshot.settings_payload
+                    )
+                ),
                 metadata={"tool_approval": True},
             )
         if tools_disabled_for_turn:
@@ -7814,15 +9480,40 @@ async def chat(request: Request, chat_request: ChatRequest):
                     workflow_config["name"],
                     modules=active_workflow_modules,
                     include_default_modules=False,
+                    module_catalog=turn_tool_filter_snapshot.module_catalog,
                 ),
                 metadata={"workflow": workflow_config["name"]},
+            )
+        if image_attachments and not tools_disabled_for_turn:
+            _add_turn_system_message(
+                generation_ctx,
+                "image_memory_provenance",
+                (
+                    "Image attachment records distinguish storage from provenance: "
+                    "content_hash is the durable cross-device attachment and sync "
+                    "identifier; relative_path, when present, is the current managed "
+                    "deployment-relative storage location; url is a reconstructable API "
+                    "retrieval route, not the durable saved location; source_url, when "
+                    "present, is passive recorded web provenance and may become stale. "
+                    "If this turn warrants durable image memory, create at most one "
+                    "canonical `remember` entry per image. Include its exact content_hash, "
+                    "relative_path when available, and url in the structured value, and "
+                    "include source_url and source_url_recorded_at only when supplied, "
+                    "do not create alias keys for the same image."
+                ),
+                metadata={
+                    "image_memory_provenance": True,
+                    "image_count": len(image_attachments),
+                },
             )
         runtime_identity_note = _runtime_model_identity_note(
             model=effective_model,
             mode=effective_mode,
-            provider=provider_target.get("provider")
-            if isinstance(provider_target, dict)
-            else None,
+            provider=(
+                provider_target.get("provider")
+                if isinstance(provider_target, dict)
+                else None
+            ),
         )
         if runtime_identity_note:
             _add_turn_system_message(
@@ -7926,10 +9617,48 @@ async def chat(request: Request, chat_request: ChatRequest):
             prompt_tool_definitions,
             generation_ctx.tools,
         )
-        generation_ctx.system_prompt = _with_available_tools_prompt(
-            generation_ctx.system_prompt,
-            prompt_tool_definitions,
+        capability_scope = build_capability_scope(
+            workflow=workflow_config["name"],
+            channel=WORKFLOW_TEXT,
+            modules=active_workflow_modules,
+            tool_definitions=prompt_tool_definitions,
         )
+        generation_ctx.metadata["capability_scope"] = capability_scope
+        if regeneration_history is None:
+            _update_conversation_entry(
+                session_name,
+                message_id,
+                {
+                    "metadata": {
+                        "status": "pending",
+                        "workflow": {
+                            "name": workflow_config["name"],
+                            "modules": list(active_workflow_modules),
+                        },
+                        "capability_scope": capability_scope,
+                    }
+                },
+            )
+        provider_tool_definitions: list[Any] = []
+        native_tool_name_map: dict[str, str] = {}
+        if prompt_tool_definitions and _runtime_uses_native_tool_calls(
+            request.app.state.config,
+            mode=effective_mode,
+            provider_target=provider_target,
+        ):
+            (
+                provider_tool_definitions,
+                native_tool_name_map,
+            ) = _provider_native_tool_definitions(prompt_tool_definitions)
+        if provider_tool_definitions:
+            generation_ctx.system_prompt = _without_inline_tool_protocol_prompt(
+                generation_ctx.system_prompt
+            )
+        else:
+            generation_ctx.system_prompt = _with_available_tools_prompt(
+                generation_ctx.system_prompt,
+                prompt_tool_definitions,
+            )
         if rag_prompt_text:
             generation_ctx.add_message(
                 "system",
@@ -8057,12 +9786,18 @@ async def chat(request: Request, chat_request: ChatRequest):
                 return
 
             if event_type in {"tool_call_delta", "stream_status"}:
+                console_event = dict(event)
+                if event_type == "tool_call_delta":
+                    provider_name = str(console_event.get("name") or "").strip()
+                    canonical_name = native_tool_name_map.get(provider_name)
+                    if canonical_name:
+                        console_event["name"] = canonical_name
                 try:
                     asyncio.run_coroutine_threadsafe(
                         publish_console_event(
                             request.app,
                             {
-                                **event,
+                                **console_event,
                                 "session_id": session_id,
                                 "message_id": message_id,
                             },
@@ -8093,12 +9828,8 @@ async def chat(request: Request, chat_request: ChatRequest):
                 )
                 reasoning = generate_kwargs.get("reasoning")
             output_token_limit = generate_kwargs.get("output_token_limit")
-            if prompt_tool_definitions and _server_uses_native_tool_calls(
-                request.app.state.config,
-                mode=effective_mode,
-                provider_target=provider_target,
-            ):
-                generate_kwargs["native_tool_definitions"] = prompt_tool_definitions
+            if provider_tool_definitions:
+                generate_kwargs["native_tool_definitions"] = provider_tool_definitions
             if isinstance(provider_target, dict):
                 server_url = str(provider_target.get("base_url") or "").strip()
                 if server_url:
@@ -8114,15 +9845,6 @@ async def chat(request: Request, chat_request: ChatRequest):
                     workflow_name=workflow_config["name"],
                 )
                 generate_kwargs["capture_raw_api"] = True
-                if not tools_disabled_for_turn:
-                    generate_kwargs["tool_executor"] = _build_provider_tool_executor(
-                        request.app,
-                        session_id=session_name,
-                        message_id=message_id,
-                        workflow_name=workflow_config["name"],
-                        model=effective_model,
-                        mode=effective_mode,
-                    )
             response = await asyncio.to_thread(
                 llm_service.generate,
                 chat_request.message,
@@ -8136,6 +9858,7 @@ async def chat(request: Request, chat_request: ChatRequest):
                 stream_message_id=message_id,
                 **generate_kwargs,
             )
+            _restore_provider_tool_names(response, native_tool_name_map)
             _apply_reasoning_response_metadata(
                 response,
                 reasoning,
@@ -8236,15 +9959,21 @@ async def chat(request: Request, chat_request: ChatRequest):
             llm_service.set_context(context, session_name)
         except Exception as exc:
             _append_user_turn_to_context()
-            _update_conversation_entry(
-                session_name,
-                message_id,
-                {
-                    "metadata": {"status": "error", "error": str(exc)},
-                    "updated_at": time.time(),
-                },
-            )
-            llm_service.set_context(context, session_name)
+            if regeneration_history is None:
+                _update_conversation_entry(
+                    session_name,
+                    message_id,
+                    {
+                        "metadata": {"status": "error", "error": str(exc)},
+                        "updated_at": time.time(),
+                    },
+                )
+                llm_service.set_context(context, session_name)
+            elif regeneration_original_context is not None:
+                _discard_tool_registry_records(
+                    request.app, regeneration_new_registry_ids
+                )
+                llm_service.set_context(regeneration_original_context, session_name)
             raise
         finally:
             llm_service.mode = previous_service_mode
@@ -8289,13 +10018,11 @@ async def chat(request: Request, chat_request: ChatRequest):
             )
 
         metadata_update = dict(response.get("metadata") or {})
-        metadata_update.setdefault(
-            "workflow",
-            {
-                "name": workflow_config["name"],
-                "modules": list(active_workflow_modules),
-            },
-        )
+        metadata_update["workflow"] = {
+            "name": workflow_config["name"],
+            "modules": list(active_workflow_modules),
+        }
+        metadata_update["capability_scope"] = capability_scope
         if computer_session:
             metadata_update["computer"] = {
                 "enabled": True,
@@ -8307,9 +10034,11 @@ async def chat(request: Request, chat_request: ChatRequest):
             metadata_update.setdefault("server_url", provider_target.get("base_url"))
             metadata_update.setdefault(
                 "provider_runtime",
-                provider_target.get("runtime")
-                if isinstance(provider_target.get("runtime"), dict)
-                else {},
+                (
+                    provider_target.get("runtime")
+                    if isinstance(provider_target.get("runtime"), dict)
+                    else {}
+                ),
             )
         status_value = _response_status_value(metadata_update)
         metadata_update["status"] = status_value
@@ -8347,25 +10076,31 @@ async def chat(request: Request, chat_request: ChatRequest):
         mismatch_error = _apply_model_mismatch_error(
             metadata_update,
             mode=mode_used,
-            provider=provider_target.get("provider")
-            if isinstance(provider_target, dict)
-            else None,
+            provider=(
+                provider_target.get("provider")
+                if isinstance(provider_target, dict)
+                else None
+            ),
         )
         if mismatch_error:
             text = mismatch_error
             response["text"] = text
         metadata_update.setdefault("updated_at", trace_time)
         usage_stats = _normalize_usage_counts(
-            metadata_update.get("usage")
-            if isinstance(metadata_update.get("usage"), dict)
-            else None,
+            (
+                metadata_update.get("usage")
+                if isinstance(metadata_update.get("usage"), dict)
+                else None
+            ),
             chat_request.message or "",
             text,
         )
         merged_usage = _merge_usage(
-            metadata_update.get("usage")
-            if isinstance(metadata_update.get("usage"), dict)
-            else None,
+            (
+                metadata_update.get("usage")
+                if isinstance(metadata_update.get("usage"), dict)
+                else None
+            ),
             usage_stats,
         )
         if merged_usage is not None:
@@ -8397,18 +10132,19 @@ async def chat(request: Request, chat_request: ChatRequest):
             .isoformat()
             .replace("+00:00", "Z")
         )
-        _update_conversation_entry(
-            session_name,
-            message_id,
-            {
-                "text": text,
-                "thought": response.get("thought", ""),
-                "thought_trace": conversation_trace,
-                "metadata": metadata_update,
-                "updated_at": trace_time,
-                "iso_timestamp": iso_response_ts,
-            },
-        )
+        if regeneration_history is None:
+            _update_conversation_entry(
+                session_name,
+                message_id,
+                {
+                    "text": text,
+                    "thought": response.get("thought", ""),
+                    "thought_trace": conversation_trace,
+                    "metadata": metadata_update,
+                    "updated_at": trace_time,
+                    "iso_timestamp": iso_response_ts,
+                },
+            )
         if conversation_trace and not response.get("thought_trace"):
             response["thought_trace"] = conversation_trace
         response["metadata"] = metadata_update
@@ -8450,9 +10186,11 @@ async def chat(request: Request, chat_request: ChatRequest):
             tool_payloads = response.get("tools_used") or []
             if computer_session:
                 tool_payloads = [
-                    _inject_session_into_tool_args(tool, computer_session.get("id"))
-                    if isinstance(tool, dict)
-                    else tool
+                    (
+                        _inject_session_into_tool_args(tool, computer_session.get("id"))
+                        if isinstance(tool, dict)
+                        else tool
+                    )
                     for tool in tool_payloads
                 ]
             response["tools_used"] = await _register_tool_proposals(
@@ -8463,14 +10201,119 @@ async def chat(request: Request, chat_request: ChatRequest):
                 model=chat_request.model,
                 mode=mode_used,
                 default_agent=msg_id or session_id,
+                force_tool_review=chat_request.force_tool_review,
+                allowed_tool_names=capability_scope.get("tool_names") or [],
+                ignore_existing_signatures=regeneration_history is not None,
+                persist_events=regeneration_history is None,
+                defer_auto_decisions=regeneration_history is not None,
             )
-        except Exception:
-            pass
+            if regeneration_history is not None:
+                regeneration_new_registry_ids.update(
+                    _tool_registry_ids_for_message(
+                        request.app,
+                        session_name,
+                        message_id,
+                    )
+                    - regeneration_old_registry_ids
+                )
+        except Exception as exc:
+            if regeneration_history is not None:
+                regeneration_new_registry_ids.update(
+                    _tool_registry_ids_for_message(
+                        request.app,
+                        session_name,
+                        message_id,
+                    )
+                    - regeneration_old_registry_ids
+                )
+                _discard_tool_registry_records(
+                    request.app, regeneration_new_registry_ids
+                )
+                response["tools_used"] = []
+                failed_metadata = dict(response.get("metadata") or {})
+                failed_metadata.update(
+                    {
+                        "status": "error",
+                        "error": f"Tool proposal registration failed: {exc}",
+                        "category": "tool_registration",
+                    }
+                )
+                response["metadata"] = failed_metadata
+                response["text"] = (
+                    "I couldn't safely register the requested tool. "
+                    "The previous answer was kept."
+                )
         tools_used_response = (
             response.get("tools_used")
             if isinstance(response.get("tools_used"), list)
             else []
         )
+        if regeneration_history is not None and tools_used_response:
+            registry = getattr(request.app.state, "pending_tools", None)
+            has_deferred_auto_proposal = any(
+                isinstance(tool, dict)
+                and isinstance(registry, dict)
+                and isinstance(registry.get(str(tool.get("id") or "")), dict)
+                and registry[str(tool.get("id") or "")].get("server_auto_decide")
+                for tool in tools_used_response
+            )
+            if has_deferred_auto_proposal:
+                provisional_metadata = (
+                    dict(response.get("metadata"))
+                    if isinstance(response.get("metadata"), dict)
+                    else {}
+                )
+                provisional_metadata.update(
+                    {"status": "pending", "tool_response_pending": True}
+                )
+                provisional_entry = {
+                    **assistant_placeholder,
+                    "text": str(response.get("text") or "")
+                    or _pending_tool_placeholder_text(tools_used_response),
+                    "thought": response.get("thought", ""),
+                    "thought_trace": conversation_trace,
+                    "metadata": provisional_metadata,
+                    "updated_at": time.time(),
+                    "iso_timestamp": iso_response_ts,
+                    "tools": _registered_tool_conversation_entries(
+                        request.app,
+                        tools_used_response,
+                        session_id=session_name,
+                        message_id=message_id,
+                    ),
+                }
+                regeneration_committed = _replace_latest_conversation_pair(
+                    session_name,
+                    message_id,
+                    user_entry,
+                    provisional_entry,
+                )
+                if not regeneration_committed:
+                    _discard_tool_registry_records(
+                        request.app, regeneration_new_registry_ids
+                    )
+                    if regeneration_original_context is not None:
+                        llm_service.set_context(
+                            regeneration_original_context, session_name
+                        )
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "The conversation changed while this turn was being "
+                            "regenerated. Reload before retrying."
+                        ),
+                    )
+                _discard_tool_registry_records(
+                    request.app, regeneration_old_registry_ids
+                )
+                _log_user_timeline_after_persistence()
+                tools_used_response = await _resolve_deferred_auto_proposals(
+                    request,
+                    tools_used_response,
+                    session_id=session_name,
+                    message_id=message_id,
+                )
+                response["tools_used"] = tools_used_response
         if tools_used_response and _tools_require_resolution(tools_used_response):
             text = _pending_tool_placeholder_text(tools_used_response)
             response["text"] = text
@@ -8482,38 +10325,140 @@ async def chat(request: Request, chat_request: ChatRequest):
         elif tools_used_response:
             metadata = response.get("metadata")
             metadata_update = dict(metadata) if isinstance(metadata, dict) else {}
-            if _inline_tools_need_result_continuation(
+            inline_result_continuation = _inline_tools_need_result_continuation(
                 tools_used_response, metadata_update
-            ):
+            )
+            tool_result_continuation = bool(
+                inline_result_continuation
+                or _resolved_tools_need_result_continuation(
+                    tools_used_response, response.get("text")
+                )
+            )
+            if tool_result_continuation:
                 metadata_update["status"] = "pending"
                 metadata_update["tool_response_pending"] = True
-                metadata_update["inline_tool_continuation_pending"] = True
+                metadata_update["tool_result_continuation_pending"] = True
+                if inline_result_continuation:
+                    metadata_update["inline_tool_continuation_pending"] = True
+                else:
+                    metadata_update.pop("inline_tool_continuation_pending", None)
             else:
                 metadata_update.pop("tool_response_pending", None)
                 metadata_update.pop("inline_tool_continuation_pending", None)
+                metadata_update.pop("tool_result_continuation_pending", None)
             response["metadata"] = metadata_update
             text = response.get("text") or ""
             if not text:
                 text = _resolved_tool_summary_text(tools_used_response)
                 response["text"] = text
-            elif metadata_update.get("inline_tool_continuation_pending"):
+            elif tool_result_continuation:
                 text = _resolved_tool_summary_text(tools_used_response)
                 response["text"] = text
         else:
             text = response.get("text") or text
 
-        _update_conversation_entry(
-            session_name,
-            message_id,
-            {
-                "text": response.get("text") or text,
-                "metadata": response.get("metadata")
+        if regeneration_history is not None:
+            final_metadata = (
+                dict(response.get("metadata"))
                 if isinstance(response.get("metadata"), dict)
-                else {},
-                "updated_at": time.time(),
-                "iso_timestamp": iso_response_ts,
-            },
-        )
+                else {}
+            )
+            final_text = str(response.get("text") or text or "")
+            regeneration_usable = bool(
+                not final_metadata.get("error")
+                and not final_metadata.get("empty_response")
+                and (final_text.strip() or tools_used_response)
+            )
+            if not regeneration_usable:
+                _discard_tool_registry_records(
+                    request.app, regeneration_new_registry_ids
+                )
+                if regeneration_original_context is not None:
+                    llm_service.set_context(regeneration_original_context, session_name)
+                    pydantic_ctx = ContextSchema(
+                        **regeneration_original_context.to_dict()
+                    )
+                else:
+                    pydantic_ctx = ContextSchema(**context.to_dict())
+                return ChatResponse(
+                    message=final_text,
+                    thought=response.get("thought", "") or "",
+                    tools_used=[],
+                    metadata=final_metadata,
+                    context=pydantic_ctx,
+                )
+
+            if regeneration_committed:
+                _update_conversation_entry(
+                    session_name,
+                    message_id,
+                    {
+                        "text": final_text,
+                        "thought": response.get("thought", ""),
+                        "thought_trace": conversation_trace,
+                        "metadata": final_metadata,
+                        "updated_at": time.time(),
+                        "iso_timestamp": iso_response_ts,
+                    },
+                )
+            else:
+                assistant_entry = {
+                    **assistant_placeholder,
+                    "text": final_text,
+                    "thought": response.get("thought", ""),
+                    "thought_trace": conversation_trace,
+                    "metadata": final_metadata,
+                    "updated_at": time.time(),
+                    "iso_timestamp": iso_response_ts,
+                }
+                registered_entries = _registered_tool_conversation_entries(
+                    request.app,
+                    tools_used_response,
+                    session_id=session_name,
+                    message_id=message_id,
+                )
+                if registered_entries:
+                    assistant_entry["tools"] = registered_entries
+                regeneration_committed = _replace_latest_conversation_pair(
+                    session_name,
+                    message_id,
+                    user_entry,
+                    assistant_entry,
+                )
+                if not regeneration_committed:
+                    _discard_tool_registry_records(
+                        request.app, regeneration_new_registry_ids
+                    )
+                    if regeneration_original_context is not None:
+                        llm_service.set_context(
+                            regeneration_original_context, session_name
+                        )
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "The conversation changed while this turn was being "
+                            "regenerated. Reload before retrying."
+                        ),
+                    )
+                _discard_tool_registry_records(
+                    request.app, regeneration_old_registry_ids
+                )
+                _log_user_timeline_after_persistence()
+        else:
+            _update_conversation_entry(
+                session_name,
+                message_id,
+                {
+                    "text": response.get("text") or text,
+                    "metadata": (
+                        response.get("metadata")
+                        if isinstance(response.get("metadata"), dict)
+                        else {}
+                    ),
+                    "updated_at": time.time(),
+                    "iso_timestamp": iso_response_ts,
+                },
+            )
 
         for task in response.get("tasks", []) or []:
             await request.app.state.pending_tasks.put(task)
@@ -8580,15 +10525,24 @@ async def chat(request: Request, chat_request: ChatRequest):
             context=pydantic_ctx,
         )
     except HTTPException as exc:
-        _mark_conversation_message_error_if_pending(
-            locals().get("session_name"),
-            locals().get("message_id"),
-            detail=getattr(exc, "detail", exc),
-            status_code=getattr(exc, "status_code", None),
-            category="http_exception",
-        )
+        if regeneration_history is not None and not regeneration_committed:
+            _discard_tool_registry_records(request.app, regeneration_new_registry_ids)
+            if regeneration_original_context is not None:
+                llm_service.set_context(regeneration_original_context, session_name)
+        else:
+            _mark_conversation_message_error_if_pending(
+                locals().get("session_name"),
+                locals().get("message_id"),
+                detail=getattr(exc, "detail", exc),
+                status_code=getattr(exc, "status_code", None),
+                category="http_exception",
+            )
         raise
     except Exception as e:
+        if regeneration_history is not None and not regeneration_committed:
+            _discard_tool_registry_records(request.app, regeneration_new_registry_ids)
+            if regeneration_original_context is not None:
+                llm_service.set_context(regeneration_original_context, session_name)
         logger.error(
             "Chat failed",
             exc_info=True,
@@ -8625,6 +10579,7 @@ class ChatContinueRequest(BaseModel):
     max_output_tokens: Optional[int] = Field(default=None, ge=1, le=2_000_000)
     mode: Optional[str] = None
     workflow: Optional[str] = None
+    force_tool_review: bool = False
 
 
 def _extract_image_attachment_from_tool_payload(value: Any) -> Optional[Dict[str, Any]]:
@@ -8733,6 +10688,51 @@ def _collect_tool_result_image_attachments(
     return attachments
 
 
+def _target_user_image_attachments(
+    history: Any, target_message_id: Any
+) -> List[Dict[str, Any]]:
+    """Return images explicitly saved on the user turn before one assistant turn."""
+
+    if not isinstance(history, list):
+        return []
+    normalized_target = str(target_message_id or "").strip()
+    target_index = next(
+        (
+            index
+            for index, entry in enumerate(history)
+            if isinstance(entry, dict)
+            and str(entry.get("id") or "").strip() == normalized_target
+        ),
+        None,
+    )
+    if target_index is None:
+        return []
+
+    for entry in reversed(history[:target_index]):
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("role") or "").strip().lower() not in {"user", "human"}:
+            continue
+        candidates: List[Any] = []
+        if isinstance(entry.get("attachments"), list):
+            candidates.extend(entry.get("attachments") or [])
+        metadata = entry.get("metadata")
+        if isinstance(metadata, dict) and isinstance(metadata.get("attachments"), list):
+            candidates.extend(metadata.get("attachments") or [])
+        images: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for candidate in _enrich_attachment_references(candidates):
+            if not _is_image_attachment_payload(candidate):
+                continue
+            identity = _attachment_identity(candidate)
+            if not identity or identity in seen:
+                continue
+            seen.add(identity)
+            images.append(candidate)
+        return images
+    return []
+
+
 def _attachment_content_type(value: Any) -> str:
     if not isinstance(value, dict):
         return ""
@@ -8743,6 +10743,122 @@ def _attachment_content_type(value: Any) -> str:
 
 def _is_image_attachment_payload(value: Any) -> bool:
     return _attachment_content_type(value).lower().startswith("image/")
+
+
+def _enrich_attachment_reference(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+
+    # Treat request attachment dictionaries as untrusted hints.  A narrow set of
+    # presentation/capture fields can survive without storage resolution, but
+    # durable identifiers and provenance only come from Float's stored record.
+    enriched: Dict[str, Any] = {}
+    raw_name = str(value.get("name") or value.get("filename") or "").strip()
+    safe_name = Path(raw_name.replace("\\", "/")).name[:512] if raw_name else ""
+    if safe_name:
+        enriched["name"] = safe_name
+    raw_type = _attachment_content_type(value)
+    if len(raw_type) <= 127 and re.fullmatch(
+        r"[A-Za-z0-9!#$&^_.+\-]+/[A-Za-z0-9!#$&^_.+\-]+", raw_type
+    ):
+        enriched["type"] = raw_type.lower()
+        enriched["content_type"] = raw_type.lower()
+    raw_size = value.get("size")
+    if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0:
+        enriched["size"] = raw_size
+    capture_id = str(value.get("capture_id") or "").strip()
+    if (
+        capture_id
+        and len(capture_id) <= 256
+        and re.fullmatch(r"[A-Za-z0-9_.:\-]+", capture_id)
+    ):
+        enriched["capture_id"] = capture_id
+    capture_source = str(value.get("capture_source") or "").strip()
+    if (
+        capture_source
+        and len(capture_source) <= 128
+        and re.fullmatch(r"[A-Za-z0-9_.:\-]+", capture_source)
+    ):
+        enriched["capture_source"] = capture_source
+    if value.get("transient") is True:
+        enriched["transient"] = True
+    expires_at = value.get("expires_at")
+    if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool):
+        enriched["expires_at"] = expires_at
+    elif isinstance(expires_at, str) and 0 < len(expires_at.strip()) <= 128:
+        enriched["expires_at"] = expires_at.strip()
+
+    supplied_hash = str(value.get("content_hash") or "").strip()
+    content_hash = (
+        supplied_hash if blob_store.is_canonical_content_hash(supplied_hash) else ""
+    )
+    if not content_hash:
+        match = re.search(
+            r"/api/attachments/([a-f0-9]{64})(?:/|$)",
+            str(value.get("url") or ""),
+        )
+        content_hash = match.group(1) if match else ""
+    if not content_hash:
+        return enriched
+    try:
+        descriptor = _attachment_public_descriptor(content_hash)
+    except Exception:
+        descriptor = None
+    if not descriptor:
+        return enriched
+
+    canonical: Dict[str, Any] = {"_canonical_attachment_resolved": True}
+    for key in (
+        "content_hash",
+        "filename",
+        "url",
+        "relative_path",
+        "source_url",
+        "source_url_recorded_at",
+        "display_name",
+        "folder",
+        "origin",
+        "source_sync_label",
+        "source_sync_namespace",
+        "capture_source",
+        "capture_id",
+        "caption",
+        "caption_model",
+        "caption_status",
+        "caption_updated_at",
+        "caption_generated_at",
+        "caption_recorded_at",
+        "index_status",
+        "indexed_at",
+        "index_warning",
+        "embedding_model",
+        "embedding_dim",
+        "clip_indexed_at",
+        "placeholder_caption",
+    ):
+        descriptor_value = descriptor.get(key)
+        if descriptor_value not in (None, ""):
+            canonical[key] = descriptor_value
+    canonical_type = str(descriptor.get("content_type") or "").strip()
+    if canonical_type:
+        canonical["content_type"] = canonical_type
+        canonical["type"] = canonical_type
+    if isinstance(descriptor.get("size"), int):
+        canonical["size"] = descriptor["size"]
+    canonical_filename = str(descriptor.get("filename") or "").strip()
+    if canonical_filename:
+        canonical["name"] = canonical_filename
+    return canonical
+
+
+def _enrich_attachment_references(values: Any) -> List[Dict[str, Any]]:
+    if not isinstance(values, list):
+        return []
+    return [
+        _enrich_attachment_reference(value)
+        for value in values
+        if isinstance(value, dict)
+    ]
 
 
 def _attachment_identity(value: Any) -> str:
@@ -8820,6 +10936,7 @@ def _collect_recent_context_image_attachments(
             sources.append(message.get("attachments") or [])
         for attachments in sources:
             for attachment in reversed(attachments):
+                attachment = _enrich_attachment_reference(attachment)
                 if not _is_image_attachment_payload(attachment):
                     continue
                 key = _attachment_identity(attachment)
@@ -8844,7 +10961,7 @@ def _augment_with_recent_image_attachments(
     context_messages: Any,
     vision_workflow: str,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    effective_attachments = list(attachments or [])
+    effective_attachments = _enrich_attachment_references(attachments)
     if any(_is_image_attachment_payload(item) for item in effective_attachments):
         return effective_attachments, []
     recent = _collect_recent_context_image_attachments(context_messages)
@@ -8886,13 +11003,20 @@ def _stable_tool_continue_value(value: Any) -> Any:
     return str(value)
 
 
-_CHAT_CONTINUE_LOCKS: dict[str, asyncio.Lock] = {}
+_CHAT_CONTINUE_LOCKS: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.Lock] = {}
 _CHAT_CONTINUE_LOCKS_GUARD = threading.Lock()
 _DEFAULT_TOOL_CONTINUATION_ROUND_LIMIT = 12
 
 
 def _chat_continue_lock_for(session_id: Any, message_id: Any) -> asyncio.Lock:
-    key = f"{str(session_id or 'default').strip()}:{str(message_id or '').strip()}"
+    # Both new turns and continuations decide whether their target is latest.
+    # Serializing only by message id lets two different turns in one session
+    # both pass that check and persist in completion order.  Keep one lock per
+    # session (and event loop) so transcript order follows request order.
+    key = (
+        asyncio.get_running_loop(),
+        str(session_id or "default").strip(),
+    )
     with _CHAT_CONTINUE_LOCKS_GUARD:
         lock = _CHAT_CONTINUE_LOCKS.get(key)
         if lock is None:
@@ -8917,14 +11041,20 @@ def _tool_continuation_round_limit(request: Request) -> int:
     return max(1, min(parsed, 64))
 
 
-def _tool_continue_signature(tool_events: Any, *, include_ids: bool = True) -> str:
+def _normalized_tool_continue_events(
+    tool_events: Any,
+    *,
+    include_ids: bool = True,
+    canonical_names: bool = True,
+) -> list[dict[str, Any]]:
     if not isinstance(tool_events, list):
-        return ""
+        return []
     normalized: list[dict[str, Any]] = []
     for entry in tool_events:
         if not isinstance(entry, dict):
             continue
-        name = str(entry.get("name") or entry.get("tool") or "").strip()
+        raw_name = str(entry.get("name") or entry.get("tool") or "").strip()
+        name = _normalize_tool_name(raw_name) if canonical_names else raw_name
         request_id = str(entry.get("id") or entry.get("request_id") or "").strip()
         status = str(entry.get("status") or "").strip().lower()
         args = entry.get("args") if isinstance(entry.get("args"), dict) else {}
@@ -8938,22 +11068,104 @@ def _tool_continue_signature(tool_events: Any, *, include_ids: bool = True) -> s
         if include_ids:
             payload["id"] = request_id or None
         normalized.append(payload)
-    if not normalized:
+    return normalized
+
+
+def _stable_tool_continue_json(events: list[dict[str, Any]]) -> str:
+    if not events:
         return ""
     try:
-        payload = json.dumps(
-            normalized,
+        return json.dumps(
+            events,
             sort_keys=True,
             ensure_ascii=False,
             separators=(",", ":"),
         )
     except Exception:
         return ""
+
+
+def _fnv1a_signature(payload: str) -> str:
+    if not payload:
+        return ""
     digest = 2166136261
     for char in payload:
         digest ^= ord(char)
         digest = (digest * 16777619) & 0xFFFFFFFF
     return f"{digest:08x}"
+
+
+def _tool_continue_signature(tool_events: Any, *, include_ids: bool = True) -> str:
+    """Return the UI-compatible canonical FNV signature.
+
+    This remains available for synchronous browser de-duplication. Server-side
+    replay authority uses the SHA-256 companion below.
+    """
+
+    events = _normalized_tool_continue_events(
+        tool_events,
+        include_ids=include_ids,
+        canonical_names=True,
+    )
+    return _fnv1a_signature(_stable_tool_continue_json(events))
+
+
+def _tool_continue_sha256_signature(
+    tool_events: Any,
+    *,
+    include_ids: bool = True,
+) -> str:
+    events = _normalized_tool_continue_events(
+        tool_events,
+        include_ids=include_ids,
+        canonical_names=True,
+    )
+    payload = _stable_tool_continue_json(events)
+    if not payload:
+        return ""
+    return f"sha256:{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
+
+
+def _legacy_tool_continue_signature_candidates(
+    tool_events: Any,
+    *,
+    include_ids: bool = True,
+) -> set[str]:
+    """Build bounded pre-canonicalization FNV variants for upgrade retries."""
+
+    base_events = _normalized_tool_continue_events(
+        tool_events,
+        include_ids=include_ids,
+        canonical_names=True,
+    )
+    if not base_events:
+        return set()
+    variants: list[list[dict[str, Any]]] = [[]]
+    reverse_aliases: Dict[str, list[str]] = {}
+    for alias, canonical in TOOL_NAME_ALIASES.items():
+        reverse_aliases.setdefault(canonical, []).append(alias)
+    for event in base_events:
+        canonical_name = str(event.get("name") or "")
+        names = [canonical_name, *reverse_aliases.get(canonical_name, [])]
+        next_variants: list[list[dict[str, Any]]] = []
+        for prefix in variants:
+            for candidate_name in names:
+                candidate = dict(event)
+                candidate["name"] = candidate_name
+                next_variants.append([*prefix, candidate])
+                if len(next_variants) >= 128:
+                    break
+            if len(next_variants) >= 128:
+                break
+        variants = next_variants
+    return {
+        signature
+        for signature in (
+            _fnv1a_signature(_stable_tool_continue_json(candidate))
+            for candidate in variants
+        )
+        if signature
+    }
 
 
 @router.post("/chat/continue", response_model=ChatResponse)
@@ -8963,6 +11175,166 @@ async def chat_continue(request: Request, payload: ChatContinueRequest):
         return await _chat_continue_locked(request, payload)
 
 
+def _saved_terminal_tool_event(
+    app,
+    event: Any,
+    *,
+    session_id: str,
+    message_id: str,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(event, dict):
+        return None
+    request_id = str(event.get("id") or event.get("request_id") or "").strip()
+    if not request_id:
+        return None
+    registry = getattr(app.state, "pending_tools", None)
+    record = registry.get(request_id) if isinstance(registry, dict) else None
+    terminal_statuses = {
+        "invoked",
+        "denied",
+        "error",
+        "cancelled",
+        "timeout",
+        "scheduled",
+    }
+    if (
+        not isinstance(record, dict)
+        or _tool_resolution_status(record.get("status")) not in terminal_statuses
+    ):
+        record = _rehydrate_terminal_tool(
+            app,
+            request_id,
+            session_id=session_id,
+            message_id=message_id,
+        )
+    if not isinstance(record, dict):
+        return None
+    event_name = _normalize_tool_name(event.get("name")) if event.get("name") else ""
+    record_name = _normalize_tool_name(record.get("name"))
+    if not record_name or (event_name and event_name != record_name):
+        return None
+    record_session = str(record.get("session_id") or "").strip()
+    if record_session != session_id:
+        return None
+    record_message = str(
+        record.get("message_id") or record.get("chain_id") or ""
+    ).strip()
+    if record_message != message_id:
+        return None
+    canonical: Dict[str, Any] = {
+        "id": request_id,
+        "name": record_name,
+        "args": (
+            dict(record.get("args")) if isinstance(record.get("args"), dict) else {}
+        ),
+        "status": _tool_resolution_status(record.get("status")),
+    }
+    if "result" in record:
+        canonical["result"] = record.get("result")
+    if "error" in record:
+        canonical["error"] = record.get("error")
+    if record.get("origin"):
+        canonical["origin"] = str(record.get("origin"))
+    return canonical
+
+
+def _completed_tool_continuation_replay(
+    *,
+    session_id: str,
+    message_id: str,
+    tool_events: Any,
+    context: ServiceContext,
+) -> Optional[ChatResponse]:
+    """Return an already-saved continuation without trusting a replayed result."""
+
+    history, target_found, has_later_messages = _conversation_history_through_message(
+        session_id,
+        message_id,
+    )
+    if not target_found or has_later_messages:
+        return None
+    target_entry = next(
+        (
+            entry
+            for entry in reversed(history)
+            if isinstance(entry, dict)
+            and str(entry.get("id") or "").strip() == str(message_id or "").strip()
+        ),
+        None,
+    )
+    if not isinstance(target_entry, dict):
+        return None
+    metadata = target_entry.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    if (
+        not metadata.get("tool_continued")
+        or metadata.get("tool_response_pending") is True
+    ):
+        return None
+    current_secure_signature = _tool_continue_sha256_signature(tool_events).lower()
+    saved_secure_signature = (
+        str(metadata.get("tool_continue_signature_sha256") or "").strip().lower()
+    )
+    saved_signature = str(metadata.get("tool_continue_signature") or "").strip().lower()
+    if saved_secure_signature:
+        replay_matches = bool(
+            current_secure_signature
+            and current_secure_signature == saved_secure_signature
+        )
+    else:
+        replay_matches = bool(
+            saved_signature
+            and saved_signature
+            in _legacy_tool_continue_signature_candidates(tool_events)
+        )
+    if not replay_matches:
+        return None
+    text = _scrub_tool_placeholder_text(
+        target_entry.get("text") or target_entry.get("content") or ""
+    ).strip()
+    if not text:
+        return None
+    replay_context = ServiceContext(
+        system_prompt=context.system_prompt,
+        messages=[],
+        tools=[],
+        metadata=dict(context.metadata),
+    )
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        role = entry.get("role")
+        entry_text = _sanitize_context_message_text(
+            entry.get("text") or entry.get("content")
+        )
+        attachments = (
+            entry.get("attachments")
+            if isinstance(entry.get("attachments"), list)
+            else []
+        )
+        if not role or (not entry_text and not attachments):
+            continue
+        entry_metadata = entry.get("metadata")
+        entry_metadata = (
+            dict(entry_metadata) if isinstance(entry_metadata, dict) else {}
+        )
+        if attachments:
+            entry_metadata.setdefault("attachments", attachments)
+        replay_context.add_message(
+            role,
+            entry_text or "",
+            metadata=entry_metadata,
+        )
+    return ChatResponse(
+        message=text,
+        thought="",
+        tools_used=[],
+        metadata=dict(metadata),
+        context=ContextSchema(**replay_context.to_dict()),
+    )
+
+
 async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
     """Continue an assistant message after tool invocation.
 
@@ -8970,6 +11342,17 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
     part of the persisted `/history` transcript used to rehydrate contexts.
     """
     session_name = payload.session_id or "default"
+    target_message_id = str(payload.message_id or "").strip()
+    (
+        history_prefix,
+        history_target_found,
+        history_has_later_messages,
+    ) = _conversation_history_through_message(session_name, target_message_id)
+    if not history_target_found:
+        raise HTTPException(
+            status_code=409,
+            detail="The saved assistant message was not found. Reload or regenerate the turn.",
+        )
     _, message_mode_hint = _lookup_message_runtime_hints(
         session_name,
         payload.message_id,
@@ -8979,25 +11362,140 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
         or _normalize_llm_mode(message_mode_hint)
         or _configured_request_mode(request)
     )
-    current_workflow_name = _lookup_message_workflow(session_name, payload.message_id)
-    requested_workflow_name = resolve_workflow_name(
-        payload.workflow or current_workflow_name or _default_workflow_name()
+    capability_scope_present, saved_capability_scope = _lookup_message_capability_scope(
+        session_name,
+        payload.message_id,
+    )
+    if capability_scope_present and saved_capability_scope is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "The saved tool catalog scope is invalid or from an unsupported "
+                "version. Regenerate this turn before continuing."
+            ),
+        )
+    if (
+        saved_capability_scope
+        and saved_capability_scope.get("channel") != WORKFLOW_TEXT
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="The saved tool catalog scope is for a different runtime channel.",
+        )
+    saved_enabled_modules_override = (
+        list(saved_capability_scope.get("modules") or [])
+        if saved_capability_scope is not None
+        else None
+    )
+    continuation_tool_filter_snapshot = _capture_turn_tool_filter_snapshot(
+        verified_enabled_modules=saved_enabled_modules_override,
+    )
+    current_workflow_name = (
+        str(saved_capability_scope.get("workflow") or "").strip()
+        if saved_capability_scope
+        else _lookup_message_workflow(session_name, payload.message_id)
+    )
+    if current_workflow_name:
+        current_workflow_name = resolve_foreground_workflow_name(current_workflow_name)
+    requested_workflow_name = resolve_foreground_workflow_name(
+        payload.workflow
+        or current_workflow_name
+        or resolve_workflow_name(
+            continuation_tool_filter_snapshot.settings_payload.get("default_workflow")
+        )
     )
     if current_workflow_name and not continue_transition_allowed(
         current_workflow_name,
         requested_workflow_name,
     ):
         requested_workflow_name = current_workflow_name
-    workflow_config = _workflow_request_config(requested_workflow_name)
-    capture_policy = _capture_policy_settings()
+    workflow_config = _workflow_request_config(
+        requested_workflow_name,
+        (
+            list(saved_capability_scope.get("modules") or [])
+            if saved_capability_scope
+            else None
+        ),
+        include_global_modules=saved_capability_scope is None,
+        settings_payload=continuation_tool_filter_snapshot.settings_payload,
+        module_catalog=continuation_tool_filter_snapshot.module_catalog,
+    )
+    continuation_tool_filter_snapshot = _turn_tool_filter_snapshot_with_modules(
+        continuation_tool_filter_snapshot,
+        workflow_config["modules"],
+    )
+    capture_policy = _capture_policy_settings(
+        continuation_tool_filter_snapshot.settings_payload
+    )
     base_context = llm_service.get_context(session_name)
     tool_events = payload.tools or []
-    target_message_id = str(payload.message_id or "").strip()
-    (
-        history_prefix,
-        history_target_found,
-        history_has_later_messages,
-    ) = _conversation_history_through_message(session_name, payload.message_id)
+    if not tool_events:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "A saved terminal tool result is required to continue this turn. "
+                "Reload the conversation or regenerate the response."
+            ),
+        )
+    if saved_capability_scope is not None:
+        allowed_tool_names = {
+            _normalize_tool_name(name)
+            for name in (saved_capability_scope.get("tool_names") or [])
+            if _normalize_tool_name(name)
+        }
+        validated_tool_events: list[dict[str, Any]] = []
+        invalid_tool_events: list[str] = []
+        for event in tool_events:
+            canonical = _saved_terminal_tool_event(
+                request.app,
+                event,
+                session_id=session_name,
+                message_id=str(payload.message_id or "").strip(),
+            )
+            if canonical is None:
+                invalid_tool_events.append(
+                    str(
+                        (
+                            event.get("id")
+                            or event.get("request_id")
+                            or event.get("name")
+                        )
+                        if isinstance(event, dict)
+                        else "unknown"
+                    ).strip()
+                    or "unknown"
+                )
+                continue
+            canonical_name = _normalize_tool_name(canonical.get("name"))
+            if canonical_name not in allowed_tool_names:
+                if not (
+                    canonical_name == "route_to_local_model"
+                    and canonical.get("origin") == "privacy_preflight"
+                ):
+                    invalid_tool_events.append(
+                        str(canonical.get("id") or canonical_name or "unknown")
+                    )
+                    continue
+                canonical["host_proposed_outside_model_scope"] = True
+            validated_tool_events.append(canonical)
+        if invalid_tool_events:
+            replay = _completed_tool_continuation_replay(
+                session_id=session_name,
+                message_id=str(payload.message_id or "").strip(),
+                tool_events=tool_events,
+                context=base_context,
+            )
+            if replay is not None:
+                return replay
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Tool result does not match a saved terminal proposal: "
+                    + ", ".join(invalid_tool_events)
+                ),
+            )
+        tool_events = validated_tool_events
+        payload.tools = validated_tool_events
     context = ServiceContext(
         system_prompt=base_context.system_prompt,
         messages=[],
@@ -9045,6 +11543,11 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
 
     tool_continue_signature = _tool_continue_signature(tool_events)
     tool_continue_semantic_signature = _tool_continue_signature(
+        tool_events,
+        include_ids=False,
+    )
+    tool_continue_signature_sha256 = _tool_continue_sha256_signature(tool_events)
+    tool_continue_semantic_signature_sha256 = _tool_continue_sha256_signature(
         tool_events,
         include_ids=False,
     )
@@ -9129,29 +11632,28 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
     if tool_continue_signature and existing_target_entry:
         existing_meta = existing_target_entry.get("metadata")
         if isinstance(existing_meta, dict):
-            existing_sig = (
-                str(existing_meta.get("tool_continue_signature") or "").strip().lower()
-            )
-            existing_semantic_sig = (
-                str(existing_meta.get("tool_continue_semantic_signature") or "")
+            existing_secure_sig = (
+                str(existing_meta.get("tool_continue_signature_sha256") or "")
                 .strip()
                 .lower()
             )
-            current_sig = tool_continue_signature.lower()
-            current_semantic_sig = tool_continue_semantic_signature.lower()
+            existing_sig = (
+                str(existing_meta.get("tool_continue_signature") or "").strip().lower()
+            )
+            if existing_secure_sig:
+                signature_matches = bool(
+                    tool_continue_signature_sha256
+                    and existing_secure_sig == tool_continue_signature_sha256.lower()
+                )
+            else:
+                signature_matches = bool(
+                    existing_sig
+                    and existing_sig
+                    in _legacy_tool_continue_signature_candidates(tool_events)
+                )
             already_continued = bool(existing_meta.get("tool_continued"))
             still_pending = existing_meta.get("tool_response_pending") is True
-            if (
-                (
-                    bool(current_sig and existing_sig == current_sig)
-                    or bool(
-                        current_semantic_sig
-                        and existing_semantic_sig == current_semantic_sig
-                    )
-                )
-                and already_continued
-                and not still_pending
-            ):
+            if signature_matches and already_continued and not still_pending:
                 existing_text = _scrub_tool_placeholder_text(
                     existing_target_entry.get("text")
                     or existing_target_entry.get("content")
@@ -9199,12 +11701,17 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
     computer_capture_turn = _turn_uses_computer_capture_tools(
         tool_events=tool_events,
     )
-    computer_tools_allowed = (
-        computer_capture_turn and "computer_use" in workflow_config["modules"]
+    saved_computer_scope = bool(
+        saved_capability_scope
+        and "computer_use" in (saved_capability_scope.get("modules") or [])
     )
+    computer_tools_allowed = (
+        computer_capture_turn or saved_computer_scope
+    ) and "computer_use" in workflow_config["modules"]
     active_workflow_modules = _workflow_modules_for_turn(
         workflow_config["modules"],
         allow_computer_capture=computer_tools_allowed,
+        module_catalog=continuation_tool_filter_snapshot.module_catalog,
     )
     provider_target: Optional[Dict[str, Any]] = None
     effective_mode = mode_used
@@ -9248,16 +11755,33 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
         tools=_filter_turn_tool_definitions(
             context.tools,
             allow_computer_capture=computer_tools_allowed,
+            tool_filter_snapshot=continuation_tool_filter_snapshot,
         ),
         metadata=dict(context.metadata),
+    )
+    generation_ctx.tools = filter_tool_definitions_for_scope(
+        generation_ctx.tools,
+        saved_capability_scope,
     )
     prompt_tool_definitions = _merge_prompt_tool_definitions(
         _registered_prompt_tool_definitions(
             request.app,
             allow_computer_capture=computer_tools_allowed,
+            tool_filter_snapshot=continuation_tool_filter_snapshot,
         ),
         generation_ctx.tools,
     )
+    prompt_tool_definitions = filter_tool_definitions_for_scope(
+        prompt_tool_definitions,
+        saved_capability_scope,
+    )
+    capability_scope = saved_capability_scope or build_capability_scope(
+        workflow=workflow_config["name"],
+        channel=WORKFLOW_TEXT,
+        modules=active_workflow_modules,
+        tool_definitions=prompt_tool_definitions,
+    )
+    generation_ctx.metadata["capability_scope"] = capability_scope
     generation_ctx.metadata["workflow"] = {
         "name": workflow_config["name"],
         "modules": list(active_workflow_modules),
@@ -9272,7 +11796,13 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
     _add_turn_system_message(
         generation_ctx,
         "tool_approval",
-        _turn_tool_approval_note(_approval_level_setting()),
+        _turn_tool_approval_note(
+            "all"
+            if payload.force_tool_review
+            else _approval_level_setting(
+                continuation_tool_filter_snapshot.settings_payload
+            )
+        ),
         metadata={"tool_approval": True},
     )
     _add_turn_system_message(
@@ -9282,15 +11812,18 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
             workflow_config["name"],
             modules=active_workflow_modules,
             include_default_modules=False,
+            module_catalog=continuation_tool_filter_snapshot.module_catalog,
         ),
         metadata={"workflow": workflow_config["name"]},
     )
     runtime_identity_note = _runtime_model_identity_note(
         model=effective_model,
         mode=effective_mode,
-        provider=provider_target.get("provider")
-        if isinstance(provider_target, dict)
-        else None,
+        provider=(
+            provider_target.get("provider")
+            if isinstance(provider_target, dict)
+            else None
+        ),
     )
     if runtime_identity_note:
         _add_turn_system_message(
@@ -9328,12 +11861,36 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
             metadata={"capture_policy": dict(capture_policy)},
         )
 
-    generation_ctx.system_prompt = _with_available_tools_prompt(
-        generation_ctx.system_prompt,
-        prompt_tool_definitions,
-    )
+    provider_tool_definitions: list[Any] = []
+    native_tool_name_map: dict[str, str] = {}
+    if prompt_tool_definitions and _runtime_uses_native_tool_calls(
+        request.app.state.config,
+        mode=effective_mode,
+        provider_target=provider_target,
+    ):
+        (
+            provider_tool_definitions,
+            native_tool_name_map,
+        ) = _provider_native_tool_definitions(prompt_tool_definitions)
+    if provider_tool_definitions:
+        generation_ctx.system_prompt = _without_inline_tool_protocol_prompt(
+            generation_ctx.system_prompt
+        )
+    else:
+        generation_ctx.system_prompt = _with_available_tools_prompt(
+            generation_ctx.system_prompt,
+            prompt_tool_definitions,
+        )
 
     recalled_image_attachments = _collect_tool_result_image_attachments(tool_events)
+    current_user_image_attachments = _target_user_image_attachments(
+        history_prefix, target_message_id
+    )
+    continuation_image_attachments = (
+        current_user_image_attachments
+        if current_user_image_attachments
+        else recalled_image_attachments
+    )
     normalized_tool_events: list[dict[str, Any]] = []
     for tool in tool_events:
         if not isinstance(tool, dict):
@@ -9366,10 +11923,29 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
             metadata={"tool_results": True},
         )
 
+    if current_user_image_attachments and recalled_image_attachments:
+        _add_turn_system_message(
+            generation_ctx,
+            "tool_image_scope",
+            (
+                "The images explicitly attached to the current user turn are "
+                "authoritative. Images returned by recall are retrieval context, not "
+                "replacements for those attachments. Describe or save the user's "
+                "attached images unless the user explicitly asks for recalled images."
+            ),
+            metadata={"tool_image_scope": "current_user_attachments"},
+        )
+
     _add_turn_system_message(
         generation_ctx,
         "continuation",
-        "Continue from the tool output. If discovery found the target tool and arguments are available, call it next.",
+        (
+            "Continue from the tool output. Never repeat a successful state-changing "
+            "tool in this turn. If the requested change succeeded, summarize it and "
+            "answer the user; call another tool only when a distinct unfinished step "
+            "still requires it. If discovery found the target tool and arguments are "
+            "available, call it next."
+        ),
         metadata={"continuation": True},
     )
 
@@ -9393,12 +11969,8 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
             )
             reasoning = generate_kwargs.get("reasoning")
         output_token_limit = generate_kwargs.get("output_token_limit")
-        if _server_uses_native_tool_calls(
-            request.app.state.config,
-            mode=effective_mode,
-            provider_target=provider_target,
-        ):
-            generate_kwargs["native_tool_definitions"] = prompt_tool_definitions
+        if provider_tool_definitions:
+            generate_kwargs["native_tool_definitions"] = provider_tool_definitions
         if isinstance(provider_target, dict):
             server_url = str(provider_target.get("base_url") or "").strip()
             if server_url:
@@ -9414,24 +11986,17 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
                 workflow_name=workflow_config["name"],
             )
             generate_kwargs["capture_raw_api"] = True
-            generate_kwargs["tool_executor"] = _build_provider_tool_executor(
-                request.app,
-                session_id=session_name,
-                message_id=payload.message_id,
-                workflow_name=workflow_config["name"],
-                model=effective_model,
-                mode=effective_mode,
-            )
         response = await asyncio.to_thread(
             llm_service.generate,
             [],
             session_id=session_name,
             model=effective_model,
-            attachments=recalled_image_attachments,
+            attachments=continuation_image_attachments,
             response_format=response_format,
             context=generation_ctx,
             **generate_kwargs,
         )
+        _restore_provider_tool_names(response, native_tool_name_map)
         _apply_reasoning_response_metadata(
             response,
             reasoning,
@@ -9802,7 +12367,7 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
                     "Using only the completed tool output above, answer the original user's request now in text. Do not request or invoke tools.",
                     session_id=session_name,
                     model=effective_model,
-                    attachments=recalled_image_attachments,
+                    attachments=continuation_image_attachments,
                     response_format=_resolve_route_response_format(
                         None,
                         harmony_enabled=_config_allows_harmony_for_model(
@@ -9878,7 +12443,7 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
                     [],
                     session_id=session_name,
                     model=effective_model,
-                    attachments=recalled_image_attachments,
+                    attachments=continuation_image_attachments,
                     response_format=response_format,
                     context=action_ctx,
                     **generate_kwargs,
@@ -9886,6 +12451,10 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
             finally:
                 llm_service.mode = retry_prev_mode
             if isinstance(retry_response, dict):
+                _restore_provider_tool_names(
+                    retry_response,
+                    native_tool_name_map,
+                )
                 retry_meta = dict(retry_response.get("metadata") or {})
                 retry_meta["post_discovery_persistence_retry"] = True
                 retry_response["metadata"] = retry_meta
@@ -9931,6 +12500,8 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
                 model=payload.model,
                 mode=mode_used,
                 default_agent=msg_id or session_name,
+                force_tool_review=payload.force_tool_review,
+                allowed_tool_names=capability_scope.get("tool_names") or [],
             )
         except Exception:
             pass
@@ -9950,6 +12521,17 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
         and not repeated_tool_requests
         and not has_unresolved_response_tools
         and _inline_tools_need_result_continuation(response_tools_used, response_meta)
+    )
+    tool_result_continuation = bool(
+        inline_tool_result_continuation
+        or (
+            response_tools_used
+            and not repeated_tool_requests
+            and not has_unresolved_response_tools
+            and _resolved_tools_need_result_continuation(
+                response_tools_used, response.get("text")
+            )
+        )
     )
     unfulfilled_persistence_after_discovery = (
         _response_needs_post_discovery_persistence_retry(
@@ -9988,19 +12570,25 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
         response_meta = dict(response_meta)
         response_meta["tool_response_pending"] = True
         response_meta.pop("inline_tool_continuation_pending", None)
+        response_meta.pop("tool_result_continuation_pending", None)
         response["metadata"] = response_meta
-    elif inline_tool_result_continuation:
+    elif tool_result_continuation:
         text = _resolved_tool_summary_text(response_tools_used)
         response["text"] = text
         response_meta = dict(response_meta)
         response_meta["tool_response_pending"] = True
-        response_meta["inline_tool_continuation_pending"] = True
+        response_meta["tool_result_continuation_pending"] = True
+        if inline_tool_result_continuation:
+            response_meta["inline_tool_continuation_pending"] = True
+        else:
+            response_meta.pop("inline_tool_continuation_pending", None)
         response["metadata"] = response_meta
     else:
         if response_meta.get("tool_response_pending") is not None:
             response_meta = dict(response_meta)
             response_meta.pop("tool_response_pending", None)
             response_meta.pop("inline_tool_continuation_pending", None)
+            response_meta.pop("tool_result_continuation_pending", None)
             response["metadata"] = response_meta
         text = _scrub_tool_placeholder_text(response.get("text") or "")
         if not text:
@@ -10053,21 +12641,21 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
             response["text"] = text
 
     metadata_update = dict(response.get("metadata") or {})
-    metadata_update.setdefault(
-        "workflow",
-        {
-            "name": workflow_config["name"],
-            "modules": list(active_workflow_modules),
-        },
-    )
+    metadata_update["workflow"] = {
+        "name": workflow_config["name"],
+        "modules": list(active_workflow_modules),
+    }
+    metadata_update["capability_scope"] = capability_scope
     if isinstance(provider_target, dict):
         metadata_update.setdefault("provider", provider_target.get("provider"))
         metadata_update.setdefault("server_url", provider_target.get("base_url"))
         metadata_update.setdefault(
             "provider_runtime",
-            provider_target.get("runtime")
-            if isinstance(provider_target.get("runtime"), dict)
-            else {},
+            (
+                provider_target.get("runtime")
+                if isinstance(provider_target.get("runtime"), dict)
+                else {}
+            ),
         )
     status_value = _response_status_value(metadata_update)
     metadata_update["status"] = status_value
@@ -10105,15 +12693,17 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
     mismatch_error = _apply_model_mismatch_error(
         metadata_update,
         mode=mode_used,
-        provider=provider_target.get("provider")
-        if isinstance(provider_target, dict)
-        else None,
+        provider=(
+            provider_target.get("provider")
+            if isinstance(provider_target, dict)
+            else None
+        ),
     )
     if mismatch_error:
         text = mismatch_error
         response["text"] = text
     waiting_for_next_tool_turn = bool(
-        has_unresolved_response_tools or inline_tool_result_continuation
+        has_unresolved_response_tools or tool_result_continuation
     )
     if waiting_for_next_tool_turn:
         metadata_update.pop("tool_continued", None)
@@ -10128,17 +12718,29 @@ async def _chat_continue_locked(request: Request, payload: ChatContinueRequest):
         metadata_update[
             "tool_continue_semantic_signature"
         ] = tool_continue_semantic_signature
+    if tool_continue_signature_sha256:
+        metadata_update[
+            "tool_continue_signature_sha256"
+        ] = tool_continue_signature_sha256
+    if tool_continue_semantic_signature_sha256:
+        metadata_update[
+            "tool_continue_semantic_signature_sha256"
+        ] = tool_continue_semantic_signature_sha256
     usage_stats = _normalize_usage_counts(
-        metadata_update.get("usage")
-        if isinstance(metadata_update.get("usage"), dict)
-        else None,
+        (
+            metadata_update.get("usage")
+            if isinstance(metadata_update.get("usage"), dict)
+            else None
+        ),
         tool_prompt_text if tool_prompt_text else "continue",
         text,
     )
     merged_usage = _merge_usage(
-        metadata_update.get("usage")
-        if isinstance(metadata_update.get("usage"), dict)
-        else None,
+        (
+            metadata_update.get("usage")
+            if isinstance(metadata_update.get("usage"), dict)
+            else None
+        ),
         usage_stats,
     )
     if merged_usage is not None:
@@ -10513,13 +13115,17 @@ async def memory_graph(
     include_archived: bool = False,
     focus_key: str | None = None,
     include_thread_projection: bool = True,
+    use_loaded_embeddings: bool = True,
 ):
     mgr = request.app.state.memory_manager
-    items: list[dict[str, Any]] = []
-    for key, item in mgr.iter_items(
+    item_rows = await asyncio.to_thread(
+        mgr.iter_items,
         include_pruned=include_archived,
         touch=False,
-    ):
+        run_lifecycle_sweep=False,
+    )
+    items: list[dict[str, Any]] = []
+    for key, item in item_rows:
         if item is None:
             continue
         items.append({"key": key, **item})
@@ -10529,11 +13135,13 @@ async def memory_graph(
             thread_summary = threads_service.read_summary()
         except Exception:
             logger.debug("memory graph thread projection unavailable", exc_info=True)
-    graph = memory_graph_service.build_memory_graph(
+    graph = await asyncio.to_thread(
+        memory_graph_service.build_memory_graph,
         items,
         limit=limit,
         focus_key=focus_key,
         thread_summary=thread_summary,
+        use_loaded_embeddings=use_loaded_embeddings,
     )
     return {"graph": graph}
 
@@ -10590,12 +13198,12 @@ async def memory_upsert(request: Request, key: str, payload: MemoryItemUpsert):
     privacy_decision = privacy_filter_service.decide_sensitivity(
         _memory_value_to_text(payload.value),
         explicit_sensitivity=explicit_sensitivity,
-        existing_sensitivity=existing.get("sensitivity")
-        if isinstance(existing, dict)
-        else None,
-        existing_sensitivity_source=existing.get("sensitivity_source")
-        if isinstance(existing, dict)
-        else None,
+        existing_sensitivity=(
+            existing.get("sensitivity") if isinstance(existing, dict) else None
+        ),
+        existing_sensitivity_source=(
+            existing.get("sensitivity_source") if isinstance(existing, dict) else None
+        ),
         purpose="memory",
     )
     effective_sensitivity = (
@@ -11064,6 +13672,34 @@ class ToolSchedule(BaseModel):
     chain_id: Optional[str] = None
 
 
+def _validate_recorded_tool_binding(
+    record: Dict[str, Any],
+    *,
+    name: Optional[str] = None,
+    session_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+    chain_id: Optional[str] = None,
+) -> None:
+    """Reject client context that does not match a server-recorded proposal."""
+
+    recorded_name = _normalize_tool_name(record.get("name"))
+    supplied_name = _normalize_tool_name(name) if name else ""
+    if supplied_name and supplied_name != recorded_name:
+        raise HTTPException(status_code=409, detail="Tool name does not match request")
+    for field, supplied_value in (
+        ("session_id", session_id),
+        ("message_id", message_id),
+        ("chain_id", chain_id),
+    ):
+        supplied = str(supplied_value or "").strip()
+        recorded = str(record.get(field) or "").strip()
+        if supplied and supplied != recorded:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{field} does not match request",
+            )
+
+
 _TOOL_DECISION_LOCKS: dict[str, dict[str, Any]] = {}
 _TOOL_DECISION_LOCKS_GUARD = threading.Lock()
 
@@ -11093,7 +13729,11 @@ def _release_tool_decision_lock(key: str, lock: asyncio.Lock) -> None:
 def _suggest_tool_names(tool_name: str, limit: int = 4) -> list[str]:
     raw_requested = str(tool_name or "").strip()
     requested = _normalize_tool_name(tool_name)
-    available = sorted(str(name) for name in tools.BUILTIN_TOOLS.keys())
+    available = sorted(
+        str(name)
+        for name in tools.BUILTIN_TOOLS.keys()
+        if str(name) not in _UNADVERTISED_MODEL_TOOL_ALIASES
+    )
     suggestions: list[str] = []
     if requested and requested != raw_requested and requested in available:
         suggestions.append(requested)
@@ -11508,6 +14148,13 @@ async def _decide_tool_locked(request: Request, payload: ToolDecision):
             message_id=payload.message_id,
         )
     if terminal_rec:
+        _validate_recorded_tool_binding(
+            terminal_rec,
+            name=payload.name,
+            session_id=payload.session_id,
+            message_id=payload.message_id,
+            chain_id=payload.chain_id,
+        )
         terminal_status = _tool_resolution_status(terminal_rec.get("status"))
         terminal_result = terminal_rec.get("result")
         if terminal_result is None:
@@ -11529,21 +14176,17 @@ async def _decide_tool_locked(request: Request, payload: ToolDecision):
         if recovered:
             registry[payload.request_id] = recovered
             rec = recovered
-    if not rec and payload.name:
-        # Allow the client to supply enough context to reconstruct the decision
-        # when the in-memory registry and conversation log are unavailable.
-        rec = {
-            "id": payload.request_id,
-            "name": payload.name,
-            "args": payload.args or {},
-            "session_id": payload.session_id,
-            "message_id": payload.message_id,
-            "chain_id": payload.chain_id or payload.message_id or payload.session_id,
-            "status": "proposed",
-        }
-        registry[payload.request_id] = rec
     if not rec:
         raise HTTPException(status_code=404, detail="Request not found")
+    if _tool_resolution_status(rec.get("status")) not in {"pending", "proposed"}:
+        raise HTTPException(status_code=409, detail="Request is no longer pending")
+    _validate_recorded_tool_binding(
+        rec,
+        name=payload.name,
+        session_id=payload.session_id,
+        message_id=payload.message_id,
+        chain_id=payload.chain_id,
+    )
 
     if payload.decision == "deny":
         rec["status"] = "denied"
@@ -11974,19 +14617,30 @@ async def resolve_client_tool(request: Request, payload: ToolClientResolve):
         if recovered:
             registry[payload.request_id] = recovered
             rec = recovered
-    if not rec and payload.name:
-        rec = {
-            "id": payload.request_id,
-            "name": payload.name,
-            "args": payload.args or {},
-            "session_id": payload.session_id,
-            "message_id": payload.message_id,
-            "chain_id": payload.chain_id or payload.message_id or payload.session_id,
-            "status": "proposed",
-        }
-        registry[payload.request_id] = rec
     if not rec:
         raise HTTPException(status_code=404, detail="Request not found")
+    if _tool_resolution_status(rec.get("status")) not in {"proposed", "pending"}:
+        raise HTTPException(status_code=409, detail="Request is no longer pending")
+
+    rec_name = _normalize_tool_name(rec.get("name"))
+    if rec_name not in CLIENT_RESOLUTION_TOOLS:
+        raise HTTPException(
+            status_code=409,
+            detail="This tool must be resolved by the server approval flow",
+        )
+    if payload.name and _normalize_tool_name(payload.name) != rec_name:
+        raise HTTPException(status_code=409, detail="Tool name does not match request")
+    for field in ("session_id", "message_id", "chain_id"):
+        supplied = str(getattr(payload, field) or "").strip()
+        recorded = str(rec.get(field) or "").strip()
+        if supplied and supplied != recorded:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{field} does not match request",
+            )
+    recorded_args = rec.get("args") if isinstance(rec.get("args"), dict) else {}
+    if payload.args is not None and payload.args != recorded_args:
+        raise HTTPException(status_code=409, detail="Tool args do not match request")
 
     status = str(payload.status or "invoked").strip().lower()
     result_payload = payload.result
@@ -12004,10 +14658,8 @@ async def resolve_client_tool(request: Request, payload: ToolClientResolve):
             {
                 "type": "tool",
                 "id": payload.request_id,
-                "name": rec["name"],
-                "args": payload.args
-                if isinstance(payload.args, dict)
-                else rec.get("args", {}),
+                "name": rec_name,
+                "args": recorded_args,
                 "result": result_payload,
                 "chain_id": rec.get("chain_id"),
                 "message_id": rec.get("message_id"),
@@ -12015,6 +14667,7 @@ async def resolve_client_tool(request: Request, payload: ToolClientResolve):
                 "session_id": rec.get("session_id"),
                 "model": rec.get("model"),
                 "mode": rec.get("mode"),
+                "origin": rec.get("origin"),
             },
             default_agent=rec.get("chain_id") or rec.get("session_id"),
         )
@@ -12025,12 +14678,13 @@ async def resolve_client_tool(request: Request, payload: ToolClientResolve):
             _append_tool_event_to_conversation(
                 rec["session_id"],
                 rec["message_id"],
-                rec["name"],
-                payload.args if isinstance(payload.args, dict) else rec.get("args", {}),
+                rec_name,
+                recorded_args,
                 result_payload,
                 status=status,
                 model=rec.get("model"),
                 mode=rec.get("mode"),
+                origin=rec.get("origin"),
                 request_id=payload.request_id,
             )
     except Exception:
@@ -12038,17 +14692,17 @@ async def resolve_client_tool(request: Request, payload: ToolClientResolve):
     registry.pop(payload.request_id, None)
     log_tool_event(
         rec.get("session_id"),
-        rec["name"],
+        rec_name,
         status,
-        args=payload.args if isinstance(payload.args, dict) else rec.get("args"),
+        args=recorded_args,
         result=result_payload,
         message_id=rec.get("message_id"),
         request_id=payload.request_id,
     )
     _emit_tool_hook(
-        rec["name"],
+        rec_name,
         status,
-        args=payload.args if isinstance(payload.args, dict) else rec.get("args") or {},
+        args=recorded_args,
         result=result_payload,
         session_id=rec.get("session_id"),
         message_id=rec.get("message_id"),
@@ -12076,29 +14730,29 @@ async def schedule_tool(request: Request, payload: ToolSchedule) -> dict:
         if recovered:
             registry[payload.request_id] = recovered
             rec = recovered
-    if not rec and payload.name:
-        rec = {
-            "id": payload.request_id,
-            "name": payload.name,
-            "args": payload.args or {},
-            "session_id": payload.session_id,
-            "message_id": payload.message_id,
-            "chain_id": payload.chain_id or payload.message_id or payload.session_id,
-            "status": "proposed",
-        }
-        registry[payload.request_id] = rec
     if not rec:
         raise HTTPException(status_code=404, detail="Request not found")
+    if _tool_resolution_status(rec.get("status")) not in {"proposed", "pending"}:
+        raise HTTPException(status_code=409, detail="Request is no longer pending")
 
-    name = payload.name or rec.get("name")
+    name = _normalize_tool_name(rec.get("name"))
+    if not name:
+        raise HTTPException(status_code=409, detail="Saved request has no tool name")
+    if payload.name and _normalize_tool_name(payload.name) != name:
+        raise HTTPException(status_code=409, detail="Tool name does not match request")
+    for field in ("session_id", "message_id", "chain_id"):
+        supplied = str(getattr(payload, field) or "").strip()
+        recorded = str(rec.get(field) or "").strip()
+        if supplied and supplied != recorded:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{field} does not match request",
+            )
     raw_args = payload.args if payload.args is not None else rec.get("args", {})
-    if name:
-        _, args = normalize_and_sanitize_tool_args(str(name), raw_args)
-    else:
-        args = sanitize_args(raw_args if isinstance(raw_args, dict) else {})
-    session_id = payload.session_id or rec.get("session_id")
-    message_id = payload.message_id or rec.get("message_id")
-    chain_id = payload.chain_id or rec.get("chain_id") or message_id or session_id
+    _, args = normalize_and_sanitize_tool_args(name, raw_args)
+    session_id = rec.get("session_id")
+    message_id = rec.get("message_id")
+    chain_id = rec.get("chain_id") or message_id or session_id
     prompt: str | None = None
     if payload.prompt is not None:
         try:
@@ -12130,6 +14784,35 @@ async def schedule_tool(request: Request, payload: ToolSchedule) -> dict:
         }:
             conversation_mode = "new_chat"
 
+    try:
+        _attach_scheduled_tool_to_event(
+            event_id=str(payload.event_id),
+            request_id=str(payload.request_id),
+            name=str(name) if name is not None else None,
+            args=args,
+            prompt=prompt,
+            conversation_mode=conversation_mode,
+            session_id=session_id,
+            message_id=message_id,
+            chain_id=chain_id,
+            user=user,
+        )
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Save the Calendar event before attaching its scheduled action.",
+        ) from exc
+    except Exception as exc:
+        logger.exception(
+            "Could not persist scheduled tool %s on event %s",
+            payload.request_id,
+            payload.event_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="The calendar action could not be saved; the tool remains pending.",
+        ) from exc
+
     rec["status"] = "scheduled"
     rec["args"] = args
     if name:
@@ -12149,6 +14832,7 @@ async def schedule_tool(request: Request, payload: ToolSchedule) -> dict:
                 "status": "scheduled",
                 "scheduled_event_id": payload.event_id,
                 "session_id": session_id,
+                "origin": rec.get("origin"),
             },
             default_agent=chain_id or session_id,
         )
@@ -12164,79 +14848,9 @@ async def schedule_tool(request: Request, payload: ToolSchedule) -> dict:
                 args,
                 {"scheduled_event_id": payload.event_id},
                 status="scheduled",
+                origin=rec.get("origin"),
                 request_id=payload.request_id,
             )
-    except Exception:
-        pass
-
-    # Persist the scheduled tool payload onto the calendar event so the
-    # "upcoming tasks" panel can show/edit/run the action reliably.
-    try:
-        event_payload = calendar_store.load_event(payload.event_id) or {}
-        if isinstance(event_payload, dict):
-            event_payload.setdefault("id", payload.event_id)
-            if not event_payload.get("title"):
-                event_payload["title"] = f"Schedule tool: {name or 'tool'}"
-            actions = event_payload.get("actions")
-            if not isinstance(actions, list):
-                actions = []
-                event_payload["actions"] = actions
-            action: Dict[str, Any] | None = None
-            for item in actions:
-                if not isinstance(item, dict):
-                    continue
-                item_id = item.get("request_id") or item.get("id")
-                if item_id is None:
-                    continue
-                if str(item_id) == str(payload.request_id):
-                    action = item
-                    break
-            if action is None:
-                action = {"id": payload.request_id}
-                actions.append(action)
-            action.update(
-                {
-                    "kind": "tool",
-                    "name": name,
-                    "args": args,
-                    "request_id": payload.request_id,
-                    "status": "scheduled",
-                    "scheduled_event_id": payload.event_id,
-                    "scheduled_for": event_payload.get("start_time"),
-                    "session_id": session_id,
-                    "message_id": message_id,
-                    "chain_id": chain_id,
-                    "user": user,
-                    "updated_at": time.time(),
-                }
-            )
-            if conversation_mode:
-                action["conversation_mode"] = conversation_mode
-            if prompt is not None:
-                if prompt:
-                    action["prompt"] = prompt
-                else:
-                    action.pop("prompt", None)
-            tool_json = json.dumps(
-                {"tool": name or "tool", "args": args},
-                indent=2,
-                ensure_ascii=False,
-            )
-            desc = event_payload.get("description")
-            replace_desc = False
-            if not isinstance(desc, str) or not desc.strip():
-                replace_desc = True
-            else:
-                try:
-                    parsed = json.loads(desc)
-                except Exception:
-                    parsed = None
-                if isinstance(parsed, dict) and "tool" in parsed and "args" in parsed:
-                    replace_desc = True
-            if replace_desc:
-                event_payload["description"] = tool_json
-            event_payload["status"] = "scheduled"
-            _persist_calendar_event(payload.event_id, event_payload)
     except Exception:
         pass
 
@@ -12333,6 +14947,175 @@ def _conversation_tail_overlap(
         if existing_keys[-overlap:] == incoming_keys[:overlap]:
             return overlap
     return 0
+
+
+def _preserve_server_owned_conversation_state(
+    name: str,
+    existing: Any,
+    incoming: List[Dict[str, Any]],
+    *,
+    preserve_omitted_server_messages: bool = True,
+) -> List[Dict[str, Any]]:
+    """Keep runtime receipts authoritative across browser transcript saves."""
+
+    existing_messages = existing if isinstance(existing, list) else []
+    existing_by_id: Dict[str, Dict[str, Any]] = {}
+    for message in existing_messages:
+        if not isinstance(message, dict):
+            continue
+        message_id = str(message.get("id") or "").strip()
+        if message_id:
+            existing_by_id[message_id] = message
+
+    preserved: List[Dict[str, Any]] = []
+    untrusted_message_receipts: Dict[str, Dict[str, str]] = {}
+    for raw_message in incoming:
+        if not isinstance(raw_message, dict):
+            preserved.append(raw_message)
+            continue
+        message = copy.deepcopy(raw_message)
+        message_id = str(message.get("id") or "").strip()
+        previous = existing_by_id.get(message_id) if message_id else None
+
+        metadata = message.get("metadata")
+        metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        receipt = _server_message_runtime_receipt(name, message_id)
+        if message_id and previous is None:
+            untrusted_message_receipts[message_id] = {
+                _CONTINUATION_TRUST_KEY: _CONTINUATION_TRUST_INVALIDATED,
+                "reason": "client_saved_message",
+            }
+        if (
+            previous is not None
+            and "capability_scope" in receipt
+            and receipt.get(_CONTINUATION_TRUST_KEY) == _CONTINUATION_TRUST_SERVER
+        ):
+            # A scope-bearing assistant turn is a server receipt, not editable
+            # browser state. Preserve the complete turn so matching IDs cannot
+            # be used to graft authority onto altered text or tool rows.
+            preserved.append(copy.deepcopy(previous))
+            continue
+        if previous is not None and "capability_scope" in receipt:
+            metadata["capability_scope"] = copy.deepcopy(
+                receipt.get("capability_scope")
+            )
+        else:
+            previous_metadata = (
+                previous.get("metadata") if isinstance(previous, dict) else None
+            )
+            if (
+                isinstance(previous_metadata, dict)
+                and "capability_scope" in previous_metadata
+            ):
+                # Missing sidecar authority must stay visibly invalid. Dropping
+                # the embedded scope here would silently downgrade the turn to
+                # the legacy, unscoped continuation path.
+                metadata["capability_scope"] = copy.deepcopy(
+                    previous_metadata.get("capability_scope")
+                )
+        if metadata:
+            message["metadata"] = metadata
+        else:
+            message.pop("metadata", None)
+
+        previous_tools = previous.get("tools") if isinstance(previous, dict) else None
+        previous_tools = previous_tools if isinstance(previous_tools, list) else []
+        previous_by_id: Dict[str, Dict[str, Any]] = {}
+        for tool in previous_tools:
+            if not isinstance(tool, dict):
+                continue
+            tool_id = str(tool.get("id") or tool.get("request_id") or "").strip()
+            if tool_id:
+                previous_by_id[tool_id] = tool
+
+        incoming_tools = message.get("tools")
+        incoming_tools = incoming_tools if isinstance(incoming_tools, list) else []
+        merged_tools: List[Any] = []
+        seen_tool_ids: set[str] = set()
+        for raw_tool in incoming_tools:
+            if not isinstance(raw_tool, dict):
+                merged_tools.append(copy.deepcopy(raw_tool))
+                continue
+            tool_id = str(
+                raw_tool.get("id") or raw_tool.get("request_id") or ""
+            ).strip()
+            previous_tool = previous_by_id.get(tool_id) if tool_id else None
+            if previous_tool is not None:
+                merged_tools.append(copy.deepcopy(previous_tool))
+                seen_tool_ids.add(tool_id)
+                continue
+            client_tool = copy.deepcopy(raw_tool)
+            client_tool.pop("server_recorded", None)
+            client_tool[_CLIENT_SAVED_TOOL_MARKER] = True
+            merged_tools.append(client_tool)
+            if tool_id:
+                seen_tool_ids.add(tool_id)
+        for tool_id, previous_tool in previous_by_id.items():
+            if tool_id not in seen_tool_ids:
+                merged_tools.append(copy.deepcopy(previous_tool))
+        if merged_tools:
+            message["tools"] = merged_tools
+        else:
+            message.pop("tools", None)
+        preserved.append(message)
+
+    # Browser autosave can race a server append. Rebuild around the existing
+    # order and retain omitted server-owned assistant turns so a stale client
+    # snapshot cannot erase a just-completed response. Intentional destructive
+    # replacement remains available through ``allow_partial_overwrite`` at the
+    # route boundary.
+    if preserve_omitted_server_messages:
+        preserved_by_id = {
+            str(message.get("id") or "").strip(): message
+            for message in preserved
+            if isinstance(message, dict) and str(message.get("id") or "").strip()
+        }
+        merged_preserved: List[Dict[str, Any]] = []
+        emitted_ids: set[str] = set()
+        for previous in existing_messages:
+            if not isinstance(previous, dict):
+                continue
+            message_id = str(previous.get("id") or "").strip()
+            if not message_id:
+                continue
+            incoming_message = preserved_by_id.get(message_id)
+            if incoming_message is not None:
+                merged_preserved.append(incoming_message)
+                emitted_ids.add(message_id)
+                continue
+            receipt = _server_message_runtime_receipt(name, message_id)
+            server_owned = (
+                receipt.get(_CONTINUATION_TRUST_KEY) == _CONTINUATION_TRUST_SERVER
+            )
+            server_pending = (
+                receipt.get(_CONTINUATION_TRUST_KEY) == _CONTINUATION_TRUST_INVALIDATED
+                and receipt.get("reason") == "capability_scope_pending"
+            )
+            if server_owned or server_pending:
+                merged_preserved.append(copy.deepcopy(previous))
+                emitted_ids.add(message_id)
+        for message in preserved:
+            message_id = (
+                str(message.get("id") or "").strip()
+                if isinstance(message, dict)
+                else ""
+            )
+            if message_id and message_id in emitted_ids:
+                continue
+            merged_preserved.append(message)
+            if message_id:
+                emitted_ids.add(message_id)
+        preserved = merged_preserved
+    if untrusted_message_receipts:
+        conversation_store.merge_metadata(
+            name,
+            {
+                _SERVER_RUNTIME_RECEIPTS_KEY: {
+                    "messages": untrusted_message_receipts,
+                }
+            },
+        )
+    return preserved
 
 
 def _payload_marks_client_window(payload: ConversationPayload) -> bool:
@@ -12547,7 +15330,10 @@ class RenamePayload(BaseModel):
 async def rename_conversation(name: str, payload: RenamePayload):
     target_name = str(payload.new_name or "").strip() or name
     if target_name != name:
-        conversation_store.rename_conversation(name, target_name)
+        try:
+            conversation_store.rename_conversation(name, target_name)
+        except FileExistsError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
     updates: Dict[str, Any] = {}
     if payload.privacy_mode is not None or payload.sensitivity is not None:
         privacy_mode = conversation_store.normalize_conversation_privacy_mode(
@@ -12644,7 +15430,7 @@ def _conversation_base_name(name: str) -> str:
 
 
 _TOOL_DISCOVERY_PROMPT_HINT = (
-    "Tool discovery: use `help`, `tool_help`, or `tool_info` when the needed "
+    "Tool discovery: use `help` or `tool_info` when the needed "
     "tool or schema is unclear. If discovery identifies the right target tool "
     "and arguments are available, call that target tool next."
 )
@@ -12652,12 +15438,26 @@ _TOOL_DISCOVERY_PROMPT_HINT = (
 _JSON_TOOL_CALL_PROMPT_HINT = (
     "Tool call syntax for this turn: emit direct JSON only in the form "
     '{"tool":"<exact_tool_name>","args":{...}}; for example, '
-    '{"tool":"tool_help","args":{}} or {"tool":"list_dir","args":{"path":"."}}. '
+    '{"tool":"help","args":{}} or {"tool":"list_dir","args":{"path":"."}}. '
     "Use exact tool identifiers and valid JSON only. "
     "Do not wrap JSON calls in Harmony markers."
 )
 
 _HARMONY_TOOL_CALL_PROMPT_HINT = (
+    "Tool call syntax for this turn: emit Harmony tool calls only in the form "
+    "<|channel|>commentary to=<exact_tool_name> <|constrain|>json <|message|>{...}; "
+    "for example, <|channel|>commentary to=help <|constrain|>json <|message|>{}. "
+    "Use exact tool identifiers and valid JSON in the message body only. "
+    "Do not prepend standalone JSON tool calls outside the Harmony wrapper."
+)
+_LEGACY_JSON_TOOL_CALL_PROMPT_HINT = (
+    "Tool call syntax for this turn: emit direct JSON only in the form "
+    '{"tool":"<exact_tool_name>","args":{...}}; for example, '
+    '{"tool":"tool_help","args":{}} or {"tool":"list_dir","args":{"path":"."}}. '
+    "Use exact tool identifiers and valid JSON only. "
+    "Do not wrap JSON calls in Harmony markers."
+)
+_LEGACY_HARMONY_TOOL_CALL_PROMPT_HINT = (
     "Tool call syntax for this turn: emit Harmony tool calls only in the form "
     "<|channel|>commentary to=<exact_tool_name> <|constrain|>json <|message|>{...}; "
     "for example, <|channel|>commentary to=tool_help <|constrain|>json <|message|>{}. "
@@ -12667,6 +15467,8 @@ _HARMONY_TOOL_CALL_PROMPT_HINT = (
 _TOOL_CALL_PROMPT_HINTS = (
     _JSON_TOOL_CALL_PROMPT_HINT,
     _HARMONY_TOOL_CALL_PROMPT_HINT,
+    _LEGACY_JSON_TOOL_CALL_PROMPT_HINT,
+    _LEGACY_HARMONY_TOOL_CALL_PROMPT_HINT,
 )
 
 
@@ -12674,7 +15476,7 @@ def _ensure_tool_discovery_hint(prompt: str) -> str:
     base = (prompt or "").strip()
     lowered = base.lower()
     if (
-        "tool_help" in lowered
+        "help" in lowered
         and "tool_info" in lowered
         and (
             "tool choice" in lowered
@@ -12702,6 +15504,24 @@ def _strip_tool_call_prompt_hints(prompt: str) -> str:
     return cleaned.strip()
 
 
+def _without_inline_tool_protocol_prompt(prompt: str) -> str:
+    """Keep behavioral guidance while native definitions carry the protocol."""
+
+    cleaned = _strip_available_tools_prompt_section(
+        _strip_tool_call_prompt_hints(prompt)
+    )
+    cleaned = cleaned.replace(
+        "`help`, `tool_help`, or `tool_info`",
+        "`help` or `tool_info`",
+    )
+    cleaned = cleaned.replace(
+        "follow the runtime-specific tool-call syntax instruction appended for this turn.",
+        "use the provider's native tool-call interface for this turn.",
+    )
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 def _strip_tool_guidance_prompt_hints(prompt: str) -> str:
     cleaned = _strip_tool_call_prompt_hints(prompt)
     cleaned = cleaned.replace(_TOOL_DISCOVERY_PROMPT_HINT, "")
@@ -12723,13 +15543,19 @@ def _model_supports_harmony_tool_calls(model_name: Any) -> bool:
     return "gpt-oss" in normalized
 
 
-def _server_uses_native_tool_calls(
+def _runtime_uses_native_tool_calls(
     cfg: Any,
     *,
     mode: Any,
     provider_target: Optional[Dict[str, Any]] = None,
 ) -> bool:
-    if str(mode or "").strip().lower() != "server":
+    normalized_mode = str(mode or "").strip().lower()
+    # OpenAI's API lane exposes Float functions through the native tools field.
+    # Without the registered definitions the model only sees prose guidance and
+    # cannot produce a provider-native function call for the Float harness.
+    if normalized_mode == "api":
+        return True
+    if normalized_mode != "server":
         return False
     if isinstance(provider_target, dict):
         provider = str(provider_target.get("provider") or "").strip().lower()
@@ -12811,6 +15637,10 @@ def _effective_system_prompt(
             "system_prompt",
             app_config.load_config().get("system_prompt", ""),
         )
+    base = base.replace(
+        "`help`, `tool_help`, or `tool_info`",
+        "`help` or `tool_info`",
+    )
     resolved_base = _ensure_tool_discovery_hint(_strip_tool_call_prompt_hints(base))
     if custom:
         resolved_base = (
@@ -13268,7 +16098,9 @@ async def import_conversation(
                         used_names=used_names,
                         destination_folder=requested_destination,
                     )
-                    conversation_store.save_conversation(next_name, payload_messages)
+                    conversation_store.replace_conversation_content(
+                        next_name, payload_messages
+                    )
                     imported_names.append(
                         {
                             "name": next_name,
@@ -13346,7 +16178,7 @@ async def import_conversation(
                             used_names=used_names,
                             destination_folder=requested_destination,
                         )
-                        conversation_store.save_conversation(
+                        conversation_store.replace_conversation_content(
                             next_name, payload_messages
                         )
                         imported_names.append(
@@ -13437,7 +16269,7 @@ async def import_conversation(
         raise HTTPException(status_code=400, detail="Imported messages must be a list")
 
     name = (resolved_name or "").strip() or f"import-{int(time.time())}"
-    conversation_store.save_conversation(name, messages)
+    conversation_store.replace_conversation_content(name, messages)
     return {"status": "imported", "name": name, "message_count": len(messages)}
 
 
@@ -13538,19 +16370,21 @@ async def write_conversation_compaction(payload: ConversationCompactionPayload):
 
 @router.post("/conversations/{name:path}")
 async def save_conversation(name: str, payload: ConversationPayload):
-    messages_to_save = payload.messages
     partial_merge: Optional[Dict[str, Any]] = None
-    if not payload.allow_partial_overwrite:
-        existing = conversation_store.load_conversation(name)
+    messages_to_save: List[Dict[str, Any]] = []
+
+    def _mutate(existing: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        nonlocal messages_to_save, partial_merge
+        incoming: List[Dict[str, Any]] = payload.messages
         if (
-            isinstance(existing, list)
+            not payload.allow_partial_overwrite
             and len(existing) > len(payload.messages)
             and payload.messages
         ):
             overlap = _conversation_tail_overlap(existing, payload.messages)
             if overlap > 0 and len(existing) > overlap:
                 appended = payload.messages[overlap:]
-                messages_to_save = [*existing, *appended]
+                incoming = [*existing, *appended]
                 partial_merge = {
                     "status": "merged_partial" if appended else "skipped_partial",
                     "existing_messages": len(existing),
@@ -13568,7 +16402,15 @@ async def save_conversation(name: str, payload: ConversationPayload):
                         "set allow_partial_overwrite=true intentionally."
                     ),
                 )
-    conversation_store.save_conversation(name, messages_to_save)
+        messages_to_save = _preserve_server_owned_conversation_state(
+            name,
+            existing,
+            incoming,
+            preserve_omitted_server_messages=not payload.allow_partial_overwrite,
+        )
+        return messages_to_save
+
+    conversation_store.mutate_conversation(name, _mutate)
     privacy_updates = _apply_conversation_privacy_filter(name, messages_to_save)
     display_name = (payload.name or "").strip()
     if display_name:
@@ -13632,6 +16474,259 @@ async def list_calendar_events(detailed: bool = False):
     return {"events": out}
 
 
+@router.get("/calendar/occurrences")
+async def list_calendar_occurrences(
+    range_start: float,
+    range_end: float,
+    limit_per_event: int = 512,
+    include_inactive: bool = False,
+):
+    """Expand stored events for a Calendar viewport.
+
+    The scheduled runner uses the same recurrence implementation. Inactive
+    series are omitted unless a review surface explicitly requests them.
+    """
+
+    if range_end < range_start:
+        raise HTTPException(status_code=400, detail="range_end must follow range_start")
+    if range_end - range_start > 366 * 2 * 86400:
+        raise HTTPException(
+            status_code=400, detail="Calendar range may not exceed two years"
+        )
+    events: List[Dict[str, Any]] = []
+    fallback_occurrences: List[Dict[str, Any]] = []
+    errors: List[Dict[str, str]] = []
+    for event_id in calendar_store.list_events():
+        event = calendar_store.load_event(event_id)
+        if not isinstance(event, dict) or not event:
+            continue
+        item = dict(event)
+        item.setdefault("id", event_id)
+        item["status"] = _normalize_calendar_status(item.get("status"))
+        if not include_inactive and item["status"] in {
+            "acknowledged",
+            "skipped",
+            "cancelled",
+            "paused",
+        }:
+            continue
+        recurrence_problem = recurrence_error(item)
+        if recurrence_problem:
+            errors.append(
+                {
+                    "event_id": event_id,
+                    "title": str(item.get("title") or event_id),
+                    "error": recurrence_problem,
+                }
+            )
+            start = coerce_epoch_seconds(item.get("start_time"))
+            if start is not None and range_start <= start <= range_end:
+                fallback = dict(item)
+                fallback["source_event_id"] = event_id
+                fallback["occurrence_time"] = start
+                fallback["occurrence_id"] = f"{event_id}:invalid"
+                fallback["recurrence_error"] = recurrence_problem
+                fallback_occurrences.append(fallback)
+            continue
+        events.append(item)
+    effective_limit = max(1, min(limit_per_event, 2048))
+    expanded = expand_events(
+        events,
+        range_start=range_start,
+        range_end=range_end,
+        per_event_limit=effective_limit + 1,
+    )
+    occurrences: List[Dict[str, Any]] = []
+    counts_by_event: Dict[str, int] = {}
+    truncated_ids: set[str] = set()
+    for occurrence in expanded:
+        source_id = str(occurrence.get("source_event_id") or occurrence.get("id") or "")
+        count = counts_by_event.get(source_id, 0)
+        if count >= effective_limit:
+            truncated_ids.add(source_id)
+            continue
+        counts_by_event[source_id] = count + 1
+        occurrences.append(occurrence)
+    occurrences.extend(fallback_occurrences)
+    occurrences.sort(key=lambda item: float(item.get("occurrence_time") or 0))
+    return {
+        "occurrences": occurrences,
+        "count": len(occurrences),
+        "errors": errors,
+        "truncated": [
+            {
+                "event_id": event_id,
+                "title": next(
+                    (
+                        str(event.get("title") or event_id)
+                        for event in events
+                        if str(event.get("id") or "") == event_id
+                    ),
+                    event_id,
+                ),
+                "limit": effective_limit,
+            }
+            for event_id in sorted(truncated_ids)
+        ],
+    }
+
+
+def _get_work_run_store(app) -> WorkRunStore:
+    store = getattr(app.state, "work_run_store", None)
+    if isinstance(store, WorkRunStore):
+        return store
+    config_payload = getattr(app.state, "config", None)
+    store = WorkRunStore(config_payload if isinstance(config_payload, dict) else {})
+    app.state.work_run_store = store
+    return store
+
+
+def _backfill_calendar_work_runs(
+    store: WorkRunStore,
+    *,
+    event_id: str = "",
+    raise_on_error: bool = False,
+) -> Dict[str, int]:
+    stats = {"events": 0, "seen": 0, "recorded": 0, "invalid": 0, "failed": 0}
+    for stored_event_id in calendar_store.list_events():
+        if event_id and stored_event_id != event_id:
+            continue
+        event = calendar_store.load_event(stored_event_id)
+        if not isinstance(event, dict):
+            continue
+        stats["events"] += 1
+        projected = project_calendar_event(
+            store,
+            stored_event_id,
+            event,
+            raise_on_error=raise_on_error,
+        )
+        for key in ("seen", "recorded", "invalid", "failed"):
+            stats[key] += int(projected.get(key) or 0)
+    return stats
+
+
+class _AuthorizationReceiptUpdateError(RuntimeError):
+    """The server-owned pending receipt could not be reconciled safely."""
+
+
+def _authorization_receipt_matches(
+    receipt: Mapping[str, Any], authorization: Mapping[str, Any]
+) -> bool:
+    if str(receipt.get("action_id") or "") != str(authorization.get("action_id") or ""):
+        return False
+    expected_occurrence = coerce_epoch_seconds(authorization.get("occurrence_at"))
+    receipt_occurrence = coerce_epoch_seconds(receipt.get("occurrence_at"))
+    if expected_occurrence is None or receipt_occurrence is None:
+        return False
+    if abs(expected_occurrence - receipt_occurrence) > 0.0005:
+        return False
+    receipt_authorization = receipt.get("authorization")
+    if not isinstance(receipt_authorization, Mapping):
+        return False
+    return bool(
+        receipt_authorization.get("id") == authorization.get("id")
+        and receipt_authorization.get("request_digest")
+        == authorization.get("request_digest")
+    )
+
+
+def _update_authorization_receipt(
+    event: Dict[str, Any],
+    authorization: Mapping[str, Any],
+    *,
+    status: str,
+    require_match: bool,
+) -> Optional[str]:
+    """Update one exact pending receipt without creating a second identity."""
+
+    history = event.get("run_history")
+    history = list(history) if isinstance(history, list) else []
+    matches = [
+        index
+        for index, receipt in enumerate(history)
+        if isinstance(receipt, Mapping)
+        and _authorization_receipt_matches(receipt, authorization)
+    ]
+    if len(matches) != 1:
+        if require_match:
+            raise _AuthorizationReceiptUpdateError(
+                "the matching authorization receipt is missing or ambiguous"
+            )
+        return None
+
+    index = matches[0]
+    receipt = dict(history[index])
+    receipt["authorization"] = dict(authorization)
+    receipt["status"] = status
+    receipt["phase"] = "authorization"
+    receipt["tool_invoked"] = False
+    receipt["state_delta_certainty"] = "confirmed_no_change"
+    decision_time = coerce_epoch_seconds(
+        authorization.get("decided_at") or authorization.get("invalidated_at")
+    )
+    if status == "authorization_approved":
+        receipt.pop("finished_at", None)
+        receipt["summary"] = "Scheduled action approved once and awaiting dispatch."
+    elif status == AUTHORIZATION_DENIED:
+        if decision_time is not None:
+            receipt["finished_at"] = decision_time
+        receipt["summary"] = "Scheduled action authorization was denied."
+    else:
+        if decision_time is not None:
+            receipt["finished_at"] = decision_time
+        receipt["summary"] = "Scheduled action authorization was invalidated."
+    history[index] = receipt
+    event["run_history"] = history
+    return str(receipt.get("id") or "") or None
+
+
+@router.get("/calendar/runs")
+async def list_calendar_job_runs(
+    request: Request,
+    event_id: str = "",
+    status: str = "",
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    """List durable Calendar execution receipts from the shared work ledger."""
+
+    store = _get_work_run_store(request.app)
+    backfill = await asyncio.to_thread(
+        _backfill_calendar_work_runs,
+        store,
+        event_id=str(event_id or "").strip(),
+    )
+    filters = {
+        "source": "calendar",
+        "event_id": str(event_id or "").strip(),
+        "status": str(status or "").strip().lower(),
+    }
+    records = await asyncio.to_thread(
+        store.list_runs,
+        **filters,
+        limit=limit,
+        offset=offset,
+    )
+    # Count after the page read so concurrent append-only inserts cannot yield
+    # a total smaller than the returned page.
+    total = await asyncio.to_thread(store.count_runs, **filters)
+    next_offset = offset + len(records)
+    return {
+        "runs": records,
+        "count": total,
+        "limit": limit,
+        "offset": offset,
+        "has_more": next_offset < total,
+        "next_offset": next_offset if next_offset < total else None,
+        "storage": {
+            "backend": "sqlite",
+            "device_local": True,
+            "backfill": backfill,
+        },
+    }
+
+
 @router.post("/calendar/reminders/flush")
 async def flush_calendar_reminders():
     """Synchronously trigger any due calendar reminders for catch-up on launch."""
@@ -13690,27 +16785,402 @@ async def get_calendar_event(event_id: str):
 
 
 @router.post("/calendar/events/{event_id}")
-async def save_calendar_event(event_id: str, event: CalendarEvent):
+async def save_calendar_event(event_id: str, event: CalendarEvent, request: Request):
     # Merge updates to avoid wiping fields the client didn't send (e.g. description,
     # location, or scheduled tool metadata stored alongside the event).
-    existing = calendar_store.load_event(event_id) or {}
     update = event.model_dump(exclude_unset=True)
-    merged: Dict[str, Any]
-    if isinstance(existing, dict) and existing:
+    update.pop("run_history", None)
+    authorization_receipts_changed = False
+
+    def apply_update(existing: Dict[str, Any]) -> Dict[str, Any]:
+        nonlocal authorization_receipts_changed
         merged = dict(existing)
-        merged.update(update)
-    else:
-        merged = dict(update)
-    merged["id"] = event_id
-    merged["status"] = _normalize_calendar_status(merged.get("status"))
-    _persist_calendar_event(event_id, merged)
+        previous_status = _normalize_calendar_status(existing.get("status"))
+        incoming_actions = update.get("actions")
+        merged.update({key: value for key, value in update.items() if key != "actions"})
+        if isinstance(incoming_actions, list):
+            merged["actions"] = merge_client_action_definitions(
+                (
+                    existing.get("actions")
+                    if isinstance(existing.get("actions"), list)
+                    else []
+                ),
+                incoming_actions,
+            )
+        merged["run_history"] = (
+            list(existing.get("run_history"))
+            if isinstance(existing.get("run_history"), list)
+            else []
+        )
+        merged["id"] = event_id
+        merged["status"] = _normalize_calendar_status(merged.get("status"))
+        rearmed_one_time_event = bool(
+            not merged.get("rrule")
+            and previous_status in {"acknowledged", "skipped", "cancelled"}
+            and merged["status"] in {"pending", "scheduled"}
+        )
+        if rearmed_one_time_event:
+            execution_fields = {
+                "run_id",
+                "running_occurrence_at",
+                "started_at",
+                "executed_at",
+                "interrupted_at",
+                "last_occurrence_at",
+                "result",
+                "error",
+                "followup_status",
+                "followup_error",
+                "followup_prompt",
+                "followup_tool_name",
+                "followup_tool_args",
+                "followup_message_id",
+                "followup_started_at",
+                "followup_completed_at",
+                "recovery_count",
+                "recovered_at",
+                "authorization",
+                "authorization_id",
+                "authorization_status",
+                "authorization_request_digest",
+                "authorization_occurrence_at",
+                "approval_id",
+                "approval_status",
+                "approved_at",
+                "work_run_receipt_id",
+                "effect_id",
+                "effect_ids",
+                "effect_status",
+                "effect_certainty",
+                "state_delta_certainty",
+                "reconciliation_outcome",
+                "reconciliation_summary",
+                "reconcile_required",
+                "tool_invoked",
+                "cancel_requested",
+                "cancel_request_id",
+                "cancel_requested_at",
+                "cancelled_at",
+                "prompt_checkpoint",
+                "external_control_revision",
+                "run_control_revision",
+            }
+            rearmed_actions = []
+            for raw_action in merged.get("actions") or []:
+                if not isinstance(raw_action, dict):
+                    continue
+                action = {
+                    key: value
+                    for key, value in raw_action.items()
+                    if key not in execution_fields
+                }
+                action["status"] = "scheduled"
+                action["external_control_revision"] = (
+                    external_control_revision(raw_action) + 1
+                )
+                rearmed_actions.append(action)
+            merged["actions"] = rearmed_actions
+        background_job = normalize_background_job(event_id, merged)
+        if background_job is not None:
+            merged["background_job"] = background_job
+        bump_actions_for_event_control_change(existing, merged)
+        invalidated_authorizations = (
+            []
+            if rearmed_one_time_event
+            else invalidate_event_authorizations_for_edit(existing, merged)
+        )
+        for authorization in invalidated_authorizations:
+            receipt_id = _update_authorization_receipt(
+                merged,
+                authorization,
+                status="authorization_invalidated",
+                require_match=False,
+            )
+            authorization_receipts_changed = bool(
+                authorization_receipts_changed or receipt_id
+            )
+        return merged
+
+    merged = calendar_store.update_event(event_id, apply_update, create=True)
+    if authorization_receipts_changed:
+        try:
+            await asyncio.to_thread(
+                project_calendar_event,
+                _get_work_run_store(request.app),
+                event_id,
+                merged,
+                raise_on_error=True,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Calendar authorization invalidation needs Activity repair for %s",
+                event_id,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "The Calendar edit was saved, but its authorization receipt "
+                    "needs Activity repair."
+                ),
+            ) from exc
+    try:
+        _ingest_calendar_event(event_id, merged)
+    except Exception:
+        pass
     return {"status": "saved"}
 
 
+class CalendarActionAuthorizationDecision(BaseModel):
+    decision: Literal["approve_once", "deny"]
+    authorization_id: str = Field(min_length=1, max_length=512)
+    request_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    occurrence_at: float = Field(gt=0)
+
+
+@router.post("/calendar/events/{event_id}/actions/{action_id}/authorization")
+async def decide_calendar_action_authorization(
+    request: Request,
+    event_id: str,
+    action_id: str,
+    payload: CalendarActionAuthorizationDecision,
+):
+    """Record one local approve-once or deny decision without dispatching work."""
+
+    _require_local_control(request)
+    receipt_id: Optional[str] = None
+
+    def update_receipt(event: Dict[str, Any], outcome: Dict[str, Any]) -> None:
+        nonlocal receipt_id
+        authorization = outcome.get("authorization")
+        if not isinstance(authorization, Mapping):
+            raise _AuthorizationReceiptUpdateError(
+                "the authorization decision has no durable snapshot"
+            )
+        receipt_status = (
+            "authorization_approved"
+            if outcome.get("status") == AUTHORIZATION_APPROVED_ONCE
+            else AUTHORIZATION_DENIED
+        )
+        receipt_id = _update_authorization_receipt(
+            event,
+            authorization,
+            status=receipt_status,
+            require_match=True,
+        )
+
+    try:
+        outcome = await asyncio.to_thread(
+            apply_authorization_decision,
+            event_id,
+            action_id,
+            decision=payload.decision,
+            authorization_id=payload.authorization_id,
+            request_digest=payload.request_digest,
+            occurrence_at=payload.occurrence_at,
+            event_mutator=update_receipt,
+        )
+    except AuthorizationNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (
+        AuthorizationConflictError,
+        AuthorizationPermissionError,
+    ) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (ScheduledActionAuthorizationError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception(
+            "Could not record authorization decision for %s/%s",
+            event_id,
+            action_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The authorization decision could not be recorded with its "
+                "Activity receipt."
+            ),
+        ) from exc
+
+    stored = calendar_store.load_event(event_id)
+    if not isinstance(stored, dict) or not stored:
+        raise HTTPException(
+            status_code=503,
+            detail="The authorization decision could not be reloaded for Activity.",
+        )
+    try:
+        await asyncio.to_thread(
+            project_calendar_event,
+            _get_work_run_store(request.app),
+            event_id,
+            stored,
+            raise_on_error=True,
+        )
+    except Exception as exc:
+        logger.exception(
+            "Could not project authorization decision for %s/%s",
+            event_id,
+            action_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="The authorization decision was saved but Activity needs repair.",
+        ) from exc
+    try:
+        await asyncio.to_thread(_ingest_calendar_event, event_id, stored)
+    except Exception:
+        logger.warning(
+            "Could not re-index Calendar authorization decision for %s/%s",
+            event_id,
+            action_id,
+            exc_info=True,
+        )
+    return {
+        "status": outcome["status"],
+        "event_id": event_id,
+        "action_id": action_id,
+        "authorization": outcome["authorization"],
+        "receipt_id": receipt_id,
+        "idempotent": bool(outcome.get("idempotent")),
+        "execution_started": False,
+    }
+
+
+class CalendarActionCancellationRequest(BaseModel):
+    run_id: str = Field(min_length=1, max_length=512)
+
+    @model_validator(mode="after")
+    def normalize_run_id(self):
+        self.run_id = str(self.run_id or "").strip()
+        if not self.run_id:
+            raise ValueError("run_id is required")
+        return self
+
+
+@router.post("/calendar/events/{event_id}/actions/{action_id}/cancel")
+async def cancel_calendar_action(
+    request: Request,
+    event_id: str,
+    action_id: str,
+    payload: CalendarActionCancellationRequest,
+):
+    """Request exact-run cancellation without replaying or claiming early exit."""
+
+    _require_local_control(request)
+    try:
+        outcome = await asyncio.to_thread(
+            request_scheduled_action_cancellation,
+            event_id,
+            action_id,
+            expected_run_id=payload.run_id,
+        )
+    except ScheduledActionCancellationNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ScheduledActionCancellationConflict, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception(
+            "Could not record cancellation request for %s/%s",
+            event_id,
+            action_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="The cancellation request could not be recorded.",
+        ) from exc
+
+    stored = calendar_store.load_event(event_id)
+    if not isinstance(stored, dict) or not stored:
+        raise HTTPException(
+            status_code=503,
+            detail="The cancellation was saved but Calendar state could not be read.",
+        )
+    history = stored.get("run_history")
+    history = history if isinstance(history, list) else []
+    matching_receipts = [
+        receipt
+        for receipt in history
+        if isinstance(receipt, dict)
+        and str(receipt.get("run_id") or "") == payload.run_id
+        and str(receipt.get("action_id") or "") == action_id
+    ]
+    if len(matching_receipts) != 1:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The cancellation was saved but its Activity receipt needs repair."
+            ),
+        )
+    receipt_id = str(matching_receipts[0].get("id") or "").strip()
+    try:
+        await asyncio.to_thread(
+            project_calendar_event,
+            _get_work_run_store(request.app),
+            event_id,
+            stored,
+            raise_on_error=True,
+        )
+    except Exception as exc:
+        logger.exception(
+            "Could not project cancellation for %s/%s",
+            event_id,
+            action_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="The cancellation was saved but Activity needs repair.",
+        ) from exc
+    warning: Optional[str] = None
+    try:
+        await asyncio.to_thread(_ingest_calendar_event, event_id, stored)
+    except Exception:
+        warning = "Cancellation was saved, but Calendar search needs refresh."
+        logger.warning(
+            "Could not re-index Calendar cancellation for %s/%s",
+            event_id,
+            action_id,
+            exc_info=True,
+        )
+    return {
+        **outcome,
+        "receipt_id": receipt_id,
+        "activity_projected": True,
+        "tool_replayed": False,
+        "warning": warning,
+    }
+
+
 @router.delete("/calendar/events/{event_id}")
-async def delete_calendar_event(event_id: str):
-    calendar_store.delete_event(event_id)
-    return {"status": "deleted"}
+async def delete_calendar_event(request: Request, event_id: str):
+    store = _get_work_run_store(request.app)
+    try:
+        deletion = await asyncio.to_thread(
+            delete_calendar_event_with_receipts,
+            store,
+            event_id,
+        )
+    except calendar_store.CalendarEventActiveRunError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This event has an active run. Use End future series for "
+                "recurring work and Request current run stop in Activity, then "
+                "delete the event after the run is terminal."
+            ),
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Calendar event was not deleted because its run receipts could not "
+                "be preserved in Activity."
+            ),
+        ) from exc
+    return {
+        "status": "deleted",
+        "preserved_run_count": int(deletion.get("recorded") or 0),
+        "invalid_run_count": int(deletion.get("invalid") or 0),
+    }
 
 
 class PromptAction(BaseModel):
@@ -13719,17 +17189,26 @@ class PromptAction(BaseModel):
 
 @router.post("/calendar/events/{event_id}/prompt")
 async def handle_event_prompt(event_id: str, payload: PromptAction):
-    event = calendar_store.load_event(event_id)
-    if not event:
-        raise HTTPException(status_code=404, detail="Event not found")
     action = _normalize_calendar_status(payload.action, default="")
     if action == "acknowledged":
-        event["status"] = "acknowledged"
+        next_status = "acknowledged"
     elif action == "skipped":
-        event["status"] = "skipped"
+        next_status = "skipped"
     else:
         raise HTTPException(status_code=400, detail="Invalid action")
-    _persist_calendar_event(event_id, event)
+
+    def apply_prompt_action(current: Dict[str, Any]) -> Dict[str, Any]:
+        updated = {**current, "status": next_status}
+        bump_actions_for_event_control_change(current, updated)
+        return updated
+
+    event = calendar_store.update_event(event_id, apply_prompt_action)
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    try:
+        _ingest_calendar_event(event_id, event)
+    except Exception:
+        pass
     return {"status": event["status"]}
 
 
@@ -15054,6 +18533,8 @@ async def knowledge_text(payload: KnowledgeTextPayload):
 
 
 _ALLOWED_VISION_WORKFLOWS = {"auto", "image_qa", "ocr", "compare", "caption"}
+_IMAGE_CAPTION_ENGINES = {"local", "cloud", "off"}
+_DEFAULT_CLOUD_CAPTION_MODEL = "gpt-5.4-nano"
 
 
 def _normalize_attachment_origin(value: Any, *, default: str = "upload") -> str:
@@ -15115,6 +18596,247 @@ def _configured_vision_caption_model() -> str:
     )
 
 
+def _normalize_image_caption_engine(value: Any) -> str:
+    engine = str(value or "").strip().lower()
+    return engine if engine in _IMAGE_CAPTION_ENGINES else "local"
+
+
+def _configured_image_caption_engine(
+    config: Optional[Dict[str, Any]] = None,
+) -> str:
+    cfg = config if isinstance(config, dict) else app_config.load_config()
+    return _normalize_image_caption_engine(cfg.get("image_caption_engine"))
+
+
+def _configured_cloud_caption_model(
+    config: Optional[Dict[str, Any]] = None,
+) -> str:
+    cfg = config if isinstance(config, dict) else app_config.load_config()
+    return (
+        str(cfg.get("image_caption_cloud_model") or "").strip()
+        or _DEFAULT_CLOUD_CAPTION_MODEL
+    )
+
+
+def _installed_caption_model_path(
+    model: str,
+    cfg: Dict[str, Any],
+) -> Optional[Path]:
+    resolved = resolve_installed_vision_caption_model(
+        model,
+        models_folder=str(cfg.get("models_folder") or "").strip() or None,
+    )
+    return Path(resolved) if resolved else None
+
+
+def _local_caption_model_weights_available(model: str, cfg: Dict[str, Any]) -> bool:
+    raw = str(model or "").strip()
+    if not raw:
+        return False
+    return _installed_caption_model_path(raw, cfg) is not None
+
+
+def _shared_local_captioner(model: str, cfg: Dict[str, Any]) -> Any:
+    models_folder = str(cfg.get("models_folder") or "").strip() or None
+    runtime_model = resolve_vision_caption_runtime_model(
+        model,
+        models_folder=models_folder,
+    )
+    return get_shared_vision_captioner(
+        model,
+        models_folder=models_folder,
+        runtime_model=runtime_model,
+    )
+
+
+def _local_captioner_loaded(model: str, cfg: Optional[Dict[str, Any]] = None) -> bool:
+    captioner = _shared_local_captioner(model, cfg or {})
+    return bool(
+        getattr(captioner, "_loaded", False)
+        and getattr(captioner, "_proc", None) is not None
+        and getattr(captioner, "_net", None) is not None
+    )
+
+
+def _local_captioner_verified(
+    model: str,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> bool:
+    captioner = _shared_local_captioner(model, cfg or {})
+    return bool(getattr(captioner, "_verified", False))
+
+
+def _run_local_captioner(
+    model: str,
+    data: bytes,
+    *,
+    config: Optional[Dict[str, Any]] = None,
+) -> Any:
+    normalized_model = str(model or "").strip()
+    cfg = config if isinstance(config, dict) else {}
+    models_folder = str(cfg.get("models_folder") or "").strip() or None
+    runtime_model = resolve_vision_caption_runtime_model(
+        normalized_model,
+        models_folder=models_folder,
+    )
+    _captioner, result = run_shared_vision_captioner(
+        data,
+        model=normalized_model,
+        models_folder=models_folder,
+        runtime_model=runtime_model,
+    )
+    return result
+
+
+def _image_caption_status(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    cfg = dict(config) if isinstance(config, dict) else app_config.load_config()
+    engine = _configured_image_caption_engine(cfg)
+    local_model = resolve_vision_caption_model(
+        str(cfg.get("vision_model") or "").strip(),
+        str(os.getenv("VISION_CAPTION_MODEL") or "").strip(),
+    )
+    dependency_modules = ("transformers", "torch", "PIL")
+    try:
+        dependencies_available = all(
+            importlib.util.find_spec(module_name) is not None
+            for module_name in dependency_modules
+        )
+    except (ImportError, ValueError):
+        dependencies_available = False
+    weights_available = _local_caption_model_weights_available(local_model, cfg)
+    local_installed = weights_available
+    local_can_attempt = dependencies_available and local_installed
+    local_loaded = _local_captioner_loaded(local_model, cfg)
+    local_verified = _local_captioner_verified(local_model, cfg)
+    if not dependencies_available:
+        local_reason = "caption_dependencies_unavailable"
+    elif not weights_available:
+        local_reason = "model_weights_unavailable"
+    elif not local_loaded:
+        local_reason = "model_installed_not_loaded"
+    else:
+        local_reason = ""
+
+    cloud_model = _configured_cloud_caption_model(cfg)
+    api_key_set = bool(str(cfg.get("api_key") or "").strip())
+    api_url_configured = bool(str(cfg.get("api_url") or "").strip())
+    cloud_configured = bool(cloud_model and api_key_set and api_url_configured)
+    if engine == "local":
+        ready = local_loaded
+        can_generate = local_can_attempt
+        configured_model = local_model
+    elif engine == "cloud":
+        ready = cloud_configured
+        can_generate = cloud_configured
+        configured_model = cloud_model
+    else:
+        ready = True
+        can_generate = False
+        configured_model = ""
+    return {
+        "engine": engine,
+        "configured_model": configured_model,
+        "ready": ready,
+        "can_generate": can_generate,
+        "can_attempt": can_generate,
+        "automatic_downloads": False,
+        "local": {
+            "model": local_model,
+            "weights_available": weights_available,
+            "installed": local_installed,
+            "dependencies_available": dependencies_available,
+            "configured": local_can_attempt,
+            "can_attempt": local_can_attempt,
+            "loaded": local_loaded,
+            "verified": local_verified,
+            "loadable": local_loaded,
+            "reason": local_reason,
+        },
+        "cloud": {
+            "provider": "openai-compatible",
+            "model": cloud_model,
+            "configured": cloud_configured,
+            "api_url_configured": api_url_configured,
+            "api_key_set": api_key_set,
+        },
+    }
+
+
+def _cloud_caption_responses_url(api_url: str) -> str:
+    base = _responses_api_base(api_url)
+    return f"{base.rstrip('/')}/responses"
+
+
+def _generate_cloud_image_caption(
+    data: bytes,
+    *,
+    content_type: str,
+    config: Dict[str, Any],
+) -> str:
+    status = _image_caption_status(config)
+    cloud = status["cloud"]
+    if not cloud["configured"]:
+        raise RuntimeError("Cloud caption provider is not configured")
+    media_type = (
+        str(content_type or "").strip().lower()
+        if str(content_type or "").strip().lower().startswith("image/")
+        else "image/jpeg"
+    )
+    encoded = base64.b64encode(data).decode("ascii")
+    payload = {
+        "model": cloud["model"],
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "Write one concise, factual caption for this image. "
+                            "Describe only visible content and note uncertainty."
+                        ),
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:{media_type};base64,{encoded}",
+                        "detail": "low",
+                    },
+                ],
+            }
+        ],
+        "max_output_tokens": 180,
+    }
+    timeout = min(max(float(config.get("timeout") or 60), 10), 120)
+    response = http_session.post(
+        _cloud_caption_responses_url(str(config.get("api_url") or "")),
+        headers={
+            "Authorization": f"Bearer {str(config.get('api_key') or '').strip()}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    caption = normalize_generated_caption(
+        _extract_responses_visible_text(response.json())
+    )
+    if is_low_quality_generated_caption(caption):
+        return ""
+    return caption
+
+
+def _is_legacy_clip_placeholder(metadata: Dict[str, Any], caption: str) -> bool:
+    model = str(metadata.get("caption_model") or "").strip().lower()
+    if "clip" not in model and "siglip" not in model:
+        return False
+    status = str(metadata.get("caption_status") or "").strip().lower()
+    return status != "manual" and (
+        bool(metadata.get("placeholder_caption"))
+        or is_placeholder_caption(caption)
+        or is_low_quality_generated_caption(caption)
+    )
+
+
 def _attachment_status_defaults(
     metadata: Dict[str, Any],
     *,
@@ -15122,12 +18844,18 @@ def _attachment_status_defaults(
 ) -> Dict[str, Any]:
     meta = dict(metadata) if isinstance(metadata, dict) else {}
     is_image = str(content_type or "").lower().startswith("image/")
+    caption = _sanitize_attachment_caption(meta.get("caption") or "")
+    legacy_clip_placeholder = _is_legacy_clip_placeholder(meta, caption)
     caption_status = str(meta.get("caption_status") or "").strip().lower()
+    if legacy_clip_placeholder:
+        caption_status = "placeholder"
     if not caption_status:
-        if meta.get("caption"):
+        if caption:
             if meta.get("caption_model") == "manual-caption":
                 caption_status = "manual"
-            elif bool(meta.get("placeholder_caption")):
+            elif bool(meta.get("placeholder_caption")) or is_placeholder_caption(
+                caption
+            ):
                 caption_status = "placeholder"
             else:
                 caption_status = "generated"
@@ -15153,7 +18881,11 @@ def _attachment_status_defaults(
     return {
         "caption_status": caption_status,
         "index_status": index_status,
-        "placeholder_caption": bool(meta.get("placeholder_caption")),
+        "placeholder_caption": bool(
+            meta.get("placeholder_caption")
+            or is_placeholder_caption(caption)
+            or legacy_clip_placeholder
+        ),
     }
 
 
@@ -15203,6 +18935,10 @@ def _iter_attachment_hashes() -> List[str]:
     )
 
 
+class _AttachmentIndexCancelled(RuntimeError):
+    """A queued generation no longer owns a durable attachment."""
+
+
 def _caption_and_index_image_bytes(
     data: bytes,
     *,
@@ -15211,13 +18947,126 @@ def _caption_and_index_image_bytes(
     url: str | None = None,
     content_hash: str | None = None,
     caption_override: str | None = None,
+    generate_caption: bool = True,
     progress_callback: Any = None,
+    index_generation: str = "",
+) -> Dict[str, Any]:
+    blob_hash = str(content_hash or "").strip() or put_blob(data)
+    if hashlib.sha256(data).hexdigest() != blob_hash:
+        raise ValueError("attachment index bytes do not match content_hash")
+    with attachment_metadata_lock(BLOBS_DIR, blob_hash):
+        prior_metadata = _read_attachment_meta(blob_hash)
+        if index_generation:
+            current_generation = str(
+                prior_metadata.get("index_generation") or ""
+            ).strip()
+            deletion_status = (
+                str(prior_metadata.get("deletion_status") or "").strip().lower()
+            )
+            if (
+                current_generation != index_generation
+                or deletion_status == "cleanup_pending"
+            ):
+                raise _AttachmentIndexCancelled(
+                    "attachment index generation is stale or deleting"
+                )
+        durable_target = _resolve_attachment_target(
+            blob_hash,
+            filename=filename,
+            migrate_legacy=False,
+        )
+        if durable_target is None:
+            if index_generation:
+                raise _AttachmentIndexCancelled(
+                    "attachment bytes were deleted before indexing"
+                )
+            raise FileNotFoundError("attachment bytes are unavailable for indexing")
+        try:
+            return _caption_and_index_image_bytes_locked(
+                data,
+                filename=filename,
+                content_type=content_type,
+                url=url,
+                content_hash=blob_hash,
+                caption_override=caption_override,
+                generate_caption=generate_caption,
+                progress_callback=progress_callback,
+                index_generation=index_generation,
+            )
+        except _AttachmentIndexCancelled:
+            raise
+        except Exception:
+            preserved_status = (
+                str(prior_metadata.get("caption_status") or "").strip().lower()
+            )
+            preserve_caption_state = preserved_status in {
+                "manual",
+                "generated",
+                "placeholder",
+                "disabled",
+            }
+
+            def _mark_failed(current: Dict[str, Any]) -> Dict[str, Any]:
+                if (
+                    index_generation
+                    and str(current.get("index_generation") or "").strip()
+                    != index_generation
+                ):
+                    return current
+                current["index_status"] = "error"
+                current["index_warning"] = "attachment_index_failed"
+                current["metadata_updated_at"] = _utc_now_compact_iso()
+                if preserve_caption_state:
+                    for key in (
+                        "caption",
+                        "caption_model",
+                        "caption_status",
+                        "caption_updated_at",
+                        "caption_generated_at",
+                        "placeholder_caption",
+                    ):
+                        if key in prior_metadata:
+                            current[key] = prior_metadata[key]
+                        else:
+                            current.pop(key, None)
+                elif str(current.get("caption_status") or "").strip().lower() in {
+                    "",
+                    "pending",
+                    "indexing",
+                }:
+                    current["caption_status"] = "error"
+                current.pop("index_generation", None)
+                current.pop("index_generation_started_at", None)
+                return current
+
+            try:
+                _mutate_attachment_meta(blob_hash, _mark_failed)
+            except Exception:
+                logger.warning(
+                    "Failed to persist attachment index failure for %s",
+                    blob_hash,
+                    exc_info=True,
+                )
+            raise
+
+
+def _caption_and_index_image_bytes_locked(
+    data: bytes,
+    *,
+    filename: str,
+    content_type: str,
+    url: str | None = None,
+    content_hash: str | None = None,
+    caption_override: str | None = None,
+    generate_caption: bool = True,
+    progress_callback: Any = None,
+    index_generation: str = "",
 ) -> Dict[str, Any]:
     """Caption + index an image into both text and CLIP knowledge stores.
 
     Persistence strategy:
-    - Always store the caption text in the main (text) knowledge index so it is
-      visible/auditable in the UI.
+    - Store only real captions in the main text index. Placeholder/failure
+      text remains an attachment status and is never searchable knowledge.
     - Best-effort: also store the image's CLIP embedding into a dedicated CLIP
       index (separate collection/class to avoid dimension conflicts).
 
@@ -15233,27 +19082,34 @@ def _caption_and_index_image_bytes(
     indexed_at = _utc_now_compact_iso()
     uploaded_at = indexed_at
     existing_caption_meta: Dict[str, Any] = {}
-    try:
-        existing_caption_meta = _read_attachment_meta(blob_hash)
-        merged_meta = dict(existing_caption_meta)
-        existing_status = str(merged_meta.get("caption_status") or "").strip().lower()
-        merged_meta.update(
+
+    def _mark_indexing(current: Dict[str, Any]) -> Dict[str, Any]:
+        existing_status = str(current.get("caption_status") or "").strip().lower()
+        try:
+            _sanitize_attachment_source_url(current.get("source_url"))
+        except ValueError:
+            current.pop("source_url", None)
+            current.pop("source_url_recorded_at", None)
+        current.update(
             {
                 "filename": safe_name,
                 "content_type": content_type,
                 "size": len(data),
-                "uploaded_at": merged_meta.get("uploaded_at") or uploaded_at,
+                "uploaded_at": current.get("uploaded_at") or uploaded_at,
                 "index_status": "indexing",
             }
         )
+        if index_generation:
+            current["index_generation"] = index_generation
+            current.setdefault("index_generation_started_at", indexed_at)
+        else:
+            current.pop("index_generation", None)
+            current.pop("index_generation_started_at", None)
         if existing_status != "manual":
-            merged_meta["caption_status"] = "indexing"
-        _write_attachment_meta(
-            blob_hash,
-            merged_meta,
-        )
-    except Exception:
-        pass
+            current["caption_status"] = "indexing"
+        return current
+
+    existing_caption_meta = _mutate_attachment_meta(blob_hash, _mark_indexing)
 
     def _emit_progress(**payload: Any) -> None:
         if not callable(progress_callback):
@@ -15266,20 +19122,31 @@ def _caption_and_index_image_bytes(
     manual_caption = _sanitize_attachment_caption(caption_override or "")
     preserved_caption = ""
     preserved_caption_model = ""
-    if not manual_caption:
+    caption_outcome = "missing"
+    if generate_caption and not manual_caption:
         existing_caption = _sanitize_attachment_caption(
             existing_caption_meta.get("caption") or ""
         )
         existing_caption_status = (
             str(existing_caption_meta.get("caption_status") or "").strip().lower()
         )
-        existing_placeholder = bool(
-            existing_caption_meta.get("placeholder_caption")
-        ) or is_placeholder_caption(existing_caption)
+        existing_placeholder = (
+            bool(existing_caption_meta.get("placeholder_caption"))
+            or is_placeholder_caption(existing_caption)
+            or _is_legacy_clip_placeholder(
+                existing_caption_meta,
+                existing_caption,
+            )
+        )
         existing_low_quality = is_low_quality_generated_caption(existing_caption)
         if existing_caption_status == "manual":
             manual_caption = existing_caption
-        elif existing_caption and not existing_placeholder and not existing_low_quality:
+        elif (
+            existing_caption_status not in {"failed", "error", "placeholder"}
+            and existing_caption
+            and not existing_placeholder
+            and not existing_low_quality
+        ):
             preserved_caption = existing_caption
             preserved_caption_model = (
                 str(existing_caption_meta.get("caption_model") or "").strip()
@@ -15296,6 +19163,7 @@ def _caption_and_index_image_bytes(
         caption = manual_caption
         placeholder = False
         caption_model = "manual-caption"
+        caption_outcome = "manual"
     elif preserved_caption:
         _emit_progress(
             status="running",
@@ -15307,7 +19175,8 @@ def _caption_and_index_image_bytes(
         caption = preserved_caption
         placeholder = False
         caption_model = preserved_caption_model
-    else:
+        caption_outcome = "preserved"
+    elif generate_caption:
         _emit_progress(
             status="running",
             phase_label="Generating image caption",
@@ -15318,7 +19187,21 @@ def _caption_and_index_image_bytes(
         caption, placeholder, caption_model = _generate_image_caption(
             data,
             content_hash=blob_hash,
+            content_type=content_type,
         )
+        caption_outcome = (
+            "disabled"
+            if caption_model == "disabled"
+            else "placeholder"
+            if placeholder
+            else "generated"
+            if caption
+            else "missing"
+        )
+    else:
+        caption = ""
+        placeholder = False
+        caption_model = ""
 
     try:
         latest_meta = _read_attachment_meta(blob_hash)
@@ -15326,10 +19209,24 @@ def _caption_and_index_image_bytes(
         latest_meta = {}
     latest_caption = _sanitize_attachment_caption(latest_meta.get("caption") or "")
     latest_status = str(latest_meta.get("caption_status") or "").strip().lower()
-    if latest_status == "manual" and latest_caption:
+    if generate_caption and latest_status == "manual" and latest_caption:
         caption = latest_caption
         placeholder = False
         caption_model = "manual-caption"
+        caption_outcome = "manual"
+
+    if (
+        caption_model != "manual-caption"
+        and caption
+        and (
+            placeholder
+            or is_placeholder_caption(caption)
+            or is_low_quality_generated_caption(caption)
+        )
+    ):
+        placeholder = True
+        caption_outcome = "placeholder"
+    searchable_caption = caption if caption and not placeholder else ""
 
     source = f"image:{blob_hash}"
     source_namespace = _coerce_relative_files_path(
@@ -15337,14 +19234,10 @@ def _caption_and_index_image_bytes(
     )
     if source_namespace:
         source = f"{source_namespace}/{source}"
-    caption_metadata = {
-        "kind": "image_caption",
-        "type": "image_caption",
+    attachment_metadata = {
         "source": source,
         "filename": safe_name,
         "content_type": content_type,
-        "caption_model": caption_model,
-        "placeholder": placeholder,
         "content_hash": blob_hash,
         "url": attachment_url,
     }
@@ -15353,18 +19246,36 @@ def _caption_and_index_image_bytes(
         "source_sync_label",
         "source_sync_original_relative_path",
         "relative_path",
+        "display_name",
+        "folder",
+        "source_url",
+        "source_url_recorded_at",
     ):
         value = existing_caption_meta.get(key)
         if value:
-            caption_metadata[key] = value
-    _emit_progress(
-        status="running",
-        phase_label="Writing caption text index",
-        phase_index=3,
-        phase_count=4,
-        detail="Saving the caption into the text knowledge store.",
-    )
-    doc_id = service.ingest_text(caption, caption_metadata)
+            attachment_metadata[key] = value
+    doc_id: Optional[str] = None
+    if searchable_caption:
+        caption_metadata = {
+            **attachment_metadata,
+            "kind": "image_caption",
+            "type": "image_caption",
+            "caption_model": caption_model,
+            "placeholder": placeholder,
+        }
+        _emit_progress(
+            status="running",
+            phase_label="Writing caption text index",
+            phase_index=3,
+            phase_count=4,
+            detail="Saving the caption into the text knowledge store.",
+        )
+        doc_id = service.ingest_text(searchable_caption, caption_metadata)
+    else:
+        try:
+            service.delete_source(source)
+        except Exception:
+            pass
 
     clip_service = _get_clip_rag_service(raise_http=False)
     clip_model = None
@@ -15396,18 +19307,26 @@ def _caption_and_index_image_bytes(
                 model_name=str(clip_model or "ViT-B-32"),
             )
             clip_info["dim"] = len(clip_embedding)
-            clip_metadata = dict(caption_metadata)
+            clip_metadata = dict(attachment_metadata)
             clip_metadata.update(
                 {
                     "kind": "image_embedding",
                     "type": "image_embedding",
                     "derived": True,
                     "embedding_model": f"clip:{clip_model}",
-                    "caption_doc_id": doc_id,
+                    "caption_available": bool(searchable_caption),
                     "__embedding": clip_embedding,
                 }
             )
-            clip_doc_id = clip_service.ingest_text(caption, clip_metadata)
+            if doc_id:
+                clip_metadata["caption_doc_id"] = doc_id
+            else:
+                clip_metadata.pop("caption_doc_id", None)
+            clip_doc_id = clip_service.ingest_text(
+                searchable_caption
+                or str(existing_caption_meta.get("display_name") or safe_name),
+                clip_metadata,
+            )
             clip_info["saved"] = True
             clip_info["id"] = clip_doc_id
         else:
@@ -15418,10 +19337,18 @@ def _caption_and_index_image_bytes(
 
     try:
         existing_meta = _read_attachment_meta(blob_hash)
+        if (
+            index_generation
+            and str(existing_meta.get("index_generation") or "").strip()
+            != index_generation
+        ):
+            raise _AttachmentIndexCancelled(
+                "attachment index generation changed before finalization"
+            )
         merged_meta = dict(existing_meta)
         current_caption = _sanitize_attachment_caption(merged_meta.get("caption") or "")
         current_status = str(merged_meta.get("caption_status") or "").strip().lower()
-        if current_status == "manual" and current_caption:
+        if generate_caption and current_status == "manual" and current_caption:
             caption = current_caption
             placeholder = False
             caption_model = "manual-caption"
@@ -15437,35 +19364,62 @@ def _caption_and_index_image_bytes(
                 "content_type": content_type,
                 "size": len(data),
                 "uploaded_at": merged_meta.get("uploaded_at") or uploaded_at,
-                "caption": caption,
-                "caption_model": caption_model,
-                "placeholder_caption": placeholder,
-                "caption_status": (
-                    "manual"
-                    if caption_model == "manual-caption"
-                    else "placeholder"
-                    if placeholder
-                    else "generated"
-                ),
                 "index_status": "indexed",
                 "indexed_at": indexed_at,
                 "clip_embedding_model": f"clip:{clip_model}" if clip_model else "",
                 "clip_embedding_dim": clip_info.get("dim"),
             }
         )
-        if caption_model == "manual-caption":
+        if searchable_caption:
+            merged_meta.update(
+                {
+                    "caption": searchable_caption,
+                    "caption_model": caption_model,
+                    "placeholder_caption": placeholder,
+                    "caption_status": (
+                        "manual"
+                        if caption_model == "manual-caption"
+                        else "placeholder"
+                        if placeholder
+                        else "generated"
+                    ),
+                }
+            )
+        elif placeholder:
+            for key in (
+                "caption",
+                "caption_updated_at",
+                "caption_generated_at",
+            ):
+                merged_meta.pop(key, None)
+            merged_meta["caption_model"] = caption_model
+            merged_meta["placeholder_caption"] = True
+            merged_meta["caption_status"] = "placeholder"
+        else:
+            for key in (
+                "caption",
+                "caption_model",
+                "caption_updated_at",
+                "caption_generated_at",
+            ):
+                merged_meta.pop(key, None)
+            merged_meta["placeholder_caption"] = False
+            merged_meta["caption_status"] = (
+                "disabled" if caption_model == "disabled" else "missing"
+            )
+        if caption_model == "manual-caption" and searchable_caption:
             merged_meta["caption_updated_at"] = (
                 existing_caption_updated_at or indexed_at
             )
             merged_meta.pop("caption_generated_at", None)
-        elif preserved_caption:
+        elif preserved_caption and searchable_caption:
             if existing_caption_updated_at:
                 merged_meta["caption_updated_at"] = existing_caption_updated_at
             if existing_caption_generated_at:
                 merged_meta["caption_generated_at"] = existing_caption_generated_at
             if not existing_caption_updated_at and not existing_caption_generated_at:
                 merged_meta["caption_generated_at"] = indexed_at
-        else:
+        elif searchable_caption:
             merged_meta["caption_generated_at"] = indexed_at
             merged_meta.pop("caption_updated_at", None)
         clip_error = clip_info.get("error")
@@ -15478,11 +19432,18 @@ def _caption_and_index_image_bytes(
             if clip_info.get("saved"):
                 merged_meta["index_status"] = "indexed"
                 merged_meta["clip_indexed_at"] = indexed_at
-        _write_attachment_meta(blob_hash, merged_meta)
+        merged_meta.pop("index_generation", None)
+        merged_meta.pop("index_generation_started_at", None)
+        _mutate_attachment_meta(blob_hash, lambda _current: merged_meta)
     except Exception:
         logger.debug("Failed to update attachment index metadata", exc_info=True)
+        raise
 
-    complete_detail = "Caption and index data are ready."
+    complete_detail = (
+        "Caption and index data are ready."
+        if searchable_caption
+        else "Image retrieval index is ready; no caption was stored."
+    )
     clip_error = clip_info.get("error")
     if isinstance(clip_error, str) and clip_error:
         complete_detail = "Caption saved with an index warning."
@@ -15502,8 +19463,9 @@ def _caption_and_index_image_bytes(
         "id": doc_id,
         "source": source,
         "url": attachment_url,
-        "caption": caption,
+        "caption": searchable_caption,
         "caption_model": caption_model,
+        "caption_status": caption_outcome,
         "saved": True,
         "embedding_dim": clip_info.get("dim"),
         "placeholder": placeholder,
@@ -15511,24 +19473,44 @@ def _caption_and_index_image_bytes(
     }
 
 
-def _forget_attachment_knowledge(content_hash: str) -> None:
-    source = f"image:{content_hash}"
-    try:
-        _get_rag_service().delete_source(source)
-    except Exception:
-        pass
-    try:
-        clip_service = _get_clip_rag_service(raise_http=False)
-        if clip_service:
-            clip_service.delete_source(source)
-    except Exception:
-        pass
+def _forget_attachment_knowledge(content_hash: str, *, strict: bool = False) -> None:
+    normalized_hash = _normalize_attachment_hash(content_hash)
+    sources = {f"image:{normalized_hash}"}
+    metadata = _read_attachment_meta(normalized_hash)
+    # Model and dimension fields describe an attempted embedding and may be
+    # present even when the mirror write failed. Only the success timestamp is
+    # durable proof that unavailable CLIP cleanup must remain retryable.
+    clip_mirror_expected = bool(str(metadata.get("clip_indexed_at") or "").strip())
+    namespace = _coerce_relative_files_path(
+        str(metadata.get("source_sync_namespace") or "")
+    )
+    if namespace:
+        sources.add(f"{namespace}/image:{normalized_hash}")
+    errors: list[str] = []
+    for source in sources:
+        try:
+            _get_rag_service().delete_source(source)
+        except Exception as exc:
+            if strict:
+                errors.append(f"text:{source}:{exc}")
+        try:
+            clip_service = _get_clip_rag_service(raise_http=False)
+            if clip_service:
+                clip_service.delete_source(source)
+            elif strict and clip_mirror_expected:
+                errors.append(f"clip:{source}:unavailable")
+        except Exception as exc:
+            if strict:
+                errors.append(f"clip:{source}:{exc}")
+    if errors:
+        raise RuntimeError("; ".join(errors))
 
 
 def _reindex_attachment_caption(
     content_hash: str,
     *,
     caption_override: str | None = None,
+    generate_caption: bool = True,
 ) -> Optional[Dict[str, Any]]:
     normalized_hash = _normalize_attachment_hash(content_hash)
     metadata = _read_attachment_meta(normalized_hash)
@@ -15559,6 +19541,7 @@ def _reindex_attachment_caption(
         url=f"/api/attachments/{normalized_hash}/{filename}",
         content_hash=normalized_hash,
         caption_override=caption_override,
+        generate_caption=generate_caption,
     )
 
 
@@ -15566,20 +19549,52 @@ def _generate_image_caption(
     data: bytes,
     *,
     content_hash: str | None = None,
+    content_type: str = "image/jpeg",
 ) -> tuple[str, bool, str]:
+    cfg = (
+        dict(llm_service.config)
+        if isinstance(getattr(llm_service, "config", None), dict)
+        else app_config.load_config()
+    )
+    engine = _configured_image_caption_engine(cfg)
+    if engine == "off":
+        return "", False, "disabled"
+    if engine == "cloud":
+        caption_model = _configured_cloud_caption_model(cfg)
+        try:
+            caption = _generate_cloud_image_caption(
+                data,
+                content_type=content_type,
+                config=cfg,
+            )
+        except Exception:
+            logger.warning("Cloud image caption generation failed", exc_info=True)
+            caption = ""
+        if caption:
+            return caption, False, f"cloud:{caption_model}"
+        key = (content_hash or hashlib.sha256(data).hexdigest())[:8]
+        return placeholder_caption(key), True, f"cloud:{caption_model}"
+
     placeholder = False
     caption = ""
     caption_model = "vision-captioner"
     try:
-        configured_model = _configured_vision_caption_model()
-        try:
-            captioner = VisionCaptioner(model=configured_model)
-        except TypeError:
-            # Test doubles and alternate captioner implementations may not
-            # accept a `model=` kwarg; fall back to the default constructor.
-            captioner = VisionCaptioner()
-        caption_model = getattr(captioner, "model", caption_model)
-        result = captioner.run(data)
+        configured_model = resolve_vision_caption_model(
+            str(cfg.get("vision_model") or "").strip(),
+            str(os.getenv("VISION_CAPTION_MODEL") or "").strip(),
+        )
+        models_folder = str(cfg.get("models_folder") or "").strip() or None
+        runtime_model = resolve_vision_caption_runtime_model(
+            configured_model,
+            models_folder=models_folder,
+        )
+        captioner, result = run_shared_vision_captioner(
+            data,
+            model=configured_model,
+            models_folder=models_folder,
+            runtime_model=runtime_model,
+        )
+        caption_model = getattr(captioner, "model", configured_model)
         if isinstance(result, str):
             caption = normalize_generated_caption(result)
             placeholder = is_placeholder_caption(
@@ -15604,24 +19619,23 @@ def _generate_image_caption(
     return caption, placeholder, caption_model
 
 
+_CAPTION_RASTER_CONTENT_TYPES = SAFE_RASTER_IMAGE_TYPES
+
+
 @router.post("/knowledge/caption-image")
 async def knowledge_caption_image(file: UploadFile = UploadFileType(...)):
     """Caption an image and store it in the knowledge base."""
     if not file or not file.filename:
         raise HTTPException(status_code=400, detail="file is required")
     ctype = (file.content_type or "").lower()
-    if ctype not in {
-        "image/png",
-        "image/jpeg",
-        "image/gif",
-        "image/webp",
-        "image/svg+xml",
-    }:
+    if ctype not in _CAPTION_RASTER_CONTENT_TYPES:
         raise HTTPException(status_code=400, detail="Unsupported image type")
 
-    data = await file.read()
+    data = await file.read(MAX_UPLOAD_SIZE + 1)
     if not data:
         raise HTTPException(status_code=400, detail="Empty file")
+    if len(data) > MAX_UPLOAD_SIZE:
+        raise HTTPException(status_code=400, detail="File too large")
 
     return _caption_and_index_image_bytes(
         data,
@@ -15636,18 +19650,17 @@ async def knowledge_caption_image_preview(file: UploadFile = UploadFileType(...)
     if not file or not file.filename:
         raise HTTPException(status_code=400, detail="file is required")
     ctype = (file.content_type or "").lower()
-    if ctype not in {
-        "image/png",
-        "image/jpeg",
-        "image/gif",
-        "image/webp",
-        "image/svg+xml",
-    }:
+    if ctype not in _CAPTION_RASTER_CONTENT_TYPES:
         raise HTTPException(status_code=400, detail="Unsupported image type")
-    data = await file.read()
+    data = await file.read(MAX_UPLOAD_SIZE + 1)
     if not data:
         raise HTTPException(status_code=400, detail="Empty file")
-    caption, placeholder, model = _generate_image_caption(data)
+    if len(data) > MAX_UPLOAD_SIZE:
+        raise HTTPException(status_code=400, detail="File too large")
+    caption, placeholder, model = _generate_image_caption(
+        data,
+        content_type=ctype,
+    )
     return {
         "caption": caption,
         "placeholder": placeholder,
@@ -16364,17 +20377,49 @@ async def knowledge_delete(doc_id: str):
 # ---------------------------------------------------------------------------
 # Attachments (chat file uploads)
 
+_MAX_ATTACHMENT_SOURCE_URL_LENGTH = 2048
+_MAX_ATTACHMENT_DISPLAY_NAME_LENGTH = 160
+_MAX_ATTACHMENT_FOLDER_LENGTH = 240
+
+
+def _sanitize_attachment_source_url(value: Any) -> str:
+    # This is passive provenance only. Float never fetches this URL.
+    return _validate_attachment_source_url(
+        value,
+        max_length=_MAX_ATTACHMENT_SOURCE_URL_LENGTH,
+    )
+
+
+def _sanitize_attachment_display_name(value: Any) -> str:
+    display_name = re.sub(r"\s+", " ", str(value or "").strip())
+    if len(display_name) > _MAX_ATTACHMENT_DISPLAY_NAME_LENGTH:
+        raise ValueError("display_name is too long")
+    if any(ord(character) < 32 for character in display_name):
+        raise ValueError("display_name contains unsafe characters")
+    return display_name
+
+
+def _sanitize_attachment_folder(value: Any) -> str:
+    raw = str(value or "").strip().replace("\\", "/")
+    if not raw:
+        return ""
+    if len(raw) > _MAX_ATTACHMENT_FOLDER_LENGTH:
+        raise ValueError("folder is too long")
+    segments = [re.sub(r"\s+", " ", part.strip()) for part in raw.split("/")]
+    if any(not part or part in {".", ".."} for part in segments):
+        raise ValueError("folder contains an invalid segment")
+    if any(ord(character) < 32 for segment in segments for character in segment):
+        raise ValueError("folder contains unsafe characters")
+    return "/".join(segments)
+
 
 def _attachment_meta_path(content_hash: str) -> Path:
     return BLOBS_DIR / f"{content_hash}.json"
 
 
 def _read_attachment_meta(content_hash: str) -> Dict[str, Any]:
-    meta_path = _attachment_meta_path(content_hash)
-    if not meta_path.exists():
-        return {}
     try:
-        return json.loads(meta_path.read_text(encoding="utf-8"))
+        return read_attachment_metadata(BLOBS_DIR, content_hash)
     except Exception:
         logger.warning(
             "Failed to read attachment metadata for %s", content_hash, exc_info=True
@@ -16383,17 +20428,40 @@ def _read_attachment_meta(content_hash: str) -> Dict[str, Any]:
 
 
 def _write_attachment_meta(content_hash: str, metadata: Dict[str, Any]) -> None:
-    meta_path = _attachment_meta_path(content_hash)
     try:
-        meta_path.write_text(json.dumps(metadata), encoding="utf-8")
+        write_attachment_metadata(BLOBS_DIR, content_hash, metadata)
     except Exception:
         logger.warning(
             "Failed to write attachment metadata for %s", content_hash, exc_info=True
         )
+        raise
+
+
+def _mutate_attachment_meta(
+    content_hash: str,
+    mutate: Any,
+) -> Dict[str, Any]:
+    try:
+        return mutate_attachment_metadata(BLOBS_DIR, content_hash, mutate)
+    except Exception:
+        logger.warning(
+            "Failed to mutate attachment metadata for %s", content_hash, exc_info=True
+        )
+        raise
 
 
 def _normalize_attachment_hash(value: str) -> str:
     return str(value or "").strip().lower()
+
+
+def _require_attachment_hash(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not re.fullmatch(r"[a-f0-9]{64}", raw):
+        raise HTTPException(
+            status_code=400,
+            detail="content_hash must be exactly 64 lowercase hexadecimal characters",
+        )
+    return raw
 
 
 def _resolve_legacy_attachment_path(filename: Optional[str]) -> Optional[Path]:
@@ -16418,20 +20486,105 @@ def _resolve_legacy_attachment_path(filename: Optional[str]) -> Optional[Path]:
     return None
 
 
+@lru_cache(maxsize=2048)
+def _cached_attachment_file_sha256(
+    resolved_path: str,
+    size: int,
+    modified_ns: int,
+) -> str:
+    """Hash a stable file version without re-reading it on every gallery lookup."""
+
+    del size, modified_ns  # Included in the cache key to invalidate changed files.
+    digest = hashlib.sha256()
+    with Path(resolved_path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _attachment_target_matches_hash(target: Path, content_hash: str) -> bool:
+    if not blob_store.is_canonical_content_hash(content_hash):
+        return False
+    try:
+        resolved = target.resolve()
+        stat = resolved.stat()
+        if not resolved.is_file():
+            return False
+        actual_hash = _cached_attachment_file_sha256(
+            str(resolved),
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+        )
+    except Exception:
+        return False
+    return actual_hash == content_hash
+
+
+def _canonicalize_attachment_storage_target(
+    target: Path,
+    content_hash: str,
+    *,
+    migrate_legacy: bool,
+) -> Path:
+    """Copy a verified flat legacy file into content-addressed asset storage."""
+
+    resolved = target.resolve()
+    if not migrate_legacy:
+        return resolved
+    try:
+        if resolved == (BLOBS_DIR / content_hash).resolve():
+            return resolved
+    except Exception:
+        pass
+    if resolved.parent.name == content_hash:
+        return resolved
+    try:
+        files_root = _resolve_data_files_root().resolve()
+        relative = resolved.relative_to(files_root)
+        root_name = relative.parts[0].lower() if relative.parts else ""
+        origin = {
+            "captured": "captured",
+            "screenshots": "screenshot",
+            "uploads": "upload",
+        }.get(root_name, "upload")
+        asset = put_asset(
+            resolved.read_bytes(),
+            filename=resolved.name,
+            origin=origin,
+        )
+        canonical = Path(asset["path"]).resolve()
+        if asset.get("content_hash") == content_hash and canonical.is_file():
+            return canonical
+    except Exception:
+        logger.warning(
+            "Failed to copy verified legacy attachment %s into canonical storage",
+            content_hash,
+            exc_info=True,
+        )
+    return resolved
+
+
 def _resolve_attachment_target(
     content_hash: str,
     *,
     filename: Optional[str] = None,
+    migrate_legacy: bool = True,
 ) -> Optional[Path]:
     normalized_hash = _normalize_attachment_hash(content_hash)
-    metadata = _read_attachment_meta(normalized_hash) if normalized_hash else {}
+    if not blob_store.is_canonical_content_hash(normalized_hash):
+        return None
+    metadata = _read_attachment_meta(normalized_hash)
     if isinstance(metadata, dict):
         rel_candidate = str(
             metadata.get("relative_path") or metadata.get("source_path") or ""
         ).strip()
         target = resolve_managed_path(rel_candidate)
-        if target and target.exists() and target.is_file():
-            return target
+        if target and _attachment_target_matches_hash(target, normalized_hash):
+            return _canonicalize_attachment_storage_target(
+                target,
+                normalized_hash,
+                migrate_legacy=migrate_legacy,
+            )
 
         abs_candidate = str(
             metadata.get("path") or metadata.get("source_path") or ""
@@ -16446,8 +20599,12 @@ def _resolve_attachment_target(
                 target.relative_to(blob_store._resolve_data_files_root().parent)
             except Exception:
                 target = None
-            if target and target.exists() and target.is_file():
-                return target
+            if target and _attachment_target_matches_hash(target, normalized_hash):
+                return _canonicalize_attachment_storage_target(
+                    target,
+                    normalized_hash,
+                    migrate_legacy=migrate_legacy,
+                )
 
     candidates = [filename]
     if isinstance(metadata, dict):
@@ -16457,22 +20614,84 @@ def _resolve_attachment_target(
     for candidate_name in candidates:
         if not normalized_hash:
             break
-        target = find_asset_path(normalized_hash, filename=candidate_name)
-        if target and target.exists() and target.is_file():
-            return target
+        target = (
+            find_asset_path(normalized_hash, filename=candidate_name)
+            if migrate_legacy
+            else _find_attachment_asset_path_read_only(
+                normalized_hash,
+                filename=candidate_name,
+            )
+        )
+        if target and _attachment_target_matches_hash(target, normalized_hash):
+            return _canonicalize_attachment_storage_target(
+                target,
+                normalized_hash,
+                migrate_legacy=migrate_legacy,
+            )
     for candidate_name in candidates:
         fallback = _resolve_legacy_attachment_path(candidate_name)
-        if fallback:
-            return fallback
+        if fallback and _attachment_target_matches_hash(fallback, normalized_hash):
+            return _canonicalize_attachment_storage_target(
+                fallback,
+                normalized_hash,
+                migrate_legacy=migrate_legacy,
+            )
     if normalized_hash:
         direct = (BLOBS_DIR / normalized_hash).resolve()
         try:
             direct.relative_to(BLOBS_DIR)
         except Exception:
             direct = None
-        if direct and direct.exists() and direct.is_file():
+        if direct and _attachment_target_matches_hash(direct, normalized_hash):
             return direct
     return None
+
+
+def _find_attachment_asset_path_read_only(
+    content_hash: str,
+    *,
+    filename: Optional[str] = None,
+) -> Optional[Path]:
+    """Resolve managed attachment bytes without migrating legacy storage."""
+
+    normalized_hash = _normalize_attachment_hash(content_hash)
+    if not re.fullmatch(r"[a-f0-9]{64}", normalized_hash):
+        return None
+    wanted_name = Path(str(filename or "")).name.strip()
+    candidates: list[Path] = []
+    files_root = blob_store._resolve_data_files_root()
+    for dirname in blob_store.ASSET_ORIGIN_DIRS.values():
+        candidate_root = files_root / dirname / normalized_hash
+        if candidate_root.exists() and candidate_root.is_dir():
+            candidates.extend(
+                child for child in candidate_root.iterdir() if child.is_file()
+            )
+
+    legacy_sync_root = files_root / "workspace" / "sync"
+    if legacy_sync_root.exists() and legacy_sync_root.is_dir():
+        for candidate_root in legacy_sync_root.rglob(normalized_hash):
+            if candidate_root.is_dir() and candidate_root.name == normalized_hash:
+                candidates.extend(
+                    child for child in candidate_root.iterdir() if child.is_file()
+                )
+
+    try:
+        current_sync_roots = blob_store._iter_sync_attachment_roots(normalized_hash)
+        for candidate_root in current_sync_roots:
+            if candidate_root.exists() and candidate_root.is_dir():
+                candidates.extend(
+                    child for child in candidate_root.iterdir() if child.is_file()
+                )
+    except Exception:
+        pass
+
+    fallback: Optional[Path] = None
+    for candidate in candidates:
+        if fallback is None:
+            fallback = candidate
+        if wanted_name and candidate.name == wanted_name:
+            return candidate
+    return fallback
 
 
 def _repair_attachment_storage_metadata(
@@ -16480,25 +20699,176 @@ def _repair_attachment_storage_metadata(
     metadata: Dict[str, Any],
     target: Path,
 ) -> Dict[str, Any]:
-    next_meta = dict(metadata or {})
-    changed = False
+    updates: Dict[str, Any] = {}
     try:
         relative_path = managed_relative_path(target)
     except Exception:
         relative_path = ""
     if (
         relative_path
-        and str(next_meta.get("relative_path") or "").strip() != relative_path
+        and str(metadata.get("relative_path") or "").strip() != relative_path
     ):
-        next_meta["relative_path"] = relative_path
-        changed = True
+        updates["relative_path"] = relative_path
     absolute_path = str(target.resolve())
-    if absolute_path and str(next_meta.get("path") or "").strip() != absolute_path:
-        next_meta["path"] = absolute_path
-        changed = True
-    if changed:
-        _write_attachment_meta(content_hash, next_meta)
-    return next_meta
+    if absolute_path and str(metadata.get("path") or "").strip() != absolute_path:
+        updates["path"] = absolute_path
+    if not updates:
+        return dict(metadata or {})
+
+    def _apply(current: Dict[str, Any]) -> Dict[str, Any]:
+        current.update(updates)
+        return current
+
+    return _mutate_attachment_meta(content_hash, _apply)
+
+
+def _attachment_public_descriptor(content_hash: str) -> Optional[Dict[str, Any]]:
+    normalized_hash = _normalize_attachment_hash(content_hash)
+    metadata = _read_attachment_meta(normalized_hash)
+    filename = str(metadata.get("filename") or "").strip() or normalized_hash
+    target = _resolve_attachment_target(normalized_hash, filename=filename)
+    if not target or not target.exists() or not target.is_file():
+        return None
+    metadata = _repair_attachment_storage_metadata(
+        normalized_hash,
+        metadata,
+        target,
+    )
+    media = build_attachment_media_descriptor(
+        normalized_hash,
+        target,
+        metadata=metadata,
+        preferred_filename=filename,
+    )
+    if media["metadata_changed"]:
+        media_metadata = dict(media["metadata"])
+
+        def _merge_media(current: Dict[str, Any]) -> Dict[str, Any]:
+            current.update(media_metadata)
+            return current
+
+        metadata = _mutate_attachment_meta(normalized_hash, _merge_media)
+    filename = str(media["filename"] or "").strip() or filename
+    stat = target.stat()
+    content_type = (
+        media["content_type"]
+        or str(metadata.get("content_type") or "").strip()
+        or mimetypes.guess_type(filename)[0]
+        or "application/octet-stream"
+    )
+    uploaded_at = str(metadata.get("uploaded_at") or "").strip()
+    if not uploaded_at:
+        uploaded_at = (
+            datetime.utcfromtimestamp(stat.st_mtime).replace(microsecond=0).isoformat()
+            + "Z"
+        )
+    try:
+        display_name = _sanitize_attachment_display_name(metadata.get("display_name"))
+    except ValueError:
+        display_name = ""
+    try:
+        folder = _sanitize_attachment_folder(metadata.get("folder"))
+    except ValueError:
+        folder = ""
+    try:
+        source_url = _sanitize_attachment_source_url(metadata.get("source_url"))
+    except ValueError:
+        source_url = ""
+    size = media["size"] if isinstance(media["size"], int) else stat.st_size
+    return {
+        "content_hash": normalized_hash,
+        "filename": filename,
+        "display_name": display_name,
+        "folder": folder,
+        "content_type": content_type,
+        "size": size,
+        "uploaded_at": uploaded_at,
+        # This route is reconstructable and deployment-local, not storage.
+        "url": f"/api/attachments/{normalized_hash}/{filename}",
+        # This path is the current managed location and may change after sync.
+        "relative_path": str(metadata.get("relative_path") or "").strip(),
+        # External source URLs are passive provenance only and are never fetched.
+        "source_url": source_url,
+        "source_url_recorded_at": (
+            str(metadata.get("source_url_recorded_at") or "").strip()
+            if source_url
+            else ""
+        ),
+        "origin": _infer_attachment_origin(metadata),
+        "source_sync_label": str(metadata.get("source_sync_label") or "").strip(),
+        "source_sync_namespace": str(
+            metadata.get("source_sync_namespace") or ""
+        ).strip(),
+        "capture_source": str(metadata.get("capture_source") or "").strip(),
+        "capture_id": str(metadata.get("capture_id") or "").strip(),
+        "caption": _sanitize_attachment_caption(metadata.get("caption") or ""),
+        **_attachment_caption_tracker_fields(
+            metadata,
+            content_type=str(content_type or ""),
+        ),
+        "content_available": True,
+        "deletion_status": "",
+        "cleanup_failed": [],
+    }
+
+
+def _attachment_cleanup_pending_descriptor(
+    content_hash: str,
+    metadata: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    if str(metadata.get("deletion_status") or "").strip().lower() != (
+        "cleanup_pending"
+    ):
+        return None
+    filename = Path(str(metadata.get("filename") or content_hash)).name or content_hash
+    try:
+        display_name = _sanitize_attachment_display_name(metadata.get("display_name"))
+    except ValueError:
+        display_name = ""
+    try:
+        folder = _sanitize_attachment_folder(metadata.get("folder"))
+    except ValueError:
+        folder = ""
+    try:
+        source_url = _sanitize_attachment_source_url(metadata.get("source_url"))
+    except ValueError:
+        source_url = ""
+    cleanup_failed = metadata.get("cleanup_failed")
+    if not isinstance(cleanup_failed, list):
+        cleanup_failed = []
+    cleanup_failed = [
+        str(item).strip()
+        for item in cleanup_failed
+        if isinstance(item, str) and str(item).strip()
+    ]
+    size = metadata.get("size")
+    return {
+        "content_hash": content_hash,
+        "filename": filename,
+        "display_name": display_name,
+        "folder": folder,
+        "content_type": str(metadata.get("content_type") or "").strip()
+        or "application/octet-stream",
+        "size": size if isinstance(size, int) and not isinstance(size, bool) else 0,
+        "uploaded_at": str(metadata.get("uploaded_at") or "").strip(),
+        "url": "",
+        "relative_path": "",
+        "source_url": source_url,
+        "source_url_recorded_at": (
+            str(metadata.get("source_url_recorded_at") or "").strip()
+            if source_url
+            else ""
+        ),
+        "origin": _infer_attachment_origin(metadata),
+        "caption": _sanitize_attachment_caption(metadata.get("caption") or ""),
+        **_attachment_caption_tracker_fields(
+            metadata,
+            content_type=str(metadata.get("content_type") or "").strip(),
+        ),
+        "content_available": False,
+        "deletion_status": "cleanup_pending",
+        "cleanup_failed": cleanup_failed,
+    }
 
 
 class AttachmentInfo(BaseModel):
@@ -16523,6 +20893,7 @@ def _index_uploaded_attachment(
     url: str,
     content_hash: str,
     started_at: str = "",
+    index_generation: str = "",
 ) -> None:
     """Best-effort: index uploaded attachments into knowledge for retrieval."""
     operation_id = _attachment_operation_id(content_hash)
@@ -16563,14 +20934,50 @@ def _index_uploaded_attachment(
                 url=url,
                 content_hash=content_hash,
                 progress_callback=_notify,
+                index_generation=index_generation,
             )
+    except _AttachmentIndexCancelled:
+        _notify(
+            {
+                "status": "complete",
+                "phase_label": "Attachment indexing skipped",
+                "phase_index": phase_count,
+                "phase_count": phase_count,
+                "detail": (
+                    "The attachment was deleted or superseded before indexing began."
+                ),
+                "counts": {"cancelled": True},
+            }
+        )
     except Exception:
         try:
-            metadata = _read_attachment_meta(content_hash)
-            metadata["index_status"] = "error"
-            if not str(metadata.get("caption_status") or "").strip():
-                metadata["caption_status"] = "error"
-            _write_attachment_meta(content_hash, metadata)
+
+            def _mark_index_error(metadata: Dict[str, Any]) -> Dict[str, Any]:
+                if (
+                    index_generation
+                    and str(metadata.get("index_generation") or "").strip()
+                    != index_generation
+                ):
+                    return metadata
+                metadata["index_status"] = "error"
+                if str(metadata.get("caption_status") or "").strip().lower() in {
+                    "",
+                    "pending",
+                    "indexing",
+                }:
+                    metadata["caption_status"] = "error"
+                metadata.pop("index_generation", None)
+                metadata.pop("index_generation_started_at", None)
+                return metadata
+
+            with attachment_metadata_lock(BLOBS_DIR, content_hash):
+                current = _read_attachment_meta(content_hash)
+                if current and (
+                    not index_generation
+                    or str(current.get("index_generation") or "").strip()
+                    == index_generation
+                ):
+                    _mutate_attachment_meta(content_hash, _mark_index_error)
         except Exception:
             pass
         _notify(
@@ -16595,11 +21002,13 @@ async def attachments_upload(
     file: UploadFile = UploadFileType(...),
     origin: str = Form(default="upload"),
     capture_source: Optional[str] = Form(default=None),
+    source_url: Optional[str] = Form(default=None),
 ):
-    """Upload a file to blob storage and return a stable URL.
+    """Upload a file to managed storage and return its attachment references.
 
     Stores as a content-addressed file under `data/files/*/<content_hash>/`
-    while preserving the stable `/attachments/{content_hash}/{filename}` URL.
+    and returns its durable hash, current managed relative path, and a
+    reconstructable `/attachments/{content_hash}/{filename}` retrieval route.
 
     Best-effort: image uploads are captioned and indexed (text + CLIP) so they
     become retrievable via the RAG system.
@@ -16609,6 +21018,10 @@ async def attachments_upload(
     data = await file.read()
     if len(data) > MAX_UPLOAD_SIZE:
         raise HTTPException(status_code=400, detail="File too large")
+    try:
+        normalized_source_url = _sanitize_attachment_source_url(source_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     normalized_origin = _normalize_attachment_origin(origin)
     # Sanitize/normalize filename for URL; keep original extension
@@ -16626,30 +21039,80 @@ async def attachments_upload(
         .isoformat()
         .replace("+00:00", "Z")
     )
-    _write_attachment_meta(
-        h,
-        {
-            "filename": filename,
-            "content_type": file.content_type,
-            "size": len(data),
-            "uploaded_at": uploaded_at,
-            "origin": normalized_origin,
-            "relative_path": asset_info.get("relative_path"),
-            "path": asset_info.get("path"),
-            "capture_source": (
-                str(capture_source).strip() if capture_source is not None else None
-            ),
-            **(
-                {"caption_status": "pending", "index_status": "indexing"}
-                if str(file.content_type or "").lower().startswith("image/")
-                else {
-                    "caption_status": "not_applicable",
-                    "index_status": "not_applicable",
-                }
-            ),
-        },
+    caption_engine = _configured_image_caption_engine(
+        getattr(request.app.state, "config", None)
     )
-    if str(file.content_type or "").lower().startswith("image/"):
+    image_upload = str(file.content_type or "").lower().startswith("image/")
+    queued_generation = str(uuid4()) if image_upload else ""
+    should_queue_index = False
+
+    def _merge_upload(existing_metadata: Dict[str, Any]) -> Dict[str, Any]:
+        nonlocal should_queue_index
+        metadata = dict(existing_metadata)
+        for cleanup_key in ("deletion_status", "cleanup_failed"):
+            metadata.pop(cleanup_key, None)
+        metadata.update(
+            {
+                "filename": filename,
+                "content_type": file.content_type,
+                "size": len(data),
+                "uploaded_at": existing_metadata.get("uploaded_at") or uploaded_at,
+                "origin": normalized_origin,
+                "relative_path": asset_info.get("relative_path"),
+                "path": asset_info.get("path"),
+                "capture_source": (
+                    str(capture_source).strip() if capture_source is not None else None
+                ),
+            }
+        )
+        existing_caption = _sanitize_attachment_caption(
+            existing_metadata.get("caption") or ""
+        )
+        existing_caption_status = (
+            str(existing_metadata.get("caption_status") or "").strip().lower()
+        )
+        preserves_caption = bool(existing_caption) and existing_caption_status in {
+            "manual",
+            "generated",
+        }
+        index_status = str(existing_metadata.get("index_status") or "").lower()
+        needs_index = image_upload and (
+            index_status != "indexed"
+            or (caption_engine != "off" and not preserves_caption)
+        )
+        should_queue_index = bool(
+            needs_index and not attachment_index_generation_is_active(existing_metadata)
+        )
+        if image_upload:
+            if should_queue_index:
+                metadata["index_status"] = "indexing"
+                metadata["index_generation"] = queued_generation
+                metadata["index_generation_started_at"] = uploaded_at
+            if not preserves_caption:
+                metadata["caption_status"] = (
+                    "disabled" if caption_engine == "off" else "pending"
+                )
+        else:
+            metadata["caption_status"] = "not_applicable"
+            metadata["index_status"] = "not_applicable"
+            metadata.pop("index_generation", None)
+            metadata.pop("index_generation_started_at", None)
+        try:
+            saved_source_url = _sanitize_attachment_source_url(
+                metadata.get("source_url")
+            )
+        except ValueError:
+            saved_source_url = ""
+            metadata.pop("source_url", None)
+            metadata.pop("source_url_recorded_at", None)
+        if normalized_source_url and not saved_source_url:
+            metadata["source_url"] = normalized_source_url
+            metadata["source_url_recorded_at"] = uploaded_at
+        metadata["metadata_updated_at"] = uploaded_at
+        return metadata
+
+    metadata = _mutate_attachment_meta(h, _merge_upload)
+    if should_queue_index:
         emit_operation_notification(
             request.app,
             operation_id=_attachment_operation_id(h),
@@ -16659,31 +21122,40 @@ async def attachments_upload(
             status="queued",
             phase_label="Queued for captioning and retrieval indexing",
             detail=(
-                "Background work will generate a caption and refresh image "
-                "retrieval data."
+                "Background work will refresh image retrieval data"
+                + (
+                    " without generating a caption."
+                    if caption_engine == "off"
+                    else " and generate a caption."
+                )
             ),
             started_at=uploaded_at,
             counts={"bytes": len(data)},
         )
-    background_tasks.add_task(
-        _index_uploaded_attachment,
-        request.app,
-        data,
-        filename=filename,
-        content_type=str(file.content_type or ""),
-        url=url,
-        content_hash=h,
-        started_at=uploaded_at,
-    )
+        background_tasks.add_task(
+            _index_uploaded_attachment,
+            request.app,
+            data,
+            filename=filename,
+            content_type=str(file.content_type or ""),
+            url=url,
+            content_hash=h,
+            started_at=uploaded_at,
+            index_generation=queued_generation,
+        )
     return {
         "content_hash": h,
-        "filename": filename,
+        "filename": str(metadata.get("filename") or filename),
         "content_type": file.content_type,
         "size": len(data),
-        "url": url,
-        "uploaded_at": uploaded_at,
-        "origin": normalized_origin,
-        "relative_path": asset_info.get("relative_path"),
+        "url": f"/api/attachments/{h}/{str(metadata.get('filename') or filename)}",
+        "uploaded_at": metadata.get("uploaded_at") or uploaded_at,
+        "origin": metadata.get("origin") or normalized_origin,
+        "relative_path": metadata.get("relative_path") or "",
+        "display_name": str(metadata.get("display_name") or ""),
+        "folder": str(metadata.get("folder") or ""),
+        "source_url": str(metadata.get("source_url") or ""),
+        "source_url_recorded_at": str(metadata.get("source_url_recorded_at") or ""),
     }
 
 
@@ -16691,68 +21163,91 @@ async def attachments_upload(
 async def attachments_list():
     entries: list[Dict[str, Any]] = []
     for name in _iter_attachment_hashes():
-        meta = _read_attachment_meta(name)
-        filename = str(meta.get("filename") or "").strip() or name
-        target = _resolve_attachment_target(name, filename=filename)
-        if not target or not target.exists() or not target.is_file():
-            continue
-        meta = _repair_attachment_storage_metadata(name, meta, target)
-        descriptor = build_attachment_media_descriptor(
-            name,
-            target,
-            metadata=meta,
-            preferred_filename=filename,
-        )
-        if descriptor["metadata_changed"]:
-            _write_attachment_meta(name, descriptor["metadata"])
-            meta = descriptor["metadata"]
-        filename = str(descriptor["filename"] or "").strip() or filename
-        stat = target.stat()
-        size = (
-            descriptor["size"] if isinstance(descriptor["size"], int) else stat.st_size
-        )
-        content_type = descriptor["content_type"] or mimetypes.guess_type(filename)[0]
-        uploaded_at = meta.get("uploaded_at")
-        if not uploaded_at:
-            uploaded_at = (
-                datetime.utcfromtimestamp(stat.st_mtime)
-                .replace(microsecond=0)
-                .isoformat()
-                + "Z"
+        descriptor = _attachment_public_descriptor(name)
+        if not descriptor:
+            descriptor = _attachment_cleanup_pending_descriptor(
+                name,
+                _read_attachment_meta(name),
             )
+            if not descriptor:
+                continue
         try:
             sort_value = datetime.fromisoformat(
-                uploaded_at.replace("Z", "+00:00")
+                str(descriptor["uploaded_at"]).replace("Z", "+00:00")
             ).timestamp()
         except Exception:
-            sort_value = stat.st_mtime
-        entries.append(
-            {
-                "content_hash": name,
-                "filename": filename,
-                "content_type": content_type,
-                "size": size,
-                "uploaded_at": uploaded_at,
-                "url": f"/api/attachments/{name}/{filename}",
-                "origin": _infer_attachment_origin(meta),
-                "relative_path": meta.get("relative_path") or "",
-                "source_sync_label": str(meta.get("source_sync_label") or "").strip(),
-                "source_sync_namespace": str(
-                    meta.get("source_sync_namespace") or ""
-                ).strip(),
-                "capture_source": meta.get("capture_source") or "",
-                "caption": _sanitize_attachment_caption(meta.get("caption") or ""),
-                **_attachment_caption_tracker_fields(
-                    meta,
-                    content_type=str(content_type or ""),
-                ),
-                "_sort": sort_value,
-            }
-        )
+            sort_value = 0.0
+        entries.append({**descriptor, "_sort": sort_value})
     entries.sort(key=lambda item: (item["_sort"], item["content_hash"]), reverse=True)
     for item in entries:
         item.pop("_sort", None)
     return {"attachments": entries}
+
+
+class AttachmentMetadataUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    display_name: Optional[str] = None
+    folder: Optional[str] = None
+    source_url: Optional[str] = None
+
+
+@router.get("/attachments/{content_hash}/metadata")
+async def attachment_metadata_get(content_hash: str):
+    normalized_hash = _require_attachment_hash(content_hash)
+    descriptor = _attachment_public_descriptor(normalized_hash)
+    if not descriptor:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    return {"attachment": descriptor}
+
+
+@router.patch("/attachments/{content_hash}/metadata")
+async def attachment_metadata_patch(
+    content_hash: str,
+    payload: AttachmentMetadataUpdate,
+):
+    normalized_hash = _require_attachment_hash(content_hash)
+    descriptor = _attachment_public_descriptor(normalized_hash)
+    if not descriptor:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    changed_fields = payload.model_fields_set
+    updates: Dict[str, Any] = {}
+    removals: set[str] = set()
+    try:
+        if "display_name" in changed_fields:
+            display_name = _sanitize_attachment_display_name(payload.display_name)
+            if display_name:
+                updates["display_name"] = display_name
+            else:
+                removals.add("display_name")
+        if "folder" in changed_fields:
+            folder = _sanitize_attachment_folder(payload.folder)
+            if folder:
+                updates["folder"] = folder
+            else:
+                removals.add("folder")
+        if "source_url" in changed_fields:
+            source_url = _sanitize_attachment_source_url(payload.source_url)
+            if source_url:
+                updates["source_url"] = source_url
+                updates["source_url_recorded_at"] = _utc_now_compact_iso()
+            else:
+                removals.update({"source_url", "source_url_recorded_at"})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    updates["metadata_updated_at"] = _utc_now_compact_iso()
+
+    def _apply_metadata_patch(metadata: Dict[str, Any]) -> Dict[str, Any]:
+        for key in removals:
+            metadata.pop(key, None)
+        metadata.update(updates)
+        return metadata
+
+    _mutate_attachment_meta(normalized_hash, _apply_metadata_patch)
+    updated = _attachment_public_descriptor(normalized_hash)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    return {"status": "saved", "attachment": updated}
 
 
 class AttachmentsRagRehydrate(BaseModel):
@@ -16771,60 +21266,92 @@ async def attachments_rag_rehydrate(payload: AttachmentsRagRehydrate):
         except Exception:
             max_items = None
     allowed_hashes = {
-        _normalize_attachment_hash(item)
-        for item in payload.content_hashes or []
-        if _normalize_attachment_hash(item)
+        _require_attachment_hash(item) for item in payload.content_hashes or []
     }
     scanned = 0
     updated = 0
+    captions_generated = 0
+    captions_unavailable = 0
+    failed = 0
     for name in _iter_attachment_hashes():
-        if allowed_hashes and _normalize_attachment_hash(name) not in allowed_hashes:
+        if allowed_hashes and name not in allowed_hashes:
             continue
         meta = _read_attachment_meta(name)
         filename = meta.get("filename") or name
-        target = _resolve_attachment_target(name, filename=filename)
+        target = _resolve_attachment_target(
+            name,
+            filename=filename,
+            migrate_legacy=not payload.dry_run,
+        )
         if not target or not target.exists() or not target.is_file():
+            failed += 1
             continue
-        meta = _repair_attachment_storage_metadata(name, meta, target)
+        if not payload.dry_run:
+            meta = _repair_attachment_storage_metadata(name, meta, target)
         descriptor = build_attachment_media_descriptor(
             name,
             target,
             metadata=meta,
             preferred_filename=str(filename or ""),
         )
-        if descriptor["metadata_changed"]:
-            _write_attachment_meta(name, descriptor["metadata"])
-            meta = descriptor["metadata"]
+        if descriptor["metadata_changed"] and not payload.dry_run:
+            descriptor_metadata = dict(descriptor["metadata"])
+            meta = _mutate_attachment_meta(
+                name,
+                lambda current: {**current, **descriptor_metadata},
+            )
         filename = descriptor["filename"] or filename
         content_type = descriptor["content_type"] or ""
         if not str(content_type).lower().startswith("image/"):
             continue
-        scanned += 1
-        if max_items is not None and scanned > max_items:
+        if max_items is not None and scanned >= max_items:
             break
+        scanned += 1
         if payload.dry_run:
             continue
         try:
             data = target.read_bytes()
         except Exception:
+            failed += 1
             continue
         url = f"/api/attachments/{name}/{filename}"
         try:
-            _caption_and_index_image_bytes(
+            result = _caption_and_index_image_bytes(
                 data,
                 filename=filename,
                 content_type=str(content_type).lower(),
                 url=url,
                 content_hash=name,
             )
+            if not isinstance(result, dict):
+                failed += 1
+                continue
             updated += 1
+            caption_status = str(result.get("caption_status") or "").strip().lower()
+            if result.get("caption") and caption_status == "generated":
+                captions_generated += 1
+            elif not result.get("caption"):
+                captions_unavailable += 1
         except Exception:
-            pass
-    return {"scanned": scanned, "reindexed": updated}
+            failed += 1
+    return {
+        "scanned": scanned,
+        "reindexed": updated,
+        "captions_generated": captions_generated,
+        "captions_unavailable": captions_unavailable,
+        "failed": failed,
+        "dry_run": bool(payload.dry_run),
+    }
 
 
 class AttachmentCaptionPayload(BaseModel):
     caption: str
+
+
+class AttachmentCaptionGeneratePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    replace_generated: bool = False
 
 
 def _sanitize_attachment_caption(value: Any) -> str:
@@ -16832,9 +21359,83 @@ def _sanitize_attachment_caption(value: Any) -> str:
     return text[:2000]
 
 
+@router.get("/attachments/caption/status")
+async def attachment_caption_status(request: Request):
+    return _image_caption_status(getattr(request.app.state, "config", None))
+
+
+@router.post("/attachments/caption/{content_hash}/generate")
+async def attachment_caption_generate(
+    request: Request,
+    content_hash: str,
+    payload: AttachmentCaptionGeneratePayload,
+):
+    normalized_hash = _require_attachment_hash(content_hash)
+    descriptor = _attachment_public_descriptor(normalized_hash)
+    if not descriptor:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    content_type = str(descriptor.get("content_type") or "").lower()
+    if not content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Attachment is not an image")
+    metadata = _read_attachment_meta(normalized_hash)
+    caption_status = str(metadata.get("caption_status") or "").strip().lower()
+    caption = _sanitize_attachment_caption(metadata.get("caption") or "")
+    if caption_status == "manual" or metadata.get("caption_model") == "manual-caption":
+        raise HTTPException(
+            status_code=409,
+            detail="Manual captions are protected; remove it explicitly first",
+        )
+    if (
+        caption
+        and caption_status == "generated"
+        and not payload.replace_generated
+        and not _is_legacy_clip_placeholder(metadata, caption)
+        and not is_low_quality_generated_caption(caption)
+    ):
+        return {"status": "preserved", "attachment": descriptor}
+    engine_status = _image_caption_status(getattr(request.app.state, "config", None))
+    if engine_status["engine"] == "off":
+        raise HTTPException(status_code=409, detail="Caption generation is disabled")
+    if not engine_status["can_generate"]:
+        raise HTTPException(
+            status_code=409,
+            detail="The configured caption engine is not ready",
+        )
+    if payload.replace_generated:
+
+        def _prepare_caption_replacement(current: Dict[str, Any]) -> Dict[str, Any]:
+            if (
+                str(current.get("caption_status") or "").strip().lower() == "manual"
+                or current.get("caption_model") == "manual-caption"
+            ):
+                return current
+            for key in (
+                "caption",
+                "caption_model",
+                "caption_updated_at",
+                "caption_generated_at",
+            ):
+                current.pop(key, None)
+            current["caption_status"] = "pending"
+            current["placeholder_caption"] = False
+            return current
+
+        _mutate_attachment_meta(normalized_hash, _prepare_caption_replacement)
+    result = _reindex_attachment_caption(normalized_hash)
+    if not result:
+        raise HTTPException(status_code=500, detail="Caption generation failed")
+    updated = _attachment_public_descriptor(normalized_hash)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    return {
+        "status": str(updated.get("caption_status") or "generated"),
+        "attachment": updated,
+    }
+
+
 @router.get("/attachments/caption/{content_hash}")
 async def attachment_caption_get(content_hash: str):
-    normalized_hash = _normalize_attachment_hash(content_hash)
+    normalized_hash = _require_attachment_hash(content_hash)
     if not _resolve_attachment_target(normalized_hash):
         raise HTTPException(status_code=404, detail="Attachment not found")
     metadata = _read_attachment_meta(normalized_hash)
@@ -16850,25 +21451,32 @@ async def attachment_caption_get(content_hash: str):
 
 @router.put("/attachments/caption/{content_hash}")
 async def attachment_caption_put(content_hash: str, payload: AttachmentCaptionPayload):
-    normalized_hash = _normalize_attachment_hash(content_hash)
+    normalized_hash = _require_attachment_hash(content_hash)
     if not _resolve_attachment_target(normalized_hash):
         raise HTTPException(status_code=404, detail="Attachment not found")
     caption = _sanitize_attachment_caption(payload.caption)
     if not caption:
         raise HTTPException(status_code=400, detail="caption is required")
-    metadata = _read_attachment_meta(normalized_hash)
-    metadata["caption"] = caption
-    metadata["caption_updated_at"] = _utc_now_compact_iso()
-    metadata["caption_model"] = "manual-caption"
-    metadata["caption_status"] = "manual"
-    metadata["index_status"] = "indexing"
-    metadata["placeholder_caption"] = False
-    _write_attachment_meta(normalized_hash, metadata)
+    caption_updated_at = _utc_now_compact_iso()
+
+    def _save_manual_caption(metadata: Dict[str, Any]) -> Dict[str, Any]:
+        metadata["caption"] = caption
+        metadata["caption_updated_at"] = caption_updated_at
+        metadata["metadata_updated_at"] = caption_updated_at
+        metadata["caption_model"] = "manual-caption"
+        metadata["caption_status"] = "manual"
+        metadata["index_status"] = "indexing"
+        metadata["placeholder_caption"] = False
+        return metadata
+
+    _mutate_attachment_meta(normalized_hash, _save_manual_caption)
     try:
         _reindex_attachment_caption(normalized_hash, caption_override=caption)
     except Exception:
-        metadata["index_status"] = "error"
-        _write_attachment_meta(normalized_hash, metadata)
+        _mutate_attachment_meta(
+            normalized_hash,
+            lambda metadata: {**metadata, "index_status": "error"},
+        )
         logger.warning(
             "Failed to reindex attachment caption for %s",
             normalized_hash,
@@ -16886,41 +21494,62 @@ async def attachment_caption_put(content_hash: str, payload: AttachmentCaptionPa
 
 @router.delete("/attachments/caption/{content_hash}")
 async def attachment_caption_delete(content_hash: str):
-    normalized_hash = _normalize_attachment_hash(content_hash)
+    normalized_hash = _require_attachment_hash(content_hash)
     if not _resolve_attachment_target(normalized_hash):
         raise HTTPException(status_code=404, detail="Attachment not found")
-    metadata = _read_attachment_meta(normalized_hash)
-    had_caption = bool(_sanitize_attachment_caption(metadata.get("caption") or ""))
-    metadata.pop("caption", None)
-    metadata.pop("caption_updated_at", None)
-    metadata.pop("caption_generated_at", None)
-    metadata.pop("caption_model", None)
-    metadata.pop("clip_embedding_model", None)
-    metadata.pop("clip_embedding_dim", None)
-    metadata.pop("clip_indexed_at", None)
-    metadata["caption_status"] = "pending"
-    metadata["index_status"] = "indexing"
-    metadata["placeholder_caption"] = False
-    _write_attachment_meta(normalized_hash, metadata)
+    had_caption = False
+
+    def _remove_caption(metadata: Dict[str, Any]) -> Dict[str, Any]:
+        nonlocal had_caption
+        had_caption = bool(_sanitize_attachment_caption(metadata.get("caption") or ""))
+        for key in (
+            "caption",
+            "caption_updated_at",
+            "caption_generated_at",
+            "caption_model",
+            "clip_embedding_model",
+            "clip_embedding_dim",
+            "clip_indexed_at",
+        ):
+            metadata.pop(key, None)
+        metadata["caption_status"] = "pending"
+        metadata["index_status"] = "indexing"
+        metadata["placeholder_caption"] = False
+        metadata["metadata_updated_at"] = _utc_now_compact_iso()
+        return metadata
+
+    metadata = _mutate_attachment_meta(normalized_hash, _remove_caption)
     try:
-        _reindex_attachment_caption(normalized_hash)
+        _forget_attachment_knowledge(normalized_hash)
+        _reindex_attachment_caption(
+            normalized_hash,
+            generate_caption=False,
+        )
     except Exception:
-        metadata["index_status"] = "error"
-        metadata["caption_status"] = "error"
-        _write_attachment_meta(normalized_hash, metadata)
+        metadata = _mutate_attachment_meta(
+            normalized_hash,
+            lambda current: {
+                **current,
+                "index_status": "error",
+                "caption_status": "error",
+            },
+        )
         logger.warning(
             "Failed to refresh attachment caption for %s",
             normalized_hash,
             exc_info=True,
         )
+    refreshed_metadata = _read_attachment_meta(normalized_hash)
+    descriptor = _attachment_public_descriptor(normalized_hash)
     return {
         "status": "deleted",
         "content_hash": normalized_hash,
         "deleted": had_caption,
         **_attachment_caption_tracker_fields(
-            _read_attachment_meta(normalized_hash),
+            refreshed_metadata,
             content_type=str(metadata.get("content_type") or "").strip(),
         ),
+        "attachment": descriptor,
     }
 
 
@@ -16930,7 +21559,8 @@ async def attachments_reveal(
     filename: Optional[str] = Query(default=None),
 ):
     """Reveal the stored blob path and best-effort open its folder."""
-    target = _resolve_attachment_target(content_hash, filename=filename)
+    normalized_hash = _require_attachment_hash(content_hash)
+    target = _resolve_attachment_target(normalized_hash, filename=filename)
     if not target:
         raise HTTPException(status_code=404, detail="Attachment not found")
     opened = _open_path_in_system_file_browser(target)
@@ -16950,37 +21580,148 @@ async def attachments_get(content_hash: str, filename: str):
     Falls back to legacy uploads path resolution by filename when the blob hash
     file is missing (for older migrated records).
     """
-    target = _resolve_attachment_target(content_hash, filename=filename)
+    normalized_hash = _require_attachment_hash(content_hash)
+    target = _resolve_attachment_target(normalized_hash, filename=filename)
     if not target:
         raise HTTPException(status_code=404, detail="Attachment not found")
-    metadata = _read_attachment_meta(_normalize_attachment_hash(content_hash))
+    metadata = _read_attachment_meta(normalized_hash)
     descriptor = build_attachment_media_descriptor(
-        _normalize_attachment_hash(content_hash),
+        normalized_hash,
         target,
         metadata=metadata,
         preferred_filename=filename,
     )
     if descriptor["metadata_changed"]:
-        _write_attachment_meta(
-            _normalize_attachment_hash(content_hash), descriptor["metadata"]
+        descriptor_metadata = dict(descriptor["metadata"])
+        _mutate_attachment_meta(
+            normalized_hash,
+            lambda current: {**current, **descriptor_metadata},
         )
     media_type = descriptor["content_type"] or "application/octet-stream"
-    return FileResponse(path=str(target), media_type=media_type)
+    headers = {"X-Content-Type-Options": "nosniff"}
+    inline_types = {
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+        "audio/mpeg",
+        "audio/wav",
+        "video/mp4",
+        "video/webm",
+    }
+    if media_type not in inline_types:
+        headers["Content-Security-Policy"] = "sandbox; default-src 'none'"
+        return FileResponse(
+            path=str(target),
+            media_type=media_type,
+            filename=str(descriptor.get("filename") or filename),
+            content_disposition_type="attachment",
+            headers=headers,
+        )
+    return FileResponse(path=str(target), media_type=media_type, headers=headers)
+
+
+def _mark_attachment_cleanup_pending(
+    content_hash: str,
+    cleanup_failed: list[str],
+) -> None:
+    failures = [str(item).strip() for item in cleanup_failed if str(item).strip()]
+
+    def _mark(metadata: Dict[str, Any]) -> Dict[str, Any]:
+        metadata["deletion_status"] = "cleanup_pending"
+        metadata["cleanup_failed"] = failures
+        metadata["metadata_updated_at"] = _utc_now_compact_iso()
+        metadata.pop("index_generation", None)
+        metadata.pop("index_generation_started_at", None)
+        return metadata
+
+    try:
+        _mutate_attachment_meta(content_hash, _mark)
+    except Exception:
+        logger.warning(
+            "Failed to persist attachment cleanup retry state for %s",
+            content_hash,
+            exc_info=True,
+        )
+
+
+def _delete_attachment_canonically(content_hash: str) -> Dict[str, Any]:
+    """Delete attachment bytes, retrieval mirrors, and metadata as one lifecycle."""
+
+    normalized_hash = _require_attachment_hash(content_hash)
+    # Serialize the destructive transition with caption/index work. If deletion
+    # wins the lock, a queued generation sees the tombstone or missing bytes and
+    # cancels; if indexing wins, deletion waits and then removes every mirror.
+    with attachment_metadata_lock(BLOBS_DIR, normalized_hash):
+        ok = blob_delete(normalized_hash)
+        if not ok:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "status": "failed",
+                    "message": "Failed to delete attachment content",
+                    "content_hash": normalized_hash,
+                    "metadata_preserved": True,
+                    "knowledge_preserved": True,
+                },
+            )
+
+        # Persist a retry record before mirror cleanup. If the process or a
+        # mirror fails after the bytes are gone, the gallery exposes cleanup.
+        _mark_attachment_cleanup_pending(
+            normalized_hash,
+            ["knowledge", "metadata"],
+        )
+    cleanup_errors: list[str] = []
+    try:
+        _forget_attachment_knowledge(normalized_hash, strict=True)
+    except Exception:
+        _mark_attachment_cleanup_pending(normalized_hash, ["knowledge"])
+        logger.warning(
+            "Attachment content was deleted but knowledge cleanup failed for %s",
+            normalized_hash,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "status": "partial",
+                "message": "Attachment content was deleted, but cleanup was incomplete",
+                "content_hash": normalized_hash,
+                "content_deleted": True,
+                "metadata_preserved": True,
+                "cleanup_failed": ["knowledge"],
+            },
+        )
+    try:
+        delete_attachment_metadata(BLOBS_DIR, normalized_hash)
+    except Exception:
+        cleanup_errors.append("metadata")
+        _mark_attachment_cleanup_pending(normalized_hash, cleanup_errors)
+        logger.warning(
+            "Attachment content was deleted but metadata cleanup failed for %s",
+            normalized_hash,
+            exc_info=True,
+        )
+    if cleanup_errors:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "status": "partial",
+                "message": "Attachment content was deleted, but cleanup was incomplete",
+                "content_hash": normalized_hash,
+                "content_deleted": True,
+                "cleanup_failed": cleanup_errors,
+            },
+        )
+    return {"status": "deleted", "content_hash": normalized_hash}
 
 
 @router.delete("/attachments/{content_hash}")
 async def attachments_delete(content_hash: str):
-    """Delete an attachment blob by content hash."""
-    normalized_hash = _normalize_attachment_hash(content_hash)
-    _forget_attachment_knowledge(normalized_hash)
-    ok = blob_delete(normalized_hash)
-    try:
-        _attachment_meta_path(normalized_hash).unlink(missing_ok=True)
-    except Exception:
-        pass
-    if not ok:
-        raise HTTPException(status_code=500, detail="Failed to delete blob")
-    return {"status": "deleted"}
+    """Delete an attachment and all of its derived retrieval records."""
+
+    return _delete_attachment_canonically(content_hash)
 
 
 # ---------------------------------------------------------------------------
@@ -17258,6 +21999,8 @@ class SettingsRequest(BaseModel):
     realtime_base_url: Optional[str] = None
     realtime_connect_url: Optional[str] = None
     vision_model: Optional[str] = None
+    image_caption_engine: Optional[str] = None
+    image_caption_cloud_model: Optional[str] = None
     dev_mode: Optional[bool] = None
     max_context_length: Optional[int] = None
     kv_cache: Optional[bool] = None
@@ -17430,6 +22173,8 @@ async def get_settings(request: Request):
             "realtime_connect_url", DEFAULT_REALTIME_CONNECT_URL
         ),
         "vision_model": cfg.get("vision_model"),
+        "image_caption_engine": _configured_image_caption_engine(cfg),
+        "image_caption_cloud_model": _configured_cloud_caption_model(cfg),
         "dev_mode": cfg.get("dev_mode", False),
         "max_context_length": cfg.get("max_context_length"),
         "kv_cache": cfg.get("enable_kv_cache"),
@@ -17865,6 +22610,19 @@ async def update_settings(request: Request, settings: SettingsRequest):
         safe_set("VISION_MODEL", caption_model)
         safe_set("VISION_CAPTION_MODEL", caption_model)
         cfg["vision_model"] = caption_model
+    if settings.image_caption_engine is not None:
+        raw_engine = str(settings.image_caption_engine or "").strip().lower()
+        if raw_engine not in _IMAGE_CAPTION_ENGINES:
+            raise HTTPException(status_code=400, detail="Invalid image_caption_engine")
+        safe_set("IMAGE_CAPTION_ENGINE", raw_engine)
+        cfg["image_caption_engine"] = raw_engine
+    if settings.image_caption_cloud_model is not None:
+        cloud_model = (
+            str(settings.image_caption_cloud_model or "").strip()
+            or _DEFAULT_CLOUD_CAPTION_MODEL
+        )
+        safe_set("IMAGE_CAPTION_CLOUD_MODEL", cloud_model)
+        cfg["image_caption_cloud_model"] = cloud_model
     if settings.max_context_length is not None:
         safe_set("MAX_CONTEXT_LENGTH", str(settings.max_context_length))
         cfg["max_context_length"] = settings.max_context_length
@@ -18080,19 +22838,26 @@ async def update_settings(request: Request, settings: SettingsRequest):
         safe_set("SAE_LIVE_INSPECT_CONSOLE", str(live_inspect).lower())
         cfg["sae_live_inspect_console"] = live_inspect
     background_autonomy_changed = False
+
+    def set_background_autonomy_config(key: str, value: Any) -> None:
+        nonlocal background_autonomy_changed
+        if cfg.get(key) != value:
+            background_autonomy_changed = True
+        cfg[key] = value
+
     if settings.background_autonomy_enabled is not None:
         enabled_value = bool(settings.background_autonomy_enabled)
         safe_set("FLOAT_BACKGROUND_AUTONOMY_ENABLED", str(enabled_value).lower())
-        cfg["background_autonomy_enabled"] = enabled_value
-        background_autonomy_changed = True
+        set_background_autonomy_config("background_autonomy_enabled", enabled_value)
     if settings.background_autonomy_sandbox_processes is not None:
         sandbox_processes = bool(settings.background_autonomy_sandbox_processes)
         safe_set(
             "FLOAT_BACKGROUND_AUTONOMY_SANDBOX_PROCESSES",
             str(sandbox_processes).lower(),
         )
-        cfg["background_autonomy_sandbox_processes"] = sandbox_processes
-        background_autonomy_changed = True
+        set_background_autonomy_config(
+            "background_autonomy_sandbox_processes", sandbox_processes
+        )
     if settings.background_autonomy_mode is not None:
         mode_value = (
             str(settings.background_autonomy_mode or "overnight")
@@ -18105,15 +22870,13 @@ async def update_settings(request: Request, settings: SettingsRequest):
                 status_code=400, detail="Invalid background autonomy mode"
             )
         safe_set("FLOAT_BACKGROUND_AUTONOMY_MODE", mode_value)
-        cfg["background_autonomy_mode"] = mode_value
-        background_autonomy_changed = True
+        set_background_autonomy_config("background_autonomy_mode", mode_value)
     if settings.background_autonomy_interval_seconds is not None:
         interval = max(
             30, min(int(settings.background_autonomy_interval_seconds), 86400)
         )
         safe_set("FLOAT_BACKGROUND_AUTONOMY_INTERVAL_SECONDS", str(interval))
-        cfg["background_autonomy_interval_seconds"] = interval
-        background_autonomy_changed = True
+        set_background_autonomy_config("background_autonomy_interval_seconds", interval)
     if settings.background_autonomy_max_reflections_per_tick is not None:
         max_reflections = max(
             0, min(int(settings.background_autonomy_max_reflections_per_tick), 5)
@@ -18121,41 +22884,45 @@ async def update_settings(request: Request, settings: SettingsRequest):
         safe_set(
             "FLOAT_BACKGROUND_AUTONOMY_MAX_REFLECTIONS_PER_TICK", str(max_reflections)
         )
-        cfg["background_autonomy_max_reflections_per_tick"] = max_reflections
-        background_autonomy_changed = True
+        set_background_autonomy_config(
+            "background_autonomy_max_reflections_per_tick", max_reflections
+        )
     if settings.background_autonomy_max_runtime_seconds is not None:
         max_runtime = max(
             60, min(int(settings.background_autonomy_max_runtime_seconds), 86400)
         )
         safe_set("FLOAT_BACKGROUND_AUTONOMY_MAX_RUNTIME_SECONDS", str(max_runtime))
-        cfg["background_autonomy_max_runtime_seconds"] = max_runtime
-        background_autonomy_changed = True
+        set_background_autonomy_config(
+            "background_autonomy_max_runtime_seconds", max_runtime
+        )
     if settings.background_autonomy_satisfied_threshold is not None:
         threshold = max(
             0.0, min(float(settings.background_autonomy_satisfied_threshold), 1.0)
         )
         safe_set("FLOAT_BACKGROUND_AUTONOMY_SATISFIED_THRESHOLD", str(threshold))
-        cfg["background_autonomy_satisfied_threshold"] = threshold
-        background_autonomy_changed = True
+        set_background_autonomy_config(
+            "background_autonomy_satisfied_threshold", threshold
+        )
     if settings.background_autonomy_basic_tick_count is not None:
         tick_count = max(1, min(int(settings.background_autonomy_basic_tick_count), 20))
         safe_set("FLOAT_BACKGROUND_AUTONOMY_BASIC_TICK_COUNT", str(tick_count))
-        cfg["background_autonomy_basic_tick_count"] = tick_count
-        background_autonomy_changed = True
+        set_background_autonomy_config(
+            "background_autonomy_basic_tick_count", tick_count
+        )
     if settings.background_autonomy_basic_tick_seconds is not None:
         tick_seconds = max(
             5, min(int(settings.background_autonomy_basic_tick_seconds), 86400)
         )
         safe_set("FLOAT_BACKGROUND_AUTONOMY_BASIC_TICK_SECONDS", str(tick_seconds))
-        cfg["background_autonomy_basic_tick_seconds"] = tick_seconds
-        background_autonomy_changed = True
+        set_background_autonomy_config(
+            "background_autonomy_basic_tick_seconds", tick_seconds
+        )
     if settings.background_autonomy_min_priority is not None:
         min_priority = max(
             0.0, min(float(settings.background_autonomy_min_priority), 1.0)
         )
         safe_set("FLOAT_BACKGROUND_AUTONOMY_MIN_PRIORITY", str(min_priority))
-        cfg["background_autonomy_min_priority"] = min_priority
-        background_autonomy_changed = True
+        set_background_autonomy_config("background_autonomy_min_priority", min_priority)
     if settings.weaviate_url is not None:
         safe_set("WEAVIATE_URL", settings.weaviate_url)
         # clear alternate var to avoid ambiguity
@@ -18192,6 +22959,11 @@ async def update_settings(request: Request, settings: SettingsRequest):
     autonomy_service = getattr(request.app.state, "background_autonomy_service", None)
     if isinstance(autonomy_service, BackgroundAutonomyService):
         autonomy_service.update_config(cfg, reset_session=background_autonomy_changed)
+    if background_autonomy_changed:
+        autonomy_wakeup = getattr(request.app.state, "background_autonomy_wakeup", None)
+        wakeup_set = getattr(autonomy_wakeup, "set", None)
+        if callable(wakeup_set):
+            wakeup_set()
     # Ensure the singleton RAG service picks up any backend/model changes.
     _update_rag_config(cfg)
     response_settings = _redact_settings(cfg)
@@ -18491,9 +23263,9 @@ def _background_autonomy_console_status(status: str) -> str:
     normalized = str(status or "").strip().lower()
     if normalized == "error":
         return "error"
-    if normalized in {"busy", "ran", "planned"}:
+    if normalized in {"busy", "running"}:
         return "active"
-    return "queued"
+    return "idle"
 
 
 def _background_autonomy_console_agent(status: Dict[str, Any]) -> Dict[str, Any]:
@@ -18508,7 +23280,11 @@ def _background_autonomy_console_agent(status: Dict[str, Any]) -> Dict[str, Any]
     )
     enabled = bool(status.get("enabled"))
     mode = str(status.get("mode") or status.get("configured_mode") or "manual")
-    last_status = str(state.get("last_status") or ("ready" if enabled else "manual"))
+    last_status = (
+        "running"
+        if state.get("running")
+        else str(state.get("last_status") or ("ready" if enabled else "manual"))
+    )
     candidate_count = int(reflection.get("candidate_count") or 0)
     summary = (
         f"{mode.replace('_', ' ')} autonomy, "
@@ -18538,7 +23314,12 @@ def _background_autonomy_console_agent(status: Dict[str, Any]) -> Dict[str, Any]
             kind="background",
             label="Background autonomy supervisor",
         ),
-        "controls": controls_for_status(agent_status),
+        "controls": controls_for_status(
+            agent_status,
+            allow_pause=False,
+            allow_redirect=False,
+            allow_stop=False,
+        ),
         "resources": {
             "candidate_count": candidate_count,
             "scheduled_due": int(scheduled.get("due") or 0),
@@ -18572,7 +23353,12 @@ async def _publish_background_autonomy_event(app, result: Dict[str, Any]) -> Non
                 kind="background",
                 label="Background autonomy supervisor",
             ),
-            "controls": controls_for_status(agent_status),
+            "controls": controls_for_status(
+                agent_status,
+                allow_pause=False,
+                allow_redirect=False,
+                allow_stop=False,
+            ),
             "metadata": {"background_autonomy": result},
         },
         default_agent="system:background-autonomy",
@@ -18587,7 +23373,8 @@ def _get_reflection_service(app):
 
     config_payload = getattr(app.state, "config", None)
     service = ReflectionService(
-        config_payload if isinstance(config_payload, dict) else {}
+        config_payload if isinstance(config_payload, dict) else {},
+        work_run_store=_get_work_run_store(app),
     )
     app.state.reflection_service = service
     try:
@@ -18597,6 +23384,405 @@ def _get_reflection_service(app):
     except Exception:
         pass
     return service
+
+
+def _backfill_reflection_work_runs(
+    store: WorkRunStore,
+    service: Any,
+    *,
+    job_id: str = "",
+) -> Dict[str, int]:
+    """Project retained reflection rows in bounded pages, idempotently."""
+
+    stats = {"seen": 0, "recorded": 0, "invalid": 0, "failed": 0}
+    task_cache: Dict[str, Dict[str, Any]] = {}
+    offset = 0
+    page_size = 200
+    supports_offset = True
+    while True:
+        try:
+            page = service.list_runs(
+                str(job_id or ""),
+                limit=page_size,
+                offset=offset,
+            )
+        except TypeError:
+            # Compatibility for injected/older services used by extensions.
+            if offset:
+                break
+            supports_offset = False
+            page = service.list_runs(str(job_id or ""), limit=page_size)
+        page = page if isinstance(page, list) else []
+        for run in page:
+            stats["seen"] += 1
+            if not isinstance(run, dict) or not run.get("id"):
+                stats["invalid"] += 1
+                continue
+            task_id = str(run.get("task_id") or "")
+            if not task_id:
+                stats["invalid"] += 1
+                continue
+            if task_id not in task_cache:
+                task = service.get_task(task_id)
+                task_cache[task_id] = task if isinstance(task, dict) else {}
+            task = task_cache[task_id]
+            if not task:
+                stats["invalid"] += 1
+                continue
+            try:
+                store.upsert(
+                    reflection_run_receipt(task, run),
+                    source="reflection",
+                )
+                stats["recorded"] += 1
+            except Exception:
+                stats["failed"] += 1
+        if not supports_offset or len(page) < page_size:
+            break
+        offset += len(page)
+    return stats
+
+
+def backfill_work_run_ledger(
+    app,
+    *,
+    source: str = "",
+    job_id: str = "",
+) -> Dict[str, Any]:
+    """Repair the durable Activity ledger from retained legacy receipts."""
+
+    source_filter = str(source or "").strip().lower()
+    job_filter = str(job_id or "").strip()
+    store = _get_work_run_store(app)
+    result: Dict[str, Any] = {}
+    if source_filter in {"", "calendar"}:
+        result["calendar"] = _backfill_calendar_work_runs(
+            store,
+            event_id=job_filter,
+        )
+    if source_filter in {"", "reflection"}:
+        result["reflection"] = _backfill_reflection_work_runs(
+            store,
+            _get_reflection_service(app),
+            job_id=job_filter,
+        )
+    return result
+
+
+@router.get("/work/runs")
+async def list_work_runs(
+    request: Request,
+    source: str = "",
+    job_id: str = "",
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    """List durable Calendar and reflection receipts for Activity."""
+
+    source_filter = str(source or "").strip().lower()
+    job_filter = str(job_id or "").strip()
+    backfill = await asyncio.to_thread(
+        backfill_work_run_ledger,
+        request.app,
+        source=source_filter,
+        job_id=job_filter,
+    )
+    store = _get_work_run_store(request.app)
+    filters = {"source": source_filter, "job_id": job_filter}
+    records, total = await asyncio.gather(
+        asyncio.to_thread(
+            store.list_runs,
+            **filters,
+            limit=limit,
+            offset=offset,
+        ),
+        asyncio.to_thread(store.count_runs, **filters),
+    )
+    next_offset = offset + len(records)
+    return {
+        "runs": records,
+        "count": total,
+        "limit": limit,
+        "offset": offset,
+        "has_more": next_offset < total,
+        "next_offset": next_offset if next_offset < total else None,
+        "storage": {
+            "backend": "sqlite",
+            "device_local": True,
+            "backfill": backfill,
+        },
+    }
+
+
+@router.get("/work/runs/{receipt_id}/events")
+async def list_work_run_events(
+    request: Request,
+    receipt_id: str,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    """Return metadata-only lifecycle transitions for one Activity receipt."""
+
+    store = _get_work_run_store(request.app)
+    receipt = await asyncio.to_thread(store.get, receipt_id)
+    if receipt is None:
+        raise HTTPException(status_code=404, detail="Work run receipt not found")
+    events = await asyncio.to_thread(
+        store.list_events,
+        receipt_id,
+        limit=limit,
+        offset=offset,
+    )
+    total = await asyncio.to_thread(store.count_events, receipt_id)
+    next_offset = offset + len(events)
+    return {
+        "receipt_id": receipt_id,
+        "events": events,
+        "count": total,
+        "limit": limit,
+        "offset": offset,
+        "has_more": next_offset < total,
+        "next_offset": next_offset if next_offset < total else None,
+    }
+
+
+@router.get("/work/runs/{receipt_id}/attempts")
+async def list_work_run_attempts(
+    request: Request,
+    receipt_id: str,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    """Return metadata-only provider attempts for one Activity receipt."""
+
+    store = _get_work_run_store(request.app)
+    receipt = await asyncio.to_thread(store.get, receipt_id)
+    if receipt is None:
+        raise HTTPException(status_code=404, detail="Work run receipt not found")
+    attempts = await asyncio.to_thread(
+        store.list_attempts,
+        receipt_id,
+        limit=limit,
+        offset=offset,
+    )
+    total = await asyncio.to_thread(store.count_attempts, receipt_id)
+    next_offset = offset + len(attempts)
+    return {
+        "receipt_id": receipt_id,
+        "attempts": attempts,
+        "count": total,
+        "limit": limit,
+        "offset": offset,
+        "has_more": next_offset < total,
+        "next_offset": next_offset if next_offset < total else None,
+    }
+
+
+@router.get("/work/runs/{receipt_id}/effects")
+async def list_work_run_effects(
+    request: Request,
+    receipt_id: str,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+):
+    """Return redacted mutation evidence for one Activity receipt."""
+
+    store = _get_work_run_store(request.app)
+    receipt = await asyncio.to_thread(store.get, receipt_id)
+    if receipt is None:
+        raise HTTPException(status_code=404, detail="Work run receipt not found")
+    effects = await asyncio.to_thread(
+        store.list_effects,
+        receipt_id,
+        limit=limit,
+        offset=offset,
+    )
+    total = await asyncio.to_thread(store.count_effects, receipt_id)
+    next_offset = offset + len(effects)
+    return {
+        "receipt_id": receipt_id,
+        "effects": effects,
+        "count": total,
+        "limit": limit,
+        "offset": offset,
+        "has_more": next_offset < total,
+        "next_offset": next_offset if next_offset < total else None,
+    }
+
+
+class WorkEffectReconciliationDecision(BaseModel):
+    decision: Literal["confirm_applied", "confirm_no_change"]
+
+
+@router.post("/work/runs/{receipt_id}/effects/{effect_id}/reconcile")
+async def reconcile_work_run_effect(
+    request: Request,
+    receipt_id: str,
+    effect_id: str,
+    payload: WorkEffectReconciliationDecision,
+):
+    """Record a local observation about an uncertain effect without replaying it."""
+
+    _require_local_control(request)
+    try:
+        result = await asyncio.to_thread(
+            reconcile_work_effect,
+            _get_work_run_store(request.app),
+            receipt_id=receipt_id,
+            effect_id=effect_id,
+            decision=payload.decision,
+        )
+    except WorkEffectNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (WorkEffectReconciliationConflict, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Could not reconcile work effect %s/%s", receipt_id, effect_id)
+        raise HTTPException(
+            status_code=503,
+            detail="The Activity reconciliation decision could not be recorded.",
+        ) from exc
+
+    receipt = result.get("receipt")
+    receipt = receipt if isinstance(receipt, dict) else {}
+    event_id = str(receipt.get("event_id") or "").strip()
+    action_id = str(receipt.get("action_id") or "").strip()
+    calendar_updated = False
+    calendar_event_changed = False
+    calendar_projection_changed = False
+    warning: Optional[str] = None
+    if event_id and action_id:
+
+        def project_to_calendar(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            nonlocal calendar_projection_changed
+            projected = apply_reconciliation_to_calendar_event(
+                event,
+                event_id=event_id,
+                action_id=action_id,
+                receipt_id=receipt_id,
+                effect_id=effect_id,
+                decision=payload.decision,
+                aggregate=result.get("aggregate"),
+            )
+            calendar_projection_changed = projected != event
+            return projected if calendar_projection_changed else None
+
+        try:
+            stored_event = await asyncio.to_thread(
+                calendar_store.update_event,
+                event_id,
+                project_to_calendar,
+            )
+        except CalendarActionNotFound:
+            warning = (
+                "Activity was reconciled, but its Calendar action is no longer "
+                "available."
+            )
+            receipt_preserved = False
+
+            def preserve_reconciled_history(
+                event: Dict[str, Any]
+            ) -> Optional[Dict[str, Any]]:
+                nonlocal receipt_preserved
+                history = event.get("run_history")
+                history = list(history) if isinstance(history, list) else []
+                updated_history = list(history)
+                for index, raw_record in enumerate(history):
+                    if not isinstance(raw_record, dict) or str(
+                        raw_record.get("id") or ""
+                    ) != str(receipt_id):
+                        continue
+                    record = dict(raw_record)
+                    for field in (
+                        "status",
+                        "phase",
+                        "finished_at",
+                        "summary",
+                        "effect_status",
+                        "effect_certainty",
+                        "state_delta_certainty",
+                        "reconciliation_outcome",
+                        "reconcile_required",
+                        "tool_invoked",
+                    ):
+                        if field in receipt:
+                            record[field] = receipt[field]
+                    updated_history[index] = record
+                    receipt_preserved = True
+                    break
+                if not receipt_preserved:
+                    return None
+                updated = dict(event)
+                updated["run_history"] = updated_history
+                return updated
+
+            try:
+                stored_event = await asyncio.to_thread(
+                    calendar_store.update_event,
+                    event_id,
+                    preserve_reconciled_history,
+                )
+                calendar_event_changed = receipt_preserved
+            except Exception:
+                stored_event = {}
+                logger.warning(
+                    "Could not preserve reconciled Activity history on Calendar %s",
+                    event_id,
+                    exc_info=True,
+                )
+        except WorkEffectReconciliationConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception(
+                "Activity was reconciled but Calendar projection failed for %s/%s",
+                event_id,
+                action_id,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Activity was reconciled, but its Calendar state needs repair."
+                ),
+            ) from exc
+        if stored_event:
+            if warning is None:
+                calendar_updated = True
+                calendar_event_changed = calendar_projection_changed
+        if stored_event and calendar_event_changed:
+            try:
+                await asyncio.to_thread(_ingest_calendar_event, event_id, stored_event)
+            except Exception:
+                warning = "Calendar was updated, but its search index needs refresh."
+                logger.warning(
+                    "Could not re-index reconciled Calendar event %s",
+                    event_id,
+                    exc_info=True,
+                )
+        elif warning is None:
+            warning = (
+                "Activity was reconciled, but its Calendar event is no longer "
+                "available."
+            )
+    elif str(receipt.get("source") or "").strip().lower() == "calendar":
+        warning = "Activity was reconciled without a linked Calendar action."
+
+    return {
+        "status": (
+            "reconciled"
+            if (result.get("aggregate") or {}).get("all_resolved") is not False
+            else "reconcile_required"
+        ),
+        "receipt_id": receipt_id,
+        "effect_id": effect_id,
+        "decision": result["decision"],
+        "idempotent": bool(result.get("idempotent")),
+        "tool_replayed": False,
+        "calendar_updated": calendar_updated,
+        "warning": warning,
+        "receipt": receipt,
+        "effect": result.get("effect"),
+        "aggregate": result.get("aggregate"),
+    }
 
 
 def _reflection_workflow_payload() -> Dict[str, Any]:
@@ -18741,7 +23927,7 @@ def _save_reflection_conversation(
         },
     ]
     try:
-        conversation_store.save_conversation(name, messages)
+        conversation_store.replace_conversation_content(name, messages)
         conversation_store.merge_metadata(
             name,
             {
@@ -18789,7 +23975,12 @@ async def _publish_reflection_event(
             "workflow": _reflection_workflow_payload(),
             "provenance": _reflection_provenance(task),
             "handoff": _reflection_handoff(task),
-            "controls": controls_for_status(agent_status),
+            "controls": controls_for_status(
+                agent_status,
+                allow_pause=False,
+                allow_redirect=False,
+                allow_stop=False,
+            ),
             "metadata": _reflection_event_metadata(task, run),
         },
         default_agent=f"reflection:{task_id}",
@@ -19049,7 +24240,7 @@ def _task_plan_provenance_payload(
 ) -> Dict[str, Any]:
     if plan.provenance is not None:
         payload = plan.provenance.model_dump(exclude_none=True)
-        if task_id and not payload.get("task_id"):
+        if task_id:
             payload["task_id"] = task_id
         return payload
     return build_agent_provenance(
@@ -19079,7 +24270,9 @@ def _task_console_status(state: str) -> str:
     normalized = str(state or "").strip().lower()
     if normalized in {"success", "complete", "completed"}:
         return "complete"
-    if normalized in {"failure", "failed", "revoked"}:
+    if normalized == "revoked":
+        return "stopped"
+    if normalized in {"failure", "failed"}:
         return "error"
     if normalized in {"pending", "received"}:
         return "queued"
@@ -19090,6 +24283,7 @@ class ActionRevertRequest(BaseModel):
     action_ids: Optional[List[str]] = None
     response_id: Optional[str] = None
     conversation_id: Optional[str] = None
+    confirm_conversation: bool = False
     force: bool = False
 
 
@@ -19187,6 +24381,14 @@ async def post_revert_actions(request: Request, payload: ActionRevertRequest) ->
     service = _get_action_history_service(request.app)
     if service is None:
         raise HTTPException(status_code=404, detail="Action history unavailable")
+    conversation_wide = bool(
+        payload.conversation_id and not payload.response_id and not payload.action_ids
+    )
+    if conversation_wide and not payload.confirm_conversation:
+        raise HTTPException(
+            status_code=400,
+            detail="Undoing an entire chat requires explicit confirmation.",
+        )
     try:
         result = service.revert_actions(
             action_ids=payload.action_ids or None,
@@ -19202,6 +24404,15 @@ async def post_revert_actions(request: Request, payload: ActionRevertRequest) ->
                 agent_label="action history",
             ),
         )
+    except calendar_store.CalendarEventActiveRunError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This undo would delete an event with an active run. Request "
+                "the current run to stop, wait for terminal Activity state, "
+                "then try the undo again."
+            ),
+        ) from exc
     except ValueError as exc:
         detail = str(exc)
         status_code = 409 if "cannot revert" in detail.lower() else 400
@@ -19380,22 +24591,38 @@ def _console_agent_record(app, agent_id: str) -> Optional[Dict[str, Any]]:
 def _console_agent_task_id(
     agent_id: str, record: Optional[Dict[str, Any]]
 ) -> Optional[str]:
+    task_ids = _console_agent_task_ids(agent_id, record)
+    return task_ids[0] if task_ids else None
+
+
+def _console_agent_task_ids(
+    agent_id: str, record: Optional[Dict[str, Any]]
+) -> list[str]:
+    task_ids: list[str] = []
+
+    def add(value: Any) -> None:
+        task_id = str(value or "").strip()
+        if task_id and task_id not in task_ids:
+            task_ids.append(task_id)
+
     provenance = record.get("provenance") if isinstance(record, dict) else None
     if isinstance(provenance, dict):
-        task_id = str(provenance.get("task_id") or "").strip()
-        if task_id:
-            return task_id
+        authoritative_ids = provenance.get("task_ids")
+        if isinstance(authoritative_ids, list) and authoritative_ids:
+            for task_id in authoritative_ids:
+                add(task_id)
+        else:
+            add(provenance.get("task_id"))
     if str(agent_id or "").startswith("task:"):
-        task_id = str(agent_id).split(":", 1)[1].strip()
-        return task_id or None
-    return None
+        add(str(agent_id).split(":", 1)[1])
+    return task_ids
 
 
 async def _console_stop_task(task_id: str) -> None:
     try:
         from app.tasks import celery_app
-    except Exception:
-        return
+    except Exception as exc:
+        raise RuntimeError("Celery control is unavailable") from exc
     await asyncio.to_thread(celery_app.control.revoke, task_id, terminate=True)
 
 
@@ -19408,65 +24635,57 @@ async def _apply_agent_console_control(
     record = _console_agent_record(request.app, agent_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Agent not found")
+    normalized_action = str(action or "").strip().lower()
+    if normalized_action in {"pause", "resume", "redirect"}:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{normalized_action} is not supported by the current worker runtime"
+            ),
+        )
+    if normalized_action != "stop":
+        raise HTTPException(status_code=400, detail="Unsupported agent control")
+
     controls = (
         record.get("controls") if isinstance(record.get("controls"), dict) else {}
     )
     available = (
         controls.get("available") if isinstance(controls.get("available"), list) else []
     )
-    normalized_action = str(action or "").strip().lower()
     if normalized_action not in available:
         raise HTTPException(
             status_code=409,
             detail=f"{normalized_action} is not available for this agent",
         )
 
-    current_status = str(record.get("status") or "active").strip().lower() or "active"
-    next_status = current_status
-    note = str(payload.note or "").strip() if payload is not None else ""
-    workflow_target = str(payload.workflow or "").strip() if payload is not None else ""
-    mode_target = str(payload.mode or "").strip() if payload is not None else ""
-    model_target = str(payload.model or "").strip() if payload is not None else ""
-    handoff = record.get("handoff") if isinstance(record.get("handoff"), dict) else None
-    if normalized_action == "pause":
-        next_status = "paused"
-        message = "Paused delegated run in the console."
-    elif normalized_action == "resume":
-        next_status = "active"
-        message = "Resumed delegated run in the console."
-    elif normalized_action == "redirect":
-        message = "Redirect requested for delegated run."
-        if note:
-            handoff = append_handoff_note(
-                handoff,
-                f"Redirect: {note}",
-                fallback_summary=str(
-                    record.get("summary") or "Redirect requested."
-                ).strip(),
-            )
-    elif normalized_action == "stop":
-        task_id = _console_agent_task_id(agent_id, record)
-        if task_id:
+    task_ids = _console_agent_task_ids(agent_id, record)
+    if not task_ids:
+        raise HTTPException(
+            status_code=409,
+            detail="Stop requires a live Celery task id",
+        )
+    try:
+        for task_id in task_ids:
             await _console_stop_task(task_id)
-            message = "Stop requested; Celery revoke sent."
-        else:
-            message = "Stopped delegated run in the console."
-        next_status = "stopped"
-    else:
-        raise HTTPException(status_code=400, detail="Unsupported agent control")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Unable to send Celery stop request: {exc}",
+        ) from exc
+    message = (
+        "Stop requested for the tracked Celery task."
+        if len(task_ids) == 1
+        else f"Stop requested for {len(task_ids)} tracked Celery tasks."
+    )
+    next_status = "stopped"
+    handoff = record.get("handoff") if isinstance(record.get("handoff"), dict) else None
 
     updated_controls = controls_for_status(
         next_status,
-        existing=merge_agent_payload(
-            controls,
-            {
-                "redirect_note": note or controls.get("redirect_note"),
-                "redirect_workflow": workflow_target
-                or controls.get("redirect_workflow"),
-                "redirect_mode": mode_target or controls.get("redirect_mode"),
-                "redirect_model": model_target or controls.get("redirect_model"),
-            },
-        ),
+        allow_pause=False,
+        allow_redirect=False,
+        allow_stop=True,
+        existing=controls,
     )
     event = await publish_console_event(
         request.app,
@@ -19478,18 +24697,18 @@ async def _apply_agent_console_control(
             "agent_label": record.get("label") or agent_id,
             "agent_status": next_status,
             "content": message,
-            "workflow": record.get("workflow")
-            if isinstance(record.get("workflow"), dict)
-            else None,
-            "provenance": record.get("provenance")
-            if isinstance(record.get("provenance"), dict)
-            else None,
+            "workflow": (
+                record.get("workflow")
+                if isinstance(record.get("workflow"), dict)
+                else None
+            ),
+            "provenance": (
+                record.get("provenance")
+                if isinstance(record.get("provenance"), dict)
+                else None
+            ),
             "handoff": handoff,
             "controls": updated_controls,
-            "note": note or None,
-            "redirect_workflow": workflow_target or None,
-            "redirect_mode": mode_target or None,
-            "redirect_model": model_target or None,
         },
         default_agent=agent_id,
     )
@@ -19545,17 +24764,39 @@ async def redirect_console_agent(
     return await _apply_agent_console_control(request, agent_id, "redirect", payload)
 
 
+def _celery_chain_task_ids(result: Any) -> list[str]:
+    """Collect the terminal and parent task ids from a Celery chain result."""
+
+    task_ids: list[str] = []
+    seen_objects: set[int] = set()
+    current = result
+    while current is not None and id(current) not in seen_objects:
+        seen_objects.add(id(current))
+        task_id = str(getattr(current, "id", "") or "").strip()
+        if task_id and task_id not in task_ids:
+            task_ids.append(task_id)
+        current = getattr(current, "parent", None)
+    return task_ids
+
+
 @router.post("/tasks/")
 async def start_task(request: Request, plan: TaskPlan):
     """Start a multi-step task using ``MultiAgentEngine``."""
     steps = _task_plan_payload(plan)
     result = await asyncio.to_thread(engine.plan_and_execute, steps)
     task_id = str(result.id)
+    task_ids = _celery_chain_task_ids(result) or [task_id]
     context = _task_plan_console_context(steps)
     workflow_meta = _task_plan_workflow_metadata(plan)
     provenance = _task_plan_provenance_payload(plan, context, task_id=task_id)
+    provenance["task_ids"] = task_ids
     handoff = _task_plan_handoff_payload(plan, steps, context)
-    controls = controls_for_status("queued")
+    controls = controls_for_status(
+        "queued",
+        allow_pause=False,
+        allow_redirect=False,
+        allow_stop=True,
+    )
     await publish_console_event(
         request.app,
         {
@@ -19602,12 +24843,10 @@ async def get_task_status(task_id: str, request: Request):
         existing_record.get("controls") if isinstance(existing_record, dict) else None
     )
     console_status = _task_console_status(state)
-    if (
-        isinstance(existing_record, dict)
-        and str(existing_record.get("status") or "").strip().lower() == "paused"
-        and console_status in {"active", "queued"}
-    ):
-        console_status = "paused"
+    if isinstance(existing_record, dict) and console_status in {"active", "queued"}:
+        existing_status = str(existing_record.get("status") or "").strip().lower()
+        if existing_status in {"paused", "stopped"}:
+            console_status = existing_status
     await publish_console_event(
         request.app,
         {
@@ -19620,20 +24859,29 @@ async def get_task_status(task_id: str, request: Request):
             "agent_label": "Celery task chain",
             "content": f"Task chain state: {state}",
             "result_ready": "result" in data,
-            "workflow": existing_record.get("workflow")
-            if isinstance(existing_record, dict)
-            else None,
-            "provenance": existing_record.get("provenance")
-            if isinstance(existing_record, dict)
-            else None,
-            "handoff": existing_record.get("handoff")
-            if isinstance(existing_record, dict)
-            else None,
+            "workflow": (
+                existing_record.get("workflow")
+                if isinstance(existing_record, dict)
+                else None
+            ),
+            "provenance": (
+                existing_record.get("provenance")
+                if isinstance(existing_record, dict)
+                else None
+            ),
+            "handoff": (
+                existing_record.get("handoff")
+                if isinstance(existing_record, dict)
+                else None
+            ),
             "controls": controls_for_status(
                 console_status,
-                existing=existing_controls
-                if isinstance(existing_controls, dict)
-                else None,
+                allow_pause=False,
+                allow_redirect=False,
+                allow_stop=True,
+                existing=(
+                    existing_controls if isinstance(existing_controls, dict) else None
+                ),
             ),
         },
         default_agent=f"task:{task_id}",

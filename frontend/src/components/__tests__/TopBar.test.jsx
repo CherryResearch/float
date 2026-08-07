@@ -129,12 +129,63 @@ describe("TopBar local runtime entries", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     if (originalFetch) {
       global.fetch = originalFetch;
     } else {
       delete global.fetch;
     }
   });
+
+  it("changes theme only when activated and names the destination theme", () => {
+    vi.useFakeTimers();
+    const { setState, state } = renderTopBar({ theme: "dark" });
+    const themeButton = screen.getByRole("button", { name: "Switch to light theme" });
+
+    expect(themeButton).toHaveAttribute("title", "Switch to light theme");
+    fireEvent.mouseEnter(themeButton);
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+
+    const hasThemeChange = () =>
+      setState.mock.calls.some(([updater]) => {
+        const candidate = typeof updater === "function" ? updater(state) : updater;
+        return candidate?.theme !== state.theme;
+      });
+    expect(hasThemeChange()).toBe(false);
+
+    fireEvent.click(themeButton);
+    expect(hasThemeChange()).toBe(true);
+  });
+
+  it.each([
+    ["all", "Review all", "high", "High risk only"],
+    ["high", "High risk only", "auto", "Full auto"],
+    ["auto", "Full auto", "all", "Review all"],
+  ])(
+    "renders the %s approval mode as %s",
+    (level, label, nextLevel, nextLabel) => {
+      const { setState, state } = renderTopBar({ approvalLevel: level });
+      const approvalButton = screen.getByRole("button", {
+        name: `Approval mode: ${label}`,
+      });
+
+      expect(approvalButton).toHaveTextContent(label);
+      expect(approvalButton).toHaveAttribute(
+        "title",
+        `Approval mode: ${label}. Click to switch to ${nextLabel}.`,
+      );
+
+      fireEvent.click(approvalButton);
+      expect(
+        setState.mock.calls.some(([updater]) => {
+          const candidate = typeof updater === "function" ? updater(state) : updater;
+          return candidate?.approvalLevel === nextLevel;
+        }),
+      ).toBe(true);
+    },
+  );
 
   it("shows local runtime markers in the local model select", async () => {
     renderTopBar({ localModel: "lmstudio" });

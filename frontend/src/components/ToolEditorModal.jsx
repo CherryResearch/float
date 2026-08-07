@@ -3,8 +3,16 @@ import { createPortal } from "react-dom";
 import axios from "axios";
 import ToolArgsForm, { schemaTypeOptions } from "./ToolArgsForm";
 import ActionListEditor from "./ActionListEditor";
+import BackgroundJobFields from "./BackgroundJobFields";
 import "../styles/ToolEditor.css";
 import { GlobalContext } from "../main";
+import { normalizeBackgroundJobPolicy } from "../utils/backgroundJobPolicy";
+import {
+  addZonedCalendarInterval,
+  addZonedCalendarMonths,
+  dateToZonedInput,
+  zonedInputToDate,
+} from "../utils/zonedDateTime";
 import {
   buildModelGroups,
   DEFAULT_API_MODELS,
@@ -34,19 +42,6 @@ const normalizeDate = (value) => {
   return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
 };
 
-const toDateInput = (date) => {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
-};
-
-const toTimeInput = (date) => {
-  const hour = String(date.getHours()).padStart(2, "0");
-  const minute = String(date.getMinutes()).padStart(2, "0");
-  return `${hour}:${minute}`;
-};
-
 const resolveEpochMs = (value) => {
   if (!value) return null;
   if (value instanceof Date) {
@@ -68,22 +63,6 @@ const resolveEpochMs = (value) => {
   return null;
 };
 
-const toLocalInputValue = (date) => {
-  if (!date || Number.isNaN(date.getTime())) return "";
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  const hour = String(date.getHours()).padStart(2, "0");
-  const minute = String(date.getMinutes()).padStart(2, "0");
-  return `${year}-${month}-${day}T${hour}:${minute}`;
-};
-
-const parseLocalInputValue = (value) => {
-  if (!value) return null;
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? null : parsed;
-};
-
 const normalizeTaskStatus = (value) => {
   const raw = String(value || "")
     .trim()
@@ -101,6 +80,7 @@ const TASK_STATUS_OPTIONS = [
   { value: "pending", label: "Pending" },
   { value: "scheduled", label: "Scheduled" },
   { value: "prompted", label: "Needs review" },
+  { value: "paused", label: "Paused" },
   { value: "acknowledged", label: "Done" },
   { value: "skipped", label: "Skipped" },
 ];
@@ -175,6 +155,14 @@ const normalizeTaskActionForSave = (
       normalized.chain_id = inlineConversation.chain_id;
     }
   } else if (conversationMode !== "inline") {
+    if (inlineConversation?.session_id) {
+      normalized.origin_session_id =
+        normalized.origin_session_id || inlineConversation.session_id;
+    }
+    if (inlineConversation?.message_id) {
+      normalized.origin_message_id =
+        normalized.origin_message_id || inlineConversation.message_id;
+    }
     delete normalized.session_id;
     delete normalized.message_id;
     delete normalized.chain_id;
@@ -427,14 +415,15 @@ const ToolEditorModal = ({
     () =>
       buildInlineConversationContext(taskPrefill) ||
       buildInlineConversationContext(task) ||
+      buildInlineConversationContext(schedulePrefill) ||
       buildInlineConversationContext({
         session_id: state.sessionId,
       }),
-    [state.sessionId, task, taskPrefill],
+    [schedulePrefill, state.sessionId, task, taskPrefill],
   );
   const defaultTaskConversationMode = inlineConversationContext ? "inline" : "new_chat";
   const defaultScheduleConversationMode =
-    state.sessionId && (tool?.id || tool?.status) ? "inline" : "new_chat";
+    inlineConversationContext && (tool?.id || tool?.status) ? "inline" : "new_chat";
 
   const defaultTz = useMemo(() => {
     const preferred =
@@ -452,6 +441,10 @@ const ToolEditorModal = ({
   const [taskDurationMin, setTaskDurationMin] = useState(60);
   const [taskSubmitting, setTaskSubmitting] = useState(false);
   const [taskActions, setTaskActions] = useState([]);
+  const [taskRrule, setTaskRrule] = useState("");
+  const [taskBackgroundJob, setTaskBackgroundJob] = useState(() =>
+    normalizeBackgroundJobPolicy(),
+  );
   const [taskActionsValidation, setTaskActionsValidation] = useState({
     ok: true,
     errors: [],
@@ -468,6 +461,10 @@ const ToolEditorModal = ({
   const [schedulePrompt, setSchedulePrompt] = useState("");
   const [scheduleConversationMode, setScheduleConversationMode] = useState(
     defaultScheduleConversationMode,
+  );
+  const [scheduleRrule, setScheduleRrule] = useState("");
+  const [scheduleBackgroundJob, setScheduleBackgroundJob] = useState(() =>
+    normalizeBackgroundJobPolicy(),
   );
   const [scheduleAdvancedOpen, setScheduleAdvancedOpen] = useState(false);
   const [scheduleSubmitting, setScheduleSubmitting] = useState(false);
@@ -496,7 +493,7 @@ const ToolEditorModal = ({
     dragRef.current.active = false;
     setDragging(false);
     setDragOffset({ x: 0, y: 0 });
-  }, [open]);
+  }, [open, isTaskMode]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -561,8 +558,9 @@ const ToolEditorModal = ({
     const baseTitle =
       (schedule?.title && String(schedule.title)) ||
       `Schedule tool: ${tool?.name || "tool"}`;
+    const scheduleTz = schedule?.timezone ? String(schedule.timezone) : defaultTz;
     const baseStart =
-      parseLocalInputValue(schedule?.start) ||
+      zonedInputToDate(schedule?.start, scheduleTz) ||
       (typeof schedule?.start_time === "number"
         ? new Date(schedule.start_time * 1000)
         : schedule?.start_time
@@ -572,14 +570,18 @@ const ToolEditorModal = ({
       Number.isFinite(schedule?.durationMin) ? schedule.durationMin : 30;
     setScheduleEventId(schedule?.event_id ? String(schedule.event_id) : "");
     setScheduleTitle(baseTitle);
-    setScheduleStart(toLocalInputValue(baseStart));
+    setScheduleStart(dateToZonedInput(baseStart, scheduleTz));
     setScheduleDurationMin(baseDuration);
-    setScheduleTimezone(schedule?.timezone ? String(schedule.timezone) : defaultTz);
+    setScheduleTimezone(scheduleTz);
     setScheduleLocation(schedule?.location ? String(schedule.location) : "");
     setScheduleDescription(
       schedule?.description ? String(schedule.description) : "",
     );
     setSchedulePrompt(schedule?.prompt ? String(schedule.prompt) : "");
+    setScheduleRrule(schedule?.rrule ? String(schedule.rrule) : "");
+    setScheduleBackgroundJob(
+      normalizeBackgroundJobPolicy(schedule?.background_job),
+    );
     setScheduleConversationMode(
       normalizeConversationMode(
         schedule?.conversation_mode,
@@ -663,13 +665,17 @@ const ToolEditorModal = ({
     setTaskId(idText);
     setTaskTitle(titleText);
     setTaskNotes(notesText);
-    setTaskDate(toDateInput(startDateObj));
-    setTaskTime(toTimeInput(startDateObj));
+    const zonedStartInput = dateToZonedInput(startDateObj, tzText);
+    const [zonedDate, zonedTime] = zonedStartInput.split("T");
+    setTaskDate(zonedDate || "");
+    setTaskTime(zonedTime || "09:00");
     setTaskStatus(statusValue || "pending");
     setTaskTimezone(tzText || defaultTz);
     setTaskDurationMin(durationMinRaw);
     setTaskSubmitting(false);
     setTaskActions(actionsList);
+    setTaskRrule(baseTask.rrule ? String(baseTask.rrule) : "");
+    setTaskBackgroundJob(normalizeBackgroundJobPolicy(baseTask.background_job));
     setTaskActionsValidation({ ok: true, errors: [] });
     setError("");
   }, [open, isTaskMode, task, taskPrefill, defaultTz]);
@@ -917,7 +923,8 @@ const ToolEditorModal = ({
       setError(validation.message || "Arguments do not match the tool schema.");
       return;
     }
-    const startDate = parseLocalInputValue(scheduleStart);
+    const tzText = (scheduleTimezone || defaultTz || "UTC").trim() || "UTC";
+    const startDate = zonedInputToDate(scheduleStart, tzText);
     if (!startDate) {
       setError("Schedule time is invalid.");
       return;
@@ -925,7 +932,6 @@ const ToolEditorModal = ({
     const titleText =
       (scheduleTitle || `Schedule tool: ${(name || tool?.name || "tool").trim()}`)
         .trim() || `Schedule tool: ${(name || tool?.name || "tool").trim()}`;
-    const tzText = (scheduleTimezone || defaultTz || "UTC").trim() || "UTC";
     const durationRaw =
       typeof scheduleDurationMin === "number" && Number.isFinite(scheduleDurationMin)
         ? scheduleDurationMin
@@ -941,6 +947,20 @@ const ToolEditorModal = ({
     if (!scheduleEventId) {
       setScheduleEventId(eventId);
     }
+    const schedulePolicy = normalizeBackgroundJobPolicy(scheduleBackgroundJob);
+    const scheduleOwnership = {
+      ...schedulePolicy.ownership,
+      calendar_event_id: eventId,
+      ...(inlineConversationContext?.session_id
+        ? {
+            owner_kind: "conversation",
+            conversation_id: inlineConversationContext.session_id,
+            ...(inlineConversationContext.message_id
+              ? { message_id: inlineConversationContext.message_id }
+              : {}),
+          }
+        : {}),
+    };
 
     setScheduleSubmitting(true);
     setError("");
@@ -955,6 +975,7 @@ const ToolEditorModal = ({
           location: scheduleLocation.trim() || undefined,
           start_time: Math.floor(startDate.getTime() / 1000),
           end_time: Math.floor(endDate.getTime() / 1000),
+          rrule: scheduleRrule || null,
           timezone: tzText,
           status: "scheduled",
           prompt: schedulePrompt.trim() || undefined,
@@ -962,6 +983,7 @@ const ToolEditorModal = ({
             scheduleConversationMode,
             defaultScheduleConversationMode,
           ),
+          background_job: { ...schedulePolicy, ownership: scheduleOwnership },
         },
       });
       onCancel?.();
@@ -979,39 +1001,44 @@ const ToolEditorModal = ({
 
   const parseTaskStartDate = () => {
     if (!taskDate || !taskTime) return null;
-    const parsed = new Date(`${taskDate}T${taskTime}`);
-    return Number.isNaN(parsed.getTime()) ? null : parsed;
+    return zonedInputToDate(`${taskDate}T${taskTime}`, taskTimezone);
+  };
+
+  const setTaskDateTime = (date) => {
+    const input = dateToZonedInput(date, taskTimezone);
+    const [datePart, timePart] = input.split("T");
+    setTaskDate(datePart || "");
+    setTaskTime(timePart || "09:00");
   };
 
   const nudgeTaskDate = (days) => {
     const base = parseTaskStartDate() || normalizeDate(taskPrefill?.startDate);
     const deltaDays = Number.isFinite(days) ? days : 0;
-    const shifted = new Date(base.getTime() + deltaDays * 86400000);
-    setTaskDate(toDateInput(shifted));
-    setTaskTime(toTimeInput(shifted));
+    const shifted = addZonedCalendarInterval(
+      base,
+      "days",
+      deltaDays,
+      taskTimezone,
+    );
+    setTaskDateTime(shifted || base);
   };
 
   const nudgeTaskMonth = (months) => {
     const base = parseTaskStartDate() || normalizeDate(taskPrefill?.startDate);
     const delta = Number.isFinite(months) ? months : 0;
-    const shifted = new Date(base.getTime());
-    shifted.setMonth(shifted.getMonth() + delta);
-    setTaskDate(toDateInput(shifted));
-    setTaskTime(toTimeInput(shifted));
+    setTaskDateTime(addZonedCalendarMonths(base, delta, taskTimezone) || base);
   };
 
   const nudgeTaskTime = (minutes) => {
     const base = parseTaskStartDate() || normalizeDate(taskPrefill?.startDate);
     const deltaMinutes = Number.isFinite(minutes) ? minutes : 0;
     const shifted = new Date(base.getTime() + deltaMinutes * 60000);
-    setTaskDate(toDateInput(shifted));
-    setTaskTime(toTimeInput(shifted));
+    setTaskDateTime(shifted);
   };
 
   const snapTaskToNow = () => {
     const now = new Date();
-    setTaskDate(toDateInput(now));
-    setTaskTime(toTimeInput(now));
+    setTaskDateTime(now);
   };
 
   const handleSaveTask = async () => {
@@ -1039,6 +1066,20 @@ const ToolEditorModal = ({
       Math.min(24 * 60, Math.round(Number.isFinite(durationRaw) ? durationRaw : 60)),
     );
     const endDate = new Date(startDate.getTime() + safeDuration * 60000);
+    const backgroundJob = normalizeBackgroundJobPolicy(taskBackgroundJob);
+    const ownership = {
+      ...backgroundJob.ownership,
+      calendar_event_id: idText,
+      ...(inlineConversationContext?.session_id
+        ? {
+            owner_kind: "conversation",
+            conversation_id: inlineConversationContext.session_id,
+          }
+        : {}),
+      ...(inlineConversationContext?.message_id
+        ? { message_id: inlineConversationContext.message_id }
+        : {}),
+    };
 
     setTaskSubmitting(true);
     setError("");
@@ -1057,8 +1098,13 @@ const ToolEditorModal = ({
           .filter(Boolean),
         start_time: Math.floor(startDate.getTime() / 1000),
         end_time: Math.floor(endDate.getTime() / 1000),
+        rrule: taskRrule || null,
         timezone: tzText,
         status: normalizeTaskStatus(taskStatus),
+        background_job:
+          Array.isArray(taskActions) && taskActions.length
+            ? { ...backgroundJob, ownership }
+            : null,
       });
       onCancel?.();
     } catch (err) {
@@ -1301,6 +1347,18 @@ const ToolEditorModal = ({
                 disabled={taskSubmitting}
                 defaultConversationMode={defaultTaskConversationMode}
                 inlineConversation={inlineConversationContext}
+              />
+              <BackgroundJobFields
+                compact
+                rrule={taskRrule}
+                onRruleChange={setTaskRrule}
+                policy={taskBackgroundJob}
+                onPolicyChange={setTaskBackgroundJob}
+                startValue={`${taskDate}T${taskTime}`}
+                timezone={taskTimezone}
+                showExecutionPolicy={
+                  Array.isArray(taskActions) && taskActions.length > 0
+                }
               />
             </div>
 
@@ -1728,7 +1786,10 @@ const ToolEditorModal = ({
                         )
                       }
                     >
-                      <option value="inline" disabled={!state.sessionId}>
+                      <option
+                        value="inline"
+                        disabled={!inlineConversationContext?.session_id}
+                      >
                         Current chat
                       </option>
                       <option value="new_chat">New chat</option>
@@ -1740,6 +1801,15 @@ const ToolEditorModal = ({
                 </>
               )}
             </div>
+            <BackgroundJobFields
+              compact
+              rrule={scheduleRrule}
+              onRruleChange={setScheduleRrule}
+              policy={scheduleBackgroundJob}
+              onPolicyChange={setScheduleBackgroundJob}
+              startValue={scheduleStart}
+              timezone={scheduleTimezone}
+            />
           </div>
         )}
 

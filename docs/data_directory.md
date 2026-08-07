@@ -16,6 +16,8 @@ data/
   threads/                     # generated thread summaries (threads_summary.json)
   databases/
     memory.sqlite3             # memory store backing /memory endpoints
+    reflections.sqlite3        # canonical reflection tasks and runs
+    work_runs.sqlite3          # durable local Activity receipts + lifecycle states
     deployment_events.sqlite3 # content-free local software/data event ledger
     calendar_events/           # JSON payloads for upcoming/past events
     chroma/                    # Chroma vector store used by the RAG backend
@@ -48,6 +50,7 @@ Conversation history lives under `data/conversations/` (legacy `conversations/` 
   - Read/write for `data/databases/` when mutating structured stores.
   - Full read/write/delete for `data/workspace/`.
 - RAG "memorize"/"forget" operations work on `data/databases/chroma/`: they add/remove vector rows keyed to the knowledge item while leaving the underlying file/text in `data/files` or the knowledge store untouched.
+- `work_runs.sqlite3` is the device-local Activity ledger. It keeps one current receipt snapshot per stable id, append-only lifecycle rows, and one current indexed snapshot per provider-attempt/effect id backed by internal transition rows. Receipt `event_count` counts lifecycle rows; `attempt_count` and `effect_count` count indexed attempt/effect snapshots, and each child snapshot has its own `transition_count`. Effect rows retain only allowlisted classification, certainty, policy, approval/permission, identifier, target-redaction, and digest fields; they do not retain tool arguments or raw results. Provider rows likewise exclude prompts, raw responses, error messages, and checkpoint bodies. These child journals currently cover the scheduled-action runner, and a successful tool return records an acknowledgement rather than independent remote reconciliation. Exact resume context remains in Calendar compatibility state until a protected checkpoint capsule exists. The database has no age-based retention policy, foreign-key enforcement, or versioned migration framework yet. It is not a Knowledge/RAG or sync source. Because the compact receipt summary can still contain useful result text, treat the whole ledger as local user data rather than content-free telemetry.
 - The backend seeds missing directories at startup; scripts can assume the tree exists.
 - Before adding a new artifact type, update this document and the README so agents know where to write.
 
@@ -65,6 +68,7 @@ Conversation history lives under `data/conversations/` (legacy `conversations/` 
 ## Recent Migrations
 
 - `calendar_events/` moved to `data/databases/calendar_events/` and is created automatically.
+- Calendar, reflection, and Activity storage now resolve beneath the same `FLOAT_DATA_DIR`; `FLOAT_CALENDAR_DIR`, `FLOAT_REFLECTION_STORE`, and `FLOAT_WORK_RUN_STORE` remain explicit per-store overrides.
 - The Chroma vector store now lives under `data/databases/chroma/` and respects `CHROMA_PERSIST_DIR`.
 - Local model downloads default to `data/models/`; legacy `models/` folders are still detected for backward compatibility.
 - `data/files/{uploads|screenshots|downloaded|workspace}` are created automatically so uploads, captures, and docs ingest share one sandbox.

@@ -39,6 +39,27 @@
   font-size: clamp(0.7rem, 1vw, 0.85rem);
 }
 
+.week-cell .week-event {
+  background: color-mix(in srgb, var(--color-primary) 16%, var(--color-surface));
+  border: 1px solid color-mix(in srgb, var(--color-primary) 42%, transparent);
+  border-radius: var(--radius-sm);
+  color: var(--color-text);
+  display: block;
+  font-size: clamp(0.68rem, 0.9vw, 0.8rem);
+  margin-bottom: 3px;
+  overflow: hidden;
+  padding: 3px 5px;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  width: 100%;
+}
+
+.week-cell .week-event.is-paused {
+  opacity: 0.68;
+  border-style: dashed;
+}
+
 .modal-overlay {
   position: fixed;
   top: 0;

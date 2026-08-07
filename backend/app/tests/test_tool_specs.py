@@ -263,7 +263,8 @@ def test_tool_specs_endpoint_returns_schemas(tmp_path, monkeypatch):
     live_resp = client.get("/api/tools/specs?workflow=live")
     assert live_resp.status_code == 200
     live_names = {tool.get("name") for tool in live_resp.json().get("tools", [])}
-    assert {"help", "tool_help", "tool_info", "read_file", "list_dir"} <= live_names
+    assert {"help", "tool_info", "read_file", "list_dir"} <= live_names
+    assert "tool_help" not in live_names
     assert "remember" in live_names
     assert all("." not in str(name or "") for name in live_names)
     assert "capture.list" not in live_names

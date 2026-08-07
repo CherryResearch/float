@@ -299,11 +299,20 @@ def test_read_file_returns_windowed_excerpt(mem_mgr, tmp_path, monkeypatch):
     assert result["next_start_line"] == 4
 
 
-def test_tool_decision_recovers_from_payload(client):
+def test_tool_decision_rejects_client_manufactured_proposal(client, monkeypatch):
+    from app import routes
     from app.main import app
 
     if hasattr(app.state, "pending_tools"):
         delattr(app.state, "pending_tools")
+    invoke_count = 0
+
+    async def fake_invoke(*args, **kwargs):
+        nonlocal invoke_count
+        invoke_count += 1
+        return "unexpected"
+
+    monkeypatch.setattr(routes, "_invoke_registered_tool_in_thread", fake_invoke)
     payload = {
         "request_id": "fallback-req",
         "decision": "accept",
@@ -316,8 +325,49 @@ def test_tool_decision_recovers_from_payload(client):
         "message_id": "msg-fallback",
     }
     res = client.post("/api/tools/decision", json=payload)
+    assert res.status_code == 404
+    assert invoke_count == 0
+
+
+def test_tool_decision_can_edit_args_for_recorded_proposal(client, monkeypatch):
+    from app import routes
+    from app.main import app
+
+    request_id = "edit-recorded-req"
+    app.state.pending_tools = {
+        request_id: {
+            "id": request_id,
+            "name": "remember",
+            "args": {"key": "draft", "value": "before"},
+            "session_id": "sess-edit",
+            "message_id": "msg-edit",
+            "chain_id": "msg-edit",
+            "status": "proposed",
+        }
+    }
+    invoked = []
+
+    async def fake_invoke(*args, **kwargs):
+        invoked.append(kwargs)
+        return {"saved": True}
+
+    monkeypatch.setattr(routes, "_invoke_registered_tool_in_thread", fake_invoke)
+    res = client.post(
+        "/api/tools/decision",
+        json={
+            "request_id": request_id,
+            "decision": "accept",
+            "name": "remember",
+            "args": {"key": "draft", "value": "after"},
+            "session_id": "sess-edit",
+            "message_id": "msg-edit",
+            "chain_id": "msg-edit",
+        },
+    )
+
     assert res.status_code == 200
     assert res.json()["status"] == "invoked"
+    assert invoked[0]["args"]["value"] == "after"
 
 
 def test_tool_decision_does_not_reconstruct_a_denied_request(client, monkeypatch):

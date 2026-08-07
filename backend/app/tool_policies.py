@@ -18,7 +18,6 @@ CLIENT_RESOLUTION_TOOL_NAMES = {"camera.capture", "route_to_local_model"}
 
 DEFAULT_LIVE_TOOL_NAMES = {
     "help",
-    "tool_help",
     "tool_info",
     "list_actions",
     "list_dir",

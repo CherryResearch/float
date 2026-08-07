@@ -22,7 +22,6 @@ from app.workflow_profiles import (
 
 _DEFAULT_DISCOVERY_PRIORITY = [
     "help",
-    "tool_help",
     "tool_info",
     "remember",
     "recall",
@@ -50,6 +49,7 @@ _DISCOVERY_OVERFLOW_PRIORITY = [
     *_DEFAULT_DISCOVERY_PRIORITY,
 ]
 _DEFAULT_HELP_HIDDEN_NAMES = {
+    "tool_help",
     "read_capability_docs",
     "memory.save",
     "create_event",
@@ -75,6 +75,7 @@ _DEFAULT_HELP_HIDDEN_NAMES = {
     "capture.delete",
 }
 _FAMILY_HELP_HIDDEN_NAMES = {
+    "tool_help",
     "memory.save",
     "create_event",
     "open_url",
@@ -119,17 +120,17 @@ _DEFAULT_DISCOVERY_SUITES = [
     },
 ]
 _COMPAT_TOOL_NAME_HINTS: Dict[str, tuple[str, ...]] = {
-    "memory.read": ("recall", "remember", "memory.save"),
-    "memory.recall": ("recall", "remember", "memory.save"),
-    "memory.search": ("recall", "remember", "memory.save"),
-    "memory.store": ("remember", "recall", "memory.save"),
-    "memory.write": ("remember", "recall", "memory.save"),
-    "memory.remember": ("remember", "recall", "memory.save"),
+    "memory.read": ("recall", "remember"),
+    "memory.recall": ("recall", "remember"),
+    "memory.search": ("recall", "remember"),
+    "memory.store": ("remember", "recall"),
+    "memory.write": ("remember", "recall"),
+    "memory.remember": ("remember", "recall"),
     "graph": ("graph.update",),
     "graph.write": ("graph.update",),
     "graph.store": ("graph.update",),
-    "open.url": ("computer.navigate", "open_url"),
-    "browser.open": ("computer.navigate", "open_url"),
+    "open.url": ("computer.navigate",),
+    "browser.open": ("computer.navigate",),
     "shell": ("shell.exec",),
     "patch": ("patch.apply",),
     "mcp": ("mcp.call",),
@@ -1175,9 +1176,9 @@ def _build_special_entry(
             return entry
         entry["notes"] = [
             "Modules are grouped runtime capability packs that can enable multiple concrete tools and one or more packaged skill/docs references.",
-            "Workflows choose behavior style and default enabled modules for a run.",
+            "Workflow profiles choose turn guidance and default reasoning effort; enabled modules come from global settings and the current request.",
             "Add-ons are packaged manifests discoverable from the repo and optional local data overrides.",
-            "Use read_capability_docs for the underlying packaged markdown guidance instead of pulling long doc bodies through tool_help.",
+            "Use read_capability_docs for the underlying packaged markdown guidance instead of pulling long doc bodies through help.",
         ]
         entry["workflows"] = catalog.get("workflows", [])
         entry["modules"] = catalog.get("modules", [])
@@ -1214,7 +1215,7 @@ def _build_special_entry(
             return entry
         entry["notes"] = [
             "Skills are packaged markdown docs stored under tracked repo roots and optional local data-module overrides.",
-            "Use read_capability_docs to list, search, and read those curated docs directly; this tool_help entry stays metadata-only.",
+            "Use read_capability_docs to list, search, and read those curated docs directly; this help entry stays metadata-only.",
         ]
         entry["skills_root"] = catalog.get("skills_root")
         entry["skills_roots"] = catalog.get("skills_roots", [])
@@ -1405,9 +1406,9 @@ def _run_tool_help(
                 "query": payload,
                 "error": "unknown_tool",
                 "tool_name": requested_name,
-                "available": available,
+                "available": _family_discovery_names(available),
                 "message": "Couldn't inspect that exact tool; showing a compact menu instead.",
-                "hint": "Retry with one returned tool name, or call help/tool_help with {} to browse the menu.",
+                "hint": "Retry with one returned tool name, or call help with {} to browse the menu.",
                 **_tool_menu_payload(
                     available,
                     detail=normalized_detail,
@@ -1416,7 +1417,10 @@ def _run_tool_help(
                     default_menu=True,
                 ),
             }
-            suggestions = _tool_name_suggestions(requested_name, available)
+            suggestions = _tool_name_suggestions(
+                requested_name,
+                _family_discovery_names(available),
+            )
             if suggestions:
                 response["did_you_mean"] = suggestions
             response["failed_call"] = recovery_line or _compact_failed_call_line(
@@ -1542,12 +1546,13 @@ def tool_info(
         failed_error_text,
     )
     if not requested_name:
+        advertised = _family_discovery_names(available)
         response = {
             "error": "missing_tool",
-            "available": available,
+            "available": advertised,
             "message": "Couldn't inspect a single tool because tool_name was missing.",
-            "hint": "Call help or tool_help with {} first, then retry with one returned name.",
-            "menu": _recovery_menu_payload(available),
+            "hint": "Call help with {} first, then retry with one returned name.",
+            "menu": _recovery_menu_payload(advertised),
         }
         response["failed_call"] = recovery_line or _compact_failed_call_line(
             "tool_info",
@@ -1586,7 +1591,7 @@ def tool_info(
                 "error": "tool_family",
                 "tool_name": requested_name,
                 "message": "That looks like a tool family or fuzzy query, not one exact tool.",
-                "hint": "Call help or tool_help with the same tool_name to browse the matching family, or retry tool_info with one exact returned name.",
+                "hint": "Call help with the same tool_name to browse the matching family, or retry tool_info with one exact returned name.",
                 "menu": _recovery_menu_payload(matched_names),
             }
             if recovery_line:
@@ -1595,12 +1600,15 @@ def tool_info(
         response = {
             "error": "unknown_tool",
             "tool_name": requested_name,
-            "available": available,
+            "available": _family_discovery_names(available),
             "message": "Couldn't inspect that exact tool; showing a compact menu instead.",
-            "hint": "Call help or tool_help with {} for a menu, or retry with one returned name.",
-            "menu": _recovery_menu_payload(available),
+            "hint": "Call help with {} for a menu, or retry with one returned name.",
+            "menu": _recovery_menu_payload(_family_discovery_names(available)),
         }
-        suggestions = _tool_name_suggestions(requested_name, available)
+        suggestions = _tool_name_suggestions(
+            requested_name,
+            _family_discovery_names(available),
+        )
         if suggestions:
             response["did_you_mean"] = suggestions
         response["failed_call"] = recovery_line or _compact_failed_call_line(

@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-08-06 alpha patch
+
+- Made Calendar-backed background work restart-safe and auditable with durable
+  prompt checkpoints, scoped scheduled-tool authorization, cooperative stop
+  requests, effect receipts, and no-replay reconciliation controls.
+- Completed the local skill-document lifecycle with guarded create, edit,
+  duplicate, import, rename, export, delete, and packaged-fallback restore
+  flows, plus clearer module ownership and tool access.
+- Stabilized chat, visual recall, and attachment handling, including
+  captionless CLIP retrieval, clearer tool progress, safer whole-chat undo,
+  and better composer and receipt density.
+- Improved device Sync and LAN controls with identity-aware address updates,
+  safer review/apply behavior, clearer connection state, and protected release
+  deployment cleanup.
+- Refined Calendar, Activity, Skills, Sync, Settings, and navigation at the
+  standard 1920x1080 desktop target with clearer action hierarchy and labels.
+
 ## 2026-07-25 alpha patch
 
 - Hardened tool approval and continuation so denied or completed requests stay

@@ -81,6 +81,9 @@ describe("Full Auto tool loop", () => {
     setStateMock.mockClear();
     axiosMocks.post.mockReset();
     axiosMocks.get.mockReset();
+    mockState.conversation = [
+      { role: "ai", id: "msg-1", text: "Requested tools.", tools: [] },
+    ];
     globalThis.WebSocket = MockWebSocket;
   });
 
@@ -295,5 +298,87 @@ describe("Full Auto tool loop", () => {
     expect(
       axiosMocks.post.mock.calls.filter(([url]) => url === "/api/chat/continue"),
     ).toHaveLength(1);
+  });
+
+  test("allows the same semantic batch in a new regeneration attempt", async () => {
+    axiosMocks.get.mockResolvedValue({ data: { agents: [] } });
+    axiosMocks.post.mockResolvedValue({
+      data: { message: "done", metadata: {}, tools_used: [] },
+    });
+
+    const { default: App } = await import("../App");
+    const {
+      announceToolContinuationAttemptReset,
+      buildToolContinuationSignature,
+    } = await import(
+      "../../utils/toolContinuations"
+    );
+    render(<App />);
+
+    await waitFor(() => expect(wsInstances.length).toBeGreaterThan(0));
+    const ws = wsInstances[0];
+    const emitResolvedRemember = async (id) => {
+      await act(async () => {
+        ws.emit({
+          type: "tool",
+          id,
+          name: "remember",
+          args: { key: "photo.owl", value: "same value" },
+          status: "proposed",
+          server_auto_decide: true,
+          session_id: "sess-1",
+          message_id: "msg-1",
+          chain_id: "msg-1",
+        });
+        ws.emit({
+          type: "tool",
+          id,
+          name: "remember",
+          args: { key: "photo.owl", value: "same value" },
+          status: "invoked",
+          result: { status: "invoked", ok: true, data: "ok" },
+          session_id: "sess-1",
+          message_id: "msg-1",
+          chain_id: "msg-1",
+        });
+      });
+    };
+
+    await emitResolvedRemember("attempt-one-tool");
+    await waitFor(() =>
+      expect(
+        axiosMocks.post.mock.calls.filter(([url]) => url === "/api/chat/continue"),
+      ).toHaveLength(1),
+    );
+
+    const staleBatch = [
+      {
+        id: "attempt-two-tool",
+        name: "remember",
+        args: { key: "photo.owl", value: "same value" },
+        status: "invoked",
+        result: { status: "invoked", ok: true, data: "ok" },
+      },
+    ];
+    mockState.conversation[0].metadata = {
+      tool_continue_signature: buildToolContinuationSignature(staleBatch),
+      tool_continue_semantic_signature: buildToolContinuationSignature(staleBatch, {
+        includeIds: false,
+      }),
+    };
+
+    act(() => {
+      announceToolContinuationAttemptReset({
+        sessionId: "sess-1",
+        messageId: "msg-1",
+      });
+    });
+    await emitResolvedRemember("attempt-two-tool");
+
+    await waitFor(() =>
+      expect(
+        axiosMocks.post.mock.calls.filter(([url]) => url === "/api/chat/continue"),
+      ).toHaveLength(2),
+    );
   });
 });

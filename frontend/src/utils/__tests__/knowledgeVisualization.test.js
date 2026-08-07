@@ -1,13 +1,18 @@
 import {
   VISUALIZATION_HEIGHT,
   VISUALIZATION_WIDTH,
+  applyManualPlacementForce,
   buildCombinedGraphData,
   buildThreadGraph,
+  filterGraphData,
+  getBaseNodeRadius,
   getNodeFocus,
+  hasMeaningfulDrag,
   hydrateKnowledgeGraph,
   hydrateMemoryGraph,
   normalizeConversationName,
   rankNodeConnections,
+  searchGraphNodes,
 } from "../knowledgeVisualization";
 
 describe("knowledgeVisualization helpers", () => {
@@ -283,10 +288,41 @@ describe("knowledgeVisualization helpers", () => {
     ]);
     expect(ranked[0]).toEqual(
       expect.objectContaining({
+        direction: "outgoing",
+        linkId: expect.stringContaining("friend_of"),
         predicate: "friend_of",
         relation: "friend",
       }),
     );
+  });
+
+  it("keeps manually placed nodes near their dragged location without hard-pinning them", () => {
+    const nodes = [
+      { id: "alice", x: 20, y: 30, vx: 0, vy: 0 },
+      { id: "bob", x: 80, y: 90, vx: 0, vy: 0 },
+    ];
+    applyManualPlacementForce(nodes, new Map([["alice", { x: 100, y: 70 }]]), 0.5, 0.75);
+
+    expect(nodes[0]).toEqual(
+      expect.objectContaining({
+        vx: 30,
+        vy: 15,
+      }),
+    );
+    expect(nodes[1]).toEqual(expect.objectContaining({ vx: 0, vy: 0 }));
+  });
+
+  it("makes a central node visibly larger than the same ordinary node", () => {
+    const person = { graphKey: "knowledge", type: "person" };
+
+    expect(getBaseNodeRadius({ ...person, isCentral: true })).toBeGreaterThan(
+      getBaseNodeRadius(person),
+    );
+  });
+
+  it("distinguishes a click-sized pointer jitter from an intentional drag", () => {
+    expect(hasMeaningfulDrag({ x: 100, y: 100 }, { x: 102, y: 101 })).toBe(false);
+    expect(hasMeaningfulDrag({ x: 100, y: 100 }, { x: 108, y: 106 })).toBe(true);
   });
 
   it("fades and shrinks nodes that are further from the focused level", () => {
@@ -301,5 +337,81 @@ describe("knowledgeVisualization helpers", () => {
       opacity: 0.3,
       scale: 0.76,
     });
+  });
+
+  it("searches node labels, summaries, types, and nested attributes", () => {
+    const nodes = [
+      {
+        id: "knowledge:person:alice",
+        label: "Alice Nguyen",
+        type: "person",
+        summaryText: "Design lead",
+        attributes: { location: { city: "Vancouver" } },
+      },
+      {
+        id: "knowledge:org:float",
+        label: "Float Systems",
+        type: "organization",
+        attributes: { discipline: "research" },
+      },
+    ];
+
+    expect(searchGraphNodes(nodes, "alice").map((node) => node.id)).toEqual([
+      "knowledge:person:alice",
+    ]);
+    expect(searchGraphNodes(nodes, "vancouver").map((node) => node.id)).toEqual([
+      "knowledge:person:alice",
+    ]);
+    expect(searchGraphNodes(nodes, "organization").map((node) => node.id)).toEqual([
+      "knowledge:org:float",
+    ]);
+  });
+
+  it("filters node types, recency, links, and one-hop focus without dangling edges", () => {
+    const now = Date.UTC(2026, 6, 29);
+    const graph = {
+      nodes: [
+        {
+          id: "alice",
+          label: "Alice",
+          type: "person",
+          updatedAt: now / 1000,
+        },
+        {
+          id: "bob",
+          label: "Bob",
+          type: "person",
+          updatedAt: (now - 2 * 24 * 60 * 60 * 1000) / 1000,
+        },
+        {
+          id: "archive",
+          label: "Archive",
+          type: "organization",
+          updatedAt: (now - 60 * 24 * 60 * 60 * 1000) / 1000,
+        },
+      ],
+      links: [
+        { source: "alice", target: "bob", type: "claim" },
+        { source: "bob", target: "archive", type: "claim" },
+      ],
+      crossLinks: [],
+      metadata: {},
+    };
+
+    const recentPeople = filterGraphData(graph, {
+      nodeTypes: ["person"],
+      recentDays: 7,
+      now,
+    });
+    expect(recentPeople.nodes.map((node) => node.id)).toEqual(["alice", "bob"]);
+    expect(recentPeople.links).toHaveLength(1);
+
+    const focused = filterGraphData(graph, {
+      focusNodeId: "alice",
+      focusMode: true,
+      now,
+    });
+    expect(focused.nodes.map((node) => node.id)).toEqual(["alice", "bob"]);
+    expect(focused.links).toHaveLength(1);
   });
 });

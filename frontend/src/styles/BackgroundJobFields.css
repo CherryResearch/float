@@ -1,0 +1,98 @@
+.background-job-fields {
+  border: 1px solid color-mix(in srgb, var(--color-black) 18%, transparent);
+  border-radius: 10px;
+  margin: 12px 0 0;
+  padding: 12px;
+}
+
+.background-job-fields legend {
+  font-weight: 700;
+  padding: 0 6px;
+}
+
+.background-job-fields-copy,
+.background-job-summary {
+  color: var(--color-gray-700);
+  font-size: 0.82rem;
+  margin: 0 0 10px;
+}
+
+.background-job-fields-grid,
+.background-job-advanced {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.background-job-fields label {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.background-job-fields label > span {
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.background-job-fields-hint {
+  color: var(--color-gray-700);
+  font-size: 0.72rem;
+  line-height: 1.35;
+}
+
+.background-job-fields input,
+.background-job-fields select {
+  box-sizing: border-box;
+  min-width: 0;
+  width: 100%;
+}
+
+.background-job-summary {
+  display: grid;
+  gap: 3px;
+  margin: 10px 0;
+}
+
+.background-job-advanced-toggle {
+  background: transparent;
+  border: 0;
+  color: var(--color-blue, #2463a6);
+  cursor: pointer;
+  font-size: 0.8rem;
+  padding: 2px 0;
+  text-align: left;
+}
+
+.background-job-advanced {
+  margin-top: 10px;
+}
+
+.background-job-fields .background-job-checkbox {
+  align-items: center;
+  display: flex;
+  gap: 7px;
+}
+
+.background-job-fields .background-job-checkbox input {
+  width: auto;
+}
+
+.background-job-raw-rule {
+  grid-column: 1 / -1;
+}
+
+.background-job-ownership-note {
+  color: var(--color-gray-700);
+  display: grid;
+  font-size: 0.78rem;
+  gap: 3px;
+  grid-column: 1 / -1;
+}
+
+@media (max-width: 720px) {
+  .background-job-fields-grid,
+  .background-job-advanced {
+    grid-template-columns: 1fr;
+  }
+}

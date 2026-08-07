@@ -7,9 +7,10 @@ import MemoryTab from "./MemoryTab";
 import ThreadsTab from "./ThreadsTab";
 import DocumentsTab from "./DocumentsTab";
 import KnowledgeSkillsTab from "./KnowledgeSkillsTab";
-import KnowledgeVisualizationsTab from "./KnowledgeVisualizationsTab";
 import KnowledgeSyncTab from "./KnowledgeSyncTab";
 import { Line, Rect } from "./Skeleton";
+
+const KnowledgeVisualizationsTab = React.lazy(() => import("./KnowledgeVisualizationsTab"));
 
 const KnowledgeViewer = () => {
   const [, setMemoryDocs] = useState([]);
@@ -156,7 +157,17 @@ const KnowledgeViewer = () => {
             </div>
           )
         ) : tab === "visualizations" ? (
-          <KnowledgeVisualizationsTab />
+          <React.Suspense
+            fallback={
+              <div className="knowledge-viz-state knowledge-viz-state--loading" role="status">
+                <Line width="36%" />
+                <Rect height={360} />
+                <span>Loading graph explorer…</span>
+              </div>
+            }
+          >
+            <KnowledgeVisualizationsTab />
+          </React.Suspense>
         ) : tab === "skills" ? (
           <KnowledgeSkillsTab />
         ) : tab === "sync" ? (

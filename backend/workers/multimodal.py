@@ -17,16 +17,22 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import logging
 import os
 import re
+import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Set
 
 # simple in-memory caches standing in for Redis/S3 backends
 VISION_CACHE: Dict[str, Any] = {}
 logger = logging.getLogger(__name__)
 ASR_CACHE: Dict[str, Any] = {}
+_SHARED_CAPTIONER_LOCK = threading.RLock()
+_SHARED_CAPTIONER: "VisionCaptioner | None" = None
+_SHARED_CAPTIONER_KEY = ""
 
 PLACEHOLDER_PREFIX = "[placeholder]"
 DEFAULT_VISION_CAPTION_MODEL = "google/paligemma2-3b-pt-224"
@@ -158,82 +164,96 @@ class VisionCaptioner(Worker):
         self._proc = None
         self._net = None
         self._device = None
+        self._load_lock = threading.RLock()
+        self._last_load_error = ""
+        self._verified = False
 
     # --- Optional heavy path -------------------------------------------------
 
     def _load_if_possible(self) -> None:
         if self._loaded:
             return
-        self._loaded = True  # ensure we only try once
-        try:
-            import importlib
-
-            from transformers import AutoProcessor
-
-            # Prefer the specific PaliGemma class if available; otherwise abort
+        with self._load_lock:
+            if self._loaded:
+                return
             try:
-                PaligemmaCls = importlib.import_module(
-                    "transformers.models.paligemma2.modeling_paligemma2"
-                ).PaliGemmaForConditionalGeneration
-            except Exception:
-                from transformers import (
-                    PaliGemmaForConditionalGeneration as PaligemmaCls,  # type: ignore
+                import importlib
+
+                from transformers import AutoProcessor
+
+                # Prefer the specific PaliGemma class if available; otherwise abort
+                try:
+                    PaligemmaCls = importlib.import_module(
+                        "transformers.models.paligemma2.modeling_paligemma2"
+                    ).PaliGemmaForConditionalGeneration
+                except Exception:
+                    from transformers import (
+                        PaliGemmaForConditionalGeneration as PaligemmaCls,  # type: ignore
+                    )
+
+                # Try local-only load first to avoid accidental network calls
+                local_only = True
+                model_id = self.model
+
+                # If a local folder exists under FLOAT_MODELS_DIR/<name>, use that
+                # without setting local_files_only=False.
+                try:
+                    from app import config as app_config  # type: ignore
+
+                    name = os.path.basename(str(model_id))
+                    for root in app_config.model_search_dirs(
+                        os.getenv("FLOAT_MODELS_DIR")
+                    ):
+                        candidate = root / name
+                        if candidate.exists() and candidate.is_dir():
+                            model_id = str(candidate)
+                            break
+                except Exception:
+                    pass  # best-effort; fall back to HF cache resolution
+
+                # Resolve optional auth token
+                token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
+
+                # Lazy import torch only when available
+                import torch  # type: ignore
+
+                dtype = torch.bfloat16 if hasattr(torch, "bfloat16") else torch.float16
+                device = (
+                    "cuda"
+                    if torch.cuda.is_available()
+                    else (
+                        "mps"
+                        if getattr(torch.backends, "mps", None)
+                        and torch.backends.mps.is_available()
+                        else "cpu"
+                    )
                 )
 
-            # Try local-only load first to avoid accidental network calls
-            local_only = True
-            model_id = self.model
-
-            # If a local folder exists under FLOAT_MODELS_DIR/<name>, use that
-            # without setting local_files_only=False.
-            try:
-                from app import config as app_config  # type: ignore
-
-                name = os.path.basename(str(model_id))
-                for root in app_config.model_search_dirs(os.getenv("FLOAT_MODELS_DIR")):
-                    candidate = root / name
-                    if candidate.exists() and candidate.is_dir():
-                        model_id = str(candidate)
-                        break
-            except Exception:
-                pass  # best-effort; fall back to HF cache resolution
-
-            # Resolve optional auth token
-            token = os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
-
-            # Lazy import torch only when available
-            import torch  # type: ignore
-
-            dtype = torch.bfloat16 if hasattr(torch, "bfloat16") else torch.float16
-            device = (
-                "cuda"
-                if torch.cuda.is_available()
-                else (
-                    "mps"
-                    if getattr(torch.backends, "mps", None)
-                    and torch.backends.mps.is_available()
-                    else "cpu"
+                proc = AutoProcessor.from_pretrained(
+                    model_id, local_files_only=local_only, token=token
                 )
-            )
-
-            proc = AutoProcessor.from_pretrained(
-                model_id, local_files_only=local_only, token=token
-            )
-            net = PaligemmaCls.from_pretrained(
-                model_id,
-                local_files_only=local_only,
-                token=token,
-                torch_dtype=dtype,
-            )
-            if device != "cpu":
-                net = net.to(device)
-            self._proc = proc
-            self._net = net
-            self._device = device
-            logger.info("VisionCaptioner loaded model: %s on %s", model_id, device)
-        except Exception as e:
-            # Keep placeholder behaviour if anything fails (missing deps, weights, etc.)
-            logger.debug("VisionCaptioner heavy path unavailable: %s", e)
+                net = PaligemmaCls.from_pretrained(
+                    model_id,
+                    local_files_only=local_only,
+                    token=token,
+                    torch_dtype=dtype,
+                )
+                if device != "cpu":
+                    net = net.to(device)
+                self._proc = proc
+                self._net = net
+                self._device = device
+                self._loaded = True
+                self._last_load_error = ""
+                logger.info("VisionCaptioner loaded model: %s on %s", model_id, device)
+            except Exception as e:
+                # A later retry may succeed after dependencies or weights are installed.
+                self._loaded = False
+                self._proc = None
+                self._net = None
+                self._device = None
+                self._last_load_error = str(e)
+                logger.debug("VisionCaptioner heavy path unavailable: %s", e)
 
     def _caption_with_model(self, image_bytes: bytes) -> str | None:
         if not self._net or not self._proc:
@@ -268,45 +288,252 @@ class VisionCaptioner(Worker):
         # Backwards compatibility: accept raw bytes as in older tests
         if isinstance(data, (bytes, bytearray)):
             key = hashlib.sha256(bytes(data)).hexdigest()
-            if key in VISION_CACHE:
-                return VISION_CACHE[key]
+            cache_key = f"{self.model}:{key}"
+            cached = VISION_CACHE.get(cache_key)
+            if isinstance(cached, str) and not is_low_quality_generated_caption(cached):
+                self._verified = True
+                return cached
             # Try heavy path
             self._load_if_possible()
             best = self._caption_with_model(bytes(data))
             if best:
                 best = normalize_generated_caption(best)
                 if not is_low_quality_generated_caption(best):
-                    VISION_CACHE[key] = best
+                    self._verified = True
+                    VISION_CACHE[cache_key] = best
                     return best
             # Placeholder fallback
-            caption = placeholder_caption(key[:8])
-            VISION_CACHE[key] = caption
-            return caption
+            return placeholder_caption(key[:8])
 
         # New path: dict input from pipeline with either image bytes or keyframe ref
         # Prefer raw image bytes when available
         if "image" in data and isinstance(data["image"], (bytes, bytearray)):
             raw = data["image"]
             key = hashlib.sha256(raw).hexdigest()
+            cache_key = f"{self.model}:{key}"
+            cached = VISION_CACHE.get(cache_key)
+            if isinstance(cached, str) and not is_low_quality_generated_caption(cached):
+                self._verified = True
+                return {"image_caption": cached, "placeholder": False}
             # Heavy path attempt
             self._load_if_possible()
             best = self._caption_with_model(raw)
             if best:
                 best = normalize_generated_caption(best)
                 if not is_low_quality_generated_caption(best):
+                    self._verified = True
+                    VISION_CACHE[cache_key] = best
                     return {"image_caption": best, "placeholder": False}
         else:
             # Fall back to a keyframe identifier/path string
             keyframe_ref = str(data.get("keyframe", ""))
             key = hashlib.sha256(keyframe_ref.encode("utf-8")).hexdigest()
         # Do not populate the global cache for non-bytes inputs to avoid pollution
-        caption = VISION_CACHE.get(key)
-        if caption is None:
-            caption = placeholder_caption(key[:8])
+        caption = placeholder_caption(key[:8])
         return {
             "image_caption": caption,
             "placeholder": is_placeholder_caption(caption),
         }
+
+
+def resolve_vision_caption_runtime_model(
+    model: str | None = None,
+    *,
+    models_folder: str | None = None,
+) -> str:
+    """Resolve a configured caption model to one stable local runtime identity."""
+
+    configured = resolve_vision_caption_model(model, os.getenv("VISION_CAPTION_MODEL"))
+    installed = resolve_installed_vision_caption_model(
+        configured,
+        models_folder=models_folder,
+    )
+    return installed or configured
+
+
+def _nonempty_caption_model_file(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _caption_model_directory_complete(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    if not _nonempty_caption_model_file(path / "config.json"):
+        return False
+    if not any(
+        _nonempty_caption_model_file(path / name)
+        for name in (
+            "preprocessor_config.json",
+            "processor_config.json",
+            "image_processor_config.json",
+        )
+    ):
+        return False
+    if not _nonempty_caption_model_file(path / "tokenizer_config.json"):
+        return False
+    if not any(
+        _nonempty_caption_model_file(path / name)
+        for name in (
+            "tokenizer.json",
+            "tokenizer.model",
+            "sentencepiece.model",
+            "spiece.model",
+        )
+    ):
+        return False
+
+    present_indexes = [
+        candidate
+        for candidate in (
+            path / "model.safetensors.index.json",
+            path / "pytorch_model.bin.index.json",
+        )
+        if candidate.is_file()
+    ]
+    if present_indexes:
+        for index_path in present_indexes:
+            try:
+                payload = json.loads(index_path.read_text(encoding="utf-8"))
+                weight_map = payload.get("weight_map")
+                shard_names = {
+                    str(value).strip()
+                    for value in weight_map.values()
+                    if str(value or "").strip()
+                }
+            except (OSError, ValueError, AttributeError):
+                continue
+            valid_shards = bool(shard_names)
+            for shard_name in shard_names:
+                shard_path = (path / shard_name).resolve()
+                try:
+                    shard_path.relative_to(path.resolve())
+                except ValueError:
+                    valid_shards = False
+                    break
+                if not _nonempty_caption_model_file(shard_path):
+                    valid_shards = False
+                    break
+            if valid_shards:
+                return True
+        return False
+    return any(
+        _nonempty_caption_model_file(path / name)
+        for name in ("model.safetensors", "pytorch_model.bin")
+    )
+
+
+def _complete_caption_model_directory(candidate: Path) -> Path | None:
+    if _caption_model_directory_complete(candidate):
+        return candidate.resolve()
+    snapshots = candidate / "snapshots"
+    try:
+        snapshot_dirs = sorted(
+            (snapshot for snapshot in snapshots.iterdir() if snapshot.is_dir()),
+            key=lambda path: path.name,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    for snapshot in snapshot_dirs:
+        if _caption_model_directory_complete(snapshot):
+            return snapshot.resolve()
+    return None
+
+
+def resolve_installed_vision_caption_model(
+    model: str | None,
+    *,
+    models_folder: str | None = None,
+) -> str | None:
+    """Return a complete local caption checkpoint path, including HF snapshots."""
+
+    configured = str(model or "").strip()
+    if not configured:
+        return None
+    complete = _complete_caption_model_directory(Path(configured).expanduser())
+    if complete is not None:
+        return str(complete)
+
+    try:
+        from app import config as app_config  # type: ignore
+
+        roots = app_config.model_search_dirs(models_folder)
+    except Exception:
+        roots = []
+    basename = configured.rstrip("/\\").replace("\\", "/").split("/")[-1]
+    cache_dirname = f"models--{configured.replace('/', '--')}"
+    for raw_root in roots:
+        root = Path(raw_root)
+        for candidate in (root / basename, root / cache_dirname):
+            complete = _complete_caption_model_directory(candidate)
+            if complete is not None:
+                return str(complete)
+    return None
+
+
+def get_shared_vision_captioner(
+    model: str | None = None,
+    *,
+    models_folder: str | None = None,
+    runtime_model: str | None = None,
+) -> VisionCaptioner:
+    """Return the process-wide local captioner, replacing it only on model change."""
+
+    global _SHARED_CAPTIONER, _SHARED_CAPTIONER_KEY
+    logical_model = resolve_vision_caption_model(
+        model,
+        os.getenv("VISION_CAPTION_MODEL"),
+    )
+    resolved_model = str(
+        runtime_model or ""
+    ).strip() or resolve_vision_caption_runtime_model(
+        model,
+        models_folder=models_folder,
+    )
+    try:
+        resolved_key = (
+            str(Path(resolved_model).resolve())
+            if Path(resolved_model).exists()
+            else resolved_model
+        )
+    except Exception:
+        resolved_key = resolved_model
+    resolved_key = f"{logical_model}\0{resolved_key}"
+    with _SHARED_CAPTIONER_LOCK:
+        if _SHARED_CAPTIONER is None or _SHARED_CAPTIONER_KEY != resolved_key:
+            _SHARED_CAPTIONER = VisionCaptioner(model=resolved_model)
+            _SHARED_CAPTIONER_KEY = resolved_key
+        return _SHARED_CAPTIONER
+
+
+def run_shared_vision_captioner(
+    data: Any,
+    *,
+    model: str | None = None,
+    models_folder: str | None = None,
+    runtime_model: str | None = None,
+) -> tuple[VisionCaptioner, Any]:
+    """Run local captioning serially through the shared model lifecycle."""
+
+    with _SHARED_CAPTIONER_LOCK:
+        captioner = get_shared_vision_captioner(
+            model,
+            models_folder=models_folder,
+            runtime_model=runtime_model,
+        )
+        return captioner, captioner.run(data)
+
+
+def reset_shared_vision_captioner() -> None:
+    """Clear the shared instance; intended for configuration swaps and tests."""
+
+    global _SHARED_CAPTIONER, _SHARED_CAPTIONER_KEY
+    with _SHARED_CAPTIONER_LOCK:
+        _SHARED_CAPTIONER = None
+        _SHARED_CAPTIONER_KEY = ""
 
 
 class ImageEmbedder(Worker):

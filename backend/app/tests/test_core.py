@@ -65,10 +65,10 @@ def test_chat_endpoint_fallback(client):
     assert resp.status_code == 200
     data = resp.json()
     # Validate response structure
-    assert data["message"] == "You said: test"
+    assert data["message"] == "No API key is configured for the model provider."
     assert data["thought"] == ""
     assert data["tools_used"] == []
-    assert data["metadata"] == {}
+    assert data["metadata"]["category"] == "api_key_missing"
     # Validate context
     assert "context" in data
     ctx = data["context"]
@@ -79,7 +79,7 @@ def test_chat_endpoint_fallback(client):
     assert messages[0]["role"] == "user" and messages[0]["content"] == "test"
     assert (
         messages[1]["role"] == "assistant"
-        and messages[1]["content"] == "You said: test"
+        and messages[1]["content"] == "No API key is configured for the model provider."
     )
 
 
@@ -268,8 +268,9 @@ def test_modelcontext_and_llmservice(monkeypatch):
     monkeypatch.delenv("API_KEY", raising=False)
     llm = LLMService()
     res = llm.generate("abc")
-    assert res.get("text") == "You said: abc"
-    assert res.get("tools_used") == [] and res.get("metadata") == {}
+    assert res.get("text") == "No API key is configured for the model provider."
+    assert res.get("tools_used") == []
+    assert res.get("metadata", {}).get("category") == "api_key_missing"
 
 
 def test_llmservice_api_error_fallback(monkeypatch):
@@ -285,7 +286,9 @@ def test_llmservice_api_error_fallback(monkeypatch):
     monkeypatch.setattr(requests, "post", boom)
 
     res = svc.generate("oops")
-    assert res["text"] == "You said: oops"
+    assert (
+        res["text"] == "The model provider request failed before returning a response."
+    )
     assert "error" in res["metadata"]
 
 
@@ -299,7 +302,10 @@ def test_llmservice_modes(monkeypatch):
 
     # API mode
     svc_api = LLMService(mode="api")
-    assert svc_api.generate("hi")["text"] == "You said: hi"
+    assert (
+        svc_api.generate("hi")["text"]
+        == "No API key is configured for the model provider."
+    )
 
     # Local mode
     svc_local = LLMService(mode="local")

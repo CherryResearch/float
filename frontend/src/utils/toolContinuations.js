@@ -24,11 +24,38 @@ export const stableValue = (value) => {
 const fnv1a = (input) => {
   let hash = 0x811c9dc5;
   const text = String(input || "");
-  for (let idx = 0; idx < text.length; idx += 1) {
-    hash ^= text.charCodeAt(idx);
+  for (const char of text) {
+    hash ^= char.codePointAt(0);
     hash = Math.imul(hash, 0x01000193) >>> 0;
   }
   return hash.toString(16).padStart(8, "0");
+};
+
+// Keep signature aliases aligned with backend/app/tool_names.py. Aliases are
+// accepted for compatibility but never appear as duplicate model tools.
+const TOOL_NAME_ALIASES = {
+  camera: "camera.capture",
+  "memory.read": "recall",
+  "memory.recall": "recall",
+  "memory.search": "recall",
+  "memory.store": "remember",
+  "memory.write": "remember",
+  "memory.remember": "remember",
+  "open.url": "computer.navigate",
+  "browser.open": "computer.navigate",
+  shell: "shell.exec",
+  patch: "patch.apply",
+  mcp: "mcp.call",
+  writefile: "write_file",
+  readfile: "read_file",
+  listdir: "list_dir",
+  tool: "help",
+  tools: "help",
+};
+
+const canonicalToolName = (value) => {
+  const name = typeof value === "string" ? value.trim() : "";
+  return TOOL_NAME_ALIASES[name] || name;
 };
 
 export const buildToolContinuationSignature = (tools, options = {}) => {
@@ -48,9 +75,9 @@ export const buildToolContinuationSignature = (tools, options = {}) => {
         : {}),
       name:
         typeof tool.name === "string"
-          ? tool.name.trim()
+          ? canonicalToolName(tool.name)
           : typeof tool.tool === "string"
-            ? tool.tool.trim()
+            ? canonicalToolName(tool.tool)
             : "",
       status: typeof tool.status === "string" ? tool.status.trim().toLowerCase() : "",
       args:
@@ -64,13 +91,40 @@ export const buildToolContinuationSignature = (tools, options = {}) => {
     .filter((tool) => (includeIds ? tool.id || tool.name : tool.name));
   if (!normalized.length) return "";
   try {
-    return fnv1a(JSON.stringify(normalized));
+    return fnv1a(JSON.stringify(stableValue(normalized)));
   } catch {
     return "";
   }
 };
 
 const activeToolContinuationLocks = new Set();
+
+export const TOOL_CONTINUATION_ATTEMPT_RESET_EVENT =
+  "float:tool-continuation-attempt-reset";
+
+export const announceToolContinuationAttemptReset = ({
+  sessionId,
+  messageId,
+} = {}) => {
+  const normalizedMessageId = String(messageId || "").trim();
+  if (
+    !normalizedMessageId ||
+    typeof window === "undefined" ||
+    typeof window.dispatchEvent !== "function" ||
+    typeof CustomEvent !== "function"
+  ) {
+    return false;
+  }
+  window.dispatchEvent(
+    new CustomEvent(TOOL_CONTINUATION_ATTEMPT_RESET_EVENT, {
+      detail: {
+        sessionId: String(sessionId || "").trim(),
+        messageId: normalizedMessageId,
+      },
+    }),
+  );
+  return true;
+};
 
 export const buildToolContinuationLockKey = ({
   sessionId,
@@ -79,10 +133,7 @@ export const buildToolContinuationLockKey = ({
 } = {}) => {
   const sessionPart = String(sessionId || "").trim() || "default";
   const messagePart = String(messageId || "").trim();
-  const semanticSignature = buildToolContinuationSignature(tools, {
-    includeIds: false,
-  });
-  const exactSignature = semanticSignature || buildToolContinuationSignature(tools);
+  const exactSignature = buildToolContinuationSignature(tools);
   if (!messagePart || !exactSignature) return "";
   return `${sessionPart}:${messagePart}:${exactSignature}`;
 };

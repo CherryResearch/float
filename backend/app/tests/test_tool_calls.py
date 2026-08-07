@@ -304,6 +304,43 @@ def test_convert_tools_for_openai_uses_responses_function_shape():
     ]
 
 
+def test_convert_tools_for_openai_removes_schema_titles_without_mutating_input():
+    tools = [
+        {
+            "name": "remember",
+            "parameters": {
+                "type": "object",
+                "title": "RememberInput",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "title": "Memory title",
+                    },
+                    "tags": {
+                        "type": "array",
+                        "title": "Tags",
+                        "items": {"type": "string", "title": "Tag"},
+                    },
+                },
+                "required": ["title"],
+            },
+        }
+    ]
+
+    converted = _convert_tools_for_openai(tools, responses_api=True)
+
+    assert converted[0]["parameters"] == {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "tags": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["title"],
+    }
+    assert tools[0]["parameters"]["title"] == "RememberInput"
+    assert tools[0]["parameters"]["properties"]["title"]["title"] == "Memory title"
+
+
 def test_generate_via_api_uses_responses_tool_shape_for_gpt5(monkeypatch):
     captured = {}
     service = LLMService(

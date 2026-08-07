@@ -32,6 +32,11 @@ const EMPTY_GLOBAL_STATE = Object.freeze({});
 const NOOP_SET_STATE = () => {};
 const LOCAL_PROVIDER_STATUS_POLL_MS = 60000;
 const MODEL_AVAILABLE_PIP = "\u25cf";
+const APPROVAL_LEVEL_OPTIONS = Object.freeze([
+  { value: "all", label: "Review all" },
+  { value: "high", label: "High risk only" },
+  { value: "auto", label: "Full auto" },
+]);
 
 const fireAndForget = (request) => {
   if (request && typeof request.catch === "function") {
@@ -280,12 +285,18 @@ const TopBar = () => {
     setBackendMode(next);
   };
 
-  // Cycle approval mode through one-word labels
+  const approvalModeIndex = APPROVAL_LEVEL_OPTIONS.findIndex(
+    (option) => option.value === state.approvalLevel,
+  );
+  const approvalMode =
+    APPROVAL_LEVEL_OPTIONS[approvalModeIndex] || APPROVAL_LEVEL_OPTIONS[0];
+  const nextApprovalMode =
+    APPROVAL_LEVEL_OPTIONS[
+      approvalModeIndex < 0 ? 0 : (approvalModeIndex + 1) % APPROVAL_LEVEL_OPTIONS.length
+    ];
+
   const toggleApprovalMode = () => {
-    const order = ["all", "high", "auto"];
-    const idx = order.indexOf(state.approvalLevel);
-    const next = order[(idx + 1) % order.length];
-    setState((prev) => ({ ...prev, approvalLevel: next }));
+    setState((prev) => ({ ...prev, approvalLevel: nextApprovalMode.value }));
   };
 
   const toggleTheme = () => {
@@ -295,40 +306,17 @@ const TopBar = () => {
     }));
   };
 
-  const renderThemeToggle = () => (
-    <button
-      className="topbar-theme-toggle"
-      onClick={(e) => {
-        const btn = e.currentTarget;
-        // Cancel any pending hover-triggered toggle
-        if (btn.__hoverTimer) {
-          clearTimeout(btn.__hoverTimer);
-          btn.__hoverTimer = null;
-        }
-        // If a hover just triggered, suppress immediate click bounce-back
-        if (btn.__lastHoverToggleAt && Date.now() - btn.__lastHoverToggleAt < 600) {
-          return;
-        }
-        toggleTheme();
-      }}
-      aria-label="Toggle theme"
-      onMouseEnter={(e) => {
-        const btn = e.currentTarget;
-        if (btn.__hoverTimer) clearTimeout(btn.__hoverTimer);
-        // Debounce hover: apply after 600ms if still hovering
-        btn.__hoverTimer = setTimeout(() => {
-          btn.__lastHoverToggleAt = Date.now();
-          toggleTheme();
-        }, 600);
-      }}
-      onMouseLeave={(e) => {
-        const btn = e.currentTarget;
-        if (btn.__hoverTimer) {
-          clearTimeout(btn.__hoverTimer);
-          btn.__hoverTimer = null;
-        }
-      }}
-    >
+  const renderThemeToggle = () => {
+    const actionLabel =
+      state.theme === "dark" ? "Switch to light theme" : "Switch to dark theme";
+    return (
+      <button
+        type="button"
+        className="topbar-theme-toggle"
+        onClick={toggleTheme}
+        aria-label={actionLabel}
+        title={actionLabel}
+      >
       {state.theme === "dark" ? (
         // Moon icon (show current state)
         <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
@@ -340,8 +328,9 @@ const TopBar = () => {
           <path d="M6.76 4.84l-1.8-1.79-1.41 1.41 1.79 1.8 1.42-1.42zm10.45 12.02l1.79 1.8 1.41-1.41-1.8-1.79-1.4 1.4zM12 4V1h-0v3h0zm0 19v-3h0v3h0zM4 12H1v0h3v0zm19 0h-3v0h3v0zM6.76 19.16l-1.42 1.42-1.79-1.8 1.41-1.41 1.8 1.79zM17.24 4.84l1.4-1.4 1.8 1.79-1.41 1.41-1.79-1.8zM12 7a5 5 0 100 10 5 5 0 000-10z" />
         </svg>
       )}
-    </button>
-  );
+      </button>
+    );
+  };
 
   const renderPrimaryControls = () => (
     <>
@@ -495,10 +484,10 @@ const TopBar = () => {
         type="button"
         className="chip approval-chip"
         onClick={toggleApprovalMode}
-        aria-label="Approval mode"
-        title="Approval level: click to cycle all -> high -> auto"
+        aria-label={`Approval mode: ${approvalMode.label}`}
+        title={`Approval mode: ${approvalMode.label}. Click to switch to ${nextApprovalMode.label}.`}
       >
-        {state.approvalLevel}
+        {approvalMode.label}
       </button>
     </>
   );

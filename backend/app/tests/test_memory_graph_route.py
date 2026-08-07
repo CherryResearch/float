@@ -179,3 +179,23 @@ def test_memory_graph_can_skip_thread_projection(client, monkeypatch):
 
     assert all(str(node.get("type")) != "thread" for node in (graph.get("nodes") or []))
     assert graph.get("metadata", {}).get("thread_projection_count") == 0
+
+
+def test_memory_graph_reads_snapshot_without_lifecycle_sweep(client, monkeypatch):
+    manager = client.app.state.memory_manager
+    observed = {}
+
+    def fake_iter_items(**kwargs):
+        observed.update(kwargs)
+        return []
+
+    monkeypatch.setattr(manager, "iter_items", fake_iter_items)
+
+    response = client.get(
+        "/memory/graph",
+        params={"use_loaded_embeddings": False},
+    )
+
+    assert response.status_code == 200
+    assert observed["touch"] is False
+    assert observed["run_lifecycle_sweep"] is False

@@ -103,6 +103,36 @@ def test_deploy_snapshot_uses_installed_manifest_for_later_stale_cleanup(tmp_pat
     assert (target / "README.md").read_text(encoding="utf-8") == "unmanaged\n"
 
 
+def test_deploy_snapshot_prunes_explicitly_retired_shipped_path(tmp_path):
+    snapshot = _snapshot(tmp_path)
+    target = tmp_path / "target"
+    retired_relative = next(iter(deploy_release_snapshot.RETIRED_SHIPPED_PATHS))
+    retired = target / retired_relative
+    retired.parent.mkdir(parents=True)
+    retired.write_text("internal eval\n", encoding="utf-8")
+    (target / create_release_snapshot.DEPLOYMENT_MANIFEST_NAME).write_text(
+        json.dumps(
+            {
+                "installed_files": [
+                    create_release_snapshot.BUILD_RECEIPT_NAME,
+                    retired_relative,
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    plan = deploy_release_snapshot.build_deployment_plan(
+        snapshot=snapshot,
+        target=target,
+    )
+    assert plan["stale_files"] == [retired_relative]
+
+    deploy_release_snapshot.apply_deployment_plan(plan)
+
+    assert not retired.exists()
+
+
 def test_deploy_snapshot_rejects_non_shipped_paths(tmp_path):
     snapshot = _snapshot(tmp_path)
     (snapshot / ".env").write_text("SECRET=bad\n", encoding="utf-8")

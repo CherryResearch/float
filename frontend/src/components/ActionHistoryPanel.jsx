@@ -23,10 +23,12 @@ const conversationLabelFor = (action) => {
 };
 
 const responseLabelFor = (action) => {
-  if (action?.response_label) return String(action.response_label);
+  if (action?.response_label) {
+    return String(action.response_label).replace(/^response\b/i, "message");
+  }
   if (action?.response_id) {
     const id = String(action.response_id);
-    return `response ${id.slice(-8)}`;
+    return `message ${id.slice(-8)}`;
   }
   return "outside chat";
 };
@@ -64,14 +66,25 @@ const itemCountFor = (value) => {
 };
 
 const actionKindLabelFor = (action) => {
-  const raw = String(action?.kind || "").trim().toLowerCase();
-  return ACTION_KIND_LABELS[raw] || normalizeActionLabel(action?.kind, "action");
+  const raw = String(action?.kind || "")
+    .trim()
+    .toLowerCase();
+  return (
+    ACTION_KIND_LABELS[raw] || normalizeActionLabel(action?.kind, "action")
+  );
 };
 
 const actionNameLabelFor = (action) => {
-  const raw = String(action?.name || "").trim().toLowerCase();
+  const raw = String(action?.name || "")
+    .trim()
+    .toLowerCase();
   if (raw && ACTION_NAME_LABELS[raw]) return ACTION_NAME_LABELS[raw];
-  if (String(action?.kind || "").trim().toLowerCase() === "revert") return "undo";
+  if (
+    String(action?.kind || "")
+      .trim()
+      .toLowerCase() === "revert"
+  )
+    return "undo";
   return normalizeActionLabel(action?.name, "write");
 };
 
@@ -94,10 +107,16 @@ const describeActionReference = (action, actionMap) => {
   if (targetIds.length) {
     const targets = targetIds.map((id) => actionMap.get(id)).filter(Boolean);
     const restoredCount = itemCountFor(action);
-    const targetCount = targets.reduce((sum, target) => sum + itemCountFor(target), 0);
+    const targetCount = targets.reduce(
+      (sum, target) => sum + itemCountFor(target),
+      0,
+    );
     const reference =
       targets.length === 1
-        ? `Undo target: ${[actionTimestampFor(targets[0]), actionTitleFor(targets[0])]
+        ? `Undo target: ${[
+            actionTimestampFor(targets[0]),
+            actionTitleFor(targets[0]),
+          ]
             .filter(Boolean)
             .join(" · ")}`
         : targets.length > 1
@@ -129,7 +148,10 @@ const describeActionReference = (action, actionMap) => {
   const actionCount = itemCountFor(action);
   const restoredCount = itemCountFor(revertAction);
   const reference = revertAction
-    ? `Later undo: ${[actionTimestampFor(revertAction), actionTitleFor(revertAction)]
+    ? `Later undo: ${[
+        actionTimestampFor(revertAction),
+        actionTitleFor(revertAction),
+      ]
         .filter(Boolean)
         .join(" · ")}`
     : `Later undo: action ${revertedById.slice(-8)}`;
@@ -158,8 +180,12 @@ const statusLabelFor = (action, actionMap) => {
     }
     return "reverted";
   }
-  const kind = String(action?.kind || "").trim().toLowerCase();
-  const raw = String(action?.status || "").trim().toLowerCase();
+  const kind = String(action?.kind || "")
+    .trim()
+    .toLowerCase();
+  const raw = String(action?.status || "")
+    .trim()
+    .toLowerCase();
   if (kind === "revert" && (!raw || raw === "applied")) return "applied";
   if (!raw) return "saved";
   if (raw === "applied") return "saved";
@@ -182,8 +208,12 @@ const normalizeDocsFocusTarget = (value) => {
 
 const buildDocsHref = (item) => {
   if (!item || typeof item !== "object") return "";
-  const section = String(item.section || "").trim().toLowerCase();
-  const resourceType = String(item.resource_type || "").trim().toLowerCase();
+  const section = String(item.section || "")
+    .trim()
+    .toLowerCase();
+  const resourceType = String(item.resource_type || "")
+    .trim()
+    .toLowerCase();
   if (resourceType !== "file" && section !== "knowledge") return "";
   const focusTarget = normalizeDocsFocusTarget(
     item.resource_id || item.label || item.resource_key,
@@ -269,6 +299,7 @@ const ActionHistoryPanel = ({
   const [feedback, setFeedback] = React.useState("");
   const [collapsedActions, setCollapsedActions] = React.useState({});
   const [hiddenActions, setHiddenActions] = React.useState({});
+  const [confirmConversationId, setConfirmConversationId] = React.useState("");
 
   const groups = React.useMemo(() => groupActions(actions), [actions]);
   const totalActionCount = React.useMemo(
@@ -277,7 +308,8 @@ const ActionHistoryPanel = ({
         (count, conversation) =>
           count +
           conversation.responses.reduce(
-            (responseCount, response) => responseCount + response.actions.length,
+            (responseCount, response) =>
+              responseCount + response.actions.length,
             0,
           ),
         0,
@@ -336,10 +368,17 @@ const ActionHistoryPanel = ({
     }
     setDetails((prev) => ({
       ...prev,
-      [actionId]: { ...(prev[actionId] || {}), loading: true, error: "", open: true },
+      [actionId]: {
+        ...(prev[actionId] || {}),
+        loading: true,
+        error: "",
+        open: true,
+      },
     }));
     try {
-      const res = await axios.get(`/api/actions/${encodeURIComponent(actionId)}`);
+      const res = await axios.get(
+        `/api/actions/${encodeURIComponent(actionId)}`,
+      );
       setDetails((prev) => ({
         ...prev,
         [actionId]: {
@@ -351,16 +390,24 @@ const ActionHistoryPanel = ({
       }));
     } catch (err) {
       const detail =
-        err?.response?.data?.detail || err?.message || "Failed to load action diff.";
+        err?.response?.data?.detail ||
+        err?.message ||
+        "Failed to load action diff.";
       setDetails((prev) => ({
         ...prev,
-        [actionId]: { loading: false, error: String(detail), open: true, action: null },
+        [actionId]: {
+          loading: false,
+          error: String(detail),
+          open: true,
+          action: null,
+        },
       }));
     }
   };
 
   const runRevert = async (key, payload, successMessage) => {
     if (!backendReady) return;
+    setConfirmConversationId("");
     setPendingKey(key);
     setFeedback("");
     try {
@@ -423,238 +470,353 @@ const ActionHistoryPanel = ({
       toggleOnCardClick={showConsoleControls}
     >
       <p className="status-note">
-        Revert tracked writes individually, by response, or by conversation.
+        Undo tracked writes individually, by message, or with confirmation
+        across an entire chat.
       </p>
 
       {feedback ? <p className="agent-console-note">{feedback}</p> : null}
 
       {!collapsed ? (
         <div className="action-history-groups">
-          {groups.map((conversation) => (
-            <article key={conversation.key} className="action-conversation-group">
-              <div className="action-group-header">
-                <div>
-                  <h4>{conversation.label}</h4>
-                  <span className="action-group-meta">
-                    {conversation.responses.reduce(
-                      (count, response) => count + response.actions.length,
-                      0,
-                    )}{" "}
-                    tracked writes
-                  </span>
-                </div>
-                {conversation.conversationId ? (
-                  <button
-                    type="button"
-                    className="agent-card-control-btn"
-                    disabled={pendingKey === `conversation:${conversation.conversationId}`}
-                    onClick={() =>
-                      runRevert(
-                        `conversation:${conversation.conversationId}`,
-                        { conversation_id: conversation.conversationId, force: false },
-                        `Reverted conversation ${conversation.label}.`,
-                      )
-                    }
-                  >
-                    Revert conversation
-                  </button>
-                ) : null}
-              </div>
+          {groups.map((conversation) => {
+            const conversationActionCount = conversation.responses.reduce(
+              (count, response) => count + response.actions.length,
+              0,
+            );
+            const conversationMessageCount = conversation.responses.filter(
+              (response) => response.responseId,
+            ).length;
+            const isConfirmingConversation =
+              confirmConversationId === conversation.conversationId;
 
-              {conversation.responses.map((response) => (
-                <div key={response.key} className="action-response-group">
-                  <div className="action-response-header">
-                    <div>
-                      <strong>{response.label}</strong>
-                      <span className="action-group-meta">
-                        {response.actions.length} action{response.actions.length === 1 ? "" : "s"}
-                      </span>
-                    </div>
-                    {response.responseId ? (
-                      <button
-                        type="button"
-                        className="agent-card-control-btn"
-                        disabled={pendingKey === `response:${response.responseId}`}
-                        onClick={() =>
-                          runRevert(
-                            `response:${response.responseId}`,
-                            {
-                              response_id: response.responseId,
-                              conversation_id: conversation.conversationId,
-                              force: false,
-                            },
-                            `Reverted ${response.label}.`,
-                          )
-                        }
-                      >
-                        Revert response
-                      </button>
-                    ) : null}
+            return (
+              <article
+                key={conversation.key}
+                className="action-conversation-group"
+              >
+                <div className="action-group-header">
+                  <div>
+                    <h4>{conversation.label}</h4>
+                    <span className="action-group-meta">
+                      {conversationActionCount} tracked write
+                      {conversationActionCount === 1 ? "" : "s"}
+                    </span>
                   </div>
-
-                  <ul className="action-list">
-                    {response.actions.map((action) => {
-                      const actionId = String(action.id);
-                      if (hiddenActions[actionId]) return null;
-
-                      const isExpanded = !!details[actionId]?.open;
-                      const isCompact = !!collapsedActions[actionId];
-                      const detail = details[actionId];
-                      const statusLabel = statusLabelFor(action, actionMap);
-                      const kindLabel = actionKindLabelFor(action);
-                      const nameLabel = actionNameLabelFor(action);
-                      const showName = !!nameLabel && nameLabel !== kindLabel;
-                      const itemCount = itemCountFor(action);
-                      const relation = describeActionReference(action, actionMap);
-                      const canRevert = !!action.revertible;
-                      const summary = actionTitleFor(action);
-
-                      return (
-                        <li
-                          key={actionId}
-                          className={`action-row${isCompact ? " compact" : ""}`}
+                  {conversation.conversationId ? (
+                    <div className="action-conversation-revert">
+                      <div className="action-row-actions">
+                        {isConfirmingConversation ? (
+                          <button
+                            type="button"
+                            className="agent-card-control-btn"
+                            onClick={() => setConfirmConversationId("")}
+                            disabled={
+                              pendingKey ===
+                              `conversation:${conversation.conversationId}`
+                            }
+                          >
+                            Cancel
+                          </button>
+                        ) : null}
+                        <button
+                          type="button"
+                          className={`agent-card-control-btn danger${
+                            isConfirmingConversation ? " is-confirming" : ""
+                          }`}
+                          disabled={
+                            pendingKey ===
+                            `conversation:${conversation.conversationId}`
+                          }
+                          aria-describedby={
+                            isConfirmingConversation
+                              ? `conversation-revert-warning-${conversation.conversationId}`
+                              : undefined
+                          }
+                          onClick={() => {
+                            if (!isConfirmingConversation) {
+                              setConfirmConversationId(
+                                conversation.conversationId,
+                              );
+                              return;
+                            }
+                            runRevert(
+                              `conversation:${conversation.conversationId}`,
+                              {
+                                conversation_id: conversation.conversationId,
+                                confirm_conversation: true,
+                                force: false,
+                              },
+                              `Reverted entire chat ${conversation.label}.`,
+                            );
+                          }}
                         >
-                          <div className="action-row-top">
-                            <div className="action-row-copy">
-                              <div className="action-row-meta">
-                                <span className="agent-activity-type">{kindLabel}</span>
-                                {showName ? (
-                                  <span className="agent-activity-name">{nameLabel}</span>
-                                ) : null}
-                                <span className="agent-activity-status">{statusLabel}</span>
-                                {itemCount > 0 ? (
-                                  <span className="action-item-count">
-                                    {itemCount} item{itemCount === 1 ? "" : "s"}
+                          {isConfirmingConversation
+                            ? "Confirm entire-chat undo"
+                            : "Undo entire chat"}
+                        </button>
+                      </div>
+                      {isConfirmingConversation ? (
+                        <span
+                          id={`conversation-revert-warning-${conversation.conversationId}`}
+                          className="action-conversation-warning"
+                          role="status"
+                        >
+                          This will undo {conversationActionCount} write
+                          {conversationActionCount === 1 ? "" : "s"} across{" "}
+                          {conversationMessageCount} message
+                          {conversationMessageCount === 1 ? "" : "s"}.
+                        </span>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
+
+                {conversation.responses.map((response) => (
+                  <div key={response.key} className="action-response-group">
+                    <div className="action-response-header">
+                      <div>
+                        <strong>{response.label}</strong>
+                        <span className="action-group-meta">
+                          {response.actions.length} action
+                          {response.actions.length === 1 ? "" : "s"}
+                        </span>
+                      </div>
+                      {response.responseId ? (
+                        <button
+                          type="button"
+                          className="agent-card-control-btn"
+                          disabled={
+                            pendingKey === `response:${response.responseId}`
+                          }
+                          onClick={() =>
+                            runRevert(
+                              `response:${response.responseId}`,
+                              {
+                                response_id: response.responseId,
+                                conversation_id: conversation.conversationId,
+                                force: false,
+                              },
+                              `Reverted ${response.label}.`,
+                            )
+                          }
+                        >
+                          Undo message
+                        </button>
+                      ) : null}
+                    </div>
+
+                    <ul className="action-list">
+                      {response.actions.map((action) => {
+                        const actionId = String(action.id);
+                        if (hiddenActions[actionId]) return null;
+
+                        const isExpanded = !!details[actionId]?.open;
+                        const isCompact = !!collapsedActions[actionId];
+                        const detail = details[actionId];
+                        const statusLabel = statusLabelFor(action, actionMap);
+                        const kindLabel = actionKindLabelFor(action);
+                        const nameLabel = actionNameLabelFor(action);
+                        const showName = !!nameLabel && nameLabel !== kindLabel;
+                        const itemCount = itemCountFor(action);
+                        const relation = describeActionReference(
+                          action,
+                          actionMap,
+                        );
+                        const canRevert = !!action.revertible;
+                        const summary = actionTitleFor(action);
+
+                        return (
+                          <li
+                            key={actionId}
+                            className={`action-row${isCompact ? " compact" : ""}`}
+                          >
+                            <div className="action-row-top">
+                              <div className="action-row-copy">
+                                <div className="action-row-meta">
+                                  <span className="agent-activity-type">
+                                    {kindLabel}
                                   </span>
+                                  {showName ? (
+                                    <span className="agent-activity-name">
+                                      {nameLabel}
+                                    </span>
+                                  ) : null}
+                                  <span className="agent-activity-status">
+                                    {statusLabel}
+                                  </span>
+                                  {itemCount > 0 ? (
+                                    <span className="action-item-count">
+                                      {itemCount} item
+                                      {itemCount === 1 ? "" : "s"}
+                                    </span>
+                                  ) : null}
+                                  {formatTimestamp(
+                                    action.created_at_ts || action.timestamp,
+                                  ) ? (
+                                    <time>
+                                      {formatTimestamp(
+                                        action.created_at_ts ||
+                                          action.timestamp,
+                                      )}
+                                    </time>
+                                  ) : null}
+                                </div>
+                                <p className="action-row-summary">{summary}</p>
+                                {!isCompact && relation?.reference ? (
+                                  <p className="action-row-reference">
+                                    {relation.reference}
+                                  </p>
                                 ) : null}
-                                {formatTimestamp(action.created_at_ts || action.timestamp) ? (
-                                  <time>{formatTimestamp(action.created_at_ts || action.timestamp)}</time>
+                                {!isCompact && relation?.detail ? (
+                                  <p className="action-row-note">
+                                    {relation.detail}
+                                  </p>
                                 ) : null}
                               </div>
-                              <p className="action-row-summary">{summary}</p>
-                              {!isCompact && relation?.reference ? (
-                                <p className="action-row-reference">{relation.reference}</p>
-                              ) : null}
-                              {!isCompact && relation?.detail ? (
-                                <p className="action-row-note">{relation.detail}</p>
-                              ) : null}
-                            </div>
 
-                            <div className="action-row-actions">
-                              <button
-                                type="button"
-                                className={`agent-card-control-btn agent-card-control-symbol${isCompact ? " is-active" : ""}`}
-                                onClick={() => {
-                                  setCollapsedActions((prev) => ({
-                                    ...prev,
-                                    [actionId]: !isCompact,
-                                  }));
-                                  if (!isCompact) {
-                                    setDetails((prev) => ({
+                              <div className="action-row-actions">
+                                <button
+                                  type="button"
+                                  className={`agent-card-control-btn agent-card-control-symbol${isCompact ? " is-active" : ""}`}
+                                  onClick={() => {
+                                    setCollapsedActions((prev) => ({
                                       ...prev,
-                                      [actionId]: {
-                                        ...(prev[actionId] || {}),
-                                        open: false,
-                                      },
+                                      [actionId]: !isCompact,
                                     }));
+                                    if (!isCompact) {
+                                      setDetails((prev) => ({
+                                        ...prev,
+                                        [actionId]: {
+                                          ...(prev[actionId] || {}),
+                                          open: false,
+                                        },
+                                      }));
+                                    }
+                                  }}
+                                  aria-label={
+                                    isCompact
+                                      ? `Expand ${summary}`
+                                      : `Minimize ${summary}`
                                   }
-                                }}
-                                aria-label={isCompact ? `Expand ${summary}` : `Minimize ${summary}`}
-                                title={isCompact ? `Expand ${summary}` : `Minimize ${summary}`}
-                              >
-                                {isCompact ? "+" : "-"}
-                              </button>
-                              <button
-                                type="button"
-                                className="agent-card-control-btn danger"
-                                onClick={() =>
-                                  setHiddenActions((prev) => ({
-                                    ...prev,
-                                    [actionId]: true,
-                                  }))
-                                }
-                                aria-label={`Hide ${summary}`}
-                                title={`Hide ${summary}`}
-                              >
-                                hide
-                              </button>
-                              {!isCompact ? (
-                                <>
-                                  {!action.metadata_only ? (
+                                  title={
+                                    isCompact
+                                      ? `Expand ${summary}`
+                                      : `Minimize ${summary}`
+                                  }
+                                >
+                                  {isCompact ? "+" : "-"}
+                                </button>
+                                <button
+                                  type="button"
+                                  className="agent-card-control-btn danger"
+                                  onClick={() =>
+                                    setHiddenActions((prev) => ({
+                                      ...prev,
+                                      [actionId]: true,
+                                    }))
+                                  }
+                                  aria-label={`Hide ${summary}`}
+                                  title={`Hide ${summary}`}
+                                >
+                                  hide
+                                </button>
+                                {!isCompact ? (
+                                  <>
+                                    {!action.metadata_only ? (
+                                      <button
+                                        type="button"
+                                        className="agent-card-control-btn"
+                                        onClick={() => toggleDiff(actionId)}
+                                        disabled={!backendReady}
+                                      >
+                                        {isExpanded ? "Hide diff" : "Show diff"}
+                                      </button>
+                                    ) : null}
                                     <button
                                       type="button"
                                       className="agent-card-control-btn"
-                                      onClick={() => toggleDiff(actionId)}
-                                      disabled={!backendReady}
+                                      disabled={
+                                        !canRevert ||
+                                        pendingKey === `action:${actionId}`
+                                      }
+                                      onClick={() =>
+                                        runRevert(
+                                          `action:${actionId}`,
+                                          {
+                                            action_ids: [action.id],
+                                            force: false,
+                                          },
+                                          `Reverted ${action.summary || action.name || "action"}.`,
+                                        )
+                                      }
                                     >
-                                      {isExpanded ? "Hide diff" : "Show diff"}
+                                      Revert action
                                     </button>
-                                  ) : null}
-                                  <button
-                                    type="button"
-                                    className="agent-card-control-btn"
-                                    disabled={!canRevert || pendingKey === `action:${actionId}`}
-                                    onClick={() =>
-                                      runRevert(
-                                        `action:${actionId}`,
-                                        { action_ids: [action.id], force: false },
-                                        `Reverted ${action.summary || action.name || "action"}.`,
-                                      )
-                                    }
-                                  >
-                                    Revert action
-                                  </button>
-                                </>
-                              ) : null}
+                                  </>
+                                ) : null}
+                              </div>
                             </div>
-                          </div>
 
-                          {!isCompact && isExpanded ? (
-                            <div className="action-diff-panel">
-                              {detail?.loading ? <p className="status-note">Loading diff...</p> : null}
-                              {detail?.error ? <p className="status-note">{detail.error}</p> : null}
-                              {detail?.action?.items?.length ? (
-                                detail.action.items.map((item) => (
-                                  <div
-                                    key={`${actionId}:${item.id || item.resource_key}`}
-                                    className="action-diff-item"
-                                  >
-                                    <div className="action-diff-meta">
-                                      <strong>{item.label || item.resource_id}</strong>
-                                      <div className="action-row-actions">
-                                        <span className="agent-activity-status">
-                                          {item.operation || "update"}
-                                        </span>
-                                        <span className="action-item-count">
-                                          {item.section || item.resource_type}
-                                        </span>
-                                        {buildDocsHref(item) ? (
-                                          <button
-                                            type="button"
-                                            className="agent-card-control-btn"
-                                            onClick={() => navigate(buildDocsHref(item))}
-                                          >
-                                            Open in docs
-                                          </button>
-                                        ) : null}
+                            {!isCompact && isExpanded ? (
+                              <div className="action-diff-panel">
+                                {detail?.loading ? (
+                                  <p className="status-note">Loading diff...</p>
+                                ) : null}
+                                {detail?.error ? (
+                                  <p className="status-note">{detail.error}</p>
+                                ) : null}
+                                {detail?.action?.items?.length ? (
+                                  detail.action.items.map((item) => (
+                                    <div
+                                      key={`${actionId}:${item.id || item.resource_key}`}
+                                      className="action-diff-item"
+                                    >
+                                      <div className="action-diff-meta">
+                                        <strong>
+                                          {item.label || item.resource_id}
+                                        </strong>
+                                        <div className="action-row-actions">
+                                          <span className="agent-activity-status">
+                                            {item.operation || "update"}
+                                          </span>
+                                          <span className="action-item-count">
+                                            {item.section || item.resource_type}
+                                          </span>
+                                          {buildDocsHref(item) ? (
+                                            <button
+                                              type="button"
+                                              className="agent-card-control-btn"
+                                              onClick={() =>
+                                                navigate(buildDocsHref(item))
+                                              }
+                                            >
+                                              Open in docs
+                                            </button>
+                                          ) : null}
+                                        </div>
                                       </div>
+                                      <pre>
+                                        {item?.diff?.unified ||
+                                          buildFallbackDiff(item)}
+                                      </pre>
                                     </div>
-                                    <pre>{item?.diff?.unified || buildFallbackDiff(item)}</pre>
-                                  </div>
-                                ))
-                              ) : !detail?.loading && !detail?.error ? (
-                                <p className="status-note">No diff details available.</p>
-                              ) : null}
-                            </div>
-                          ) : null}
-                        </li>
-                      );
-                    })}
-                  </ul>
-                </div>
-              ))}
-            </article>
-          ))}
+                                  ))
+                                ) : !detail?.loading && !detail?.error ? (
+                                  <p className="status-note">
+                                    No diff details available.
+                                  </p>
+                                ) : null}
+                              </div>
+                            ) : null}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </div>
+                ))}
+              </article>
+            );
+          })}
         </div>
       ) : null}
     </ConsoleObjectCard>

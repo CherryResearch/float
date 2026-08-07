@@ -306,6 +306,10 @@ def load_config():
         "FLOAT_REFLECTION_STORE",
         str(databases_dir / "reflections.sqlite3"),
     )
+    work_run_store_path = os.getenv(
+        "FLOAT_WORK_RUN_STORE",
+        str(databases_dir / "work_runs.sqlite3"),
+    )
     conv_folder = os.getenv("FLOAT_CONV_DIR", str(default_conv))
     models_folder = os.getenv("FLOAT_MODELS_DIR", str(DEFAULT_MODELS_DIR))
     try:
@@ -468,6 +472,15 @@ def load_config():
         ),
         "tts_model": os.getenv("TTS_MODEL", "tts-1"),
         "vision_model": os.getenv("VISION_MODEL", "google/paligemma2-3b-pt-224"),
+        # Caption generation is local-only unless the user explicitly opts in
+        # to sending image bytes to the configured OpenAI-compatible provider.
+        "image_caption_engine": (
+            os.getenv("IMAGE_CAPTION_ENGINE", "local").strip().lower() or "local"
+        ),
+        "image_caption_cloud_model": (
+            os.getenv("IMAGE_CAPTION_CLOUD_MODEL", "gpt-5.4-nano").strip()
+            or "gpt-5.4-nano"
+        ),
         # Vector store / RAG configuration
         "rag_backend": os.getenv("FLOAT_RAG_BACKEND", "chroma"),
         "chroma_persist_dir": os.getenv("CHROMA_PERSIST_DIR", str(DEFAULT_CHROMA_DIR)),
@@ -496,8 +509,9 @@ def load_config():
         ),
         # Chat retrieval controls (prompt + response metadata).
         "rag_chat_top_k": _env_int("RAG_CHAT_TOP_K", 3),
-        # Keep CLIP retrieval opt-in for chat to avoid irrelevant image matches on text-only prompts.
-        "rag_chat_clip_top_k": _env_int("RAG_CHAT_CLIP_TOP_K", 0),
+        # Visual-query gating keeps ordinary text chats quiet while allowing
+        # captionless images to remain retrievable through the CLIP index.
+        "rag_chat_clip_top_k": _env_int("RAG_CHAT_CLIP_TOP_K", 2),
         # Minimum similarity (0..1) required for a retrieved snippet to be injected
         # into the chat prompt/context. Helps avoid polluting context with 0-score items.
         "rag_chat_min_similarity": _env_float("RAG_CHAT_MIN_SIMILARITY", 0.45),
@@ -546,6 +560,7 @@ def load_config():
         "data_dir": str(data_dir),
         "memory_store_path": memory_store_path,
         "reflection_store_path": reflection_store_path,
+        "work_run_store_path": work_run_store_path,
         "reflection_scheduler_enabled": _env_bool(
             "FLOAT_REFLECTION_SCHEDULER_ENABLED", False
         ),

@@ -8,7 +8,9 @@ import { GlobalContext } from "../../main";
 import { CHAT_WINDOW_STORAGE_KEY } from "../../utils/chatWindowSizing";
 import { TOOL_REVIEW_ACTION_EVENT } from "../../utils/toolReviewActions";
 import Chat, {
+  acknowledgeClientOutboxPair,
   buildCommandAwareRequest,
+  clearRegenerationContinuationMetadata,
   formatMessageTimestampLabel,
   mergeAssistantMessageMetadata,
   mergeToolEntries,
@@ -24,6 +26,7 @@ const LocationProbe = () => {
 
 describe("Chat", () => {
   afterEach(() => {
+    vi.useRealTimers();
     document.documentElement.style.removeProperty("--center-rail-width");
     localStorage.clear();
     delete window.__FLOAT_CONVERSATION_MESSAGE_LIMIT__;
@@ -87,6 +90,17 @@ describe("Chat", () => {
     expect(formatMessageTimestampLabel(nextDay, laterSameDay)).toBe(
       `${new Date(nextDay).toLocaleDateString([], dateOptions)} · ${new Date(nextDay).toLocaleTimeString([], timeOptions)}`,
     );
+  });
+
+  it("renders externally stored Unix-second timestamps as response times", () => {
+    const timestampSeconds = Date.UTC(2026, 6, 29, 22, 17, 47) / 1000;
+    const expected = new Date(timestampSeconds * 1000).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+
+    expect(formatMessageTimestampLabel(timestampSeconds)).toBe(expected);
+    expect(formatMessageTimestampLabel(String(timestampSeconds))).toBe(expected);
   });
 
   it("shows regenerate button for AI messages", () => {
@@ -550,6 +564,102 @@ describe("Chat", () => {
     }
   });
 
+  it("suppresses an exact continuation retry but forwards a distinct request id", async () => {
+    const continuations = [];
+    const postSpy = vi.spyOn(axios, "post").mockImplementation((url, payload) => {
+      if (url !== "/api/chat/continue") {
+        return Promise.resolve({ data: {} });
+      }
+      return new Promise((resolve) => {
+        continuations.push({
+          payload,
+          resolve: () =>
+            resolve({
+              data: {
+                message: `Continued ${payload.tools[0].id}.`,
+                metadata: {},
+                tools_used: [],
+              },
+            }),
+        });
+      });
+    });
+
+    try {
+      renderChat({
+        sessionId: "sess-exact-request-locks",
+        apiModel: "gpt-5.4",
+        conversation: [
+          {
+            role: "ai",
+            id: "msg-exact-request-locks",
+            text: "Two matching tool outcomes arrived.",
+            metadata: { tool_response_pending: true },
+            tools: [
+              {
+                id: "tool-request-a",
+                name: "search_web",
+                args: { query: "otters" },
+                status: "invoked",
+                result: { status: "invoked", ok: true, data: { title: "Otters" } },
+              },
+              {
+                id: "tool-request-b",
+                name: "search_web",
+                args: { query: "otters" },
+                status: "invoked",
+                result: { status: "invoked", ok: true, data: { title: "Otters" } },
+              },
+            ],
+          },
+        ],
+        history: [{ role: "ai", text: "Two matching tool outcomes arrived." }],
+      });
+
+      const dispatchContinue = (toolId) => {
+        window.dispatchEvent(
+          new CustomEvent(TOOL_REVIEW_ACTION_EVENT, {
+            detail: {
+              action: "continue",
+              scope: "tool",
+              selectedToolId: toolId,
+              toolId,
+              messageId: "msg-exact-request-locks",
+              chainId: "msg-exact-request-locks",
+              handled: false,
+            },
+          }),
+        );
+      };
+
+      await act(async () => {
+        dispatchContinue("tool-request-a");
+        dispatchContinue("tool-request-a");
+        dispatchContinue("tool-request-b");
+        await Promise.resolve();
+      });
+
+      await waitFor(() => {
+        expect(
+          postSpy.mock.calls.filter(([url]) => url === "/api/chat/continue"),
+        ).toHaveLength(2);
+      });
+      expect(continuations.map(({ payload }) => payload.tools[0].id)).toEqual([
+        "tool-request-a",
+        "tool-request-b",
+      ]);
+
+      await act(async () => {
+        continuations.forEach(({ resolve }) => resolve());
+        await Promise.allSettled(
+          continuations.map(() => Promise.resolve()),
+        );
+      });
+    } finally {
+      postSpy.mockRestore();
+    }
+  });
+
   it("does not continue an incomplete notification-selected tool batch", async () => {
     const postSpy = vi.spyOn(axios, "post").mockResolvedValue({ data: {} });
 
@@ -892,6 +1002,8 @@ describe("Chat", () => {
         sessionId: "sess-send-mode",
         apiStatus: "online",
         apiModel: "gpt-5.4",
+        workflowProfile: "default",
+        enabledWorkflowModules: ["web-search"],
         outputTokenMode: "65536",
         customOutputTokens: 32768,
         textRagEnabled: false,
@@ -911,6 +1023,8 @@ describe("Chat", () => {
             message: "What is the capital of France?",
             mode: "api",
             model: "gpt-5.4",
+            workflow: "default",
+            modules: ["web-search"],
             max_output_tokens: 65536,
             use_rag: true,
             use_text_rag: false,
@@ -921,6 +1035,281 @@ describe("Chat", () => {
     } finally {
       postSpy.mockRestore();
       localStorage.clear();
+    }
+  });
+
+  it("starts regeneration without prior continuation attempt state", () => {
+    const cleaned = clearRegenerationContinuationMetadata({
+      status: "partial",
+      model: "gpt-5.6-sol",
+      tool_continued: true,
+      tool_continue_signature: "old-exact",
+      tool_continue_semantic_signature: "old-semantic",
+      tool_continue_signature_sha256: "old-secure",
+      tool_continuation_rounds: 12,
+      continuation_stop_reason: "tool_continuation_round_limit",
+      unresolved_tool_loop: true,
+      tool_result_continuation_pending: true,
+    });
+
+    expect(cleaned).toEqual({ status: "partial", model: "gpt-5.6-sol" });
+  });
+
+  it("acknowledges only the matching outbox pair while a later turn is queued", () => {
+    const conversation = [
+      {
+        id: "turn-a:user",
+        role: "user",
+        metadata: { client_outbox: true },
+      },
+      {
+        id: "turn-a",
+        role: "ai",
+        metadata: { status: "pending", client_outbox: true },
+      },
+      {
+        id: "turn-b:user",
+        role: "user",
+        metadata: { client_outbox: true },
+      },
+      {
+        id: "turn-b",
+        role: "ai",
+        metadata: { status: "pending", client_outbox: true },
+      },
+    ];
+
+    const acknowledged = acknowledgeClientOutboxPair(conversation, "turn-a");
+
+    expect(acknowledged[0].metadata.client_outbox).toBeUndefined();
+    expect(acknowledged[1].metadata.client_outbox).toBeUndefined();
+    expect(acknowledged[2].metadata.client_outbox).toBe(true);
+    expect(acknowledged[3].metadata.client_outbox).toBe(true);
+  });
+
+  it("does not retry an ordinary api send with its reserved message id", async () => {
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const postSpy = vi.spyOn(axios, "post").mockImplementation((url) => {
+      if (url === "/api/chat") {
+        return Promise.reject({
+          response: {
+            status: 502,
+            data: { detail: "Temporary upstream failure" },
+          },
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    try {
+      renderChat({
+        sessionId: "sess-send-no-retry",
+        apiStatus: "online",
+        apiModel: "gpt-5.4",
+      });
+
+      fireEvent.change(screen.getByRole("textbox"), {
+        target: { value: "Send this once." },
+      });
+      fireEvent.click(screen.getAllByRole("button", { name: /send message/i })[0]);
+
+      await waitFor(() => {
+        expect(screen.getAllByText("Temporary upstream failure").length).toBeGreaterThan(0);
+      });
+      expect(
+        postSpy.mock.calls.filter(([url]) => url === "/api/chat"),
+      ).toHaveLength(1);
+    } finally {
+      consoleErrorSpy.mockRestore();
+      postSpy.mockRestore();
+    }
+  });
+
+  it("keeps a server request alive when matching stream activity continues past its old deadline", async () => {
+    vi.useFakeTimers();
+    let resolveChat;
+    let requestSignal;
+    let requestMessageId;
+    const postSpy = vi.spyOn(axios, "post").mockImplementation((url, payload, config) => {
+      if (url !== "/api/chat") return Promise.resolve({ data: {} });
+      requestMessageId = payload.message_id;
+      requestSignal = config.signal;
+      return new Promise((resolve, reject) => {
+        resolveChat = resolve;
+        requestSignal.addEventListener(
+          "abort",
+          () => {
+            const error = new Error("canceled");
+            error.name = "CanceledError";
+            error.code = "ERR_CANCELED";
+            reject(error);
+          },
+          { once: true },
+        );
+      });
+    });
+    const state = {
+      conversation: [],
+      history: [],
+      sessionId: "sess-active-timeout",
+      backendMode: "server",
+      localModel: "gemma-test",
+      transformerModel: "gemma-test",
+      requestTimeoutSec: 10,
+      streamIdleTimeoutSec: 1,
+      approvalLevel: "all",
+    };
+    const setState = vi.fn();
+    const setActiveMessageId = vi.fn();
+    const renderElement = (streamActivity = null) => (
+      <GlobalContext.Provider value={{ state, setState }}>
+        <MemoryRouter>
+          <Chat
+            thoughts={[]}
+            setActiveMessageId={setActiveMessageId}
+            streamActivity={streamActivity}
+          />
+        </MemoryRouter>
+      </GlobalContext.Provider>
+    );
+
+    try {
+      const view = render(renderElement());
+      fireEvent.change(screen.getByRole("textbox"), {
+        target: { value: "Take time to reason, then answer." },
+      });
+      fireEvent.click(screen.getAllByRole("button", { name: /send message/i })[0]);
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(requestMessageId).toBeTruthy();
+      expect(requestSignal.aborted).toBe(false);
+
+      await act(async () => {
+        vi.advanceTimersByTime(20000);
+      });
+      view.rerender(
+        renderElement({
+          type: "thought",
+          message_id: requestMessageId,
+          received_at: 1,
+        }),
+      );
+      await act(async () => {
+        vi.advanceTimersByTime(20000);
+      });
+      view.rerender(
+        renderElement({
+          type: "content",
+          chain_id: requestMessageId,
+          received_at: 2,
+        }),
+      );
+      await act(async () => {
+        vi.advanceTimersByTime(20000);
+      });
+      view.rerender(
+        renderElement({
+          type: "tool",
+          message_id: requestMessageId,
+          received_at: 3,
+        }),
+      );
+      await act(async () => {
+        vi.advanceTimersByTime(10000);
+      });
+
+      expect(requestSignal.aborted).toBe(false);
+      await act(async () => {
+        resolveChat({ data: { message: "Finished", metadata: {}, tools_used: [] } });
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(requestSignal.aborted).toBe(false);
+    } finally {
+      postSpy.mockRestore();
+    }
+  });
+
+  it("times out after true inactivity and ignores activity from another message", async () => {
+    vi.useFakeTimers();
+    let requestSignal;
+    let requestMessageId;
+    const postSpy = vi.spyOn(axios, "post").mockImplementation((url, payload, config) => {
+      if (url !== "/api/chat") return Promise.resolve({ data: {} });
+      requestMessageId = payload.message_id;
+      requestSignal = config.signal;
+      return new Promise((_resolve, reject) => {
+        requestSignal.addEventListener(
+          "abort",
+          () => {
+            const error = new Error("canceled");
+            error.name = "CanceledError";
+            error.code = "ERR_CANCELED";
+            reject(error);
+          },
+          { once: true },
+        );
+      });
+    });
+    const state = {
+      conversation: [],
+      history: [],
+      sessionId: "sess-inactive-timeout",
+      backendMode: "server",
+      localModel: "gemma-test",
+      transformerModel: "gemma-test",
+      requestTimeoutSec: 10,
+      streamIdleTimeoutSec: 1,
+      approvalLevel: "all",
+    };
+    const setState = vi.fn();
+    const renderElement = (streamActivity = null) => (
+      <GlobalContext.Provider value={{ state, setState }}>
+        <MemoryRouter>
+          <Chat
+            thoughts={[]}
+            setActiveMessageId={() => {}}
+            streamActivity={streamActivity}
+          />
+        </MemoryRouter>
+      </GlobalContext.Provider>
+    );
+
+    try {
+      const view = render(renderElement());
+      fireEvent.change(screen.getByRole("textbox"), {
+        target: { value: "Wait without producing anything." },
+      });
+      fireEvent.click(screen.getAllByRole("button", { name: /send message/i })[0]);
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(requestMessageId).toBeTruthy();
+
+      await act(async () => {
+        vi.advanceTimersByTime(20000);
+      });
+      view.rerender(
+        renderElement({
+          type: "thought",
+          message_id: "msg-from-another-request",
+          received_at: 1,
+        }),
+      );
+      await act(async () => {
+        vi.advanceTimersByTime(4000);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(requestSignal.aborted).toBe(true);
+      expect(requestSignal.reason).toBe("timeout");
+      expect(
+        screen.getAllByText(/stopped waiting after 24s without response activity/i),
+      ).toHaveLength(2);
+    } finally {
+      postSpy.mockRestore();
     }
   });
 
@@ -1282,7 +1671,7 @@ describe("Chat", () => {
     }
   });
 
-  it("regenerates against the original turn backend target instead of the current picker", () => {
+  it("regenerates against the current picker instead of the original turn target", () => {
     const target = resolveRegenerateRequestTarget(
       {
         backendMode: "api",
@@ -1302,8 +1691,8 @@ describe("Chat", () => {
     );
 
     expect(target).toEqual({
-      mode: "local",
-      model: "google/gemma-3-270m",
+      mode: "api",
+      model: "gpt-5",
     });
   });
 
@@ -1328,7 +1717,7 @@ describe("Chat", () => {
             id: "assistant-1",
             text: "Original answer",
             timestamp: "2024-01-01T00:00:01Z",
-            metadata: { mode: "api", model: "gpt-5.4" },
+            metadata: { mode: "api", model: "gpt-4.1" },
           },
         ],
         history: [
@@ -1348,6 +1737,7 @@ describe("Chat", () => {
             mode: "api",
             model: "gpt-5.4",
             message_id: "assistant-1",
+            regenerate: true,
           }),
         );
       });
@@ -1357,7 +1747,58 @@ describe("Chat", () => {
     }
   });
 
-  it("clears the previous assistant response as soon as regenerate starts", async () => {
+  it.each(["local", "server"])(
+    "marks %s regeneration as an intentional replacement",
+    async (backendMode) => {
+      const postSpy = vi.spyOn(axios, "post").mockImplementation((url) => {
+        if (url === "/api/chat") {
+          return Promise.resolve({
+            data: { message: "Updated answer", metadata: {}, tools_used: [] },
+          });
+        }
+        return Promise.resolve({ data: {} });
+      });
+
+      try {
+        renderChat({
+          sessionId: `sess-regenerate-${backendMode}`,
+          backendMode,
+          localModel: "gemma-local",
+          transformerModel: "gemma-server",
+          conversation: [
+            { role: "user", text: "Tell me a fact.", timestamp: "2024-01-01T00:00:00Z" },
+            {
+              role: "ai",
+              id: "assistant-1",
+              text: "Original answer",
+              timestamp: "2024-01-01T00:00:01Z",
+            },
+          ],
+          history: [
+            { role: "user", text: "Tell me a fact." },
+            { role: "ai", text: "Original answer" },
+          ],
+        });
+
+        fireEvent.click(screen.getByLabelText("Regenerate response"));
+
+        await waitFor(() => {
+          const chatCall = postSpy.mock.calls.find(([url]) => url === "/api/chat");
+          expect(chatCall?.[1]).toEqual(
+            expect.objectContaining({
+              message_id: "assistant-1",
+              mode: backendMode,
+              regenerate: true,
+            }),
+          );
+        });
+      } finally {
+        postSpy.mockRestore();
+      }
+    },
+  );
+
+  it("visually clears regeneration without mutating the saved turn before success", async () => {
     let resolveChat;
     const chatPromise = new Promise((resolve) => {
       resolveChat = resolve;
@@ -1426,18 +1867,14 @@ describe("Chat", () => {
         return typeof update === "function" ? update(current) : current;
       }, startingState);
       expect(intermediateState.conversation[1]).toMatchObject({
-        text: "",
-        content: "",
-        thoughts: [],
-        tools: [],
-        ragMatches: [],
+        text: "Original answer",
+        content: "Original answer",
+        thoughts: ["old thought"],
+        tools: [expect.objectContaining({ id: "tool-1" })],
+        ragMatches: [{ title: "old match" }],
         metadata: expect.objectContaining({
-          status: "regenerating",
-          tool_response_pending: false,
-          tool_continued: false,
-          tool_continuation_phases: [],
-          tool_continuation_text: "",
-          tool_prelude_text: "",
+          tool_response_pending: true,
+          tool_continuation_phases: [{ text: "Old continuation output" }],
         }),
       });
 
@@ -1445,9 +1882,291 @@ describe("Chat", () => {
         resolveChat({ data: { message: "Updated answer", metadata: {}, tools_used: [] } });
         await chatPromise;
       });
+
+      const completedState = setState.mock.calls.reduce((current, [update]) => {
+        return typeof update === "function" ? update(current) : current;
+      }, startingState);
+      expect(completedState.conversation[1]).toMatchObject({
+        text: "Updated answer",
+        content: "Updated answer",
+        thoughts: [],
+        tools: [],
+        ragMatches: [],
+        metadata: expect.objectContaining({
+          status: "complete",
+          tool_response_pending: false,
+          tool_continuation_phases: [],
+        }),
+      });
     } finally {
       postSpy.mockRestore();
       localStorage.clear();
+    }
+  });
+
+  it.each([
+    "Message id already exists. Retry the turn with a new message id.",
+    "Only the latest saved user and assistant turn can be regenerated. Reload the conversation before retrying.",
+  ])("keeps the previous answer and explains an unsafe regenerate replacement", async (detail) => {
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const postSpy = vi.spyOn(axios, "post").mockImplementation((url) => {
+      if (url === "/api/chat") {
+        return Promise.reject({
+          response: {
+            status: 409,
+            data: { detail },
+          },
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    const initialState = {
+      sessionId: "sess-regenerate-conflict",
+      apiModel: "gpt-5.4",
+      conversation: [
+        {
+          id: "assistant-conflict:user",
+          role: "user",
+          text: "Tell me a fact.",
+          timestamp: "2024-01-01T00:00:00Z",
+        },
+        {
+          role: "ai",
+          id: "assistant-conflict",
+          text: "Original answer",
+          content: "Original answer",
+          timestamp: "2024-01-01T00:00:01Z",
+        },
+      ],
+      history: [
+        { role: "user", text: "Tell me a fact." },
+        { role: "ai", text: "Original answer" },
+      ],
+    };
+    const { setState } = renderChat(initialState);
+
+    try {
+      fireEvent.click(screen.getByLabelText("Regenerate response"));
+
+      expect(
+        await screen.findByText(/previous answer was kept/i),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/Check API key and endpoint/i)).not.toBeInTheDocument();
+      expect(screen.getByText("Original answer")).toBeInTheDocument();
+
+      const restoredState = setState.mock.calls.reduce((current, [update]) => {
+        return typeof update === "function" ? update(current) : current;
+      }, {
+        conversation: [],
+        history: [],
+        backendMode: "api",
+        approvalLevel: "all",
+        ...initialState,
+      });
+      expect(restoredState.conversation).toEqual(initialState.conversation);
+    } finally {
+      consoleErrorSpy.mockRestore();
+      postSpy.mockRestore();
+    }
+  });
+
+  it("keeps the previous answer when regeneration returns reasoning without a final answer", async () => {
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const postSpy = vi.spyOn(axios, "post").mockImplementation((url) => {
+      if (url === "/api/chat") {
+        return Promise.resolve({
+          data: {
+            message:
+              "The model returned reasoning but no final answer. Try regenerate, switch models, or disable reasoning.",
+            thought: "The provider returned internal reasoning only.",
+            metadata: {
+              status: "error",
+              category: "empty_response",
+              empty_response: true,
+              empty_response_reason: "thought_only",
+            },
+            tools_used: [],
+          },
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    const initialState = {
+      sessionId: "sess-regenerate-thought-only",
+      apiModel: "gpt-5.6-sol",
+      conversation: [
+        {
+          id: "assistant-thought-only:user",
+          role: "user",
+          text: "Finish the answer.",
+        },
+        {
+          id: "assistant-thought-only",
+          role: "ai",
+          text: "Original answer",
+          content: "Original answer",
+        },
+      ],
+      history: [
+        { role: "user", text: "Finish the answer." },
+        { role: "ai", text: "Original answer" },
+      ],
+    };
+    const { setState } = renderChat(initialState);
+
+    try {
+      fireEvent.click(screen.getByLabelText("Regenerate response"));
+
+      expect(
+        await screen.findByText(/previous answer was kept/i),
+      ).toBeInTheDocument();
+      expect(screen.getByText("Original answer")).toBeInTheDocument();
+      const restoredState = setState.mock.calls.reduce((current, [update]) => {
+        return typeof update === "function" ? update(current) : current;
+      }, {
+        conversation: [],
+        history: [],
+        backendMode: "api",
+        approvalLevel: "all",
+        ...initialState,
+      });
+      expect(restoredState.conversation).toEqual(initialState.conversation);
+    } finally {
+      consoleErrorSpy.mockRestore();
+      postSpy.mockRestore();
+    }
+  });
+
+  it("keeps the previous answer when API regeneration returns provider failure metadata", async () => {
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const postSpy = vi.spyOn(axios, "post").mockImplementation((url) => {
+      if (url === "/api/chat") {
+        return Promise.resolve({
+          data: {
+            message: "The model provider timed out before returning a response.",
+            metadata: {
+              status: "error",
+              error: "Read timed out",
+              category: "timeout",
+              hint: "Provider needs longer.",
+            },
+            tools_used: [],
+          },
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    const initialState = {
+      sessionId: "sess-regenerate-provider-error",
+      apiModel: "gpt-5.6-sol",
+      conversation: [
+        {
+          id: "assistant-provider-error:user",
+          role: "user",
+          text: "Continue after recall.",
+        },
+        {
+          id: "assistant-provider-error",
+          role: "ai",
+          text: "Original answer",
+          content: "Original answer",
+        },
+      ],
+      history: [
+        { role: "user", text: "Continue after recall." },
+        { role: "ai", text: "Original answer" },
+      ],
+    };
+    const { setState } = renderChat(initialState);
+
+    try {
+      fireEvent.click(screen.getByLabelText("Regenerate response"));
+
+      expect(await screen.findByText("Provider needs longer.")).toBeInTheDocument();
+      expect(screen.getByText("Original answer")).toBeInTheDocument();
+      const restoredState = setState.mock.calls.reduce((current, [update]) => {
+        return typeof update === "function" ? update(current) : current;
+      }, {
+        conversation: [],
+        history: [],
+        backendMode: "api",
+        approvalLevel: "all",
+        ...initialState,
+      });
+      expect(restoredState.conversation).toEqual(initialState.conversation);
+    } finally {
+      consoleErrorSpy.mockRestore();
+      postSpy.mockRestore();
+    }
+  });
+
+  it("clears a generic regenerate conflict after the next attempt succeeds", async () => {
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    let chatAttempts = 0;
+    const postSpy = vi.spyOn(axios, "post").mockImplementation((url) => {
+      if (url === "/api/chat") {
+        chatAttempts += 1;
+        if (chatAttempts === 1) {
+          return Promise.reject({
+            response: { status: 409, data: { detail: "Conflict" } },
+          });
+        }
+        return Promise.resolve({
+          data: { message: "Updated answer", metadata: {}, tools_used: [] },
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    try {
+      const initialState = {
+        sessionId: "sess-regenerate-recovery",
+        apiModel: "gpt-5.6-sol",
+        conversation: [
+          { id: "assistant-recovery:user", role: "user", text: "Try again." },
+          {
+            id: "assistant-recovery",
+            role: "ai",
+            text: "Original answer",
+            content: "Original answer",
+          },
+        ],
+        history: [
+          { role: "user", text: "Try again." },
+          { role: "ai", text: "Original answer" },
+        ],
+      };
+      const { setState } = renderChat(initialState);
+
+      fireEvent.click(screen.getByLabelText("Regenerate response"));
+      expect(
+        await screen.findByText(/previous answer was kept/i),
+      ).toBeInTheDocument();
+
+      const regenerateButton = screen.getByLabelText("Regenerate response");
+      await waitFor(() => expect(regenerateButton).not.toBeDisabled());
+      fireEvent.click(regenerateButton);
+      await waitFor(() => {
+        expect(screen.queryByText(/previous answer was kept/i)).not.toBeInTheDocument();
+        expect(screen.queryByText("Conflict")).not.toBeInTheDocument();
+        expect(chatAttempts).toBe(2);
+      });
+      const completedState = setState.mock.calls.reduce((current, [update]) => {
+        return typeof update === "function" ? update(current) : current;
+      }, {
+        conversation: [],
+        history: [],
+        backendMode: "api",
+        approvalLevel: "all",
+        ...initialState,
+      });
+      expect(completedState.conversation[1]).toMatchObject({
+        text: "Updated answer",
+        content: "Updated answer",
+      });
+    } finally {
+      consoleErrorSpy.mockRestore();
+      postSpy.mockRestore();
     }
   });
 
@@ -1489,6 +2208,98 @@ describe("Chat", () => {
 
     expect(getByRole("button", { name: /capture from camera/i })).toBeInTheDocument();
     expect(getByRole("button", { name: /capture from desktop/i })).toBeInTheDocument();
+  });
+
+  it("shows one stop control while a response is streaming", async () => {
+    const postSpy = vi.spyOn(axios, "post").mockImplementation((url, _payload, config) => {
+      if (url !== "/api/chat") return Promise.resolve({ data: {} });
+      return new Promise((_resolve, reject) => {
+        config?.signal?.addEventListener("abort", () => {
+          const error = new Error("canceled");
+          error.name = "CanceledError";
+          error.code = "ERR_CANCELED";
+          reject(error);
+        }, { once: true });
+      });
+    });
+
+    try {
+      renderChat({ sessionId: "sess-single-stop", apiStatus: "online", apiModel: "gpt-5.4" });
+      fireEvent.change(screen.getByRole("textbox"), {
+        target: { value: "Keep this response pending." },
+      });
+      fireEvent.click(screen.getAllByRole("button", { name: /send message/i })[0]);
+
+      await waitFor(() => {
+        expect(screen.getAllByRole("button", { name: "Stop generation" })).toHaveLength(1);
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Stop generation" }));
+    } finally {
+      postSpy.mockRestore();
+    }
+  });
+
+  it("keeps a closed composer closed while the pointer explores its opener", async () => {
+    renderChat({ sessionId: "sess-hover-closed-composer", apiStatus: "online" });
+    fireEvent.click(screen.getByRole("button", { name: /close chat input/i }));
+    const openButton = await screen.findByRole("button", { name: /open chat input/i });
+    vi.useFakeTimers();
+
+    fireEvent.mouseEnter(openButton);
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+
+    expect(openButton).toBeInTheDocument();
+    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+  });
+
+  it("portals the attachment menu above the composer and restores focus on dismiss", async () => {
+    renderChat({
+      sessionId: "sess-attachment-overlay",
+      apiStatus: "online",
+    });
+
+    const trigger = screen.getAllByRole("button", { name: /open attachments/i })[0];
+    fireEvent.click(trigger);
+
+    const menu = await screen.findByRole("toolbar", { name: /attachment actions/i });
+    expect(menu.parentElement).toBe(document.body);
+    expect(document.querySelector(".input-box .attach-popover")).toBeNull();
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    await waitFor(() => expect(menu.style.position).toBe("fixed"));
+    expect(menu.style.zIndex).toBe("3610");
+
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("toolbar", { name: /attachment actions/i }),
+      ).not.toBeInTheDocument();
+    });
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+    await waitFor(() => expect(trigger).toHaveFocus());
+  });
+
+  it("shows one error notice after the composer is closed", async () => {
+    renderChat({
+      sessionId: "sess-closed-composer-error",
+      apiStatus: "online",
+    });
+
+    const fileInput = document.querySelector('.input-box input[type="file"]');
+    const unsupported = new File(["bytes"], "sample.bin", {
+      type: "application/octet-stream",
+    });
+    fireEvent.change(fileInput, { target: { files: [unsupported] } });
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Unsupported file type");
+    fireEvent.click(screen.getByRole("button", { name: /close chat input/i }));
+
+    await waitFor(() => {
+      expect(screen.queryByLabelText("Composer notices")).not.toBeInTheDocument();
+    });
+    expect(screen.getAllByText("Unsupported file type")).toHaveLength(1);
   });
 
   it("surfaces microphone STT and volume TTS controls in chat settings", async () => {
@@ -1770,7 +2581,7 @@ describe("Chat", () => {
     }
   });
 
-  it("loads dynamic workflow profiles and keeps their ids when selected", async () => {
+  it("loads dynamic foreground workflows and hides system-only profiles", async () => {
     const getSpy = vi.spyOn(axios, "get").mockResolvedValue({
       data: {
         workflows: [
@@ -1780,9 +2591,19 @@ describe("Chat", () => {
             description: "Balanced response profile.",
           },
           {
+            id: "research_review",
+            label: "Research Review",
+            description: "Review evidence before responding.",
+            profile_kind: "foreground",
+            selectable_in_chat: true,
+          },
+          {
             id: "background_reflection",
             label: "Background Reflection",
             description: "Reflect after the active response.",
+            profile_kind: "system",
+            selectable_in_chat: false,
+            selectable_as_default: false,
           },
         ],
       },
@@ -1796,16 +2617,45 @@ describe("Chat", () => {
       fireEvent.click(screen.getAllByRole("button", { name: /chat settings/i })[0]);
       const dialog = await screen.findByRole("dialog", { name: /chat settings/i });
       fireEvent.click(within(dialog).getByRole("tab", { name: /workflow/i }));
-      const select = await within(dialog).findByLabelText(/active workflow profile/i);
+      const select = await within(dialog).findByLabelText(/workflow for new turns/i);
 
       expect(
-        within(select).getByRole("option", { name: "Background Reflection" }),
+        within(select).getByRole("option", { name: "Research Review" }),
       ).toBeInTheDocument();
-      fireEvent.change(select, { target: { value: "background_reflection" } });
+      expect(
+        within(select).queryByRole("option", { name: "Background Reflection" }),
+      ).not.toBeInTheDocument();
+      expect(within(dialog).getByText(/do not launch workers/i)).toBeInTheDocument();
+      fireEvent.change(select, { target: { value: "research_review" } });
       const stateUpdater = setState.mock.calls.at(-1)[0];
       expect(stateUpdater({ workflowProfile: "default" })).toEqual({
-        workflowProfile: "background_reflection",
+        workflowProfile: "research_review",
       });
+    } finally {
+      getSpy.mockRestore();
+    }
+  });
+
+  it("keeps a saved workflow when the catalog request fails", async () => {
+    const getSpy = vi.spyOn(axios, "get").mockRejectedValue(new Error("offline"));
+    try {
+      const { setState } = renderChat({
+        sessionId: "sess-chat-workflow-offline",
+        apiStatus: "online",
+        workflowProfile: "custom_review",
+      });
+
+      fireEvent.click(screen.getAllByRole("button", { name: /chat settings/i })[0]);
+      const dialog = await screen.findByRole("dialog", { name: /chat settings/i });
+      fireEvent.click(within(dialog).getByRole("tab", { name: /workflow/i }));
+      const select = await within(dialog).findByLabelText(/workflow for new turns/i);
+
+      await waitFor(() => expect(getSpy).toHaveBeenCalledWith("/api/workflows/catalog"));
+      expect(select).toHaveValue("custom_review");
+      expect(
+        within(select).getByRole("option", { name: "custom_review" }),
+      ).toBeInTheDocument();
+      expect(setState).not.toHaveBeenCalled();
     } finally {
       getSpy.mockRestore();
     }
@@ -2098,6 +2948,94 @@ describe("Chat", () => {
     expect(result).toHaveTextContent("Otter result");
     expect(result).not.toHaveTextContent('"status": "ok"');
     expect(onOpenConsole).not.toHaveBeenCalled();
+  });
+
+  it("keeps routine tool receipts concise until the unselected step is expanded", async () => {
+    const setActiveMessageId = vi.fn();
+    renderChat(
+      {
+        sessionId: "sess-tool-compact",
+        toolDisplayMode: "inline",
+        conversation: [
+          {
+            role: "ai",
+            id: "ai-tool-compact",
+            text: "Recall found a food note.",
+            timestamp: "2024-01-01T00:00:01Z",
+            tools: [
+              {
+                id: "tool-compact-1",
+                name: "recall",
+                args: { key: "food" },
+                status: "invoked",
+                result: {
+                  status: "invoked",
+                  ok: true,
+                  data: { message: "Found one food note." },
+                },
+              },
+            ],
+          },
+        ],
+        history: [{ role: "ai", text: "Recall found a food note." }],
+      },
+      {
+        activeMessageId: "another-message",
+        setActiveMessageId,
+      },
+    );
+
+    fireEvent.click(screen.getByText("show tools (1)"));
+
+    const card = getFirstInlineToolCard();
+    expect(card).toHaveClass("summary-only");
+    expect(screen.getByText("Found one food note.")).toBeInTheDocument();
+    expect(screen.queryByText(/^done$/i)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Explain recall state")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Tool result")).not.toBeInTheDocument();
+
+    openFirstInlineToolCard();
+
+    await waitFor(() => expect(card).toHaveAttribute("open"));
+    await waitFor(() => expect(card).not.toHaveClass("summary-only"));
+    expect(screen.getByText(/^done$/i)).toBeInTheDocument();
+    expect(screen.getByLabelText("Explain recall state")).toBeInTheDocument();
+    expect(screen.getByLabelText("Tool result")).toHaveTextContent("Found one food note.");
+    expect(setActiveMessageId).toHaveBeenCalledWith("ai-tool-compact");
+  });
+
+  it("keeps scheduled tool state visible on an unselected step", () => {
+    renderChat(
+      {
+        sessionId: "sess-tool-scheduled",
+        toolDisplayMode: "inline",
+        conversation: [
+          {
+            role: "ai",
+            id: "ai-tool-scheduled",
+            text: "Scheduled a future reminder.",
+            timestamp: "2024-01-01T00:00:01Z",
+            tools: [
+              {
+                id: "tool-scheduled-1",
+                name: "calendar_create",
+                args: { title: "Future reminder" },
+                status: "scheduled",
+                result: { scheduled_event_id: "event-1" },
+              },
+            ],
+          },
+        ],
+        history: [{ role: "ai", text: "Scheduled a future reminder." }],
+      },
+      { activeMessageId: "another-message" },
+    );
+
+    fireEvent.click(screen.getByText("show tools (1)"));
+
+    const card = getFirstInlineToolCard();
+    expect(card).not.toHaveClass("summary-only");
+    expect(screen.getByText(/^scheduled$/i)).toBeInTheDocument();
   });
 
   it("keeps inline tool cards visible in both mode", async () => {
@@ -2735,6 +3673,59 @@ describe("Chat", () => {
                 result: expect.objectContaining({ ok: true }),
               }),
             ],
+          }),
+        );
+      });
+    } finally {
+      postSpy.mockRestore();
+    }
+  });
+
+  it("auto-continues a terminal tool-only HTTP response without a socket event", async () => {
+    const postSpy = vi.spyOn(axios, "post").mockImplementation((url) => {
+      if (url === "/api/chat/continue") {
+        return Promise.resolve({
+          data: { message: "I saved the photo reference.", metadata: {}, tools_used: [] },
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    try {
+      renderChat({
+        sessionId: "sess-terminal-tools",
+        apiModel: "gpt-5.6-sol",
+        conversation: [
+          {
+            role: "ai",
+            id: "terminal-1",
+            text: "Tool results:\n- remember: invoked",
+            tools: [
+              {
+                id: "remember-1",
+                name: "remember",
+                args: { key: "photo.owl", value: "saved image reference" },
+                status: "invoked",
+                result: { status: "invoked", ok: true },
+              },
+            ],
+            metadata: {
+              status: "pending",
+              tool_response_pending: true,
+              tool_result_continuation_pending: true,
+            },
+          },
+        ],
+        history: [],
+      });
+
+      await waitFor(() => {
+        expect(postSpy).toHaveBeenCalledWith(
+          "/api/chat/continue",
+          expect.objectContaining({
+            session_id: "sess-terminal-tools",
+            message_id: "terminal-1",
+            tools: [expect.objectContaining({ name: "remember", status: "invoked" })],
           }),
         );
       });

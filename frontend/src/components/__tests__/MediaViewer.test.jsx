@@ -1,11 +1,12 @@
-import React from "react";
+import React, { createRef } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import "@testing-library/jest-dom/vitest";
 
 const axiosMocks = vi.hoisted(() => ({
   get: vi.fn(),
+  post: vi.fn(),
   put: vi.fn(),
   delete: vi.fn(),
 }));
@@ -14,6 +15,7 @@ vi.mock("axios", () => ({
   __esModule: true,
   default: axiosMocks,
   get: axiosMocks.get,
+  post: axiosMocks.post,
   put: axiosMocks.put,
   delete: axiosMocks.delete,
 }));
@@ -22,15 +24,18 @@ import MediaViewer, {
   buildMediaProvenanceRows,
   buildMediaStateInspectorRows,
 } from "../MediaViewer";
+import { captionGenerationErrorMessage } from "../../utils/mediaCaption";
 
 describe("MediaViewer caption display", () => {
   beforeEach(() => {
     axiosMocks.get.mockReset();
+    axiosMocks.post.mockReset();
     axiosMocks.put.mockReset();
     axiosMocks.delete.mockReset();
     axiosMocks.put.mockResolvedValue({ data: {} });
     axiosMocks.delete.mockResolvedValue({ data: {} });
     axiosMocks.get.mockResolvedValue({ data: {} });
+    axiosMocks.post.mockResolvedValue({ data: {} });
   });
 
   it("shows the readable caption with compact status badges", async () => {
@@ -73,7 +78,7 @@ describe("MediaViewer caption display", () => {
     await waitFor(() =>
       expect(screen.getByText("A small orange dog stands at the top of a wooden stair landing.")).toBeInTheDocument(),
     );
-    expect(screen.getByText("generated")).toBeInTheDocument();
+    expect(screen.getByText("auto caption")).toBeInTheDocument();
     expect(screen.queryByText(/caption: generated/i)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /open in viewer/i })).toBeInTheDocument();
     expect(screen.getByText(/223 KB/)).toBeInTheDocument();
@@ -129,5 +134,255 @@ describe("MediaViewer caption display", () => {
     expect(rows.find((row) => row.label === "Source")?.value).toBe("upload");
     expect(rows.find((row) => row.label === "Evidence")?.value).toBe("hash abcdef123456");
     expect(rows.find((row) => row.label === "Next")?.value).toMatch(/warnings/i);
+  });
+
+  it("does not call a generic or unsaved URL a Float retrieval copy", () => {
+    const rows = buildMediaProvenanceRows(
+      {
+        sourceUrl: "https://example.com/source-page",
+        retrievalUrl: "blob:http://localhost/preview-id",
+      },
+      {},
+    );
+
+    expect(rows.find((row) => row.label === "Recorded source")).toBeTruthy();
+    expect(rows.find((row) => row.label === "Float retrieval")).toBeUndefined();
+  });
+
+  it.each([
+    ["Manual captions are protected; remove it explicitly first", /written manually/i],
+    ["Caption generation is disabled", /captioning is off/i],
+    ["The configured caption engine is not ready", /engine is not ready/i],
+    ["Caption state conflict", /saved caption state changed/i],
+  ])("maps caption conflict details to an actionable message: %s", (detail, expected) => {
+    expect(
+      captionGenerationErrorMessage({
+        response: { status: 409, data: { detail } },
+      }),
+    ).toMatch(expected);
+  });
+
+  it("renders one caption-unavailable control while keeping CLIP state separate", async () => {
+    axiosMocks.get.mockResolvedValueOnce({
+      data: {
+        caption: "Image attachment without generated caption.",
+        caption_status: "placeholder",
+        placeholder_caption: true,
+        index_status: "indexed",
+      },
+    });
+
+    render(
+      <MemoryRouter>
+        <MediaViewer
+          src="/api/attachments/hash-2/photo.png"
+          alt="photo.png"
+          contextItems={[
+            {
+              src: "/api/attachments/hash-2/photo.png",
+              alt: "photo.png",
+              contentHash: "hash-2",
+              caption: "Image attachment without generated caption.",
+              captionStatus: "placeholder",
+              placeholderCaption: true,
+              indexStatus: "indexed",
+              sourceUrl: "https://example.com/photo-page",
+              sourceUrlRecordedAt: "2026-07-29T18:00:00Z",
+              retrievalUrl: "/api/attachments/hash-2/photo.png",
+            },
+          ]}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /open media viewer/i }));
+
+    const unavailable = await screen.findByRole("button", {
+      name: /caption unavailable.*clip image retrieval is indexed separately/i,
+    });
+    expect(screen.getAllByText("caption unavailable")).toHaveLength(1);
+    expect(screen.queryByText(/^placeholder$/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "example.com" })).toHaveAttribute(
+      "href",
+      "https://example.com/photo-page",
+    );
+    expect(screen.getByRole("link", { name: /current api copy/i })).toHaveAttribute(
+      "href",
+      "/api/attachments/hash-2/photo.png",
+    );
+
+    fireEvent.mouseOver(unavailable);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      /CLIP image retrieval is indexed separately/i,
+    );
+  });
+
+  it("opens the manual editor from a gallery ref and retries one stored image", async () => {
+    const viewerRef = createRef();
+    const onAttachmentChange = vi.fn();
+    axiosMocks.get.mockResolvedValueOnce({
+      data: {
+        caption: "Placeholder",
+        caption_status: "placeholder",
+        placeholder_caption: true,
+        index_status: "indexed",
+      },
+    });
+    axiosMocks.post.mockResolvedValueOnce({
+      data: {
+        status: "generated",
+        attachment: {
+          content_hash: "hash-3",
+          filename: "owl.png",
+          caption: "A barred owl sits beside a wooded ravine.",
+          caption_status: "generated",
+          placeholder_caption: false,
+          index_status: "indexed",
+        },
+      },
+    });
+
+    render(
+      <MemoryRouter>
+        <MediaViewer
+          ref={viewerRef}
+          src="/api/attachments/hash-3/owl.png"
+          alt="owl.png"
+          contextItems={[
+            {
+              src: "/api/attachments/hash-3/owl.png",
+              alt: "owl.png",
+              contentHash: "hash-3",
+              captionStatus: "placeholder",
+              placeholderCaption: true,
+              indexStatus: "indexed",
+            },
+          ]}
+          onAttachmentChange={onAttachmentChange}
+        />
+      </MemoryRouter>,
+    );
+
+    act(() => viewerRef.current.editCaption());
+    expect(await screen.findByRole("textbox", { name: /image caption/i })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /retry automatic caption/i }));
+
+    await waitFor(() => {
+      expect(axiosMocks.post).toHaveBeenCalledWith(
+        "/api/attachments/caption/hash-3/generate",
+        { replace_generated: false },
+      );
+    });
+    expect(await screen.findByDisplayValue(/barred owl/i)).toBeInTheDocument();
+    expect(onAttachmentChange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        content_hash: "hash-3",
+        caption_status: "generated",
+      }),
+    );
+    expect(screen.getByText(/Removing a caption keeps the original file/i)).toBeInTheDocument();
+  });
+
+  it("clears the prior caption before loading another carousel item", async () => {
+    axiosMocks.get
+      .mockResolvedValueOnce({
+        data: {
+          caption: "First image caption.",
+          caption_status: "manual",
+          caption_model: "manual-caption",
+        },
+      })
+      .mockImplementationOnce(() => new Promise(() => {}));
+
+    render(
+      <MemoryRouter>
+        <MediaViewer
+          src="/api/attachments/hash-a/first.png"
+          alt="first.png"
+          contextItems={[
+            {
+              src: "/api/attachments/hash-a/first.png",
+              alt: "first.png",
+              contentHash: "hash-a",
+              caption: "First image caption.",
+              captionStatus: "manual",
+            },
+            {
+              src: "/api/attachments/hash-b/second.png",
+              alt: "second.png",
+              contentHash: "hash-b",
+              caption: "",
+              captionStatus: "missing",
+            },
+          ]}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /open media viewer/i }));
+    expect(await screen.findByText("First image caption.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /edit caption/i }));
+    expect(screen.getByRole("textbox", { name: /image caption/i })).toHaveValue(
+      "First image caption.",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /next media/i }));
+
+    await waitFor(() => {
+      expect(screen.queryByText("First image caption.")).not.toBeInTheDocument();
+      expect(screen.getByRole("textbox", { name: /image caption/i })).toHaveValue("");
+      expect(screen.getByRole("button", { name: /^save$/i })).toBeDisabled();
+    });
+  });
+
+  it("explicitly replaces an existing generated caption when regenerated", async () => {
+    axiosMocks.get.mockResolvedValueOnce({
+      data: {
+        caption: "An inaccurate generated caption.",
+        caption_status: "generated",
+        caption_model: "local-captioner",
+      },
+    });
+    axiosMocks.post.mockResolvedValueOnce({
+      data: {
+        status: "generated",
+        attachment: {
+          content_hash: "hash-generated",
+          caption: "A corrected generated caption.",
+          caption_status: "generated",
+        },
+      },
+    });
+
+    render(
+      <MemoryRouter>
+        <MediaViewer
+          src="/api/attachments/hash-generated/image.png"
+          alt="image.png"
+          contextItems={[
+            {
+              src: "/api/attachments/hash-generated/image.png",
+              alt: "image.png",
+              contentHash: "hash-generated",
+              caption: "An inaccurate generated caption.",
+              captionStatus: "generated",
+            },
+          ]}
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /open media viewer/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /edit caption/i }));
+    fireEvent.click(screen.getByRole("button", { name: /regenerate automatic caption/i }));
+
+    await waitFor(() => {
+      expect(axiosMocks.post).toHaveBeenCalledWith(
+        "/api/attachments/caption/hash-generated/generate",
+        { replace_generated: true },
+      );
+    });
+    expect(await screen.findByDisplayValue("A corrected generated caption."))
+      .toBeInTheDocument();
   });
 });

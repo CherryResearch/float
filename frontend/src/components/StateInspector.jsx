@@ -1,4 +1,5 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import "../styles/StateInspector.css";
 
 const stringifyValue = (value) => {
@@ -40,9 +41,13 @@ const StateInspector = ({
   label = "?",
   className = "",
   ariaLabel,
+  placement = "bottom",
 }) => {
   const [open, setOpen] = useState(false);
+  const [panelPosition, setPanelPosition] = useState(null);
   const rootRef = useRef(null);
+  const buttonRef = useRef(null);
+  const panelRef = useRef(null);
   const normalizedRows = useMemo(() => normalizeStateInspectorRows(rows), [rows]);
   const tooltip = useMemo(
     () => buildStateInspectorTitle({ title, summary, rows: normalizedRows }),
@@ -52,9 +57,8 @@ const StateInspector = ({
   useEffect(() => {
     if (!open) return undefined;
     const handlePointerDown = (event) => {
-      if (rootRef.current && !rootRef.current.contains(event.target)) {
-        setOpen(false);
-      }
+      if (rootRef.current?.contains(event.target) || panelRef.current?.contains(event.target)) return;
+      setOpen(false);
     };
     const handleKeyDown = (event) => {
       if (event.key === "Escape") setOpen(false);
@@ -67,6 +71,43 @@ const StateInspector = ({
     };
   }, [open]);
 
+  useLayoutEffect(() => {
+    if (!open || typeof window === "undefined") return undefined;
+    const updatePosition = () => {
+      const button = buttonRef.current;
+      const panel = panelRef.current;
+      if (!button || !panel) return;
+      const buttonRect = button.getBoundingClientRect();
+      const panelRect = panel.getBoundingClientRect();
+      const viewportWidth = document.documentElement.clientWidth || window.innerWidth;
+      const viewportHeight = document.documentElement.clientHeight || window.innerHeight;
+      const edge = 8;
+      const gap = 6;
+      const panelWidth = Math.min(panelRect.width || 320, Math.max(0, viewportWidth - edge * 2));
+      const panelHeight = panelRect.height || 0;
+      const maxLeft = Math.max(edge, viewportWidth - panelWidth - edge);
+      const left = Math.min(maxLeft, Math.max(edge, buttonRect.right - panelWidth));
+      const belowTop = buttonRect.bottom + gap;
+      const aboveTop = buttonRect.top - panelHeight - gap;
+      const preferTop = placement === "top";
+      let top = preferTop ? aboveTop : belowTop;
+      if (preferTop && top < edge) top = belowTop;
+      if (!preferTop && top + panelHeight > viewportHeight - edge && aboveTop >= edge) {
+        top = aboveTop;
+      }
+      top = Math.max(edge, Math.min(top, Math.max(edge, viewportHeight - panelHeight - edge)));
+      setPanelPosition({ left, top });
+    };
+
+    updatePosition();
+    window.addEventListener("resize", updatePosition);
+    window.addEventListener("scroll", updatePosition, true);
+    return () => {
+      window.removeEventListener("resize", updatePosition);
+      window.removeEventListener("scroll", updatePosition, true);
+    };
+  }, [open, placement, normalizedRows, summary, title]);
+
   if (!summary && normalizedRows.length === 0) return null;
 
   return (
@@ -77,6 +118,7 @@ const StateInspector = ({
       onClick={(event) => event.stopPropagation()}
     >
       <button
+        ref={buttonRef}
         type="button"
         className="state-inspector-button"
         aria-label={ariaLabel || title || "Explain state"}
@@ -90,8 +132,16 @@ const StateInspector = ({
       >
         {label}
       </button>
-      {open && (
-        <span className="state-inspector-panel" role="dialog" aria-label={title}>
+      {open && typeof document !== "undefined" && createPortal(
+        <span
+          ref={panelRef}
+          className="state-inspector-panel"
+          role="dialog"
+          aria-label={title}
+          data-placement={placement === "top" ? "top" : "bottom"}
+          style={panelPosition ? panelPosition : { visibility: "hidden" }}
+          onClick={(event) => event.stopPropagation()}
+        >
           <span className="state-inspector-title">{title}</span>
           {summary ? <span className="state-inspector-summary">{summary}</span> : null}
           {normalizedRows.length ? (
@@ -104,7 +154,8 @@ const StateInspector = ({
               ))}
             </dl>
           ) : null}
-        </span>
+        </span>,
+        document.body,
       )}
     </span>
   );

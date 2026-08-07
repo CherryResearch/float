@@ -1,6 +1,7 @@
+import re
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class Message(BaseModel):
@@ -33,10 +34,25 @@ class Attachment(BaseModel):
     content_hash: Optional[str] = None
     origin: Optional[str] = None
     relative_path: Optional[str] = None
+    source_url: Optional[str] = None
+    source_url_recorded_at: Optional[str] = None
+    display_name: Optional[str] = None
+    folder: Optional[str] = None
     capture_source: Optional[str] = None
     capture_id: Optional[str] = None
     transient: Optional[bool] = None
     expires_at: Optional[Union[str, float]] = None
+
+    @field_validator("content_hash")
+    @classmethod
+    def validate_content_hash(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        if not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value):
+            raise ValueError(
+                "content_hash must be exactly 64 lowercase hexadecimal characters"
+            )
+        return value
 
 
 class ComputerDisplayConfig(BaseModel):
@@ -96,8 +112,11 @@ class ComputerActionBatch(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None  # Add session tracking
-    # Frontend may provide a per-message id for streaming/association; ignore if unused
-    message_id: Optional[str] = None  # noqa: used for client correlation only
+    # Canonical assistant-turn id used for streaming correlation and persistence.
+    message_id: Optional[str] = None
+    # Regeneration intentionally replaces the latest saved user/assistant pair.
+    # Ordinary requests must still use a fresh message id.
+    regenerate: bool = False
     model: Optional[str] = None
     mode: Optional[str] = None
     response_format: Optional[str] = None
@@ -113,6 +132,7 @@ class ChatRequest(BaseModel):
     modules: List[str] = Field(default_factory=list)
     context: Optional[ModelContext] = None
     computer: Optional[ComputerConfig] = None
+    force_tool_review: bool = False
 
 
 class ChatResponse(BaseModel):

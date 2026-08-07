@@ -133,6 +133,8 @@ export const hydrateKnowledgeGraph = (graph) => {
       nodeKind: node?.nodeKind || node?.node_kind || "",
       nodeType: node?.nodeType || node?.node_type || node?.type || "",
       summaryText: node?.summaryText || node?.summary_text || "",
+      createdAt: node?.createdAt || node?.created_at || null,
+      updatedAt: node?.updatedAt || node?.updated_at || null,
       attributes:
         node?.attributes && typeof node.attributes === "object" ? node.attributes : {},
     })),
@@ -226,7 +228,6 @@ export const buildCombinedGraphData = ({
   includeThreadProjection,
   includeMemoryProjection,
   includeKnowledgeOverlay,
-  levels,
   planeOffset,
 }) => {
   const selectedGraphs = [];
@@ -265,7 +266,6 @@ export const buildCombinedGraphData = ({
         anchorX: nodeAnchor.anchorX,
         anchorY: nodeAnchor.anchorY,
         depth: slot.depth,
-        focusLevel: Number(levels?.[graph.graphKey] || 0),
       });
     });
     graph.links.forEach((link) => {
@@ -332,18 +332,177 @@ export const getNodeFocus = (node, levels, selectedNodeId) => {
 };
 
 export const getBaseNodeRadius = (node) => {
-  if (node?.type === "thread") return 11;
-  if (node?.type === "memory") return 8.5;
-  if (node?.graphKey === "knowledge" && node?.type === "person") return 12;
-  if (node?.graphKey === "knowledge") return 10;
-  if (String(node?.type || "").endsWith("_anchor")) return 6.5;
-  return 7;
+  let radius = 7;
+  if (node?.type === "thread") radius = 11;
+  else if (node?.type === "memory") radius = 8.5;
+  else if (node?.graphKey === "knowledge" && node?.type === "person") radius = 12;
+  else if (node?.graphKey === "knowledge") radius = 10;
+  else if (String(node?.type || "").endsWith("_anchor")) radius = 6.5;
+  return node?.isCentral ? radius * 1.38 : radius;
+};
+
+export const applyManualPlacementForce = (
+  nodes = [],
+  manualPositions = new Map(),
+  alpha = 1,
+  strength = 0.72,
+) => {
+  nodes.forEach((node) => {
+    const target = manualPositions.get(node?.id);
+    if (!target || !Number.isFinite(node?.x) || !Number.isFinite(node?.y)) return;
+    node.vx = Number(node.vx || 0) + (target.x - node.x) * strength * alpha;
+    node.vy = Number(node.vy || 0) + (target.y - node.y) * strength * alpha;
+  });
+};
+
+export const hasMeaningfulDrag = (start, end, threshold = 4) => {
+  if (
+    !Number.isFinite(start?.x) ||
+    !Number.isFinite(start?.y) ||
+    !Number.isFinite(end?.x) ||
+    !Number.isFinite(end?.y)
+  ) {
+    return false;
+  }
+  return Math.hypot(end.x - start.x, end.y - start.y) >= threshold;
 };
 
 const linkEndpointId = (endpoint) => {
   if (typeof endpoint === "string") return endpoint;
   if (endpoint && typeof endpoint === "object") return String(endpoint.id || "");
   return "";
+};
+
+export const getLinkEndpointId = linkEndpointId;
+
+export const getGraphLinkId = (link, index = 0) => {
+  const sourceId = linkEndpointId(link?.source);
+  const targetId = linkEndpointId(link?.target);
+  const relationId =
+    link?.claim_id || link?.predicate || link?.category || link?.type || "connected";
+  return `${sourceId}:${targetId}:${relationId}:${index}`;
+};
+
+const searchableValue = (value) => {
+  if (value == null) return "";
+  if (Array.isArray(value)) return value.map(searchableValue).join(" ");
+  if (typeof value === "object") {
+    return Object.entries(value)
+      .map(([key, nestedValue]) => `${key} ${searchableValue(nestedValue)}`)
+      .join(" ");
+  }
+  return String(value);
+};
+
+export const searchGraphNodes = (nodes = [], query = "", limit = 8) => {
+  const normalizedQuery = String(query || "")
+    .trim()
+    .toLocaleLowerCase();
+  if (!normalizedQuery) return [];
+
+  return nodes
+    .map((node) => {
+      const label = String(node?.label || "");
+      const type = String(node?.type || node?.nodeType || "");
+      const haystack = [
+        label,
+        type,
+        node?.nodeKind,
+        node?.summaryText,
+        searchableValue(node?.attributes),
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLocaleLowerCase();
+      const labelIndex = label.toLocaleLowerCase().indexOf(normalizedQuery);
+      const matchIndex = haystack.indexOf(normalizedQuery);
+      if (matchIndex < 0) return null;
+      return {
+        node,
+        score:
+          labelIndex === 0 ? 3 : labelIndex > 0 ? 2 : type.toLowerCase() === normalizedQuery ? 2 : 1,
+      };
+    })
+    .filter(Boolean)
+    .sort(
+      (left, right) =>
+        right.score - left.score ||
+        String(left.node?.label || "").localeCompare(String(right.node?.label || "")),
+    )
+    .slice(0, Math.max(1, Number(limit || 8)))
+    .map(({ node }) => node);
+};
+
+const nodeTimestamp = (node) => {
+  const raw = node?.updatedAt || node?.updated_at || node?.latestDate || node?.latest_date;
+  if (raw == null || raw === "") return null;
+  const numeric = Number(raw);
+  if (Number.isFinite(numeric)) {
+    return numeric > 10_000_000_000 ? numeric : numeric * 1000;
+  }
+  const parsed = Date.parse(String(raw));
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+export const filterGraphData = (
+  graphData,
+  {
+    nodeTypes = [],
+    excludedNodeTypes = [],
+    recentDays = 0,
+    focusNodeId = "",
+    focusMode = false,
+    now = Date.now(),
+  } = {},
+) => {
+  const nodes = Array.isArray(graphData?.nodes) ? graphData.nodes : [];
+  const links = [
+    ...(Array.isArray(graphData?.links) ? graphData.links : []),
+    ...(Array.isArray(graphData?.crossLinks) ? graphData.crossLinks : []),
+  ];
+  const selectedTypes = new Set(nodeTypes.filter(Boolean));
+  const excludedTypes = new Set(excludedNodeTypes.filter(Boolean));
+  const cutoff = recentDays > 0 ? now - recentDays * 24 * 60 * 60 * 1000 : null;
+  const focusIds = new Set();
+
+  if (focusMode && focusNodeId) {
+    focusIds.add(String(focusNodeId));
+    links.forEach((link) => {
+      const sourceId = linkEndpointId(link?.source);
+      const targetId = linkEndpointId(link?.target);
+      if (sourceId === focusNodeId) focusIds.add(targetId);
+      if (targetId === focusNodeId) focusIds.add(sourceId);
+    });
+  }
+
+  const filteredNodes = nodes.filter((node) => {
+    if (selectedTypes.size && !selectedTypes.has(String(node?.type || "unknown"))) {
+      return false;
+    }
+    if (excludedTypes.has(String(node?.type || "unknown"))) return false;
+    if (cutoff != null) {
+      const timestamp = nodeTimestamp(node);
+      if (timestamp == null || timestamp < cutoff) return false;
+    }
+    if (focusIds.size && !focusIds.has(String(node?.id || ""))) return false;
+    return true;
+  });
+  const visibleNodeIds = new Set(filteredNodes.map((node) => String(node?.id || "")));
+  const visibleLink = (link) =>
+    visibleNodeIds.has(linkEndpointId(link?.source)) &&
+    visibleNodeIds.has(linkEndpointId(link?.target));
+
+  return {
+    ...graphData,
+    nodes: filteredNodes,
+    links: (graphData?.links || []).filter(visibleLink),
+    crossLinks: (graphData?.crossLinks || []).filter(visibleLink),
+    metadata: {
+      ...(graphData?.metadata || {}),
+      unfilteredNodeCount: nodes.length,
+      filteredNodeCount: filteredNodes.length,
+    },
+  };
 };
 
 const relationshipBoost = (link) => {
@@ -360,7 +519,7 @@ export const rankNodeConnections = (selectedNodeId, nodes = [], links = []) => {
   if (!selectedId) return [];
   const nodeById = new Map(nodes.map((node) => [node.id, node]));
   return links
-    .map((link) => {
+    .map((link, index) => {
       const sourceId = linkEndpointId(link?.source);
       const targetId = linkEndpointId(link?.target);
       if (sourceId !== selectedId && targetId !== selectedId) return null;
@@ -369,14 +528,21 @@ export const rankNodeConnections = (selectedNodeId, nodes = [], links = []) => {
       if (!otherNode) return null;
       const weight = Number(link?.weight ?? link?.confidence ?? 0);
       const score = weight + relationshipBoost(link);
+      const linkId = link?.__graphLinkId || getGraphLinkId(link, index);
       return {
-        id: `${selectedId}:${otherId}:${link?.claim_id || link?.predicate || link?.type}`,
+        id: `${selectedId}:${linkId}`,
+        linkId,
         nodeId: otherId,
         label: otherNode.label || otherId,
         type: otherNode.type || "",
+        direction: sourceId === selectedId ? "outgoing" : "incoming",
+        sourceId,
+        targetId,
         predicate: link?.predicate || link?.category || link?.type || "connected",
         relation: link?.metadata?.relationship || "",
         context: link?.metadata?.context || "",
+        metadata:
+          link?.metadata && typeof link.metadata === "object" ? link.metadata : {},
         score,
         weight,
       };

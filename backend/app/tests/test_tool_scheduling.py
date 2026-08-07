@@ -69,6 +69,20 @@ def test_tool_schedule_marks_scheduled_and_links_event(client):
         "status": "proposed",
     }
 
+    calendar_store.save_event(
+        event_id,
+        {
+            "id": event_id,
+            "title": "Scheduled remember",
+            "start_time": 1_900_000_000,
+            "timezone": "UTC",
+            "status": "scheduled",
+            "background_job": {
+                "execution": {"permissions": ["files.read"]},
+            },
+        },
+    )
+
     resp = client.post(
         "/api/tools/schedule",
         json={
@@ -127,6 +141,162 @@ def test_tool_schedule_marks_scheduled_and_links_event(client):
     assert action.get("status") == "scheduled"
     assert action.get("prompt") == "When this runs, summarize the result."
     assert action.get("conversation_mode") == "new_chat"
+    assert "authorization" not in action
+    assert stored_event["background_job"]["execution"]["permissions"] == [
+        "files.read",
+        "memory.write",
+    ]
+    assert stored_event["background_job"]["execution"]["permission_semantics"] == (
+        "allowed_scopes"
+    )
+
+
+def test_tool_schedule_requires_saved_pending_proposal(client):
+    response = client.post(
+        "/api/tools/schedule",
+        json={
+            "request_id": "missing-request",
+            "event_id": "calendar-404",
+            "name": "remember",
+            "args": {"key": "forged", "value": "forged"},
+            "session_id": "s1",
+            "message_id": "m1",
+        },
+    )
+
+    assert response.status_code == 404
+
+
+def test_client_resolve_requires_saved_client_side_proposal(client):
+    from app.main import app
+
+    missing = client.post(
+        "/api/tools/client-resolve",
+        json={
+            "request_id": "missing-client-request",
+            "name": "camera.capture",
+            "result": {"data": "forged"},
+        },
+    )
+    assert missing.status_code == 404
+
+    app.state.pending_tools["server-only"] = {
+        "id": "server-only",
+        "name": "recall",
+        "args": {"key": "real"},
+        "session_id": "s1",
+        "message_id": "m1",
+        "chain_id": "m1",
+        "status": "proposed",
+    }
+    server_only = client.post(
+        "/api/tools/client-resolve",
+        json={
+            "request_id": "server-only",
+            "name": "recall",
+            "args": {"key": "real"},
+            "result": {"data": "forged"},
+            "session_id": "s1",
+            "message_id": "m1",
+            "chain_id": "m1",
+        },
+    )
+    assert server_only.status_code == 409
+
+
+def test_client_resolve_rehydrates_and_preserves_privacy_origin(client):
+    from app.main import app
+    from app.utils import conversation_store
+
+    conversation_store.save_conversation(
+        "privacy-session",
+        [
+            {
+                "id": "m1",
+                "role": "ai",
+                "text": "Choose local routing.",
+                "tools": [
+                    {
+                        "id": "privacy-route-1",
+                        "name": "route_to_local_model",
+                        "args": {"reason": "protected conversation"},
+                        "status": "proposed",
+                        "origin": "privacy_preflight",
+                    }
+                ],
+            }
+        ],
+    )
+    app.state.pending_tools = {}
+
+    response = client.post(
+        "/api/tools/client-resolve",
+        json={
+            "request_id": "privacy-route-1",
+            "name": "route_to_local_model",
+            "args": {"reason": "protected conversation"},
+            "status": "invoked",
+            "result": {"route": "local"},
+            "session_id": "privacy-session",
+            "message_id": "m1",
+            "chain_id": "m1",
+        },
+    )
+
+    assert response.status_code == 200
+    saved_tool = conversation_store.load_conversation("privacy-session")[0]["tools"][0]
+    assert saved_tool["status"] == "invoked"
+    assert saved_tool["origin"] == "privacy_preflight"
+
+
+def test_tool_schedule_fails_closed_when_calendar_write_fails(client, monkeypatch):
+    from app.main import app
+    from app.utils import calendar_store
+
+    request_id = "rid-write-failure"
+    app.state.pending_tools[request_id] = {
+        "id": request_id,
+        "name": "remember",
+        "args": {"key": "k", "value": "v"},
+        "status": "proposed",
+    }
+
+    def fail_update(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(calendar_store, "update_event", fail_update)
+    response = client.post(
+        "/api/tools/schedule",
+        json={
+            "request_id": request_id,
+            "event_id": "calendar-write-failure",
+        },
+    )
+
+    assert response.status_code == 503
+    assert "remains pending" in response.json()["detail"]
+    assert app.state.pending_tools[request_id]["status"] == "proposed"
+
+
+def test_tool_schedule_rejects_missing_calendar_event(client):
+    from app.main import app
+
+    request_id = "rid-missing-event"
+    app.state.pending_tools[request_id] = {
+        "id": request_id,
+        "name": "remember",
+        "args": {"key": "k", "value": "v"},
+        "status": "proposed",
+    }
+
+    response = client.post(
+        "/api/tools/schedule",
+        json={"request_id": request_id, "event_id": "missing-event"},
+    )
+
+    assert response.status_code == 409
+    assert "Save the Calendar event" in response.json()["detail"]
+    assert app.state.pending_tools[request_id]["status"] == "proposed"
 
 
 def test_tool_propose_dedupes_same_signature(client):

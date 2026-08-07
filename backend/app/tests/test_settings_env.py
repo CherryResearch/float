@@ -90,6 +90,33 @@ def test_mode_setting_updates_config_and_rejects_invalid_values(client):
     assert client.app.state.config["mode"] == "local"
 
 
+def test_image_caption_settings_are_explicit_and_use_supported_cloud_default(client):
+    initial = client.get("/settings")
+    assert initial.status_code == 200
+    assert initial.json()["image_caption_engine"] in {"local", "cloud", "off"}
+    assert initial.json()["image_caption_cloud_model"] == "gpt-5.4-nano"
+
+    updated = client.post(
+        "/settings",
+        json={
+            "image_caption_engine": "cloud",
+            "image_caption_cloud_model": "gpt-5.4-nano",
+        },
+    )
+    assert updated.status_code == 200
+    settings = updated.json()["settings"]
+    assert settings["image_caption_engine"] == "cloud"
+    assert settings["image_caption_cloud_model"] == "gpt-5.4-nano"
+    assert client.app.state.config["image_caption_engine"] == "cloud"
+
+    invalid = client.post(
+        "/settings",
+        json={"image_caption_engine": "automatic"},
+    )
+    assert invalid.status_code == 400
+    assert invalid.json()["detail"] == "Invalid image_caption_engine"
+
+
 def test_local_provider_settings(client, tmp_path):
     env_path = tmp_path / ".env"
     resp = client.post(

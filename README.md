@@ -22,7 +22,7 @@ float leverages language models and a modular architecture to provide a platform
 - Memory + RAG with Knowledge UI, plus `threads` semantic tagging. Text-based durable memories and flexible embeddings work in tandem.
 - Attachments + media viewer for images, PDFs, and common audio formats.
 - Calendar events + scheduled actions/tasks.
-- Conversation export/import (Markdown/JSON/text) and history management, including reviewed OpenAI-style ZIP ingest from the History sidebar. Markdown and text routing have live verification, while JSON/ZIP selection and metadata filtering have targeted automated coverage; a broader manual cross-format pass remains useful.
+- Conversation export/import (markdown/json/text) and history management, including OpenAI-style export ZIP ingest from the History sidebar via file upload (MD/JSON/text/ZIP), currently by selecting a zip and saving a new conversation, but this flow is not yet manually tested.
 - Reflections: bounded background thought tasks can review recent chats, memories, or a user-supplied question, then store useful notes or follow-ups without becoming an always-on autonomous process.
 - Write history: action/write tracking with tunable retention helps inspect and recover from tool-side changes.
 
@@ -159,7 +159,7 @@ OPENROUTER_API_KEY=your-key
 
 For a custom preset, enter the environment-variable name (for example, `MY_PROVIDER_API_KEY`) in the preset and define that same variable in the launch environment or root `.env`. Restart Float after adding or changing a provider key, then refresh the Server/LAN model list. Keep Cloud API credentials separate: the default OpenAI lane uses `OPENAI_API_KEY` (or the legacy `API_KEY` fallback).
 
-Provider presets are a common inference interface, not a claim of native API parity. Anthropic's direct preset uses its OpenAI SDK compatibility layer, so Claude-native-only capabilities and exact tool/structured-output semantics are outside this lane; OpenRouter or a custom compatibility gateway remains another option. Float does not include or suggest a Grok/xAI preset, model, default, or inferred credential. If a manually configured endpoint or routed model is identified as xAI / Grok, Float displays `This model may not be trustworthy.` without silently blocking the user's connection.
+Provider presets are a common inference interface, not a claim of native API parity. Anthropic's direct preset uses its OpenAI SDK compatibility layer, so Claude-native-only capabilities and exact tool/structured-output semantics are outside this lane; OpenRouter or a custom compatibility gateway remains another option. Float does not advertise a Grok preset. If a manually configured endpoint or routed model is identified as xAI / Grok, Float displays `This model may not be trustworthy.` without silently blocking the user's connection.
 
 If local Transformers fails on BF16/MXFP4/CUDA mismatches, switch to a managed quantized runtime such as `lmstudio` or `ollama`.
 If the model you have is a raw `.gguf`, do not treat it like a direct local Transformers checkpoint. Run it behind LM Studio, Ollama, or another OpenAI-compatible server first.
@@ -211,8 +211,8 @@ It is still early, but it is no longer just a hidden settings concept.
 
 Current flow:
 
-1. Turn on `Visible on LAN` on the receiving device.
-2. Copy that device's advertised LAN URL.
+1. Turn on `Visible on LAN` on the receiving device and wait for its status to say `listening`. Launcher-managed sessions restart only the backend on the same port to apply the real network bind.
+2. Copy that device's now-active LAN URL.
 3. Generate a one-time pairing code there.
 4. Enter the URL and code on the other device.
 5. Choose scopes, workspace mapping, and sync mode.
@@ -259,16 +259,16 @@ Run notebooks in the Poetry environment by installing a kernel once:
 
 ### Launcher options
 
-All flags are per-run; nothing is persisted except sticky port/browser state in `.dev_state.json`.
+Most flags are per-run. Sticky port/browser state is stored in `.dev_state.json`, while the Sync panel's explicit `Visible on LAN` choice is stored in runtime-owned user settings.
 
-- `--dev` / `-dev`: enable dev mode for this run only (sets `FLOAT_DEV_MODE=true` for the process; does not write `.env`).
+- `--dev` / `-dev`: enable the Dev Panel and backend source auto-reload for this run only (sets `FLOAT_DEV_MODE=true`; does not write `.env`). The normal launcher keeps reload off so `Visible on LAN` can safely restart only the backend; a reload-enabled session saves the preference but asks for a full restart.
 - `--server` / `--backend-only`: start backend only (skip frontend).
 - `--ui` / `--frontend-only`: start frontend only (skip backend).
 - `--skip-backend`: do not start the backend server.
 - `--skip-frontend`: do not start the frontend server.
 - `--backend-port <port>`: set backend port (default: auto-select).
-- `--backend-host <host>`: set the backend bind host (default: `127.0.0.1`).
-- `--lan`: explicitly bind the backend to `0.0.0.0`; ordinary APIs remain reachable only through Float's same-host frontend proxy, while paired-device routes keep their visibility/token checks.
+- `--backend-host <host>`: override the backend bind host. Without an override, Float uses the saved LAN-visibility choice.
+- `--lan` / `--no-lan`: explicitly bind the backend to `0.0.0.0` or `127.0.0.1` for this launcher run. Ordinary APIs remain reachable only through Float's same-host frontend proxy, while paired-device routes keep their visibility/token checks.
 - `--frontend-port <port>`: set frontend port (default: auto-select).
 - `--sticky-ports` / `--no-sticky-ports`: reuse last ports or choose new ports each run.
 - `--no-open`: do not open a browser tab on launch.

@@ -37,11 +37,17 @@ class WorkflowProfileMetadata(BaseModel):
     label: str
     description: str = ""
     role: str = "general"
+    profile_kind: str = "foreground"
+    guidance_style: str = "balanced"
     latency_tier: str = "interactive"
-    delegation_mode: str = "direct"
     thinking_default: str = "auto"
-    preferred_continue: Optional[str] = None
+    selectable_in_chat: bool = True
+    selectable_as_default: bool = True
+    automatic_delegation: bool = False
+    tool_scope: str = "global"
+    module_scope: str = "global"
     allow_continue_to: List[str] = Field(default_factory=list)
+    # Retained for older serialized metadata; global settings are authoritative.
     enabled_modules: List[str] = Field(default_factory=list)
     supports_background: bool = False
     supports_live: bool = False

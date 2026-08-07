@@ -1,12 +1,35 @@
 import asyncio
 import base64
 import importlib
+import io
+from pathlib import Path
 
 from fastapi.testclient import TestClient
+from PIL import Image
 
 PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z2ioAAAAASUVORK5CYII="
 )
+
+
+def _real_image_bytes() -> bytes:
+    image_path = (
+        Path(__file__).resolve().parents[3] / "docs" / "resources" / "floatlogo.png"
+    )
+    image_bytes = image_path.read_bytes()
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        image.load()
+        assert image.width >= 32
+        assert image.height >= 32
+        assert any(low != high for low, high in image.convert("RGB").getextrema())
+    return image_bytes
+
+
+def _isolated_capture_service(capture_module, tmp_path):
+    service = capture_module.CaptureService(data_dir=tmp_path)
+    service.metadata_root = (tmp_path / "capture-metadata").resolve()
+    service.metadata_root.mkdir(parents=True, exist_ok=True)
+    return service
 
 
 def _assert_not_running_on_event_loop():
@@ -391,6 +414,17 @@ def test_tool_decision_invokes_sync_tools_off_event_loop(monkeypatch, tmp_path):
         fake_invoke_tool,
         raising=False,
     )
+    app.state.pending_tools = {
+        "offloop-tool": {
+            "id": "offloop-tool",
+            "name": "remember",
+            "args": {"key": "offloop-note", "value": "threadpool check"},
+            "session_id": "sess-offloop",
+            "message_id": "msg-offloop",
+            "chain_id": "msg-offloop",
+            "status": "proposed",
+        }
+    }
 
     client = TestClient(app)
     resp = client.post(
@@ -409,7 +443,7 @@ def test_tool_decision_invokes_sync_tools_off_event_loop(monkeypatch, tmp_path):
     assert resp.json()["status"] == "invoked"
 
 
-def test_chat_auto_approved_tool_error_is_not_reported_as_pending(
+def test_chat_auto_approved_tool_error_requests_result_continuation_not_approval(
     monkeypatch, tmp_path
 ):
     monkeypatch.setenv("FLOAT_CONV_DIR", str(tmp_path))
@@ -424,7 +458,11 @@ def test_chat_auto_approved_tool_error_is_not_reported_as_pending(
     monkeypatch.setattr(
         routes.user_settings,
         "load_settings",
-        lambda: {"approval_level": "auto"},
+        lambda: {
+            "approval_level": "auto",
+            "default_workflow": "default",
+            "enabled_workflow_modules": ["computer_use"],
+        },
     )
 
     monkeypatch.setattr(
@@ -471,7 +509,9 @@ def test_chat_auto_approved_tool_error_is_not_reported_as_pending(
     assert "Awaiting approval" not in payload["message"]
     assert "computer.session.start" in payload["message"]
     assert "Playwright sync API cannot run on the asyncio loop" in payload["message"]
-    assert payload["metadata"].get("tool_response_pending") is not True
+    assert payload["metadata"].get("tool_response_pending") is True
+    assert payload["metadata"].get("tool_result_continuation_pending") is True
+    assert payload["metadata"].get("inline_tool_continuation_pending") is not True
     assert payload["tools_used"][0]["status"] == "error"
 
 
@@ -555,13 +595,29 @@ def test_capture_routes_round_trip(monkeypatch, tmp_path):
     importlib.reload(conv_store)
 
     capture_module = importlib.import_module("app.services.capture_service")
+    blob_store = importlib.import_module("app.utils.blob_store")
+    routes = importlib.import_module("app.routes")
     app = importlib.import_module("app.main").app
-    app.state.capture_service = capture_module.CaptureService(data_dir=tmp_path)
+    blobs_dir = (tmp_path / "blobs").resolve()
+    blobs_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("FLOAT_DATA_DIR", str(tmp_path / "managed-data"))
+    monkeypatch.setattr(blob_store, "BLOBS_DIR", blobs_dir)
+    monkeypatch.setattr(routes, "BLOBS_DIR", blobs_dir)
+    app.state.capture_service = _isolated_capture_service(
+        capture_module,
+        tmp_path,
+    )
+    monkeypatch.setattr(
+        routes,
+        "_index_uploaded_attachment",
+        lambda *_args, **_kwargs: None,
+    )
     client = TestClient(app)
+    image_bytes = _real_image_bytes()
 
     upload_resp = client.post(
         "/api/captures/upload",
-        files={"file": ("capture.png", PNG_BYTES, "image/png")},
+        files={"file": ("floatlogo.png", image_bytes, "image/png")},
         data={"source": "camera", "sensitivity": "protected"},
     )
 
@@ -580,6 +636,14 @@ def test_capture_routes_round_trip(monkeypatch, tmp_path):
     assert detail_resp.status_code == 200
     assert detail_resp.json()["capture"]["capture_id"] == capture_id
 
+    content_resp = client.get(f"/api/captures/{capture_id}/content")
+    assert content_resp.status_code == 200
+    assert content_resp.content == image_bytes
+    assert content_resp.headers["content-type"].startswith("image/png")
+    assert content_resp.headers["x-content-type-options"] == "nosniff"
+    assert "content-disposition" not in content_resp.headers
+    assert "content-security-policy" not in content_resp.headers
+
     promote_resp = client.post(
         f"/api/captures/{capture_id}/promote",
         json={"memory_refs": ["mem-1"]},
@@ -595,6 +659,64 @@ def test_capture_routes_round_trip(monkeypatch, tmp_path):
     assert delete_resp.json()["status"] == "deleted"
 
 
+def test_capture_upload_rejects_active_and_mislabeled_image_content(
+    monkeypatch,
+    tmp_path,
+):
+    capture_module = importlib.import_module("app.services.capture_service")
+    app = importlib.import_module("app.main").app
+    app.state.capture_service = _isolated_capture_service(
+        capture_module,
+        tmp_path,
+    )
+    client = TestClient(app)
+    svg = b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'
+
+    active_type = client.post(
+        "/api/captures/upload",
+        files={"file": ("active.svg", svg, "image/svg+xml")},
+    )
+    mislabeled_type = client.post(
+        "/api/captures/upload",
+        files={"file": ("active.png", svg, "image/png")},
+    )
+
+    assert active_type.status_code == 400
+    assert active_type.json()["detail"] == "Unsupported image type"
+    assert mislabeled_type.status_code == 400
+    assert mislabeled_type.json()["detail"] == "Invalid image data"
+
+
+def test_capture_content_forces_unsafe_legacy_content_to_download(
+    monkeypatch,
+    tmp_path,
+):
+    capture_module = importlib.import_module("app.services.capture_service")
+    app = importlib.import_module("app.main").app
+    service = _isolated_capture_service(capture_module, tmp_path)
+    app.state.capture_service = service
+    client = TestClient(app)
+    svg = b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'
+    capture = service.create_capture_from_bytes(
+        svg,
+        filename="active.svg",
+        source="legacy",
+        content_type="image/svg+xml",
+    )
+    capture_id = capture["capture_id"]
+
+    response = client.get(f"/api/captures/{capture_id}/content")
+
+    assert response.status_code == 200
+    assert response.content == svg
+    assert response.headers["content-type"].startswith("image/svg+xml")
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["content-security-policy"] == "sandbox; default-src 'none'"
+    assert response.headers["content-disposition"].startswith("attachment;")
+
+    assert client.delete(f"/api/captures/{capture_id}").status_code == 200
+
+
 def test_capture_upload_truncates_oversized_camera_filenames(monkeypatch, tmp_path):
     monkeypatch.setenv("FLOAT_CONV_DIR", str(tmp_path))
     conv_store = importlib.import_module("app.utils.conversation_store")
@@ -602,7 +724,10 @@ def test_capture_upload_truncates_oversized_camera_filenames(monkeypatch, tmp_pa
 
     capture_module = importlib.import_module("app.services.capture_service")
     app = importlib.import_module("app.main").app
-    app.state.capture_service = capture_module.CaptureService(data_dir=tmp_path)
+    app.state.capture_service = _isolated_capture_service(
+        capture_module,
+        tmp_path,
+    )
     client = TestClient(app)
 
     long_name = f"{'camera-' * 40}capture.png"

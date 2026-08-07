@@ -47,6 +47,7 @@ import KeyboardArrowRightIcon from "@mui/icons-material/KeyboardArrowRight";
 import { normalizeToolDisplayMode } from "../utils/toolDisplayModes";
 import {
   acquireToolContinuationLock,
+  announceToolContinuationAttemptReset,
   buildToolContinuationLockKey,
   buildToolContinuationSignature,
   hasMatchingToolContinuationSignature,
@@ -85,7 +86,9 @@ import {
 import { resolveAnchoredPopoverPosition } from "../utils/popoverPosition";
 import {
   FALLBACK_WORKFLOW_PROFILES,
+  isWorkflowSelectableInChat,
   normalizeWorkflowProfiles,
+  resolveSelectableWorkflowId,
 } from "../utils/workflowCatalog";
 import {
   isCustomReasoningEffort,
@@ -157,7 +160,48 @@ const COMMAND_COMPLETION_LIMIT = 8;
 const COMMAND_REFERENCE_RE = /(^|[\s\n])(\.\/\/|\.\/|\/\/)(\[[^\]\n]+\]|[^\s]+)/g;
 const TOOL_DIRECTIVE_RE = /^(\s*)%([a-z0-9._-]+)(?:\s+([\s\S]*))?$/i;
 const TOOL_DIRECTIVE_TOKEN_RE = /(^|[\s\n])%([a-z0-9._-]+)(?=$|[\s\n.,;:!?])/gi;
+const REQUEST_ACTIVITY_TYPES = new Set(["content", "thought", "tool"]);
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+
+const streamActivityMatchesRequest = (activity, messageId) => {
+  if (!activity || typeof activity !== "object") return false;
+  if (!REQUEST_ACTIVITY_TYPES.has(String(activity.type || "").toLowerCase())) {
+    return false;
+  }
+  const requestMessageId = String(messageId || "").trim();
+  if (!requestMessageId) return false;
+  return [activity.message_id, activity.chain_id]
+    .map((value) => String(value || "").trim())
+    .some((value) => value === requestMessageId);
+};
+
+const createRequestInactivityTimer = ({ timeoutMs, onTimeout }) => {
+  let timer = null;
+  let stopped = false;
+  const delay = Math.max(1, Number(timeoutMs) || 1);
+
+  const schedule = () => {
+    if (stopped) return false;
+    if (timer !== null) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = null;
+      if (stopped) return;
+      stopped = true;
+      onTimeout();
+    }, delay);
+    return true;
+  };
+
+  schedule();
+  return {
+    markActivity: schedule,
+    clear: () => {
+      stopped = true;
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+    },
+  };
+};
 const REASONING_EFFORT_TOOLTIP_TEXT =
   "Reasoning effort and output length are independent. Tinker uses the exact slider value; other supported models round custom values to the nearest named level.";
 const RAG_TOOLTIP_TEXT =
@@ -254,6 +298,26 @@ const RESPONSE_FAILURE_METADATA_KEYS = [
   "empty_response",
   "empty_response_reason",
   "warning",
+];
+const REGENERATION_CONTINUATION_METADATA_KEYS = [
+  "tool_continued",
+  "tool_continue_signature",
+  "tool_continue_semantic_signature",
+  "tool_continue_signature_sha256",
+  "tool_continue_semantic_signature_sha256",
+  "tool_continuation_rounds",
+  "tool_continuation_limit_reached",
+  "continuation_stop_reason",
+  "empty_tool_continuation",
+  "unresolved_tool_loop",
+  "tool_result_text_retry",
+  "tool_result_text_retry_failed",
+  "tool_response_pending",
+  "inline_tool_continuation_pending",
+  "tool_result_continuation_pending",
+  "tool_continuation_phases",
+  "tool_continuation_text",
+  "tool_prelude_text",
 ];
 
 const createLiveSessionCancelledError = () => {
@@ -361,7 +425,17 @@ const normalizeRealtimeToolSchema = (schema) => {
 
 const toValidDate = (value) => {
   if (!value) return null;
-  const date = value instanceof Date ? value : new Date(value);
+  const numericValue =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && /^\d+(?:\.\d+)?$/.test(value.trim())
+        ? Number(value)
+        : null;
+  const normalizedValue =
+    Number.isFinite(numericValue) && Math.abs(numericValue) < 1e12
+      ? numericValue * 1000
+      : numericValue ?? value;
+  const date = value instanceof Date ? value : new Date(normalizedValue);
   return Number.isNaN(date.getTime()) ? null : date;
 };
 
@@ -463,6 +537,95 @@ const getRequestErrorDetail = (error, fallback = "Request failed") => {
   return message || fallback;
 };
 
+const getComposerViewportBounds = () => {
+  const visualViewport = window.visualViewport;
+  return {
+    left: visualViewport?.offsetLeft || 0,
+    top: visualViewport?.offsetTop || 0,
+    width:
+      visualViewport?.width ||
+      window.innerWidth ||
+      document.documentElement.clientWidth ||
+      0,
+    height:
+      visualViewport?.height ||
+      window.innerHeight ||
+      document.documentElement.clientHeight ||
+      0,
+  };
+};
+
+const buildComposerOverlayStyle = ({
+  anchorRect,
+  popoverRect,
+  maxWidth,
+  gap,
+  zIndex,
+}) => {
+  if (!anchorRect || typeof window === "undefined") {
+    return { position: "fixed", top: "12px", left: "12px", zIndex };
+  }
+  const position = resolveAnchoredPopoverPosition({
+    anchorRect,
+    popoverRect,
+    viewport: getComposerViewportBounds(),
+    maxWidth,
+    gap,
+  });
+  return {
+    position: "fixed",
+    top: `${position.top}px`,
+    left: `${position.left}px`,
+    maxWidth: `${position.maxWidth}px`,
+    maxHeight: `${position.maxHeight}px`,
+    zIndex,
+  };
+};
+
+const createApiWrapperError = (result) => {
+  const detail = String(result?.error || "API request failed");
+  const error = new Error(detail);
+  const status = Number(result?.status);
+  if (Number.isFinite(status) && status > 0) {
+    error.response = { status, data: { detail } };
+  }
+  return error;
+};
+
+const isRegenerateMessageConflict = (error, detail) => {
+  const message = String(detail || "");
+  return (
+    /(?:message[\s_-]*id|message identifier).*(?:already exists|conflict|duplicate|reserved)/i.test(
+      message,
+    ) ||
+    /only the latest.*(?:can|may) be regenerated/i.test(message) ||
+    /(?:saved )?(?:assistant )?(?:message|turn).*(?:not found|no longer exists|stale)/i.test(
+      message,
+    ) ||
+    Number(error?.response?.status) === 409
+  );
+};
+
+const getRegenerationResponseError = (metadata, responseText = "") => {
+  if (!metadata || typeof metadata !== "object") return null;
+  const status = String(metadata.status || "").trim().toLowerCase();
+  if (metadata.empty_response) {
+    const error = new Error(
+      "Regeneration completed without returning a final answer.",
+    );
+    error.code = "EMPTY_REGENERATION_RESPONSE";
+    error.metadata = metadata;
+    return error;
+  }
+  if (!metadata.error && status !== "error") return null;
+  const error = new Error(
+    String(responseText || metadata.error || "Regeneration failed before returning a final answer."),
+  );
+  error.code = "REGENERATION_PROVIDER_ERROR";
+  error.metadata = metadata;
+  return error;
+};
+
 const getSelectedTargetModelForMode = (state, mode) => {
   return resolveRequestModelForMode({
     backendMode: mode,
@@ -472,30 +635,14 @@ const getSelectedTargetModelForMode = (state, mode) => {
   });
 };
 
-export const resolveRegenerateRequestTarget = (state, msg) => {
-  const meta = msg && typeof msg === "object" && msg.metadata && typeof msg.metadata === "object"
-    ? msg.metadata
-    : {};
+export const resolveRegenerateRequestTarget = (state) => {
   const currentMode =
     typeof state?.backendMode === "string" && state.backendMode.trim()
       ? state.backendMode.trim().toLowerCase()
       : "api";
-  const originalMode =
-    typeof meta.mode === "string" && meta.mode.trim()
-      ? meta.mode.trim().toLowerCase()
-      : currentMode;
-  const fallbackModel = getSelectedTargetModelForMode(state, originalMode);
-  const originalModelCandidates =
-    originalMode === "local"
-      ? [meta.model_requested, meta.model, meta.model_resolved, meta.model_received]
-      : [meta.model_requested, meta.model_resolved, meta.model_received, meta.model];
-  const originalModel =
-    originalModelCandidates.find(
-      (value) => typeof value === "string" && value.trim(),
-    ) || fallbackModel;
   return {
-    mode: originalMode,
-    model: typeof originalModel === "string" ? originalModel.trim() : "",
+    mode: currentMode,
+    model: getSelectedTargetModelForMode(state, currentMode),
   };
 };
 
@@ -516,6 +663,34 @@ export const mergeAssistantMessageMetadata = (existingMetadata, nextMetadata) =>
     });
   }
   return { ...existing, ...next };
+};
+
+export const clearRegenerationContinuationMetadata = (metadata) => {
+  const cleaned = metadata && typeof metadata === "object" ? { ...metadata } : {};
+  REGENERATION_CONTINUATION_METADATA_KEYS.forEach((key) => {
+    delete cleaned[key];
+  });
+  return cleaned;
+};
+
+export const acknowledgeClientOutboxPair = (conversation, messageId) => {
+  const acknowledgedId = String(messageId || "").trim();
+  if (!acknowledgedId || !Array.isArray(conversation)) {
+    return Array.isArray(conversation) ? conversation : [];
+  }
+  const acknowledgedIds = new Set([acknowledgedId, `${acknowledgedId}:user`]);
+  return conversation.map((item) => {
+    if (
+      !item ||
+      !acknowledgedIds.has(String(item.id || "")) ||
+      !item.metadata?.client_outbox
+    ) {
+      return item;
+    }
+    const metadata = { ...item.metadata };
+    delete metadata.client_outbox;
+    return { ...item, metadata };
+  });
 };
 
 const unwrapCommandValue = (value) => {
@@ -1030,6 +1205,14 @@ export const serializeComposerDraftAttachments = (attachments = []) => {
         relative_path:
           normalizeStoredString(attachment.relative_path) ||
           normalizeStoredString(attachment.relativePath) ||
+          null,
+        source_url:
+          normalizeStoredString(attachment.source_url) ||
+          normalizeStoredString(attachment.sourceUrl) ||
+          null,
+        source_url_recorded_at:
+          normalizeStoredString(attachment.source_url_recorded_at) ||
+          normalizeStoredString(attachment.sourceUrlRecordedAt) ||
           null,
         capture_source:
           normalizeStoredString(attachment.capture_source) ||
@@ -2188,6 +2371,7 @@ const Chat = ({
     activeMessageId,
     setActiveMessageId,
     messageDelta,
+    streamActivity = null,
     onOpenConsole,
     onOpenConversation,
     parentConversationLink = null,
@@ -2243,6 +2427,7 @@ const Chat = ({
   const [chatWorkflowProfiles, setChatWorkflowProfiles] = useState(
     FALLBACK_WORKFLOW_PROFILES,
   );
+  const [workflowCatalogResolved, setWorkflowCatalogResolved] = useState(false);
   const [availableInputDevices, setAvailableInputDevices] = useState({
     audioinput: [],
     videoinput: [],
@@ -2251,6 +2436,12 @@ const Chat = ({
   const [micTestLevel, setMicTestLevel] = useState(0);
   const [chatSettingsPopoverStyle, setChatSettingsPopoverStyle] = useState(null);
   const [attachmentMenuOpen, setAttachmentMenuOpen] = useState(false);
+  const [attachmentPopoverStyle, setAttachmentPopoverStyle] = useState(null);
+  const [inputAlertStyle, setInputAlertStyle] = useState(null);
+  const inputAlerts = [error, cameraError, liveVisualError].filter(
+    (value) => typeof value === "string" && value.trim(),
+  );
+  const inputAlertsKey = inputAlerts.join("\n");
   const fileInputRef = useRef(null);
   const cameraVideoRef = useRef(null);
   const cameraStreamRef = useRef(null);
@@ -2270,6 +2461,9 @@ const Chat = ({
   const chatSettingsTriggerRef = useRef(null);
   const chatSettingsPopoverRef = useRef(null);
   const attachmentMenuRef = useRef(null);
+  const attachmentTriggerRef = useRef(null);
+  const attachmentPopoverRef = useRef(null);
+  const inputAlertStackRef = useRef(null);
   const removedAttachmentIdsRef = useRef(new Set());
   const activeAttachmentUploadsRef = useRef(new Set());
   const toolCatalogRef = useRef(null);
@@ -2293,7 +2487,7 @@ const Chat = ({
   });
   const chatContainerRef = useRef(null);
   const chatBoxRef = useRef(null);
-  const inputBoxRef = useRef(null); // ref to manage hover-close behavior
+  const inputBoxRef = useRef(null);
   const composerInputRef = useRef(null);
   const bottomSentinelRef = useRef(null);
   const messageRefs = useRef({});
@@ -2344,6 +2538,7 @@ const Chat = ({
   const ttsAudioRef = useRef(null);
   const ttsRequestIdRef = useRef(0);
   const [collapsedTools, setCollapsedTools] = useState({});
+  const [expandedToolCards, setExpandedToolCards] = useState({});
   const [collapseAllTools, setCollapseAllTools] = useState(true);
   const thinkingMode = normalizeThinkingMode(state.thinkingMode);
   const thinkingEffortValue = reasoningEffortValue(thinkingMode);
@@ -2356,23 +2551,52 @@ const Chat = ({
     outputTokenMode,
     customOutputTokens,
   );
-  const workflowProfile = state.workflowProfile || "default";
-  const workflowOptions = chatWorkflowProfiles.some(
+  const requestedWorkflowProfile = state.workflowProfile || "default";
+  const workflowProfile = resolveSelectableWorkflowId(
+    chatWorkflowProfiles,
+    requestedWorkflowProfile,
+    { allowUnknown: !workflowCatalogResolved },
+  );
+  const selectableChatWorkflowProfiles = chatWorkflowProfiles.filter(
+    isWorkflowSelectableInChat,
+  );
+  const workflowOptions = selectableChatWorkflowProfiles.some(
     (profile) => profile.id === workflowProfile,
   )
-    ? chatWorkflowProfiles
+    ? selectableChatWorkflowProfiles
     : [
         {
           id: workflowProfile,
           label: workflowProfile,
           description: "Current profile from saved settings.",
         },
-        ...chatWorkflowProfiles,
+        ...selectableChatWorkflowProfiles,
       ];
   const activeWorkflowProfile =
     workflowOptions.find((profile) => profile.id === workflowProfile) ||
     workflowOptions[0] ||
     null;
+  useEffect(() => {
+    const knownProfile = chatWorkflowProfiles.some(
+      (profile) => profile.id === requestedWorkflowProfile,
+    );
+    if (
+      requestedWorkflowProfile === workflowProfile ||
+      (!workflowCatalogResolved && !knownProfile)
+    ) {
+      return;
+    }
+    setState((previous) => ({
+      ...previous,
+      workflowProfile,
+    }));
+  }, [
+    chatWorkflowProfiles,
+    requestedWorkflowProfile,
+    setState,
+    workflowCatalogResolved,
+    workflowProfile,
+  ]);
   const textRagEnabled = state.textRagEnabled !== false;
   const visionRagEnabled = state.visionRagEnabled !== false;
   const ragEmbeddingModel = state.ragEmbeddingModel || "local:all-MiniLM-L6-v2";
@@ -2710,6 +2934,7 @@ const Chat = ({
   const mediaRecorderRef = useRef(null);
   const audioChunksRef = useRef([]);
   const activeRequestRef = useRef(null);
+  const activeRequestActivityRef = useRef(null);
   const [toolEditorState, setToolEditorState] = useState(null); // { tool, onSubmit }
   const [messageEditorState, setMessageEditorState] = useState(null); // { mode: "user"|"assistant", assistantId, text }
   const [audioTranscribing, setAudioTranscribing] = useState(false);
@@ -2738,7 +2963,6 @@ const Chat = ({
   const [compactionNowMs, setCompactionNowMs] = useState(() => Date.now());
   const initialScrollRef = useRef(false);
   const toolContinueLocksRef = useRef(new Set());
-  const entryHoverTimer = useRef(null); // hover timer for open/close
   const inputOffsetRef = useRef(null);
   const inputOffsetRafRef = useRef(null);
   const inputOffsetTimerRef = useRef(null);
@@ -3492,33 +3716,37 @@ const Chat = ({
     if (typeof window === "undefined") return;
     const trigger = chatSettingsTriggerRef.current;
     if (!trigger) return;
-    const visualViewport = window.visualViewport;
-    const position = resolveAnchoredPopoverPosition({
+    setChatSettingsPopoverStyle(buildComposerOverlayStyle({
       anchorRect: trigger.getBoundingClientRect(),
       popoverRect: chatSettingsPopoverRef.current?.getBoundingClientRect(),
-      viewport: {
-        left: visualViewport?.offsetLeft || 0,
-        top: visualViewport?.offsetTop || 0,
-        width:
-          visualViewport?.width ||
-          window.innerWidth ||
-          document.documentElement.clientWidth ||
-          0,
-        height:
-          visualViewport?.height ||
-          window.innerHeight ||
-          document.documentElement.clientHeight ||
-          0,
-      },
-    });
-    setChatSettingsPopoverStyle({
-      position: "fixed",
-      top: `${position.top}px`,
-      left: `${position.left}px`,
-      maxWidth: `${position.maxWidth}px`,
-      maxHeight: `${position.maxHeight}px`,
       zIndex: 3600,
-    });
+    }));
+  }, []);
+
+  const updateAttachmentPopoverPosition = useCallback(() => {
+    if (typeof window === "undefined") return;
+    const trigger = attachmentTriggerRef.current;
+    if (!trigger) return;
+    setAttachmentPopoverStyle(buildComposerOverlayStyle({
+      anchorRect: trigger.getBoundingClientRect(),
+      popoverRect: attachmentPopoverRef.current?.getBoundingClientRect(),
+      maxWidth: 240,
+      gap: 8,
+      zIndex: 3610,
+    }));
+  }, []);
+
+  const updateInputAlertPosition = useCallback(() => {
+    if (typeof window === "undefined") return;
+    const composer = inputBoxRef.current;
+    if (!composer) return;
+    setInputAlertStyle(buildComposerOverlayStyle({
+      anchorRect: composer.getBoundingClientRect(),
+      popoverRect: inputAlertStackRef.current?.getBoundingClientRect(),
+      maxWidth: 980,
+      gap: 10,
+      zIndex: 3620,
+    }));
   }, []);
 
   const startMicTest = useCallback(async () => {
@@ -4595,11 +4823,13 @@ const Chat = ({
   const toggleCollapseAllTools = useCallback(() => {
     setCollapseAllTools((prev) => !prev);
     setCollapsedTools({});
+    setExpandedToolCards({});
   }, []);
 
   const toggleToolCollapse = useCallback(
     (messageId) => {
       if (!messageId) return;
+      setExpandedToolCards({});
       setCollapsedTools((prev) => {
         const hasOverride = Object.prototype.hasOwnProperty.call(prev, messageId);
         const current = hasOverride ? prev[messageId] : collapseAllTools;
@@ -4777,6 +5007,8 @@ const Chat = ({
     ],
   );
   const clearActiveRequest = useCallback(() => {
+    activeRequestActivityRef.current?.clear?.();
+    activeRequestActivityRef.current = null;
     if (activeRequestRef.current) {
       activeRequestRef.current = null;
     }
@@ -4796,6 +5028,23 @@ const Chat = ({
           err.cancelled === true ||
           err?.message === "Generation cancelled"),
     );
+  useEffect(() => {
+    const activeRequest = activeRequestActivityRef.current;
+    if (
+      activeRequest &&
+      streamActivityMatchesRequest(streamActivity, activeRequest.messageId)
+    ) {
+      activeRequest.markActivity();
+    }
+  }, [streamActivity]);
+
+  useEffect(
+    () => () => {
+      activeRequestActivityRef.current?.clear?.();
+      activeRequestActivityRef.current = null;
+    },
+    [],
+  );
   const buildToolOutcomeResult = useCallback((status, message, data = null, ok = null) => {
     const normalized = String(status || "").toLowerCase();
     const resolvedOk =
@@ -5077,14 +5326,25 @@ const Chat = ({
         const timeoutMs = computeAdaptiveTimeoutMs(text, attemptIndex);
         const canAbort = typeof AbortController !== "undefined";
         const controller = canAbort ? new AbortController() : null;
+        const inactivityTimer = controller
+          ? createRequestInactivityTimer({
+              timeoutMs,
+              onTimeout: () => {
+                if (!controller.signal?.aborted) {
+                  controller.abort("timeout");
+                }
+              },
+            })
+          : null;
         if (controller && trackAbort) {
           activeRequestRef.current = controller;
+          activeRequestActivityRef.current = {
+            controller,
+            messageId: payload?.message_id,
+            markActivity: inactivityTimer.markActivity,
+            clear: inactivityTimer.clear,
+          };
         }
-        const timer = setTimeout(() => {
-          if (controller) {
-            controller.abort("timeout");
-          }
-        }, timeoutMs);
         try {
           const response = await axios.post(
             endpoint,
@@ -5119,7 +5379,7 @@ const Chat = ({
               error.message.toLowerCase().includes("timeout"));
           if (abortedByTimeout) {
             const timeoutError = new Error(
-              `Stopped waiting after ${Math.round(timeoutMs / 1000)}s. Try again or adjust model settings.`,
+              `Stopped waiting after ${Math.round(timeoutMs / 1000)}s without response activity. Try again or adjust model settings.`,
             );
             timeoutError.code = "REQUEST_TIMEOUT";
             timeoutError.timeoutMs = timeoutMs;
@@ -5128,7 +5388,7 @@ const Chat = ({
           }
           throw error;
         } finally {
-          clearTimeout(timer);
+          inactivityTimer?.clear();
           if (controller && activeRequestRef.current === controller) {
             clearActiveRequest();
           }
@@ -5467,6 +5727,7 @@ const Chat = ({
   useEffect(() => {
     setCollapseAllTools(true);
     setCollapsedTools({});
+    setExpandedToolCards({});
   }, [state.sessionId]);
 
   useEffect(() => {
@@ -5538,20 +5799,6 @@ const Chat = ({
     document.addEventListener("keydown", handleEscape);
     return () => document.removeEventListener("keydown", handleEscape);
   }, [browserSessionPopup]);
-
-  // Ensure only one hover timer is ever active and clear on state changes
-  useEffect(() => {
-    if (entryHoverTimer.current) {
-      clearTimeout(entryHoverTimer.current);
-      entryHoverTimer.current = null;
-    }
-    return () => {
-      if (entryHoverTimer.current) {
-        clearTimeout(entryHoverTimer.current);
-        entryHoverTimer.current = null;
-      }
-    };
-  }, [entryOpen]);
 
   const focusComposerInput = useCallback(() => {
     const candidate =
@@ -5712,6 +5959,18 @@ const Chat = ({
   useEffect(() => () => stopCameraCapture(), [stopCameraCapture]);
 
   useEffect(() => {
+    if (!cameraOpen) return undefined;
+    const handleEscape = (event) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      stopCameraCapture();
+      window.requestAnimationFrame(() => attachmentTriggerRef.current?.focus());
+    };
+    document.addEventListener("keydown", handleEscape);
+    return () => document.removeEventListener("keydown", handleEscape);
+  }, [cameraOpen, stopCameraCapture]);
+
+  useEffect(() => {
     if (!cameraOpen || !cameraVideoRef.current || !cameraStreamRef.current) return undefined;
     const video = cameraVideoRef.current;
     video.srcObject = cameraStreamRef.current;
@@ -5764,11 +6023,13 @@ const Chat = ({
   useEffect(() => {
     if (!chatSettingsOpen || chatSettingsSection !== "workflow") return undefined;
     let cancelled = false;
+    setWorkflowCatalogResolved(false);
     axios
       .get("/api/workflows/catalog")
       .then((response) => {
         if (!cancelled) {
           setChatWorkflowProfiles(normalizeWorkflowProfiles(response?.data));
+          setWorkflowCatalogResolved(true);
         }
       })
       .catch(() => {
@@ -5810,11 +6071,14 @@ const Chat = ({
     const handlePointerDown = (event) => {
       const target = event.target;
       if (attachmentMenuRef.current?.contains(target)) return;
+      if (attachmentPopoverRef.current?.contains(target)) return;
       setAttachmentMenuOpen(false);
     };
     const handleEscape = (event) => {
       if (event.key === "Escape") {
+        event.preventDefault();
         setAttachmentMenuOpen(false);
+        window.requestAnimationFrame(() => attachmentTriggerRef.current?.focus());
       }
     };
     document.addEventListener("mousedown", handlePointerDown);
@@ -5826,6 +6090,98 @@ const Chat = ({
       document.removeEventListener("keydown", handleEscape);
     };
   }, [attachmentMenuOpen]);
+
+  useEffect(() => {
+    if (!attachmentMenuOpen) {
+      setAttachmentPopoverStyle(null);
+      return undefined;
+    }
+    let frameId = null;
+    const syncPosition = () => {
+      if (frameId !== null) {
+        window.cancelAnimationFrame(frameId);
+      }
+      frameId = window.requestAnimationFrame(() => {
+        frameId = null;
+        updateAttachmentPopoverPosition();
+      });
+    };
+    syncPosition();
+    const resizeObserver =
+      typeof ResizeObserver === "function"
+        ? new ResizeObserver(syncPosition)
+        : null;
+    if (attachmentPopoverRef.current) {
+      resizeObserver?.observe(attachmentPopoverRef.current);
+    }
+    if (attachmentTriggerRef.current) {
+      resizeObserver?.observe(attachmentTriggerRef.current);
+    }
+    const visualViewport = window.visualViewport;
+    window.addEventListener("resize", syncPosition);
+    window.addEventListener("scroll", syncPosition, true);
+    visualViewport?.addEventListener("resize", syncPosition);
+    visualViewport?.addEventListener("scroll", syncPosition);
+    const focusFrameId = window.requestAnimationFrame(() => {
+      attachmentPopoverRef.current
+        ?.querySelector("button")
+        ?.focus();
+    });
+    return () => {
+      if (frameId !== null) {
+        window.cancelAnimationFrame(frameId);
+      }
+      window.cancelAnimationFrame(focusFrameId);
+      window.removeEventListener("resize", syncPosition);
+      window.removeEventListener("scroll", syncPosition, true);
+      visualViewport?.removeEventListener("resize", syncPosition);
+      visualViewport?.removeEventListener("scroll", syncPosition);
+      resizeObserver?.disconnect();
+    };
+  }, [attachmentMenuOpen, updateAttachmentPopoverPosition]);
+
+  useEffect(() => {
+    if (!inputAlerts.length) {
+      setInputAlertStyle(null);
+      return undefined;
+    }
+    let frameId = null;
+    const syncPosition = () => {
+      if (frameId !== null) {
+        window.cancelAnimationFrame(frameId);
+      }
+      frameId = window.requestAnimationFrame(() => {
+        frameId = null;
+        updateInputAlertPosition();
+      });
+    };
+    syncPosition();
+    const resizeObserver =
+      typeof ResizeObserver === "function"
+        ? new ResizeObserver(syncPosition)
+        : null;
+    if (inputAlertStackRef.current) {
+      resizeObserver?.observe(inputAlertStackRef.current);
+    }
+    if (inputBoxRef.current) {
+      resizeObserver?.observe(inputBoxRef.current);
+    }
+    const visualViewport = window.visualViewport;
+    window.addEventListener("resize", syncPosition);
+    window.addEventListener("scroll", syncPosition, true);
+    visualViewport?.addEventListener("resize", syncPosition);
+    visualViewport?.addEventListener("scroll", syncPosition);
+    return () => {
+      if (frameId !== null) {
+        window.cancelAnimationFrame(frameId);
+      }
+      window.removeEventListener("resize", syncPosition);
+      window.removeEventListener("scroll", syncPosition, true);
+      visualViewport?.removeEventListener("resize", syncPosition);
+      visualViewport?.removeEventListener("scroll", syncPosition);
+      resizeObserver?.disconnect();
+    };
+  }, [inputAlerts.length, inputAlertsKey, updateInputAlertPosition]);
 
   useEffect(() => {
     if (!chatSettingsOpen) {
@@ -5972,6 +6328,9 @@ const Chat = ({
         content_hash: contentHash,
         origin: a.origin || null,
         relative_path: a.relative_path || a.relativePath || null,
+        source_url: a.source_url || a.sourceUrl || null,
+        source_url_recorded_at:
+          a.source_url_recorded_at || a.sourceUrlRecordedAt || null,
         capture_source: a.capture_source || a.captureSource || null,
         capture_id: a.capture_id || a.captureId || null,
         transient: a.transient === true,
@@ -5991,6 +6350,8 @@ const Chat = ({
           content_hash,
           origin,
            relative_path,
+           source_url,
+           source_url_recorded_at,
            capture_source,
            capture_id,
            transient,
@@ -6006,6 +6367,8 @@ const Chat = ({
         content_hash,
           origin,
            relative_path,
+           source_url,
+           source_url_recorded_at,
            capture_source,
            capture_id,
            transient,
@@ -6027,6 +6390,8 @@ const Chat = ({
            content_hash,
            origin,
            relative_path,
+           source_url,
+           source_url_recorded_at,
            capture_source,
            capture_id,
            transient,
@@ -6039,6 +6404,8 @@ const Chat = ({
         content_hash,
            origin,
            relative_path,
+           source_url,
+           source_url_recorded_at,
            capture_source,
            capture_id,
            transient,
@@ -6073,10 +6440,12 @@ const Chat = ({
               text: displayMessage,
               timestamp: timestampIso,
               attachments: attachmentsForState,
-              metadata:
-                hasImageAttachments || effectiveVisionWorkflow !== "auto"
+              metadata: {
+                client_outbox: true,
+                ...(hasImageAttachments || effectiveVisionWorkflow !== "auto"
                   ? { vision: { workflow: effectiveVisionWorkflow } }
-                  : undefined,
+                  : {}),
+              },
             },
             {
               role: "ai",
@@ -6085,7 +6454,7 @@ const Chat = ({
               thoughts: [],
               tools: [],
               timestamp: timestampIso,
-              metadata: { status: "pending" },
+              metadata: { status: "pending", client_outbox: true },
             },
           ],
           history: newHistory,
@@ -6124,7 +6493,7 @@ const Chat = ({
           activeRequestRef.current = controller;
         }
         try {
-          let res = await apiWrapper.chat(
+          const res = await apiWrapper.chat(
             {
               message: effectiveMessage,
               mode: "api",
@@ -6133,43 +6502,20 @@ const Chat = ({
               message_id: msgId,
               attachments: apiAttachments,
               vision_workflow: effectiveVisionWorkflow,
+              ...workflowPayload,
               ...generationControlPayload,
               ...ragPayload,
             },
             { signal: controller?.signal },
           );
           debugLog("API Response:", res);
-          // quick client-side retry for transient errors
           if (res?.cancelled) {
             const userCancelError = new Error("Generation cancelled");
             userCancelError.code = "USER_CANCELLED";
             throw userCancelError;
           }
           if (res.error) {
-            await new Promise((r) => setTimeout(r, 400));
-            res = await apiWrapper.chat(
-              {
-                message: effectiveMessage,
-                mode: "api",
-                session_id: state.sessionId,
-                model: state.apiModel,
-                message_id: msgId,
-                attachments: apiAttachments,
-                vision_workflow: effectiveVisionWorkflow,
-                ...workflowPayload,
-                ...generationControlPayload,
-                ...ragPayload,
-              },
-              { signal: controller?.signal },
-            );
-            if (res?.cancelled) {
-              const userCancelError = new Error("Generation cancelled");
-              userCancelError.code = "USER_CANCELLED";
-              throw userCancelError;
-            }
-            if (res.error) {
-              throw new Error(res.error);
-            }
+            throw createApiWrapperError(res);
           }
           aiResponse = res.message;
           responseThought = res.thought || "";
@@ -6265,7 +6611,10 @@ const Chat = ({
 
       memoryStore["last_ai_response"] = { content: aiResponse, importance: 4 };
       setState((prev) => {
-        const updatedConversation = [...prev.conversation];
+        const updatedConversation = acknowledgeClientOutboxPair(
+          prev.conversation,
+          msgId,
+        );
         const idx = updatedConversation.findIndex((m) => m && m.id === msgId);
         if (idx !== -1) {
           const entry = { ...updatedConversation[idx], text: aiResponse };
@@ -6278,6 +6627,10 @@ const Chat = ({
             entry.metadata = mergeAssistantMessageMetadata(entry.metadata, {
               status: "complete",
             });
+          }
+          if (entry.metadata && typeof entry.metadata === "object") {
+            entry.metadata = { ...entry.metadata };
+            delete entry.metadata.client_outbox;
           }
           if (typeof responseThought === "string" && responseThought.trim()) {
             const trimmed = responseThought.trim();
@@ -6373,7 +6726,7 @@ const Chat = ({
         }
         setBanner({
           message: detail,
-          hint: "Generation exceeded the current timeout. Try again, simplify the prompt, or raise the limit in Settings.",
+          hint: "No matching reasoning, response, or tool activity arrived before the inactivity timeout. Try again or raise the limit in Settings.",
           category: "timeout",
           actions,
         });
@@ -6504,45 +6857,17 @@ const Chat = ({
     if (!userText.trim()) return;
     abortActiveRequest();
     clearActiveRequest();
+    setError(null);
+    setBanner(null);
     setLoading(true);
     setIsStreaming(true);
     setRegeneratingMessageId(msg.id);
     setActiveMessageId && setActiveMessageId(msg.id);
-    const regenerateStartedAt = new Date().toISOString();
-    setState((prev) => {
-      const updated = Array.isArray(prev.conversation) ? [...prev.conversation] : [];
-      if (overrideUserText != null) {
-        const userIdx = updated.findIndex((m) => m && m.id === `${msg.id}:user`);
-        if (userIdx !== -1) {
-          updated[userIdx] = {
-            ...updated[userIdx],
-            text: overrideUserText,
-            timestamp: regenerateStartedAt,
-          };
-        }
-      }
-      const mIdx = updated.findIndex((m) => m && m.id === msg.id);
-      if (mIdx === -1) return prev;
-      updated[mIdx] = {
-        ...updated[mIdx],
-        text: "",
-        content: "",
-        thoughts: [],
-        tools: [],
-        ragMatches: [],
-        timestamp: regenerateStartedAt,
-        metadata: mergeAssistantMessageMetadata(updated[mIdx]?.metadata, {
-          status: "regenerating",
-          tool_response_pending: false,
-          tool_continued: false,
-          tool_continuation_phases: [],
-          tool_continuation_text: "",
-          tool_prelude_text: "",
-        }),
-      };
-      return { ...prev, conversation: updated };
+    announceToolContinuationAttemptReset({
+      sessionId: state.sessionId,
+      messageId: msg.id,
     });
-    const regenerateTarget = resolveRegenerateRequestTarget(state, msg);
+    const regenerateTarget = resolveRegenerateRequestTarget(state);
     let responseMetadata = null;
     let ragMatchesFromResponse = [];
     let responseThought = "";
@@ -6563,6 +6888,7 @@ const Chat = ({
               session_id: state.sessionId,
               model: regenerateTarget.model || state.apiModel,
               message_id: msg.id,
+              regenerate: true,
               attachments: previousAttachments,
               vision_workflow: previousVisionWorkflow,
               ...workflowPayload,
@@ -6577,7 +6903,7 @@ const Chat = ({
             throw userCancelError;
           }
           if (res.error) {
-            throw new Error(res.error);
+            throw createApiWrapperError(res);
           }
           aiResponse = res.message;
           responseThought = res.thought || "";
@@ -6585,6 +6911,21 @@ const Chat = ({
           const md = res.metadata || {};
           responseMetadata = Object.keys(md).length ? md : null;
           ragMatchesFromResponse = ragMatchesFromSection(md?.rag);
+          const responseError = getRegenerationResponseError(md, aiResponse);
+          if (responseError) throw responseError;
+          if (md.warning) {
+            setBanner({
+              message: md.warning,
+              hint: md.hint,
+              category: md.category || "api_warning",
+              actions: [
+                { label: "Settings", onClick: () => navigate("/settings") },
+                { label: "Use local", onClick: () => setState((prev) => ({ ...prev, backendMode: "local" })) },
+              ],
+            });
+          } else {
+            setBanner(null);
+          }
         } finally {
           if (controller && activeRequestRef.current === controller) {
             clearActiveRequest();
@@ -6602,6 +6943,7 @@ const Chat = ({
           mode,
           session_id: state.sessionId,
           message_id: msg.id,
+          regenerate: true,
           model,
           attachments: previousAttachments,
           vision_workflow: previousVisionWorkflow,
@@ -6620,13 +6962,15 @@ const Chat = ({
         const meta = r.data?.metadata || {};
         responseMetadata = Object.keys(meta).length ? meta : null;
         ragMatchesFromResponse = ragMatchesFromSection(meta?.rag);
-        if (meta?.error || meta?.warning) {
+        const responseError = getRegenerationResponseError(meta, aiResponse);
+        if (responseError) throw responseError;
+        if (meta?.warning) {
           const actions = [{ label: "Settings", onClick: () => navigate("/settings") }];
           if (mode === "server") {
             actions.push({ label: "Use local", onClick: () => setState((prev) => ({ ...prev, backendMode: "local" })) });
           }
           setBanner({
-            message: meta.warning || meta.error,
+            message: meta.warning,
             hint:
               meta.hint ||
               (mode === "server"
@@ -6640,36 +6984,68 @@ const Chat = ({
         }
       }
 
+      // Reasoning and retrieval context are diagnostics, not a replacement
+      // answer. Keep the saved response unless regeneration produced text or
+      // an actionable tool proposal the transcript can actually render.
+      const hasUserVisibleRegenerationOutput =
+        (typeof aiResponse === "string" && aiResponse.trim()) ||
+        responseTools.length > 0;
+      if (!hasUserVisibleRegenerationOutput) {
+        const emptyResponseError = new Error(
+          "Regeneration completed without returning a final answer.",
+        );
+        emptyResponseError.code = "EMPTY_REGENERATION_RESPONSE";
+        throw emptyResponseError;
+      }
+
       setState((prev) => {
         const updated = [...prev.conversation];
-        if (overrideUserText != null) {
-          const userIdx = updated.findIndex((m) => m && m.id === `${msg.id}:user`);
-          if (userIdx !== -1) {
-            updated[userIdx] = {
-              ...updated[userIdx],
-              text: overrideUserText,
-              timestamp: new Date().toISOString(),
-            };
-          }
-        }
         const mIdx = updated.findIndex((m) => m.id === msg.id);
         if (mIdx !== -1) {
+          if (overrideUserText != null) {
+            let userIdx = updated.findIndex(
+              (m) => m && m.id === `${msg.id}:user`,
+            );
+            if (userIdx === -1 && mIdx > 0 && updated[mIdx - 1]?.role === "user") {
+              userIdx = mIdx - 1;
+            }
+            if (userIdx !== -1) {
+              updated[userIdx] = {
+                ...updated[userIdx],
+                text: overrideUserText,
+                timestamp: new Date().toISOString(),
+              };
+            }
+          }
+          const cleanMetadata = clearRegenerationContinuationMetadata(
+            updated[mIdx]?.metadata,
+          );
+          [
+            ...RESPONSE_FAILURE_METADATA_KEYS,
+            "rag",
+            "inline_tool_payload",
+            "inline_tool_payloads",
+          ].forEach((key) => {
+            delete cleanMetadata[key];
+          });
           const entry = {
             ...updated[mIdx],
             text: aiResponse,
             content: aiResponse,
+            thoughts: [],
+            tools: [],
+            ragMatches: [],
             timestamp: new Date().toISOString(),
-          };
-          if (responseMetadata && Object.keys(responseMetadata).length) {
-            entry.metadata = mergeAssistantMessageMetadata(
-              entry.metadata,
-              responseMetadata,
-            );
-          } else if (aiResponse && aiResponse.trim()) {
-            entry.metadata = mergeAssistantMessageMetadata(entry.metadata, {
+            metadata: mergeAssistantMessageMetadata(cleanMetadata, {
               status: "complete",
-            });
-          }
+              tool_response_pending: false,
+              tool_continued: false,
+              tool_continuation_phases: [],
+              tool_continuation_text: "",
+              tool_prelude_text: "",
+              ...(responseMetadata || {}),
+            }),
+          };
           if (typeof responseThought === "string" && responseThought.trim()) {
             const trimmed = responseThought.trim();
             const thoughts = Array.isArray(entry.thoughts) ? [...entry.thoughts] : [];
@@ -6735,12 +7111,54 @@ const Chat = ({
       }
       console.error("Regenerate failed", err);
       const isTimeoutError = err && err.code === "REQUEST_TIMEOUT";
+      const isEmptyRegenerationError =
+        err && err.code === "EMPTY_REGENERATION_RESPONSE";
+      const isProviderRegenerationError =
+        err && err.code === "REGENERATION_PROVIDER_ERROR";
       const detail =
         isTimeoutError
           ? err.message
-          : (err && err.response && err.response.data && (err.response.data.detail || err.response.data.message)) || err?.message || "Request failed";
+          : getRequestErrorDetail(err, "Request failed");
       setError(detail);
-      if (isTimeoutError) {
+      if (isRegenerateMessageConflict(err, detail)) {
+        setBanner({
+          message: detail,
+          hint: "Float could not safely replace the saved turn, so the previous answer was kept. Reload the conversation and retry regeneration.",
+          category: "regenerate_conflict",
+          actions: [],
+        });
+      } else if (isEmptyRegenerationError) {
+        setBanner({
+          message: detail,
+          hint: "The model returned no user-visible answer, so the previous answer was kept. Retry, switch models, or reduce reasoning effort.",
+          category: "empty_response",
+          actions: [{ label: "Settings", onClick: () => navigate("/settings") }],
+        });
+      } else if (isProviderRegenerationError) {
+        const failureMetadata =
+          err?.metadata && typeof err.metadata === "object" ? err.metadata : {};
+        const actions = [
+          { label: "Settings", onClick: () => navigate("/settings") },
+        ];
+        if (
+          regenerateTarget.mode === "api" ||
+          regenerateTarget.mode === "server"
+        ) {
+          actions.push({
+            label: "Use local",
+            onClick: () =>
+              setState((prev) => ({ ...prev, backendMode: "local" })),
+          });
+        }
+        setBanner({
+          message: detail,
+          hint:
+            failureMetadata.hint ||
+            "The previous answer was kept. Verify the selected provider and retry regeneration.",
+          category: failureMetadata.category || "regenerate_error",
+          actions,
+        });
+      } else if (isTimeoutError) {
         const actions = [{ label: "Settings", onClick: () => navigate("/settings") }];
         if (state.backendMode === "api") {
           actions.push({ label: "Use local", onClick: () => setState((prev) => ({ ...prev, backendMode: "local" })) });
@@ -7072,31 +7490,29 @@ const Chat = ({
   const maybeContinueAfterTools = useCallback(
     async (msgBase, toolsOverride = null, continueTarget = null) => {
       if (!msgBase || !msgBase.id) return;
-      if (toolContinueLocksRef.current.has(msgBase.id)) return;
       const tools = Array.isArray(toolsOverride) ? toolsOverride : msgBase.tools;
       const messageForContinuation = { ...msgBase, tools };
       if (!canContinueMessage(messageForContinuation)) return;
       const batch = buildToolContinuationBatch(tools);
       if (!batch) return;
-      if (
-        hasMatchingToolContinuationSignature(msgBase.metadata, batch) ||
-        hasMatchingToolContinuationSignature(msgBase.metadata, batch, {
-          includeIds: false,
-        })
-      ) {
-        return;
-      }
-      toolContinueLocksRef.current.add(msgBase.id);
+      if (hasMatchingToolContinuationSignature(msgBase.metadata, batch)) return;
+      const localLockKey = buildToolContinuationLockKey({
+        sessionId: state.sessionId,
+        messageId: msgBase.id,
+        tools: batch,
+      });
+      if (!localLockKey || toolContinueLocksRef.current.has(localLockKey)) return;
+      toolContinueLocksRef.current.add(localLockKey);
       try {
         await continueGenerating(
           { ...msgBase, tools: batch },
           continueTarget ? { continueTarget } : undefined,
         );
       } finally {
-        toolContinueLocksRef.current.delete(msgBase.id);
+        toolContinueLocksRef.current.delete(localLockKey);
       }
     },
-    [canContinueMessage, continueGenerating],
+    [canContinueMessage, continueGenerating, state.sessionId],
   );
 
   useEffect(() => {
@@ -7107,7 +7523,8 @@ const Chat = ({
       const metadata =
         entry.metadata && typeof entry.metadata === "object" ? entry.metadata : {};
       return (
-        metadata.inline_tool_continuation_pending === true &&
+        (metadata.inline_tool_continuation_pending === true ||
+          metadata.tool_result_continuation_pending === true) &&
         metadata.tool_response_pending === true &&
         Boolean(buildToolContinuationBatch(resolveMessageTools(entry)))
       );
@@ -7875,6 +8292,8 @@ const Chat = ({
         uploadError: "",
         origin: res.data?.origin || origin,
         relative_path: res.data?.relative_path || "",
+        source_url: res.data?.source_url || "",
+        source_url_recorded_at: res.data?.source_url_recorded_at || "",
         capture_source: captureSource,
         capture_id: captureId,
         transient:
@@ -8693,9 +9112,6 @@ const Chat = ({
     compactionBusy && compactionStartedAt
       ? Math.max(0, compactionNowMs - compactionStartedAt)
       : null;
-  const inputAlerts = [error, cameraError, liveVisualError].filter(
-    (value) => typeof value === "string" && value.trim(),
-  );
   const audioRecorderStatus = audioRecording
     ? "Recording microphone input"
     : audioTranscribing
@@ -9220,7 +9636,7 @@ const Chat = ({
               )}
               {chatSettingsSection === "workflow" && (
                 <>
-                  <label htmlFor="chat-workflow-profile">active workflow profile</label>
+                  <label htmlFor="chat-workflow-profile">workflow for new turns</label>
                   <select
                     id="chat-workflow-profile"
                     value={workflowProfile}
@@ -9242,7 +9658,7 @@ const Chat = ({
                     optional {state.enabledWorkflowModules?.length === 1 ? "module" : "modules"} enabled.
                   </span>
                   <span className="chat-settings-note">
-                    This changes the active chat profile. Defaults, modules, and skill docs are managed in Knowledge.
+                    Changing this also updates your default across chats. Profiles set guidance and reasoning; they do not launch workers or change global tool access.
                   </span>
                   <button
                     type="button"
@@ -9307,7 +9723,46 @@ const Chat = ({
           document.body,
         )
       : null;
-
+  const inputAlertsFallbackStyle = buildComposerOverlayStyle({
+    anchorRect: inputBoxRef.current?.getBoundingClientRect(),
+    popoverRect: {
+      width: Math.min(inputBoxRef.current?.getBoundingClientRect()?.width || 760, 980),
+      height: Math.max(56, inputAlerts.length * 64),
+    },
+    maxWidth: 980,
+    gap: 10,
+    zIndex: 3620,
+  });
+  const attachmentPopoverFallbackStyle = buildComposerOverlayStyle({
+    anchorRect: attachmentTriggerRef.current?.getBoundingClientRect(),
+    popoverRect: { width: 145, height: 48 },
+    maxWidth: 240,
+    gap: 8,
+    zIndex: 3610,
+  });
+  const inputAlertsPopover =
+    entryOpen && inputAlerts.length > 0 && typeof document !== "undefined"
+      ? createPortal(
+          <div
+            ref={inputAlertStackRef}
+            className="input-alert-stack input-alert-stack-floating"
+            aria-live="polite"
+            aria-label="Composer notices"
+            style={inputAlertStyle || inputAlertsFallbackStyle}
+          >
+            {inputAlerts.map((message, index) => (
+              <div
+                key={`input-alert-${index}-${message}`}
+                className="input-error"
+                role="alert"
+              >
+                {message}
+              </div>
+            ))}
+          </div>,
+          document.body,
+        )
+      : null;
   return (
     <>
     <div className="chat-container" ref={chatContainerRef}>
@@ -9623,6 +10078,9 @@ const Chat = ({
                         contentHash: att.content_hash || att.contentHash || null,
                         origin: att.origin || null,
                         relative_path: att.relative_path || att.relativePath || null,
+                        source_url: att.source_url || att.sourceUrl || null,
+                        source_url_recorded_at:
+                          att.source_url_recorded_at || att.sourceUrlRecordedAt || null,
                         capture_source: att.capture_source || att.captureSource || null,
                         caption_status: att.caption_status || null,
                         index_status: att.index_status || null,
@@ -9790,6 +10248,15 @@ const Chat = ({
                         ? tool.id || tool.request_id || null
                         : null;
                     const requestId = rawRequestId ? String(rawRequestId) : null;
+                    const syntheticToolKey =
+                      typeof tool?.synthetic_id === "string" ? tool.synthetic_id : "";
+                    const toolDetailKey = `${toolCollapseKey}:${
+                      requestId || syntheticToolKey || toolName || "tool"
+                    }:${i}`;
+                    const toolCardExpanded = expandedToolCards[toolDetailKey] === true;
+                    const isRoutineResolvedTool = status === "invoked";
+                    const showToolExecutionDetails =
+                      isActiveMessage || toolCardExpanded || !isRoutineResolvedTool;
                     const baselineArgs =
                       hasArgs && tool && typeof tool === "object" && tool.args && typeof tool.args === "object"
                         ? tool.args
@@ -9802,13 +10269,11 @@ const Chat = ({
                       null;
                     const previewText = hasResult
                       ? summarizeToolValue(tool.result, toolName)
-                      : hasArgs
+                      : hasArgs && showToolExecutionDetails
                         ? summarizeToolValue(tool.args, toolName)
                         : "";
                     const acceptDisabled = tool?.manual_fill_required === true && !requestId;
                     const localDenyAllowed = tool?.synthetic === true && !requestId;
-                    const syntheticToolKey =
-                      typeof tool?.synthetic_id === "string" ? tool.synthetic_id : "";
                     const toolInspectorRows = [
                       {
                         label: "Source",
@@ -9935,7 +10400,7 @@ const Chat = ({
                     return {
                       mode: targetMode,
                       model: routeModel || resolved.model || "",
-                      workflow: state.workflowProfile || "default",
+                      workflow: workflowProfile,
                     };
                   };
                   const submitDecision = async (
@@ -10155,11 +10620,23 @@ const Chat = ({
                           toolsCollapsed ? " collapsed" : ""
                         }${
                           isActiveMessage ? " active" : ""
+                        }${
+                          showToolExecutionDetails ? "" : " summary-only"
                         }`}
                         data-tool-id={requestId || undefined}
                         data-chain-id={chainTarget || undefined}
                         onToggle={(event) => {
-                          if (!event.currentTarget.open || !chainTarget) return;
+                          const isOpen = event.currentTarget.open;
+                          setExpandedToolCards((prev) => {
+                            if (Boolean(prev[toolDetailKey]) === isOpen) return prev;
+                            if (isOpen) {
+                              return { ...prev, [toolDetailKey]: true };
+                            }
+                            const next = { ...prev };
+                            delete next[toolDetailKey];
+                            return next;
+                          });
+                          if (!isOpen || !chainTarget) return;
                           if (typeof requestAnimationFrame === "function") {
                             requestAnimationFrame(() =>
                               scrollMessageIntoView(chainTarget, "smooth", {
@@ -10182,22 +10659,26 @@ const Chat = ({
                           <div className="tool-meta">
                             <span className="tool-step-index">{i + 1}</span>
                             <span className="tool-name">{tool.name || "tool"}</span>
-                            <span className={`tool-status-badge status-${statusTone}`}>
-                              <span className="tool-status-glyph" aria-hidden="true">
-                                {statusGlyph}
+                            {showToolExecutionDetails && (
+                              <span className={`tool-status-badge status-${statusTone}`}>
+                                <span className="tool-status-glyph" aria-hidden="true">
+                                  {statusGlyph}
+                                </span>
+                                {statusLabel}
                               </span>
-                              {statusLabel}
-                            </span>
-                            <StateInspector
-                              title="Why this tool is here"
-                              summary={
-                                isPending
-                                  ? "The assistant proposed this tool and is waiting for review."
-                                  : "This tool state came from the current chat turn."
-                              }
-                              rows={toolInspectorRows}
-                              ariaLabel={`Explain ${tool.name || "tool"} state`}
-                            />
+                            )}
+                            {showToolExecutionDetails && (
+                              <StateInspector
+                                title="Why this tool is here"
+                                summary={
+                                  isPending
+                                    ? "The assistant proposed this tool and is waiting for review."
+                                    : "This tool state came from the current chat turn."
+                                }
+                                rows={toolInspectorRows}
+                                ariaLabel={`Explain ${tool.name || "tool"} state`}
+                              />
+                            )}
                           </div>
                           {previewText && (
                             <span className="tool-preview" title={previewText}>
@@ -10269,6 +10750,8 @@ const Chat = ({
                                     start_time: Math.floor(Date.now() / 1000),
                                     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
                                     title: `Schedule tool: ${toolName || "tool"}`,
+                                    session_id: sessionIdForTool || state.sessionId || undefined,
+                                    message_id: chainTarget || undefined,
                                   },
                                   onSchedule: async ({ args, name, schedule }) => {
                                     if (!schedule || !schedule.event_id) {
@@ -10277,8 +10760,9 @@ const Chat = ({
                                     const eventId = String(schedule.event_id);
                                     const resolvedName =
                                       (name || toolName || "").trim() || toolName || "tool";
-                                    const continueInline =
-                                      schedule.conversation_mode !== "new_chat";
+                                    const reqId = requestId ? String(requestId) : eventId;
+                                    const ownerSession =
+                                      sessionIdForTool || state.sessionId || undefined;
                                     try {
                                       await axios.post(
                                         `/api/calendar/events/${encodeURIComponent(eventId)}`,
@@ -10289,11 +10773,26 @@ const Chat = ({
                                           location: schedule.location,
                                           start_time: schedule.start_time,
                                           end_time: schedule.end_time,
+                                          rrule: schedule.rrule,
                                           timezone: schedule.timezone,
                                           status: schedule.status || "scheduled",
+                                          background_job: schedule.background_job,
+                                          actions: [
+                                            {
+                                              id: reqId,
+                                              request_id: reqId,
+                                              kind: "tool",
+                                              name: resolvedName,
+                                              args: args || {},
+                                              prompt: schedule.prompt,
+                                              conversation_mode: schedule.conversation_mode,
+                                              session_id: ownerSession,
+                                              message_id: chainTarget || undefined,
+                                              chain_id: chainTarget || undefined,
+                                            },
+                                          ],
                                         },
                                       );
-                                      const reqId = requestId ? String(requestId) : eventId;
                                       await axios.post("/api/tools/schedule", {
                                         request_id: reqId,
                                         event_id: eventId,
@@ -10301,11 +10800,9 @@ const Chat = ({
                                         args: args || {},
                                         prompt: schedule.prompt,
                                         conversation_mode: schedule.conversation_mode,
-                                        session_id: continueInline
-                                          ? sessionIdForTool || state.sessionId
-                                          : undefined,
-                                        message_id: continueInline ? chainTarget : undefined,
-                                        chain_id: continueInline ? chainTarget : undefined,
+                                        session_id: ownerSession,
+                                        message_id: chainTarget || undefined,
+                                        chain_id: chainTarget || undefined,
                                       });
                                       if (chainTarget && requestId) {
                                         setState((prev) => {
@@ -10382,6 +10879,8 @@ const Chat = ({
                                     start_time: Math.floor(Date.now() / 1000),
                                     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
                                     title: `Retry tool: ${toolName || "tool"}`,
+                                    session_id: sessionIdForTool || state.sessionId || undefined,
+                                    message_id: chainTarget || undefined,
                                   },
                                 });
                               }}
@@ -10394,7 +10893,8 @@ const Chat = ({
                           {">"}
                         </span>
                       </summary>
-                      {(hasArgs || hasResult || toolSourceLabel) && (
+                      {showToolExecutionDetails &&
+                        (hasArgs || hasResult || toolSourceLabel) && (
                         <div className="tool-content">
                           {toolSourceLabel && (
                             <div className="tool-source">source: {toolSourceLabel}</div>
@@ -10507,6 +11007,7 @@ const Chat = ({
                           summary="Routing, retrieval, and tool details for this response."
                           rows={messageMetadataRows}
                           label="i"
+                          placement="top"
                           className="message-state-inspector"
                           ariaLabel="Show message metadata"
                         />
@@ -10732,17 +11233,12 @@ const Chat = ({
     )}
     {!entryOpen && error && <p className="error">{error}</p>}
     {commandSuggestionsPopover}
+    {inputAlertsPopover}
     {typeof document !== 'undefined' && createPortal(
       (entryOpen ? (
         <div
           className={`input-box${cameraOpen ? " camera-open" : ""}`}
           ref={inputBoxRef}
-          onMouseEnter={() => {
-            if (entryHoverTimer.current) {
-              clearTimeout(entryHoverTimer.current);
-              entryHoverTimer.current = null;
-            }
-          }}
         >
           <div
             className={`composer-resize-edge${cameraOpen ? " is-disabled" : ""}`}
@@ -10775,19 +11271,6 @@ const Chat = ({
             <div className="input-status-strip" role="status" aria-live="polite">
               <span className="input-status-dot" aria-hidden="true" />
               <span>{audioRecorderStatus}</span>
-            </div>
-          )}
-          {inputAlerts.length > 0 && (
-            <div className="input-alert-stack" aria-live="polite">
-              {inputAlerts.map((message, index) => (
-                <div
-                  key={`input-alert-${index}-${message}`}
-                  className="input-error"
-                  role="alert"
-                >
-                  {message}
-                </div>
-              ))}
             </div>
           )}
           {banner && (
@@ -10850,7 +11333,11 @@ const Chat = ({
           )}
           {cameraOpen && (
             <div className="camera-capture-panel">
-              <div className="camera-capture-stage">
+              <div
+                className="camera-capture-stage"
+                role="region"
+                aria-label="Camera preview"
+              >
                 <video
                   ref={cameraVideoRef}
                   className="camera-capture-preview"
@@ -11099,77 +11586,91 @@ const Chat = ({
                   </IconButton>
                 </Tooltip>
                 <div className="attach-menu" ref={attachmentMenuRef}>
-                  {attachmentMenuOpen && (
-                    <div className="attach-popover" role="menu">
-                      <Tooltip title="Attach file">
-                        <IconButton
-                          onClick={handleAttachmentFileAction}
-                          aria-label="attach file"
-                          className="action-icon"
+                  {attachmentMenuOpen &&
+                    typeof document !== "undefined" &&
+                    createPortal(
+                      <div
+                        ref={attachmentPopoverRef}
+                        id="chat-attachment-menu"
+                        className="attach-popover attach-popover-floating"
+                        role="toolbar"
+                        aria-label="Attachment actions"
+                        style={attachmentPopoverStyle || attachmentPopoverFallbackStyle}
+                      >
+                        <Tooltip title="Attach file">
+                          <IconButton
+                            onClick={handleAttachmentFileAction}
+                            aria-label="attach file"
+                            className="action-icon"
+                          >
+                            <AttachFileIcon />
+                          </IconButton>
+                        </Tooltip>
+                        <Tooltip
+                          title={
+                            recording
+                              ? liveVisualMode === "camera"
+                                ? "Turn live camera off"
+                                : "Turn live camera on"
+                              : cameraOpen
+                                ? "Close camera capture"
+                                : "Capture from camera"
+                          }
                         >
-                          <AttachFileIcon />
-                        </IconButton>
-                      </Tooltip>
-                      <Tooltip
-                        title={
-                          recording
-                            ? liveVisualMode === "camera"
-                              ? "Turn live camera off"
-                              : "Turn live camera on"
-                            : cameraOpen
-                              ? "Close camera capture"
-                            : "Capture from camera"
-                        }
-                      >
-                        <span>
-                          <IconButton
-                            onClick={handleAttachmentCameraAction}
-                            aria-label="capture from camera"
-                            className={`action-icon visual-stream-toggle${
-                              recording ? " is-live-option" : ""
-                            }${
-                              recording && liveVisualMode !== "camera" ? " is-off" : ""
-                            }${
-                              recording && liveVisualMode === "camera" ? " is-on" : ""
-                            }`}
-                            disabled={cameraBusy}
-                          >
-                            <PhotoCameraIcon />
-                          </IconButton>
-                        </span>
-                      </Tooltip>
-                      <Tooltip
-                        title={
-                          recording
-                            ? liveVisualMode === "screen"
-                              ? "Turn desktop capture off"
-                              : "Turn desktop capture on"
-                            : "Capture from desktop"
-                        }
-                      >
-                        <span>
-                          <IconButton
-                            onClick={handleAttachmentScreenAction}
-                            aria-label="capture from desktop"
-                            className={`action-icon visual-stream-toggle${
-                              recording ? " is-live-option" : ""
-                            }${
-                              recording && liveVisualMode !== "screen" ? " is-off" : ""
-                            }${
-                              recording && liveVisualMode === "screen" ? " is-on" : ""
-                            }`}
-                            disabled={screenCaptureBusy}
-                          >
-                            <ScreenShareIcon />
-                          </IconButton>
-                        </span>
-                      </Tooltip>
-                    </div>
-                  )}
+                          <span>
+                            <IconButton
+                              onClick={handleAttachmentCameraAction}
+                              aria-label="capture from camera"
+                              className={`action-icon visual-stream-toggle${
+                                recording ? " is-live-option" : ""
+                              }${
+                                recording && liveVisualMode !== "camera" ? " is-off" : ""
+                              }${
+                                recording && liveVisualMode === "camera" ? " is-on" : ""
+                              }`}
+                              disabled={cameraBusy}
+                            >
+                              <PhotoCameraIcon />
+                            </IconButton>
+                          </span>
+                        </Tooltip>
+                        <Tooltip
+                          title={
+                            recording
+                              ? liveVisualMode === "screen"
+                                ? "Turn desktop capture off"
+                                : "Turn desktop capture on"
+                              : "Capture from desktop"
+                          }
+                        >
+                          <span>
+                            <IconButton
+                              onClick={handleAttachmentScreenAction}
+                              aria-label="capture from desktop"
+                              className={`action-icon visual-stream-toggle${
+                                recording ? " is-live-option" : ""
+                              }${
+                                recording && liveVisualMode !== "screen" ? " is-off" : ""
+                              }${
+                                recording && liveVisualMode === "screen" ? " is-on" : ""
+                              }`}
+                              disabled={screenCaptureBusy}
+                            >
+                              <ScreenShareIcon />
+                            </IconButton>
+                          </span>
+                        </Tooltip>
+                      </div>,
+                      document.body,
+                    )}
                   <Tooltip title="Attachments">
                     <IconButton
+                      ref={attachmentTriggerRef}
                       onClick={() => setAttachmentMenuOpen((prev) => !prev)}
                       aria-label="open attachments"
+                      aria-haspopup="true"
+                      aria-expanded={attachmentMenuOpen}
+                      aria-controls={attachmentMenuOpen ? "chat-attachment-menu" : undefined}
                       className={`action-icon attach-trigger${
                         attachmentMenuOpen ? " is-open" : ""
                       }`}
@@ -11179,18 +11680,6 @@ const Chat = ({
                   </Tooltip>
                 </div>
                 <div className="send-stack">
-                  {isStreaming && (
-                    <Tooltip title="Stop generation">
-                      <button
-                        type="button"
-                        className="chip stop-chip"
-                        onClick={cancelGeneration}
-                        aria-label="Stop generation"
-                      >
-                        stop
-                      </button>
-                    </Tooltip>
-                  )}
                   <Tooltip title={sendTooltip}>
                     <span>
                       <Button
@@ -11219,16 +11708,6 @@ const Chat = ({
           onClick={() => setEntryOpen(true)}
           aria-label="Open chat input"
           title="Open chat input"
-          onMouseEnter={() => {
-            if (entryHoverTimer.current) clearTimeout(entryHoverTimer.current);
-            entryHoverTimer.current = setTimeout(() => setEntryOpen(true), 600);
-          }}
-          onMouseLeave={() => {
-            if (entryHoverTimer.current) {
-              clearTimeout(entryHoverTimer.current);
-              entryHoverTimer.current = null;
-            }
-          }}
         >
           Chat
         </button>

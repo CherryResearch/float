@@ -99,7 +99,7 @@ def test_multi_agent_task_chain_publishes_console_events(monkeypatch, client):
     assert agent["workflow"]["role"] == "architect"
     assert agent["provenance"]["parent_session_id"] == "sess-1"
     assert agent["handoff"]["summary"] == "Verify the search result before responding."
-    assert set(agent["controls"]["available"]) == {"pause", "redirect", "stop"}
+    assert agent["controls"]["available"] == ["stop"]
     assert agent["events"][0]["session_id"] == "sess-1"
     assert agent["events"][0]["message_id"] == "msg-1"
     assert agent["events"][0]["chain_id"] == "chain-1"
@@ -120,19 +120,24 @@ def test_multi_agent_task_chain_publishes_console_events(monkeypatch, client):
     assert [event["status"] for event in agent["events"]] == ["queued", "success"]
 
 
-def test_agent_console_controls_update_delegated_task(monkeypatch, client):
+def test_agent_console_only_stops_real_delegated_tasks(monkeypatch, client):
     from app import routes
+
+    class ParentTask:
+        id = "task-upstream"
+        parent = None
 
     class SubmittedTask:
         id = "task-ctrl"
+        parent = ParentTask()
 
     def fake_plan_and_execute(_steps):
         return SubmittedTask()
 
-    revoked = {}
+    revoked = []
 
     async def fake_stop_task(task_id):
-        revoked["task_id"] = task_id
+        revoked.append(task_id)
 
     monkeypatch.setattr(routes.engine, "plan_and_execute", fake_plan_and_execute)
     monkeypatch.setattr(routes, "_console_stop_task", fake_stop_task)
@@ -140,44 +145,112 @@ def test_agent_console_controls_update_delegated_task(monkeypatch, client):
     queued = client.post(
         "/api/tasks/",
         json={
+            "provenance": {
+                "kind": "task_chain",
+                "task_id": "unrelated-client-task",
+            },
             "steps": [{"agent": "long_running_task"}],
         },
     )
     assert queued.status_code == 200
 
     paused = client.post("/api/agents/console/task%3Atask-ctrl/pause", json={})
-    assert paused.status_code == 200
-    assert paused.json()["agent"]["status"] == "paused"
-    assert set(paused.json()["agent"]["controls"]["available"]) == {
-        "resume",
-        "redirect",
-        "stop",
-    }
+    assert paused.status_code == 409
+    assert "not supported" in paused.json()["detail"]
 
     redirected = client.post(
         "/api/agents/console/task%3Atask-ctrl/redirect",
         json={"note": "Switch this to the verifier pass.", "workflow": "default"},
     )
-    assert redirected.status_code == 200
-    redirect_agent = redirected.json()["agent"]
-    assert (
-        redirect_agent["controls"]["redirect_note"]
-        == "Switch this to the verifier pass."
-    )
-    assert redirect_agent["controls"]["redirect_workflow"] == "default"
-    assert (
-        "Redirect: Switch this to the verifier pass."
-        in redirect_agent["handoff"]["notes"]
-    )
+    assert redirected.status_code == 409
+    assert "not supported" in redirected.json()["detail"]
 
     resumed = client.post("/api/agents/console/task%3Atask-ctrl/resume", json={})
-    assert resumed.status_code == 200
-    assert resumed.json()["agent"]["status"] == "active"
+    assert resumed.status_code == 409
+    assert "not supported" in resumed.json()["detail"]
 
     stopped = client.post("/api/agents/console/task%3Atask-ctrl/stop", json={})
     assert stopped.status_code == 200
     assert stopped.json()["agent"]["status"] == "stopped"
-    assert revoked["task_id"] == "task-ctrl"
+    assert revoked == ["task-ctrl", "task-upstream"]
+    assert "unrelated-client-task" not in revoked
+
+    class PendingTask:
+        state = "PENDING"
+
+        def ready(self):
+            return False
+
+    monkeypatch.setattr(routes.engine, "result", lambda _task_id: PendingTask())
+    assert client.get("/api/tasks/task-ctrl").status_code == 200
+    snapshot = client.get("/api/agents/console").json()
+    task_agent = next(
+        item for item in snapshot["agents"] if item["id"] == "task:task-ctrl"
+    )
+    assert task_agent["status"] == "stopped"
+    assert task_agent["controls"]["available"] == []
+
+
+def test_agent_console_reports_stop_transport_failures(monkeypatch, client):
+    from app import routes
+    from app.main import app
+
+    app.state.agent_console_state = {
+        "agents": {
+            "task:task-fail": {
+                "id": "task:task-fail",
+                "label": "Celery task chain",
+                "status": "active",
+                "controls": {"available": ["stop"]},
+                "provenance": {"task_id": "task-fail"},
+                "events": [],
+            }
+        },
+        "resources": {},
+    }
+
+    async def fail_stop(_task_id):
+        raise RuntimeError("broker offline")
+
+    monkeypatch.setattr(routes, "_console_stop_task", fail_stop)
+    response = client.post("/api/agents/console/task%3Atask-fail/stop", json={})
+
+    assert response.status_code == 503
+    assert "broker offline" in response.json()["detail"]
+    assert app.state.agent_console_state["agents"]["task:task-fail"]["status"] == (
+        "active"
+    )
+
+
+def test_revoked_task_status_maps_to_stopped():
+    from app import routes
+
+    assert routes._task_console_status("REVOKED") == "stopped"
+
+
+def test_agent_console_rejects_stop_without_celery_task_id(client):
+    from app.main import app
+
+    app.state.agent_console_state = {
+        "agents": {
+            "background:synthetic": {
+                "id": "background:synthetic",
+                "label": "Synthetic background status",
+                "status": "active",
+                "controls": {"available": ["stop"]},
+                "events": [],
+            }
+        },
+        "resources": {},
+    }
+
+    response = client.post(
+        "/api/agents/console/background%3Asynthetic/stop",
+        json={},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Stop requires a live Celery task id"
 
 
 def test_agent_console_includes_celery_worker_snapshot(monkeypatch, client):

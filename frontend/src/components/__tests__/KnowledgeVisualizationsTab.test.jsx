@@ -6,17 +6,33 @@ import axios from "axios";
 
 import KnowledgeVisualizationsTab from "../KnowledgeVisualizationsTab";
 
+const d3Spies = vi.hoisted(() => ({
+  zoomScaleBy: vi.fn(),
+  zoomTransform: vi.fn(),
+}));
+
 vi.mock("d3", () => {
-  const selection = {
-    selectAll: () => selection,
-    remove: () => selection,
-    attr: () => selection,
-    append: () => selection,
-    text: () => selection,
-    data: () => selection,
-    join: () => selection,
-    on: () => selection,
-    call: () => selection,
+  const createSelection = () => {
+    let boundData = [];
+    const selection = {
+      selectAll: () => createSelection(),
+      remove: () => selection,
+      attr: () => selection,
+      append: () => createSelection(),
+      text: () => selection,
+      data(value) {
+        if (arguments.length === 0) return boundData;
+        boundData = Array.isArray(value) ? value : [];
+        return selection;
+      },
+      join: () => selection,
+      on: () => selection,
+      call(handler, ...args) {
+        if (typeof handler === "function") handler(selection, ...args);
+        return selection;
+      },
+    };
+    return selection;
   };
   const force = {
     id: () => force,
@@ -25,6 +41,9 @@ vi.mock("d3", () => {
     radius: () => force,
   };
   const simulation = {
+    alphaDecay: () => simulation,
+    alphaMin: () => simulation,
+    velocityDecay: () => simulation,
     force: () => simulation,
     on: () => simulation,
     alphaTarget: () => simulation,
@@ -36,8 +55,27 @@ vi.mock("d3", () => {
     handler.on = () => handler;
     return handler;
   };
+  const zoom = () => {
+    const handler = () => undefined;
+    handler.scaleExtent = () => handler;
+    handler.filter = () => handler;
+    handler.on = () => handler;
+    handler.scaleBy = d3Spies.zoomScaleBy;
+    handler.transform = d3Spies.zoomTransform;
+    return handler;
+  };
+  const createTransform = (scale = 1) => ({
+    k: scale,
+    translate() {
+      return this;
+    },
+    scale(nextScale) {
+      this.k *= nextScale;
+      return this;
+    },
+  });
   return {
-    select: () => selection,
+    select: () => createSelection(),
     forceSimulation: () => simulation,
     forceLink: () => force,
     forceManyBody: () => force,
@@ -45,12 +83,17 @@ vi.mock("d3", () => {
     forceY: () => force,
     forceCollide: () => force,
     drag,
+    zoom,
+    zoomIdentity: createTransform(),
   };
 });
 
 describe("KnowledgeVisualizationsTab", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    d3Spies.zoomScaleBy.mockClear();
+    d3Spies.zoomTransform.mockClear();
+    localStorage.clear();
     vi.spyOn(axios, "post").mockResolvedValue({
       data: {
         status: "ok",
@@ -257,7 +300,14 @@ describe("KnowledgeVisualizationsTab", () => {
                   node_type: "person",
                   level: 0,
                   weight: 1,
-                  attributes: { city: "Vancouver", role: "designer" },
+                  attributes: {
+                    city: "Vancouver",
+                    role: "designer",
+                    profile: {
+                      interests: ["graphs", "design systems"],
+                      contact: { website: "https://example.com/alice" },
+                    },
+                  },
                 },
                 {
                   id: "knowledge:person:bob",
@@ -278,6 +328,10 @@ describe("KnowledgeVisualizationsTab", () => {
                   type: "claim",
                   predicate: "friend_of",
                   weight: 0.95,
+                  metadata: {
+                    relationship: "friend",
+                    evidence: { source: "social graph import", verified: true },
+                  },
                 },
               ],
               metadata: {
@@ -294,49 +348,144 @@ describe("KnowledgeVisualizationsTab", () => {
     });
   });
 
-  it("supports enabling multiple graph layers and level controls", async () => {
+  it("defaults to the stored knowledge graph and lazily loads other projections", async () => {
     render(<KnowledgeVisualizationsTab />);
 
-    const memoryToggle = await screen.findByRole("checkbox", {
-      name: /memory relation projection/i,
-    });
-    const threadToggle = screen.getByRole("checkbox", {
-      name: /thread cluster projection/i,
-    });
-    const storedGraphToggle = screen.getByRole("checkbox", {
-      name: /stored knowledge graph/i,
-    });
+    const knowledgeChoice = screen.getByRole("radio", { name: "Knowledge" });
+    const threadsChoice = screen.getByRole("radio", { name: "Threads" });
+    expect(knowledgeChoice).toHaveAttribute("aria-checked", "true");
 
-    expect(threadToggle).toBeChecked();
-    expect(memoryToggle).not.toBeChecked();
-    expect(storedGraphToggle).not.toBeChecked();
+    await waitFor(() => {
+      expect(axios.get).toHaveBeenCalledWith(
+        "/api/graph",
+        expect.objectContaining({
+          params: expect.objectContaining({ limit_nodes: 96, limit_claims: 192 }),
+        }),
+      );
+    });
+    expect(
+      axios.get.mock.calls.some(([url]) => String(url).includes("/api/threads/summary")),
+    ).toBe(false);
+    expect(
+      axios.get.mock.calls.some(([url]) => String(url).includes("/api/memory/graph")),
+    ).toBe(false);
 
+    fireEvent.click(threadsChoice);
+
+    await waitFor(() => {
+      expect(
+        axios.get.mock.calls.some(([url]) => String(url).includes("/api/threads/summary")),
+      ).toBe(true);
+    });
+    expect(JSON.parse(localStorage.getItem("float:knowledge-visualization:v1"))).toEqual(
+      expect.objectContaining({ primaryGraphKey: "threads" }),
+    );
+  });
+
+  it("finishes lazy graph loading when mounted under React Strict Mode", async () => {
+    render(
+      <React.StrictMode>
+        <KnowledgeVisualizationsTab />
+      </React.StrictMode>,
+    );
+
+    expect(await screen.findByText(/Stored graph: 2 nodes, 1 claims\./i)).toBeInTheDocument();
+    expect(screen.queryByText(/Loading Knowledge/i)).not.toBeInTheDocument();
+  });
+
+  it("adds comparison layers lazily and exposes navigation controls", async () => {
+    render(<KnowledgeVisualizationsTab />);
+
+    await screen.findByText(/Stored graph: 2 nodes, 1 claims\./i);
+    fireEvent.click(screen.getByText("Layers"));
+    const memoryToggle = screen.getByRole("checkbox", { name: "Memory" });
     fireEvent.click(memoryToggle);
-    fireEvent.click(storedGraphToggle);
 
     await waitFor(() => {
       expect(memoryToggle).toBeChecked();
-      expect(threadToggle).toBeChecked();
-      expect(storedGraphToggle).toBeChecked();
-      expect(screen.getByLabelText(/plane offset/i)).toBeInTheDocument();
+      expect(
+        axios.get.mock.calls.some(([url]) => String(url).includes("/api/memory/graph")),
+      ).toBe(true);
+      expect(
+        axios.get.mock.calls.find(([url]) => String(url).includes("/api/memory/graph"))?.[1],
+      ).toEqual(
+        expect.objectContaining({
+          params: expect.objectContaining({ use_loaded_embeddings: false }),
+        }),
+      );
+      expect(screen.getByLabelText(/layer spacing/i)).toBeInTheDocument();
     });
 
     fireEvent.click(screen.getByRole("button", { name: /increase memory level/i }));
-
     expect(screen.getByText("level 2/2")).toBeInTheDocument();
-    expect(
-      screen.getByText(/thread and memory projections can be layered together/i),
-    ).toBeInTheDocument();
-    expect(screen.getByText(/Stored graph: 2 nodes, 1 claims\./i)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /zoom in/i }));
+    expect(d3Spies.zoomScaleBy).toHaveBeenCalledWith(expect.anything(), 1.25);
+    expect(screen.getByRole("button", { name: "Fit" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Reset" })).toBeInTheDocument();
+  });
+
+  it("searches the current graph and opens an actionable node inspector", async () => {
+    render(<KnowledgeVisualizationsTab />);
+
+    await screen.findByText(/Stored graph: 2 nodes, 1 claims\./i);
+    fireEvent.change(screen.getByRole("searchbox", { name: /search nodes/i }), {
+      target: { value: "Alice" },
+    });
+    fireEvent.click(await screen.findByRole("option", { name: /Alice Nguyen/i }));
+
+    expect(screen.getByRole("heading", { name: "Node" })).toBeInTheDocument();
+    expect(screen.getByText("Alice Nguyen")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Focus 1 hop/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Bob Patel" })).toBeInTheDocument();
+    expect(screen.getByText("graphs")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "https://example.com/alice" })).toHaveAttribute(
+      "href",
+      "https://example.com/alice",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /Inspect edge friend_of/i }));
+
+    expect(screen.getByRole("heading", { name: "Relationship" })).toBeInTheDocument();
+    expect(screen.getByText("social graph import")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /target Bob Patel/i }));
+    expect(screen.getByText("Bob Patel")).toBeInTheDocument();
+  });
+
+  it("persists one central node per graph from the inspector", async () => {
+    render(<KnowledgeVisualizationsTab />);
+
+    await screen.findByText(/Stored graph: 2 nodes, 1 claims\./i);
+    fireEvent.change(screen.getByRole("searchbox", { name: /search nodes/i }), {
+      target: { value: "Alice" },
+    });
+    fireEvent.click(await screen.findByRole("option", { name: /Alice Nguyen/i }));
+    const centralButton = screen.getByRole("button", { name: /Mark central/i });
+    fireEvent.click(centralButton);
+
+    expect(screen.getByRole("button", { name: "Central node" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    await waitFor(() => {
+      expect(JSON.parse(localStorage.getItem("float:knowledge-visualization:v1"))).toEqual(
+        expect.objectContaining({
+          centralNodeIds: expect.objectContaining({
+            knowledge: "knowledge:person:alice",
+          }),
+        }),
+      );
+    });
   });
 
   it("applies a pasted manual graph update without exposing the dev sample", async () => {
     render(<KnowledgeVisualizationsTab />);
 
-    await screen.findByRole("button", { name: /apply graph update/i });
+    await screen.findByText(/Stored graph: 2 nodes, 1 claims\./i);
     expect(
       screen.queryByRole("button", { name: /load 5-person sample/i }),
     ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText(/Manage graph/i));
     fireEvent.click(screen.getByRole("button", { name: /paste json/i }));
 
     const editor = screen.getByLabelText(/graph update json/i);

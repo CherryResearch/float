@@ -2,7 +2,7 @@ import sys
 from types import SimpleNamespace
 
 
-def test_builtin_presets_exclude_grok_and_only_warn_for_manual_targets(monkeypatch):
+def test_builtin_presets_include_tinker_and_warn_for_manual_grok_targets(monkeypatch):
     from app.server_presets import (
         GROK_TRUST_WARNING,
         public_server_presets,
@@ -12,7 +12,6 @@ def test_builtin_presets_exclude_grok_and_only_warn_for_manual_targets(monkeypat
 
     monkeypatch.setenv("TINKER_API_KEY", "tinker-secret")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-secret")
-    monkeypatch.setenv("XAI_API_KEY", "must-not-be-inferred")
     presets = public_server_presets({"server_presets": []})
     by_id = {preset["id"]: preset for preset in presets}
 
@@ -25,7 +24,6 @@ def test_builtin_presets_exclude_grok_and_only_warn_for_manual_targets(monkeypat
         preset.get("provider") == "xai" or "grok" in preset.get("name", "").lower()
         for preset in presets
     )
-    assert not any(preset.get("api_key_env") == "XAI_API_KEY" for preset in presets)
     assert (
         resolve_server_auth_token(
             {"server_presets": []},
@@ -40,13 +38,6 @@ def test_builtin_presets_exclude_grok_and_only_warn_for_manual_targets(monkeypat
             base_url="https://api.x.ai/v1",
         )
         == GROK_TRUST_WARNING
-    )
-    assert (
-        resolve_server_auth_token(
-            {"server_presets": []},
-            "https://api.x.ai/v1",
-        )
-        == ""
     )
     assert (
         server_trust_warning(

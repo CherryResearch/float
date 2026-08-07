@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import sys
 import types
 from pathlib import Path
@@ -79,6 +80,9 @@ def client(tmp_path, monkeypatch):
     from app.main import app
     from app.services import rag_provider
 
+    blobs_dir = data_root / "blobs"
+    blobs_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(routes, "BLOBS_DIR", blobs_dir)
     monkeypatch.setattr(rag_provider, "_rag_service", None, raising=False)
     monkeypatch.setattr(rag_provider, "_rag_signature", None, raising=False)
     monkeypatch.setattr(rag_provider, "_clip_rag_service", None, raising=False)
@@ -852,10 +856,11 @@ def test_attachments_list_returns_caption_fields_from_metadata(client, monkeypat
 def test_attachment_rehydrate_preserves_existing_generated_caption(client, monkeypatch):
     from app import routes
 
-    content_hash = "captionpreservehash"
+    image_bytes = b"image bytes"
+    content_hash = hashlib.sha256(image_bytes).hexdigest()
     target = routes._resolve_data_files_root() / "uploads" / content_hash / "image.png"
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(b"image bytes")
+    target.write_bytes(image_bytes)
     routes._write_attachment_meta(
         content_hash,
         {
@@ -889,7 +894,14 @@ def test_attachment_rehydrate_preserves_existing_generated_caption(client, monke
     )
 
     assert resp.status_code == 200
-    assert resp.json() == {"scanned": 1, "reindexed": 1}
+    assert resp.json() == {
+        "scanned": 1,
+        "reindexed": 1,
+        "captions_generated": 0,
+        "captions_unavailable": 0,
+        "failed": 0,
+        "dry_run": False,
+    }
     assert calls == [
         (
             "A green notebook beside a mug.",
@@ -932,10 +944,11 @@ def test_attachment_rehydrate_retries_low_quality_generated_caption(
 ):
     from app import routes
 
-    content_hash = "lowqualitycaptionhash"
+    image_bytes = b"image bytes"
+    content_hash = hashlib.sha256(image_bytes).hexdigest()
     target = routes._resolve_data_files_root() / "uploads" / content_hash / "image.png"
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(b"image bytes")
+    target.write_bytes(image_bytes)
     routes._write_attachment_meta(
         content_hash,
         {
@@ -974,7 +987,14 @@ def test_attachment_rehydrate_retries_low_quality_generated_caption(
     )
 
     assert resp.status_code == 200
-    assert resp.json() == {"scanned": 1, "reindexed": 1}
+    assert resp.json() == {
+        "scanned": 1,
+        "reindexed": 1,
+        "captions_generated": 1,
+        "captions_unavailable": 0,
+        "failed": 0,
+        "dry_run": False,
+    }
     assert calls[0][0] == "striped tiger illustration on a pale background"
     meta = routes._read_attachment_meta(content_hash)
     assert meta["caption"] == "striped tiger illustration on a pale background"
@@ -989,12 +1009,17 @@ def test_attachment_indexing_preserves_manual_caption_written_during_generation(
 ):
     from app import routes
 
-    content_hash = "manualracecaptionhash"
+    image_bytes = b"image bytes"
+    content_hash = hashlib.sha256(image_bytes).hexdigest()
+    target = routes._resolve_data_files_root() / "uploads" / content_hash / "image.png"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(image_bytes)
     routes._write_attachment_meta(
         content_hash,
         {
             "filename": "image.png",
             "content_type": "image/png",
+            "relative_path": f"uploads/{content_hash}/image.png",
             "caption_status": "pending",
             "index_status": "indexing",
         },
@@ -1029,7 +1054,7 @@ def test_attachment_indexing_preserves_manual_caption_written_during_generation(
     monkeypatch.setattr(routes, "_generate_image_caption", fake_generate)
 
     result = routes._caption_and_index_image_bytes(
-        b"image bytes",
+        image_bytes,
         filename="image.png",
         content_type="image/png",
         content_hash=content_hash,
@@ -1037,6 +1062,7 @@ def test_attachment_indexing_preserves_manual_caption_written_during_generation(
 
     assert result["caption"] == "manual caption written during background work"
     assert result["caption_model"] == "manual-caption"
+    assert result["caption_status"] == "manual"
     assert calls[0][0] == "manual caption written during background work"
     assert calls[0][1]["caption_model"] == "manual-caption"
     meta = routes._read_attachment_meta(content_hash)
@@ -1050,12 +1076,16 @@ def test_attachment_rehydrate_limits_to_requested_hashes(client, monkeypatch):
     from app import routes
 
     indexed = []
-    for content_hash in ("syncimageone", "syncimagetwo"):
+    image_payloads = (b"image bytes one", b"image bytes two")
+    content_hashes = tuple(
+        hashlib.sha256(image_bytes).hexdigest() for image_bytes in image_payloads
+    )
+    for content_hash, image_bytes in zip(content_hashes, image_payloads):
         target = (
             routes._resolve_data_files_root() / "uploads" / content_hash / "image.png"
         )
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(b"image bytes")
+        target.write_bytes(image_bytes)
         routes._write_attachment_meta(
             content_hash,
             {
@@ -1075,12 +1105,19 @@ def test_attachment_rehydrate_limits_to_requested_hashes(client, monkeypatch):
 
     resp = client.post(
         "/attachments/rag/rehydrate",
-        json={"content_hashes": ["syncimageone"]},
+        json={"content_hashes": [content_hashes[0]]},
     )
 
     assert resp.status_code == 200
-    assert resp.json() == {"scanned": 1, "reindexed": 1}
-    assert indexed == ["syncimageone"]
+    assert resp.json() == {
+        "scanned": 1,
+        "reindexed": 1,
+        "captions_generated": 0,
+        "captions_unavailable": 1,
+        "failed": 0,
+        "dry_run": False,
+    }
+    assert indexed == [content_hashes[0]]
 
 
 def test_attachments_list_recovers_media_type_and_filename_for_hash_only_uploads(
@@ -1094,7 +1131,7 @@ def test_attachments_list_recovers_media_type_and_filename_for_hash_only_uploads
         b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00"
         b"\x90wS\xde"
     )
-    content_hash = "8afdae4fdbe1177c7e1cd7dc71134ac1f219bf92b666296104bea4f5c1ab07ee"
+    content_hash = hashlib.sha256(png_bytes).hexdigest()
     target = routes._resolve_data_files_root() / "uploads" / content_hash / content_hash
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(png_bytes)
@@ -1125,36 +1162,44 @@ def test_attachments_list_recovers_media_type_and_filename_for_hash_only_uploads
 def test_attachment_download_still_resolves_legacy_blob_storage(client):
     from app import routes
 
-    content_hash = "legacyvisionblob"
+    blob_bytes = b"legacy blob bytes"
+    content_hash = hashlib.sha256(blob_bytes).hexdigest()
     blob_file = routes.BLOBS_DIR / content_hash
     blob_file.parent.mkdir(parents=True, exist_ok=True)
-    blob_file.write_bytes(b"legacy blob bytes")
+    blob_file.write_bytes(blob_bytes)
 
     resp = client.get(f"/attachments/{content_hash}/legacy-image.png")
     assert resp.status_code == 200
-    assert resp.content == b"legacy blob bytes"
+    assert resp.content == blob_bytes
 
 
 def test_attachments_reveal_supports_filename_fallback_for_legacy_files(client):
     from app import routes
 
+    image_bytes = b"legacy image bytes"
+    content_hash = hashlib.sha256(image_bytes).hexdigest()
     legacy_file = routes._resolve_data_files_root() / "uploads" / "legacy-image.jpg"
     legacy_file.parent.mkdir(parents=True, exist_ok=True)
-    legacy_file.write_bytes(b"legacy image bytes")
+    legacy_file.write_bytes(image_bytes)
 
     reveal_resp = client.get(
-        "/attachments/reveal/missinghash",
+        f"/attachments/reveal/{content_hash}",
         params={"filename": "legacy-image.jpg"},
     )
     assert reveal_resp.status_code == 200
     payload = reveal_resp.json()
-    assert Path(payload["path"]).as_posix().endswith("files/uploads/legacy-image.jpg")
+    revealed_path = Path(payload["path"])
+    assert revealed_path.as_posix().endswith(
+        f"files/uploads/{content_hash}/legacy-image.jpg"
+    )
+    assert revealed_path.read_bytes() == image_bytes
 
 
 def test_attachments_reveal_prefers_relative_metadata_target_over_blob(client):
     from app import routes
 
-    content_hash = "relpathhash"
+    preferred_bytes = b"preferred bytes"
+    content_hash = hashlib.sha256(preferred_bytes).hexdigest()
     preferred_file = (
         routes._resolve_data_files_root()
         / "workspace"
@@ -1162,7 +1207,7 @@ def test_attachments_reveal_prefers_relative_metadata_target_over_blob(client):
         / "preferred-image.jpg"
     )
     preferred_file.parent.mkdir(parents=True, exist_ok=True)
-    preferred_file.write_bytes(b"preferred bytes")
+    preferred_file.write_bytes(preferred_bytes)
 
     blob_file = routes.BLOBS_DIR / content_hash
     blob_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1182,11 +1227,11 @@ def test_attachments_reveal_prefers_relative_metadata_target_over_blob(client):
     )
     assert reveal_resp.status_code == 200
     payload = reveal_resp.json()
-    assert (
-        Path(payload["path"])
-        .as_posix()
-        .endswith("files/workspace/gallery/preferred-image.jpg")
+    revealed_path = Path(payload["path"])
+    assert revealed_path.as_posix().endswith(
+        f"files/uploads/{content_hash}/preferred-image.jpg"
     )
+    assert revealed_path.read_bytes() == preferred_bytes
 
 
 def test_rag_status_avoids_loading_embedding_models(client, monkeypatch):

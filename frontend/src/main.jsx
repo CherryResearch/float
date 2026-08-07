@@ -12,8 +12,17 @@ import "@livekit/components-styles";
 import axios from "axios";
 import { ensureServiceWorker } from "./utils/push";
 import {
+  clearMissingConversationHydrationState,
+  createConversationHydrationGate,
+  getConversationHydrationRetryDelay,
+  hasUnacknowledgedClientOutboxTurn,
+  mergeCanonicalConversationWithLocalChanges,
+  shouldResumeMissingConversationAutosave,
+} from "./utils/conversationPersistence";
+import {
   CONVERSATION_WINDOW_STORAGE_KEY,
   debugLog,
+  getConversationTrimMeta,
   trimConversationMessagesForDom,
 } from "./utils/proxy";
 import { buildHistoryFromConversation } from "./utils/conversationHistory";
@@ -408,6 +417,17 @@ const GlobalProvider = ({ children }) => {
       runtimeSelectionTouchedAt: null,
     };
   });
+  const initialConversationSessionIdRef = useRef(state.sessionId);
+  const initialConversationHydrationBaselineRef = useRef(state.conversation);
+  const conversationHydrationGateRef = useRef(null);
+  if (conversationHydrationGateRef.current === null) {
+    conversationHydrationGateRef.current = createConversationHydrationGate(
+      state.sessionId,
+    );
+  }
+  const [conversationHydrationRevision, setConversationHydrationRevision] =
+    useState(0);
+  const [conversationHydrationRetry, setConversationHydrationRetry] = useState(0);
   const [userSettingsLoaded, setUserSettingsLoaded] = useState(false);
   const lastUserSettingsRef = useRef(null);
   const apiProbeStateRef = useRef({
@@ -697,8 +717,111 @@ const GlobalProvider = ({ children }) => {
     }
   }, [state.conversation, state.conversationTrimMeta]);
 
+  // The transcript restored from localStorage is only a fast visual cache. On a
+  // reload, read the active server conversation before allowing that cache to
+  // autosave, or an old tab can restore messages removed by a server-side edit.
+  useEffect(() => {
+    if (state.apiStatus !== "online" || !state.sessionId) return undefined;
+
+    const sessionId = String(state.sessionId).trim();
+    const gate = conversationHydrationGateRef.current;
+    if (sessionId !== initialConversationSessionIdRef.current) {
+      gate.bypass(sessionId);
+      setConversationHydrationRevision((value) => value + 1);
+      return undefined;
+    }
+
+    let cancelled = false;
+    let retryTimer = null;
+    const request = gate.begin(sessionId);
+    const hydrationBaseline = Array.isArray(
+      initialConversationHydrationBaselineRef.current,
+    )
+      ? initialConversationHydrationBaselineRef.current
+      : [];
+    axios
+      .get(`/api/conversations/${encodeURIComponent(sessionId)}`)
+      .then((res) => {
+        if (cancelled || !gate.acknowledge(request)) return;
+        const loadedMessages = Array.isArray(res?.data?.messages)
+          ? res.data.messages
+          : [];
+        const conversationTrimMeta = getConversationTrimMeta(res?.data);
+        setState((prev) => {
+          if (prev.sessionId !== sessionId) return prev;
+          const conversation = mergeCanonicalConversationWithLocalChanges(
+            loadedMessages,
+            hydrationBaseline,
+            prev.conversation,
+          );
+          return {
+            ...prev,
+            conversation,
+            conversationTrimMeta,
+            history: buildHistoryFromConversation(conversation),
+          };
+        });
+        setConversationHydrationRevision((value) => value + 1);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        if (err?.response?.status === 404) {
+          if (!gate.markMissing(request)) return;
+          setState((prev) => {
+            const cleared = clearMissingConversationHydrationState(prev, sessionId);
+            if (cleared === prev) return prev;
+            const conversation = mergeCanonicalConversationWithLocalChanges(
+              [],
+              hydrationBaseline,
+              prev.conversation,
+            );
+            return {
+              ...cleared,
+              conversation,
+              history: buildHistoryFromConversation(conversation),
+            };
+          });
+          setConversationHydrationRevision((value) => value + 1);
+          return;
+        }
+        if (!gate.fail(request)) return;
+        console.error("Failed to hydrate active conversation", err);
+        const retryDelay = getConversationHydrationRetryDelay(
+          conversationHydrationRetry,
+        );
+        if (retryDelay !== null) {
+          retryTimer = setTimeout(() => {
+            setConversationHydrationRetry((value) => value + 1);
+          }, retryDelay);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+      if (retryTimer !== null) clearTimeout(retryTimer);
+    };
+  }, [conversationHydrationRetry, state.apiStatus, state.sessionId]);
+
   // Persist conversation to server storage
   useEffect(() => {
+    const gate = conversationHydrationGateRef.current;
+    if (!gate.canPersist(state.sessionId)) {
+      if (
+        shouldResumeMissingConversationAutosave({
+          hydration: gate.snapshot(),
+          sessionId: state.sessionId,
+          messages: state.conversation,
+        })
+      ) {
+        gate.bypass(state.sessionId);
+      } else {
+        return;
+      }
+    }
+    // Pending rows are an optimistic UI outbox. /chat owns the authoritative
+    // user/assistant pair; saving it here first creates a duplicate-id race when
+    // a steering message waits behind an older turn.
+    if (hasUnacknowledgedClientOutboxTurn(state.conversation)) return;
     if (
       state.apiStatus === "online" &&
       state.sessionId
@@ -736,6 +859,7 @@ const GlobalProvider = ({ children }) => {
     state.sessionName,
     state.apiStatus,
     state.conversationTrimMeta,
+    conversationHydrationRevision,
   ]);
 
   useEffect(() => {

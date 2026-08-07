@@ -26,6 +26,7 @@ import axios from "axios";
 import { getConversationTrimMeta } from "../utils/proxy";
 import {
   acquireToolContinuationLock,
+  TOOL_CONTINUATION_ATTEMPT_RESET_EVENT,
   buildToolContinuationLockKey,
   buildToolContinuationSignature,
   hasMatchingToolContinuationSignature,
@@ -37,10 +38,7 @@ import {
   mergeContinuationText,
 } from "../utils/continuationText";
 import { resolveRequestModelForMode } from "../utils/modelUtils";
-import {
-  handleUnifiedPress,
-  supportsHoverInteractions,
-} from "../utils/pointerInteractions";
+import { handleUnifiedPress } from "../utils/pointerInteractions";
 import {
   CHAT_WINDOW_STORAGE_KEY,
   parseStoredChatWindowWidth,
@@ -767,6 +765,7 @@ const AppContent = () => {
   const [agentsLoading, setAgentsLoading] = useState(false);
   const [streamThoughts, setStreamThoughts] = useState(true);
   const [consoleFocus, setConsoleFocus] = useState(null);
+  const [streamActivity, setStreamActivity] = useState(null);
   const isMobileLayout = useCallback(() => {
     if (typeof window === "undefined") return false;
     return isCompactMobileViewport(window.innerWidth, window.innerHeight);
@@ -776,8 +775,6 @@ const AppContent = () => {
   const [activeMessageId, setActiveMessageId] = useState(null);
   const stateRef = useRef(state);
   const activeMessageIdRef = useRef(activeMessageId);
-  const leftHoverTimer = useRef(null);
-  const rightHoverTimer = useRef(null);
   const focusClearTimer = useRef(null);
   const backendReady = state.backendMode === "api" ? state.apiStatus === "online" : true;
   const approvalLevelRef = useRef(state.approvalLevel);
@@ -797,6 +794,7 @@ const AppContent = () => {
   const autoResolvedToolsByMessageRef = useRef(new Map());
   const autoContinuingMessageIdsRef = useRef(new Set());
   const autoContinuationSignaturesByMessageRef = useRef(new Map());
+  const resetContinuationAttemptMessageIdsRef = useRef(new Set());
 
   useEffect(() => {
     if (typeof document === "undefined") return;
@@ -930,7 +928,37 @@ const AppContent = () => {
     autoResolvedToolsByMessageRef.current = new Map();
     autoContinuingMessageIdsRef.current = new Set();
     autoContinuationSignaturesByMessageRef.current = new Map();
+    resetContinuationAttemptMessageIdsRef.current = new Set();
   }, [state.sessionId]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+    const resetAttempt = (event) => {
+      const detail = event?.detail && typeof event.detail === "object" ? event.detail : {};
+      const messageId = String(detail.messageId || "").trim();
+      const eventSessionId = String(detail.sessionId || "").trim();
+      const currentSessionId = String(stateRef.current?.sessionId || "").trim();
+      if (!messageId || (eventSessionId && eventSessionId !== currentSessionId)) return;
+
+      const trackedIds = new Set([
+        ...(autoAcceptedToolIdsByMessageRef.current.get(messageId) || []),
+        ...(autoResolvedToolsByMessageRef.current.get(messageId)?.keys?.() || []),
+      ]);
+      trackedIds.forEach((id) => {
+        autoAcceptedToolIdsRef.current.delete(id);
+        autoContinuedToolIdsRef.current.delete(id);
+      });
+      autoAcceptedToolIdsByMessageRef.current.delete(messageId);
+      autoResolvedToolsByMessageRef.current.delete(messageId);
+      autoContinuingMessageIdsRef.current.delete(messageId);
+      autoContinuationSignaturesByMessageRef.current.delete(messageId);
+      resetContinuationAttemptMessageIdsRef.current.add(messageId);
+    };
+    window.addEventListener(TOOL_CONTINUATION_ATTEMPT_RESET_EVENT, resetAttempt);
+    return () => {
+      window.removeEventListener(TOOL_CONTINUATION_ATTEMPT_RESET_EVENT, resetAttempt);
+    };
+  }, []);
 
   const agentList = useMemo(
     () => agentState.order.map((id) => agentState.byId[id]).filter(Boolean),
@@ -1068,20 +1096,6 @@ const AppContent = () => {
     if (isMobileLayout()) setLeftOpen(false);
   };
 
-  const clearLeftHoverTimer = () => {
-    if (leftHoverTimer.current) {
-      clearTimeout(leftHoverTimer.current);
-      leftHoverTimer.current = null;
-    }
-  };
-
-  const clearRightHoverTimer = () => {
-    if (rightHoverTimer.current) {
-      clearTimeout(rightHoverTimer.current);
-      rightHoverTimer.current = null;
-    }
-  };
-
   const focusConsoleOnTarget = useCallback(
     (target) => {
       if (!target || typeof target !== "object") return;
@@ -1190,6 +1204,19 @@ const AppContent = () => {
           const currentState = stateRef.current;
           const event = normalizeConsoleEvent(payload, currentState?.sessionId);
           if (!event) return;
+          const activityType =
+            payload?.type === "tool_call_delta" ? "tool" : event.type;
+          if (
+            ["content", "thought", "tool"].includes(activityType) &&
+            (event.message_id || event.chain_id)
+          ) {
+            setStreamActivity({
+              type: activityType,
+              message_id: event.message_id,
+              chain_id: event.chain_id,
+              received_at: Date.now(),
+            });
+          }
           if (actionEvent) {
             setActionHistory((prev) => mergeActionSummary(prev, actionEvent));
           }
@@ -1464,18 +1491,26 @@ const AppContent = () => {
               );
               const priorSignatures =
                 autoContinuationSignaturesByMessageRef.current.get(messageId) || new Set();
+              const startsResetAttempt =
+                resetContinuationAttemptMessageIdsRef.current.delete(messageId);
               const currentMessage = Array.isArray(stateRef.current?.conversation)
                 ? stateRef.current.conversation.find((msg) => msg && msg.id === messageId)
                 : null;
               const alreadyContinued =
-                !!(
+                !startsResetAttempt &&
+                (Boolean(
                   semanticToolContinueSignature &&
-                  priorSignatures.has(semanticToolContinueSignature)
+                    priorSignatures.has(semanticToolContinueSignature),
                 ) ||
-                hasMatchingToolContinuationSignature(currentMessage?.metadata, toolPayload) ||
-                hasMatchingToolContinuationSignature(currentMessage?.metadata, toolPayload, {
-                  includeIds: false,
-                });
+                  hasMatchingToolContinuationSignature(
+                    currentMessage?.metadata,
+                    toolPayload,
+                  ) ||
+                  hasMatchingToolContinuationSignature(
+                    currentMessage?.metadata,
+                    toolPayload,
+                    { includeIds: false },
+                  ));
               if (alreadyContinued) {
                 readyIds.forEach((id) => autoContinuedToolIdsRef.current.add(id));
                 consumeAutoContinueBatch(messageId, readyIds);
@@ -1799,7 +1834,9 @@ const AppContent = () => {
     };
   }, []);
 
-  const isCalendarView = location.pathname.startsWith("/knowledge");
+  const isCalendarView =
+    location.pathname === "/knowledge" &&
+    new URLSearchParams(location.search).get("tab") === "calendar";
   const isSettingsView = location.pathname === "/settings";
   const isKnowledgeVisualizationsView =
     location.pathname === "/knowledge" &&
@@ -1918,25 +1955,13 @@ const AppContent = () => {
         <button
           className="show-sidebar-btn left"
           onClick={(event) =>
-            handleUnifiedPress(event, () => {
-              clearLeftHoverTimer();
-              openLeft();
-            })
+            handleUnifiedPress(event, openLeft)
           }
           onPointerDown={(event) =>
-            handleUnifiedPress(event, () => {
-              clearLeftHoverTimer();
-              openLeft();
-            })
+            handleUnifiedPress(event, openLeft)
           }
-          onMouseEnter={() => {
-            if (isMobileLayout() || !supportsHoverInteractions()) return;
-            clearLeftHoverTimer();
-            // Hover-to-open delay tuned to ~0.6s per request
-            leftHoverTimer.current = setTimeout(() => openLeft(), 600);
-          }}
-          onMouseLeave={clearLeftHoverTimer}
-          title="Show history sidebar"
+          aria-label="Open chat history"
+          title="Open chat history"
         >
           {">"}
         </button>
@@ -1952,6 +1977,7 @@ const AppContent = () => {
                     thoughts={consoleEvents}
                     activeMessageId={activeMessageId}
                     setActiveMessageId={setActiveMessageId}
+                    streamActivity={streamActivity}
                     onOpenConsole={focusConsoleOnTarget}
                     onOpenConversation={openConversationById}
                     parentConversationLink={parentConversationLink}
@@ -1968,6 +1994,7 @@ const AppContent = () => {
                     backendReady={backendReady}
                     loading={agentsLoading}
                     onRefresh={fetchAgentSnapshot}
+                    userTimezone={state.userTimezone}
                   />
                 }
               />
@@ -2029,25 +2056,13 @@ const AppContent = () => {
         <button
           className="show-sidebar-btn right"
           onClick={(event) =>
-            handleUnifiedPress(event, () => {
-              clearRightHoverTimer();
-              openRight();
-            })
+            handleUnifiedPress(event, openRight)
           }
           onPointerDown={(event) =>
-            handleUnifiedPress(event, () => {
-              clearRightHoverTimer();
-              openRight();
-            })
+            handleUnifiedPress(event, openRight)
           }
-          onMouseEnter={() => {
-            if (isMobileLayout() || !supportsHoverInteractions()) return;
-            clearRightHoverTimer();
-            // Hover-to-open delay tuned to ~0.6s per request
-            rightHoverTimer.current = setTimeout(() => openRight(), 600);
-          }}
-          onMouseLeave={clearRightHoverTimer}
-          title="Show agent console"
+          aria-label="Open agent console"
+          title="Open agent console"
         >
         {"<"}
         </button>

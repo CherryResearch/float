@@ -1,5 +1,5 @@
 import React from "react";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import * as matchers from "@testing-library/jest-dom/matchers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import axios from "axios";
@@ -52,9 +52,21 @@ const buildOverview = () => ({
   device_access: {
     visibility: {
       lan_enabled: true,
+      lan_listening: true,
+      lan_binding_known: true,
+      lan_bind_host: "0.0.0.0",
+      lan_state: "listening",
+    },
+    listener: {
+      bind_host: "0.0.0.0",
+      binding_known: true,
+      lan_listening: true,
+      launcher_running: true,
+      restart_supported: true,
     },
     advertised_urls: {
       lan: "http://studio.local:59185",
+      lan_candidate: "http://studio.local:59185",
       local: "http://127.0.0.1:59185",
     },
   },
@@ -412,6 +424,201 @@ describe("KnowledgeSyncTab", () => {
     expect(screen.getByText(/Last synced .* with Pear/i)).toBeInTheDocument();
     expect(document.querySelector('[data-status-dimension="software"]')).toBeInTheDocument();
     expect(document.querySelector('[data-status-dimension="data"]')).toBeInTheDocument();
+    expect(document.querySelector(".knowledge-sync-dashboard-grid")).toBeInTheDocument();
+  });
+
+  it("keeps local backend network failures distinct from remote peer failures", async () => {
+    axios.get.mockImplementation((url) => {
+      if (url === "/api/sync/overview") return Promise.reject(new Error("Network Error"));
+      if (url === "/api/sync/mobile-serve/status") {
+        return Promise.resolve({ data: buildMobileServeStatus() });
+      }
+      if (url === "/api/user-settings") {
+        return Promise.resolve({ data: { device_display_name: "Studio" } });
+      }
+      if (url === "/api/actions") return Promise.resolve({ data: { actions: [] } });
+      return Promise.reject(new Error(`Unexpected GET ${url}`));
+    });
+
+    render(<KnowledgeSyncTab />);
+
+    expect(
+      await screen.findByText(
+        /Failed to load sync overview\. Check that this Float instance is running and reachable\./i,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/other Float instance/i)).not.toBeInTheDocument();
+  });
+
+  it("uses the saved friendly label for actions without claiming a live connection", async () => {
+    const overview = buildPairedOverview();
+    overview.sync_defaults.saved_peers[0] = {
+      ...overview.sync_defaults.saved_peers[0],
+      label: "Cherry",
+      remote_device_name: "Pear",
+    };
+    axios.get.mockImplementation((url) => {
+      if (url === "/api/sync/overview") return Promise.resolve({ data: overview });
+      if (url === "/api/sync/mobile-serve/status") {
+        return Promise.resolve({ data: buildMobileServeStatus() });
+      }
+      if (url === "/api/user-settings") {
+        return Promise.resolve({ data: { device_display_name: "Studio" } });
+      }
+      if (url === "/api/actions") return Promise.resolve({ data: { actions: [] } });
+      return Promise.reject(new Error(`Unexpected GET ${url}`));
+    });
+
+    render(<KnowledgeSyncTab />);
+
+    expect(
+      await screen.findByRole("button", { name: /send selected to cherry/i }),
+    ).toBeInTheDocument();
+    expect(screen.getAllByText("trusted, not checked").length).toBeGreaterThan(0);
+    expect(screen.getByText("Trusted Cherry; not checked")).toBeInTheDocument();
+    expect(screen.queryByText("Trusted Pear; not checked")).not.toBeInTheDocument();
+    expect(screen.queryByText("paired", { exact: true })).not.toBeInTheDocument();
+  });
+
+  it("marks a peer identity verified after a successful sync preview", async () => {
+    const overview = buildPairedOverview();
+    overview.sync_defaults.saved_peers[0] = {
+      ...overview.sync_defaults.saved_peers[0],
+      label: "Cherry",
+      remote_device_name: "Pear",
+    };
+    axios.get.mockImplementation((url) => {
+      if (url === "/api/sync/overview") return Promise.resolve({ data: overview });
+      if (url === "/api/sync/mobile-serve/status") {
+        return Promise.resolve({ data: buildMobileServeStatus() });
+      }
+      if (url === "/api/user-settings") {
+        return Promise.resolve({ data: { device_display_name: "Studio" } });
+      }
+      if (url === "/api/actions") return Promise.resolve({ data: { actions: [] } });
+      return Promise.reject(new Error(`Unexpected GET ${url}`));
+    });
+    axios.post.mockImplementation((url) => {
+      if (url === "/api/sync/plan") return Promise.resolve({ data: buildPlanResponse() });
+      return Promise.resolve({ data: {} });
+    });
+
+    render(<KnowledgeSyncTab />);
+    fireEvent.click(await screen.findByRole("button", { name: /preview changes/i }));
+
+    expect(await screen.findByText("Connected to Cherry")).toBeInTheDocument();
+    expect(screen.getAllByText("connected", { exact: true }).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/identity not verified/i)).not.toBeInTheDocument();
+  });
+
+  it("announces pending-review approval beside the review while it applies", async () => {
+    const overview = buildOverview();
+    overview.sync_reviews.pending = [
+      {
+        id: "review-1",
+        source_label: "Pear",
+        device_name: "Pear laptop",
+        device_id: "remote-device-1",
+        created_at: 1785434400,
+        requested_sections: ["settings"],
+      },
+    ];
+    overview.device_counts.pending_push_reviews = 1;
+    let overviewCalls = 0;
+    let resolveApproval;
+    const approvalPromise = new Promise((resolve) => {
+      resolveApproval = resolve;
+    });
+    axios.get.mockImplementation((url) => {
+      if (url === "/api/sync/overview") {
+        overviewCalls += 1;
+        return Promise.resolve({ data: overviewCalls === 1 ? overview : buildOverview() });
+      }
+      if (url === "/api/sync/mobile-serve/status") {
+        return Promise.resolve({ data: buildMobileServeStatus() });
+      }
+      if (url === "/api/user-settings") {
+        return Promise.resolve({ data: { device_display_name: "Studio" } });
+      }
+      if (url === "/api/actions") return Promise.resolve({ data: { actions: [] } });
+      return Promise.reject(new Error(`Unexpected GET ${url}`));
+    });
+    axios.post.mockImplementation((url) => {
+      if (url === "/api/sync/reviews/review-1/approve") return approvalPromise;
+      return Promise.resolve({ data: {} });
+    });
+
+    render(<KnowledgeSyncTab />);
+    const reviewCard = (await screen.findByText(/device Pear laptop/i)).closest("article");
+    const approveButton = within(reviewCard).getByRole("button", { name: "Approve" });
+    const rejectButton = within(reviewCard).getByRole("button", { name: "Reject" });
+    expect(approveButton).toHaveClass("knowledge-sync-action--primary");
+    expect(rejectButton).toHaveClass("knowledge-sync-action--danger");
+    fireEvent.click(approveButton);
+
+    expect(await within(reviewCard).findByRole("status")).toHaveTextContent(
+      /Applying sync from Pear\. This can take a moment while local indexes refresh\./i,
+    );
+    expect(within(reviewCard).getByRole("button", { name: "Applying..." })).toBeDisabled();
+    expect(within(reviewCard).getByRole("button", { name: "Reject" })).toBeDisabled();
+
+    await act(async () => {
+      resolveApproval({
+        data: {
+          result: {
+            sections: { settings: { label: "settings", applied: 1, skipped: 0 } },
+          },
+        },
+      });
+      await approvalPromise;
+    });
+
+    expect(await screen.findByText(/Approved push from Pear\. settings: 1 applied, 0 skipped/i)).toBeInTheDocument();
+  });
+
+  it("toggles the real LAN listener and distinguishes saved from active state", async () => {
+    const overview = buildOverview();
+    overview.device_access.visibility.lan_listening = false;
+    overview.device_access.visibility.lan_state = "restart_required";
+    overview.device_access.listener.lan_listening = false;
+    overview.device_access.advertised_urls.lan = "";
+    axios.get.mockImplementation((url) => {
+      if (url === "/api/sync/overview") return Promise.resolve({ data: overview });
+      if (url === "/api/sync/mobile-serve/status") return Promise.resolve({ data: buildMobileServeStatus() });
+      if (url === "/api/user-settings") return Promise.resolve({ data: { device_display_name: "Studio" } });
+      if (url === "/api/actions") return Promise.resolve({ data: { actions: [] } });
+      return Promise.reject(new Error(`Unexpected GET ${url}`));
+    });
+    axios.post.mockImplementation((url, payload) => {
+      if (url === "/api/sync/lan-visibility") {
+        expect(payload).toEqual({ enabled: false, restart: true });
+        return Promise.resolve({
+          data: {
+            enabled: false,
+            restart_scheduled: true,
+            message: "Restarting Float's backend in device-only mode.",
+          },
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    render(<KnowledgeSyncTab />);
+
+    expect(await screen.findByText("restart needed")).toBeInTheDocument();
+    expect(screen.getByText("http://studio.local:59185")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Generate pairing code/i })).toBeDisabled();
+    fireEvent.click(screen.getByRole("checkbox", { name: /Visible on LAN/i }));
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith("/api/sync/lan-visibility", {
+        enabled: false,
+        restart: true,
+      });
+    });
+    expect(
+      await screen.findByText("Restarting Float's backend in device-only mode."),
+    ).toBeInTheDocument();
   });
 
   it("keeps a saved peer's last observed software and data identity visible", async () => {
@@ -670,9 +877,9 @@ describe("KnowledgeSyncTab", () => {
 
     expect(await screen.findByText("Previewing sync")).toBeInTheDocument();
     expect(screen.getByText(/Stage-based progress while Float waits on the request\./i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /stop preview/i })).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole("button", { name: /stop preview/i }));
+    const stopPreviewButton = screen.getByRole("button", { name: /stop preview/i });
+    expect(stopPreviewButton).toHaveClass("knowledge-sync-action--danger");
+    fireEvent.click(stopPreviewButton);
 
     await waitFor(() => {
       expect(
@@ -798,7 +1005,10 @@ describe("KnowledgeSyncTab", () => {
 
     render(<KnowledgeSyncTab />);
 
-    expect(await screen.findByText("Sync ownership")).toBeInTheDocument();
+    const syncOwnershipLabel = await screen.findByText("Sync ownership");
+    expect(syncOwnershipLabel).toBeInTheDocument();
+    expect(syncOwnershipLabel).toHaveAttribute("tabindex", "0");
+    expect(syncOwnershipLabel).toHaveAccessibleName(/default outbound target/i);
     expect(screen.getAllByText("Pear").length).toBeGreaterThan(0);
     expect(screen.queryByText("Pear at http://pear.float:5000")).not.toBeInTheDocument();
     expect(screen.getAllByText("Review required").length).toBeGreaterThan(0);
@@ -809,7 +1019,6 @@ describe("KnowledgeSyncTab", () => {
     expect(screen.getByText(/Preview - Running - Pear/i)).toBeInTheDocument();
     expect(screen.getByText(/Pull - Completed - Pear/i)).toBeInTheDocument();
     expect(screen.getByText("Running")).toBeInTheDocument();
-
     fireEvent.click(screen.getByRole("button", { name: /explain sync ownership state/i }));
     const inspector = screen.getByRole("dialog", { name: /why this sync state is shown/i });
     expect(inspector).toBeInTheDocument();
@@ -962,8 +1171,12 @@ describe("KnowledgeSyncTab", () => {
     render(<KnowledgeSyncTab />);
 
     expect(await screen.findByText("Unverified legacy records")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Prune 1/i })).toBeInTheDocument();
-    expect(screen.getAllByRole("button", { name: "Revoke" })).toHaveLength(1);
+    expect(
+      screen.getByRole("button", { name: /Prune 1 unverified legacy device record/i }),
+    ).toHaveClass("knowledge-sync-action--danger");
+    expect(
+      screen.getByRole("button", { name: /Revoke trust for Pear Laptop/i }),
+    ).toHaveClass("knowledge-sync-action--danger");
     expect(screen.getByText("Pear Laptop")).toBeInTheDocument();
   });
 
@@ -1122,13 +1335,112 @@ describe("KnowledgeSyncTab", () => {
     });
     expect(screen.getByRole("button", { name: /preview changes/i })).toBeDisabled();
     expect(screen.getByRole("button", { name: /save connection settings/i })).toBeDisabled();
-    expect(screen.getAllByRole("button", { name: /verify device and address/i }).length).toBeGreaterThan(0);
-    expect(await screen.findByText(/Address change\. Verify the device and address/i)).toBeInTheDocument();
+    expect(
+      screen.getAllByRole("button", { name: /check and save new address/i }).length,
+    ).toBeGreaterThan(0);
+    expect(
+      await screen.findByText(/A failed check leaves the saved address unchanged/i),
+    ).toBeInTheDocument();
     expect(axios.post).not.toHaveBeenCalledWith(
       "/api/sync/plan",
       expect.anything(),
       expect.anything(),
     );
+  });
+
+  it("keeps the saved address and explains a failed moved-address check", async () => {
+    const overview = buildPairedOverview("http://pear.local:59185");
+    axios.get.mockImplementation((url) => {
+      if (url === "/api/sync/overview") return Promise.resolve({ data: overview });
+      if (url === "/api/sync/mobile-serve/status") {
+        return Promise.resolve({ data: buildMobileServeStatus() });
+      }
+      if (url === "/api/user-settings") {
+        return Promise.resolve({ data: { device_display_name: "Studio" } });
+      }
+      if (url === "/api/actions") return Promise.resolve({ data: { actions: [] } });
+      return Promise.reject(new Error(`Unexpected GET ${url}`));
+    });
+    axios.post.mockImplementation((url, payload) => {
+      if (url === "/api/sync/peer/status") {
+        expect(payload.update_saved_peer).toBe(true);
+        expect(payload.remote_url).toBe("http://pear.local:61234");
+        const error = new Error("network request failed");
+        error.response = {
+          data: {
+            detail:
+              "Remote status check failed: HTTPConnectionPool(host='pear.local'): NameResolutionError getaddrinfo failed",
+          },
+        };
+        return Promise.reject(error);
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    render(<KnowledgeSyncTab />);
+    fireEvent.change(await screen.findByLabelText("Remote Float URL"), {
+      target: { value: "http://pear.local:61234" },
+    });
+    fireEvent.click(
+      screen.getAllByRole("button", { name: /check and save new address/i })[0],
+    );
+
+    expect(
+      await screen.findByText(
+        /Saved address remains http:\/\/pear\.local:59185\. Remote device is not reachable right now\. Check the remote address/i,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/HTTPConnectionPool/i)).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Remote Float URL")).toHaveValue("http://pear.local:61234");
+    expect(screen.getByText("new address unverified")).toBeInTheDocument();
+  });
+
+  it("checks and saves a moved address when the stored fingerprint matches", async () => {
+    const overview = buildPairedOverview("http://pear.local:59185");
+    const savedPeer = overview.sync_defaults.saved_peers[0];
+    axios.get.mockImplementation((url) => {
+      if (url === "/api/sync/overview") return Promise.resolve({ data: overview });
+      if (url === "/api/sync/mobile-serve/status") {
+        return Promise.resolve({ data: buildMobileServeStatus() });
+      }
+      if (url === "/api/user-settings") {
+        return Promise.resolve({ data: { device_display_name: "Studio" } });
+      }
+      if (url === "/api/actions") return Promise.resolve({ data: { actions: [] } });
+      return Promise.reject(new Error(`Unexpected GET ${url}`));
+    });
+    axios.post.mockImplementation((url, payload) => {
+      if (url === "/api/sync/peer/status") {
+        expect(payload).toEqual(
+          expect.objectContaining({
+            remote_url: "http://pear.local:61234",
+            update_saved_peer: true,
+          }),
+        );
+        return Promise.resolve({
+          data: {
+            reachable: true,
+            identity_verified: true,
+            identity_state: "verified",
+            display_name: "Pear",
+            paired_device: { ...savedPeer, remote_url: "http://pear.local:61234" },
+          },
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    render(<KnowledgeSyncTab />);
+    fireEvent.change(await screen.findByLabelText("Remote Float URL"), {
+      target: { value: "http://pear.local:61234" },
+    });
+    fireEvent.click(
+      screen.getAllByRole("button", { name: /check and save new address/i })[0],
+    );
+
+    expect(await screen.findByText("Verified Pear; saved URL updated.")).toBeInTheDocument();
+    expect(screen.getAllByText("connected", { exact: true }).length).toBeGreaterThan(0);
+    expect(screen.getByText("Last known address: http://pear.local:61234")).toBeInTheDocument();
   });
 
   it("routes ordinary Markdown to Documents only after explicit confirmation", async () => {

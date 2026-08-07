@@ -82,6 +82,7 @@ const baseState = {
 };
 
 let settingsResponse;
+let captionStatusResponse;
 
 const renderWithState = (options = {}) => {
   const normalized =
@@ -131,6 +132,29 @@ describe("Settings tools browser", () => {
       background_autonomy_basic_tick_count: 2,
       background_autonomy_basic_tick_seconds: 300,
       background_autonomy_min_priority: 0.05,
+    };
+    captionStatusResponse = {
+      engine: "local",
+      configured_model: "google/paligemma2-3b-pt-224",
+      ready: false,
+      automatic_downloads: false,
+      local: {
+        model: "google/paligemma2-3b-pt-224",
+        weights_available: false,
+        installed: false,
+        dependencies_available: true,
+        can_attempt: false,
+        loaded: false,
+        loadable: false,
+        reason: "model_weights_unavailable",
+      },
+      cloud: {
+        provider: "openai-compatible",
+        model: "gpt-5.4-nano",
+        configured: false,
+        api_url_configured: true,
+        api_key_set: false,
+      },
     };
     vi.spyOn(axios, "post").mockResolvedValue({ data: {} });
     vi.spyOn(axios, "put").mockResolvedValue({ data: {} });
@@ -313,6 +337,9 @@ describe("Settings tools browser", () => {
           },
         });
       }
+      if (url === "/api/attachments/caption/status") {
+        return Promise.resolve({ data: captionStatusResponse });
+      }
       if (url === "/api/celery/status") {
         return Promise.resolve({ data: { online: false, workers: [] } });
       }
@@ -419,9 +446,17 @@ describe("Settings tools browser", () => {
     const card = (await screen.findByText("Web Search")).closest(".tool-browser-card");
     expect(card).not.toBeNull();
     const workflowSelect = within(card).getByRole("combobox", {
-      name: /web search workflow availability/i,
+      name: /web search availability/i,
+    });
+    const approvalSelect = within(card).getByRole("combobox", {
+      name: /web search approval requirement/i,
     });
     expect(workflowSelect).toHaveValue("both");
+    expect(within(workflowSelect).getByRole("option", { name: "Chat + live voice" }))
+      .toBeInTheDocument();
+    expect(approvalSelect).toHaveValue("low");
+    expect(within(approvalSelect).getByRole("option", { name: "Lower approval" }))
+      .toBeInTheDocument();
 
     fireEvent.change(workflowSelect, { target: { value: "text" } });
 
@@ -464,6 +499,14 @@ describe("Settings tools browser", () => {
     expect(
       screen.queryByText("Worker controls appear when the queue is reachable or tasks exist."),
     ).not.toBeInTheDocument();
+  });
+
+  it("names the review-all tool approval mode consistently", async () => {
+    renderWithState();
+
+    expect(
+      await screen.findByRole("combobox", { name: /tool approval mode/i }),
+    ).toHaveDisplayValue("Review all");
   });
 
   it("keeps recent websocket drops in a reconnecting state", async () => {
@@ -784,6 +827,133 @@ describe("Settings tools browser", () => {
     });
   });
 
+  it("shows honest local caption readiness separately from CLIP indexing", async () => {
+    renderWithState();
+
+    fireEvent.click(await screen.findByRole("button", { name: /^models\./i }));
+    const panel = (await screen.findByRole("heading", { name: "Saved image captions" }))
+      .closest(".settings-caption-engine");
+
+    expect(
+      within(panel).getByRole("button", { name: /^local captioning:/i }),
+    ).toHaveAttribute("aria-pressed", "true");
+    expect(within(panel).getByText("Not ready")).toBeInTheDocument();
+    expect(
+      within(panel).getByText(
+        "Configured model: google/paligemma2-3b-pt-224",
+      ),
+    ).toBeInTheDocument();
+    expect(within(panel).getByText("CLIP indexing: separate, local"))
+      .toBeInTheDocument();
+    expect(within(panel).getByText("Caption model weights were not found on this device."))
+      .toBeInTheDocument();
+    expect(
+      within(panel).getByLabelText(/About saved image captions:.*CLIP image indexing/i),
+    ).toBeInTheDocument();
+    expect(
+      within(panel).getByRole("link", { name: /open gallery to retry one image/i }),
+    ).toHaveAttribute("href", "/knowledge?tab=documents");
+  }, 15000);
+
+  it("keeps cloud captioning inactive until the explicit mode is saved", async () => {
+    renderWithState();
+
+    fireEvent.click(await screen.findByRole("button", { name: /^models\./i }));
+    const panel = (await screen.findByRole("heading", { name: "Saved image captions" }))
+      .closest(".settings-caption-engine");
+    fireEvent.click(
+      within(panel).getByRole("button", { name: /^cloud\/provider captioning:/i }),
+    );
+
+    expect(within(panel).getByText(/Saved engine: Local/i)).toBeInTheDocument();
+    expect(
+      within(panel).getByText(
+        /If you save Cloud\/provider, caption requests will send saved image bytes/i,
+      ),
+    ).toHaveTextContent(/It is not active yet/i);
+    expect(within(panel).getByLabelText("Cloud caption model"))
+      .toHaveValue("gpt-5.4-nano");
+
+    const saveButton = screen.getByRole("button", { name: /^save$/i });
+    await waitFor(() => expect(saveButton).not.toBeDisabled());
+    fireEvent.click(saveButton);
+
+    await waitFor(() => {
+      expect(axios.post).toHaveBeenCalledWith(
+        "/api/settings",
+        expect.objectContaining({
+          image_caption_engine: "cloud",
+          image_caption_cloud_model: "gpt-5.4-nano",
+        }),
+      );
+    });
+  }, 15000);
+
+  it("distinguishes an installed local caption model from a loaded runtime", async () => {
+    captionStatusResponse = {
+      ...captionStatusResponse,
+      ready: false,
+      can_generate: true,
+      can_attempt: true,
+      local: {
+        ...captionStatusResponse.local,
+        weights_available: true,
+        installed: true,
+        configured: true,
+        can_attempt: true,
+        loaded: false,
+        verified: false,
+        loadable: false,
+        reason: "model_installed_not_loaded",
+      },
+    };
+    renderWithState();
+
+    fireEvent.click(await screen.findByRole("button", { name: /^models\./i }));
+    const panel = (await screen.findByRole("heading", { name: "Saved image captions" }))
+      .closest(".settings-caption-engine");
+
+    expect(within(panel).getByText("Installed; loads on use")).toBeInTheDocument();
+    expect(
+      within(panel).getByText(/installed locally but has not been loaded yet/i),
+    ).toHaveTextContent(/first caption request loads it/i);
+  }, 15000);
+
+  it("labels cloud egress as active only when cloud mode is persisted", async () => {
+    settingsResponse = {
+      ...settingsResponse,
+      image_caption_engine: "cloud",
+      image_caption_cloud_model: "gpt-5.4-nano",
+    };
+    captionStatusResponse = {
+      ...captionStatusResponse,
+      engine: "cloud",
+      configured_model: "gpt-5.4-nano",
+      ready: true,
+      cloud: {
+        provider: "openai-compatible",
+        model: "gpt-5.4-nano",
+        configured: true,
+        api_url_configured: true,
+        api_key_set: true,
+      },
+    };
+
+    renderWithState();
+    fireEvent.click(await screen.findByRole("button", { name: /^models\./i }));
+    const panel = (await screen.findByRole("heading", { name: "Saved image captions" }))
+      .closest(".settings-caption-engine");
+
+    expect(
+      within(panel).getByRole("button", { name: /^cloud\/provider captioning:/i }),
+    ).toHaveAttribute("aria-pressed", "true");
+    expect(within(panel).getByText("Ready")).toBeInTheDocument();
+    expect(within(panel).getByText(/Saved engine: Cloud\/provider/i))
+      .toBeInTheDocument();
+    expect(within(panel).getByText(/Cloud captioning is saved/i))
+      .toHaveTextContent(/saved image bytes/i);
+  }, 15000);
+
   it("adds a Hugging Face model link to the personal model catalog", async () => {
     const entry = {
       alias: "my-model",
@@ -914,14 +1084,23 @@ describe("Settings tools browser", () => {
     expect(
       await screen.findByRole("heading", { name: /background processing/i }),
     ).toBeInTheDocument();
-    expect(screen.getByText(/Container orchestration and API background-response checks/i))
+    expect(screen.getByText(/Run bounded routine reflection reviews on a timer/i))
       .toBeInTheDocument();
+    expect(
+      screen.getByLabelText(/request sandboxing for background processes/i),
+    ).toBeInTheDocument();
 
     fireEvent.click(screen.getByLabelText(/enable background autonomy/i));
-    fireEvent.click(screen.getByLabelText(/sandbox background processes/i));
-    fireEvent.change(screen.getByLabelText(/background autonomy mode/i), {
+    fireEvent.click(
+      screen.getByLabelText(/request sandboxing for background processes/i),
+    );
+    fireEvent.change(screen.getByLabelText(/legacy supervisor preset/i), {
       target: { value: "extended" },
     });
+    const advancedLimits = screen.getByText(/advanced limits/i).closest("details");
+    expect(advancedLimits).not.toHaveAttribute("open");
+    fireEvent.click(screen.getByText(/advanced limits/i));
+    expect(advancedLimits).toHaveAttribute("open");
     fireEvent.change(screen.getByLabelText(/runtime budget \(minutes\)/i), {
       target: { value: "45" },
     });
@@ -940,7 +1119,6 @@ describe("Settings tools browser", () => {
         "/api/settings",
         expect.objectContaining({
           background_autonomy_enabled: true,
-          background_autonomy_sandbox_processes: false,
           background_autonomy_mode: "extended",
           background_autonomy_max_runtime_seconds: 2700,
           background_autonomy_satisfied_threshold: 0.85,
@@ -949,6 +1127,8 @@ describe("Settings tools browser", () => {
         }),
       );
     });
+    const savedPayload = axios.post.mock.calls.find(([url]) => url === "/api/settings")?.[1];
+    expect(savedPayload).not.toHaveProperty("background_autonomy_sandbox_processes");
 
     fireEvent.click(screen.getByRole("button", { name: /dry run tick/i }));
 
@@ -1304,14 +1484,14 @@ describe("Settings tools browser", () => {
     ).toBeInTheDocument();
   });
 
-  it("warns for a manually entered Grok target without suggesting a preset", async () => {
+  it("warns when a manually configured preset targets Grok", async () => {
     const xaiUrl = "https://api.x.ai/v1";
     settingsResponse = {
       ...settingsResponse,
       mode: "server",
       transformer_model: "grok-test",
       server_url: xaiUrl,
-      server_preset_id: "",
+      server_preset_id: "custom-risky-endpoint",
       server_presets: [
         {
           id: "lm-studio-local",
@@ -1320,13 +1500,22 @@ describe("Settings tools browser", () => {
           base_url: "http://127.0.0.1:1234/v1",
           builtin: true,
         },
+        {
+          id: "custom-risky-endpoint",
+          name: "Risky endpoint",
+          provider: "xai",
+          base_url: xaiUrl,
+          api_key_env: "XAI_API_KEY",
+          api_key_set: false,
+          builtin: false,
+        },
       ],
     };
     const defaultGet = axios.get.getMockImplementation();
     axios.get.mockImplementation((url, ...rest) => {
       if (url === "/api/llm/server/models") {
         return Promise.resolve({
-          data: { reachable: true, models: [], trust_warning: true },
+          data: { reachable: true, models: ["grok-test"], trust_warning: true },
         });
       }
       return defaultGet ? defaultGet(url, ...rest) : Promise.resolve({ data: {} });
@@ -1337,17 +1526,16 @@ describe("Settings tools browser", () => {
     const presetSelect = await screen.findByRole("combobox", {
       name: "Server connection preset",
     });
-    expect(presetSelect).toHaveValue("");
-    expect(screen.queryByRole("textbox", { name: "Preset name" })).not.toBeInTheDocument();
+    expect(presetSelect).toHaveValue("custom-risky-endpoint");
     expect(
-      screen.queryByRole("textbox", { name: "API key environment variable" }),
-    ).not.toBeInTheDocument();
+      screen.getByText("XAI_API_KEY is not set in the Float process environment."),
+    ).toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent(
       "This model may not be trustworthy.",
     );
     await waitFor(() => {
       expect(axios.get).toHaveBeenCalledWith("/api/llm/server/models", {
-        params: { server_url: xaiUrl },
+        params: { server_url: xaiUrl, preset_id: "custom-risky-endpoint" },
       });
     });
   });

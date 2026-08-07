@@ -11,7 +11,6 @@ import "../styles/Sidebar.css";
 import "../styles/ImportReview.css";
 import {
   handleUnifiedPress,
-  supportsHoverInteractions,
 } from "../utils/pointerInteractions";
 import {
   CONVERSATION_PRIVACY_OPTIONS,
@@ -3037,46 +3036,14 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
         className="collapse-btn"
         onClick={(event) =>
           handleUnifiedPress(event, () => {
-            const btn = event.currentTarget;
-            if (btn.__hoverTimer) {
-              clearTimeout(btn.__hoverTimer);
-              btn.__hoverTimer = null;
-            }
-            if (btn.__lastHoverToggleAt && Date.now() - btn.__lastHoverToggleAt < 300) {
-              return;
-            }
             onToggle?.();
           })
         }
         onPointerDown={(event) =>
           handleUnifiedPress(event, () => {
-            const btn = event.currentTarget;
-            if (btn.__hoverTimer) {
-              clearTimeout(btn.__hoverTimer);
-              btn.__hoverTimer = null;
-            }
-            if (btn.__lastHoverToggleAt && Date.now() - btn.__lastHoverToggleAt < 300) {
-              return;
-            }
             onToggle?.();
           })
         }
-        onMouseEnter={(e) => {
-          if (!supportsHoverInteractions()) return;
-          const btn = e.currentTarget;
-          if (btn.__hoverTimer) clearTimeout(btn.__hoverTimer);
-          btn.__hoverTimer = setTimeout(() => {
-            btn.__lastHoverToggleAt = Date.now();
-            onToggle?.();
-          }, 1000);
-        }}
-        onMouseLeave={(e) => {
-          const btn = e.currentTarget;
-          if (btn.__hoverTimer) {
-            clearTimeout(btn.__hoverTimer);
-            btn.__hoverTimer = null;
-          }
-        }}
         aria-label="Collapse history sidebar"
         title="Collapse history sidebar"
       >
@@ -3114,6 +3081,7 @@ const HistorySidebar = ({ collapsed = false, onToggle }) => {
                     className="history-sort-btn"
                     onClick={toggleSortMode}
                     aria-pressed={sortMode === HISTORY_SORT_MODES.CUSTOM}
+                    aria-label={`Conversation sort mode: ${HISTORY_SORT_MODE_LABELS[sortMode] || "updated"}. Activate to change.`}
                     title={`sort mode: ${HISTORY_SORT_MODE_LABELS[sortMode] || "updated"}. click to cycle.`}
                   >
                     <SwapVertIcon className="history-btn-icon" fontSize="inherit" aria-hidden="true" />

@@ -405,7 +405,7 @@ def test_tool_help_names_list_mode_honors_limit():
     assert result["count"] == 3
     assert len(result["tools"]) == 3
     assert result["total_count"] >= result["count"]
-    assert result["tools"] == ["help", "tool_help", "tool_info"]
+    assert result["tools"] == ["help", "tool_info", "remember"]
     assert result["remaining_count"] == result["total_count"] - result["count"]
     assert "list_actions" in result["more_tools"]
 
@@ -571,6 +571,7 @@ def test_help_alias_uses_compact_defaults(monkeypatch):
     assert result["count"] < result["total_count"]
     assert result["hidden_count"] > 0
     assert "memory.save" not in result["tools"]
+    assert "tool_help" not in result["tools"]
     assert "open_url" not in result["tools"]
     assert "subchat" not in result["tools"]
     suite_names = {suite["name"] for suite in result.get("suites", [])}
@@ -609,8 +610,8 @@ def test_tool_info_memory_read_returns_compat_suggestions():
     signature = _sign("tool_info", args)
     result = tool_info(user="tester", signature=signature, **args)
     assert result["error"] == "unknown_tool"
-    assert result["did_you_mean"][:3] == ["recall", "remember", "memory.save"]
-    assert result["menu"]["tools"] == ["recall", "remember", "memory.save"]
+    assert result["did_you_mean"] == ["recall", "remember"]
+    assert result["menu"]["tools"] == ["recall", "remember"]
 
 
 def test_help_rich_entry_prefers_empty_args_for_menu():
@@ -649,6 +650,16 @@ def test_tool_help_rich_entry_prefers_empty_args_for_menu():
     assert {} in entry.get("examples", [])
 
 
+def test_tool_info_can_explicitly_inspect_legacy_tool_help():
+    from app.tools.tool_help import tool_info
+
+    args = {"tool_name": "tool_help", "include_schema": False}
+    signature = _sign("tool_info", args)
+    result = tool_info(user="tester", signature=signature, **args)
+
+    assert result["id"] == "tool_help"
+
+
 def test_tool_help_unknown_tool_returns_menu_and_failed_call():
     from app.tools.tool_help import tool_help
 
@@ -666,7 +677,7 @@ def test_tool_help_unknown_tool_returns_menu_and_failed_call():
     assert result["error"] == "unknown_tool"
     assert "compact menu" in result["message"].lower()
     assert result["failed_call"] == "tool_info() -> missing_tool"
-    assert result["tools"] == ["help", "tool_help", "tool_info", "remember"]
+    assert result["tools"] == ["help", "tool_info", "remember", "recall"]
 
 
 def test_help_unknown_tool_still_returns_menu():
@@ -681,7 +692,7 @@ def test_help_unknown_tool_still_returns_menu():
     signature = _sign("help", args)
     result = help_tool(user="tester", signature=signature, **args)
     assert result["error"] == "unknown_tool"
-    assert result["tools"] == ["help", "tool_help", "tool_info"]
+    assert result["tools"] == ["help", "tool_info", "remember"]
     assert result["failed_call"] == "help(tool_name=totally-not-real) -> unknown_tool"
 
 
@@ -697,7 +708,7 @@ def test_tool_info_missing_tool_guides_discovery():
     assert result["error"] == "missing_tool"
     assert "help" in result["hint"]
     assert result["failed_call"] == "tool_info() -> missing_tool"
-    assert result["menu"]["tools"][:3] == ["help", "tool_help", "tool_info"]
+    assert result["menu"]["tools"][:3] == ["help", "tool_info", "remember"]
 
 
 def test_tool_info_returns_single_catalog_entry():

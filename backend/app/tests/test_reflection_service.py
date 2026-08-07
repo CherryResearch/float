@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.services import reflection_service as reflection_module
 from app.services.reflection_service import ReflectionService
+from app.services.work_run_store import WorkRunStore
 from app.tools import memory as memory_tools
 from app.tools import reflections as reflection_tools
 from app.utils import generate_signature
@@ -59,7 +60,129 @@ def test_reflection_service_crud_scoring_and_run(tmp_path, monkeypatch):
     reflection_call = next(
         call for call in calls if call.get("session_id") == f"reflection:{task['id']}"
     )
-    assert "child-subchat control tool" in reflection_call["context"].system_prompt
+    reflection_context = reflection_call["context"]
+    assert reflection_context.tools == []
+    assert "no tool access" in reflection_context.system_prompt
+    assert "child-subchat control tool" not in reflection_context.system_prompt
+
+
+def test_reflection_run_writes_compact_shared_ledger_receipt(tmp_path, monkeypatch):
+    monkeypatch.setattr(reflection_module, "try_ingest_text", lambda *a, **k: None)
+    monkeypatch.setattr(reflection_module, "get_rag_service", lambda *a, **k: None)
+
+    def fake_generate(prompt, **kwargs):
+        if kwargs.get("response_format") == "json_object":
+            return {
+                "text": (
+                    '{"novelty": 0.8, "usefulness": 0.8, '
+                    '"uncertainty_delta": 0.5, "repetition": 0.1, '
+                    '"continue": false, "should_surface_to_user": false, '
+                    '"cooldown_seconds": 0}'
+                )
+            }
+        return {
+            "text": "One bounded synthesis for the Activity receipt.",
+            "thought": "private chain-of-thought must not enter the work ledger",
+            "metadata": {
+                "provider": "test-provider",
+                "model_requested": "requested-model",
+                "model_received": "received-model",
+                "raw_provider_result": "private provider payload",
+            },
+        }
+
+    work_runs = WorkRunStore(path=tmp_path / "work-runs.sqlite3")
+    service = ReflectionService(
+        {"reflection_store_path": str(tmp_path / "reflections.sqlite3")},
+        llm_generate=fake_generate,
+        now_fn=lambda: 1_700_000_000.0,
+        work_run_store=work_runs,
+    )
+    task = service.create_task(
+        title="Ledger-safe reflection",
+        question="A private task question that must not enter Activity.",
+        source_thread_id="conversation-123",
+        event_id="calendar-event-456",
+        patience_budget={
+            "profile": "custom",
+            "max_reasoning_turns": 3,
+            "max_runtime_seconds": 900,
+        },
+        metadata={
+            "ownership": {
+                "message_id": "message-789",
+                "parent_job_id": "parent-job",
+                "parent_agent_id": "parent-agent",
+            }
+        },
+        utility=0.8,
+        uncertainty=0.7,
+    )
+
+    result = service.run_task(task["id"], force=True)
+    run = result["run"]
+    receipt = work_runs.get(run["id"])
+
+    assert receipt is not None
+    assert receipt["id"] == run["id"]
+    assert receipt["run_id"] == run["id"]
+    assert receipt["source"] == "reflection"
+    assert receipt["job_id"] == task["id"]
+    assert receipt["event_id"] == "calendar-event-456"
+    assert receipt["summary"] == run["compact_note"]
+    assert receipt["ownership"] == {
+        "owner_kind": "conversation",
+        "calendar_event_id": "calendar-event-456",
+        "conversation_id": "conversation-123",
+        "message_id": "message-789",
+        "parent_job_id": "parent-job",
+        "parent_agent_id": "parent-agent",
+    }
+    assert receipt["patience"] == {
+        "stop_condition": "reflection_patience_budget",
+        "max_attempts": 3,
+        "max_runtime_seconds": 900,
+    }
+    assert receipt["execution"]["provider"] == "test-provider"
+    assert receipt["execution"]["requested_model"] == "requested-model"
+    assert receipt["execution"]["received_model"] == "received-model"
+    assert receipt["execution"]["model"] == "received-model"
+    assert receipt["execution"]["thought_trace_length"] == 1
+    assert "output" not in receipt
+    assert "thought" not in receipt
+    assert "thought_trace" not in receipt
+    assert "evaluation" not in receipt
+    assert "input_context_ids" not in receipt
+    assert "raw_provider_result" not in receipt["execution"]
+    serialized = str(receipt)
+    assert "private chain-of-thought" not in serialized
+    assert "private task question" not in serialized
+    assert "private provider payload" not in serialized
+
+
+def test_reflection_commit_survives_work_ledger_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(reflection_module, "try_ingest_text", lambda *a, **k: None)
+    monkeypatch.setattr(reflection_module, "get_rag_service", lambda *a, **k: None)
+
+    class FailingWorkRunStore:
+        def upsert(self, *args, **kwargs):
+            raise OSError("ledger temporarily unavailable")
+
+    service = ReflectionService(
+        {"reflection_store_path": str(tmp_path / "reflections.sqlite3")},
+        llm_generate=lambda *a, **k: None,
+        work_run_store=FailingWorkRunStore(),  # type: ignore[arg-type]
+    )
+    task = service.create_task(
+        question="Keep the canonical reflection when the ledger is busy.",
+        utility=0.8,
+        uncertainty=0.7,
+    )
+
+    result = service.run_task(task["id"], force=True)
+
+    assert result["status"] == "ran"
+    assert service.list_runs(task["id"])[0]["id"] == result["run"]["id"]
 
 
 def test_reflection_priority_echo_damping_and_seeded_sampling(tmp_path, monkeypatch):
