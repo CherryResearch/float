@@ -1,9 +1,9 @@
 {
-  "build_code": "b2026.08.06.3",
-  "built_at": "2026-08-06T19:19:56.463072+00:00",
+  "build_code": "b2026.10.30.1",
+  "built_at": "2026-10-30T01:05:48.626541+00:00",
   "release_version": "0.1.0a1",
   "schema_version": 1,
-  "snapshot_digest": "3c977f9bfbe3a2e62baf3c3d5a7c205b6bb64027be240d4ef2ae93d715f11981",
+  "snapshot_digest": "6a37649d5b8e6998456361b7465d03cdae4c7a187ce17186c05a00a40b8aef4b",
   "source_dirty": false,
-  "source_revision": "fa88c640ae4add157da282090415ca25c9c14bfd"
+  "source_revision": "162b9c7e8b24bc60bbfc5c61782f84529c9017b8"
 }

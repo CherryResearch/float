@@ -538,6 +538,15 @@
 }
 
 @media (max-width: 640px) {
+  .work-history-page .settings-card-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .work-history-page-actions {
+    justify-content: flex-start;
+  }
+
   .activity-authorization-heading {
     align-items: flex-start;
     flex-direction: column;

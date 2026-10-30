@@ -19,6 +19,7 @@ from app.services.rag_provider import get_rag_service, try_ingest_text
 from app.services.work_run_projection import reflection_run_receipt
 from app.services.work_run_store import WorkRunStore
 from app.utils import calendar_store, conversation_store
+from app.utils.tokenizer import CustomTokenizer
 
 JsonDict = Dict[str, Any]
 LlmGenerate = Callable[..., Any]
@@ -30,6 +31,20 @@ DEFAULT_EXPLORATION_TEMPERATURE = 0.45
 DEFAULT_SURFACE_THRESHOLD = 0.70
 DEFAULT_TOP_K = 8
 RUNNABLE_STATUSES = {"open", "waiting"}
+FAILED_RUN_RETRY_SECONDS = 60
+MAX_REFLECTION_LINEAGE_RUNS = 512
+MAX_REFLECTION_LINEAGE_REFS = 4096
+
+
+class ReflectionFailure(RuntimeError):
+    """A bounded, content-free failure that can safely appear in Activity."""
+
+    def __init__(self, category: str, message: str):
+        super().__init__(message)
+        self.category = category
+
+    def as_dict(self) -> JsonDict:
+        return {"category": self.category, "message": str(self)}
 
 
 def _now() -> float:
@@ -218,7 +233,7 @@ def _response_text(response: Any) -> str:
     if isinstance(response, dict):
         for key in ("text", "message", "content", "output"):
             value = response.get(key)
-            if isinstance(value, str):
+            if isinstance(value, str) and value.strip():
                 return value
             if isinstance(value, dict):
                 nested = _response_text(value)
@@ -410,12 +425,19 @@ class ReflectionService:
             patience_budget if patience_budget is not None else patience,
             legacy=normalized_patience,
         )
+        task_metadata = dict(metadata or {})
+        graph_restricted = self._source_has_graph_context(
+            source_thread_id, task_metadata
+        )
+        if graph_restricted:
+            task_metadata[conversation_store.GRAPH_LOCAL_ONLY_KEY] = True
         judgment: JsonDict = {}
-        if utility is None or uncertainty is None:
+        if not graph_restricted and (utility is None or uncertainty is None):
             judgment = self._initial_task_judgment(
                 question=question_text,
                 title=_clean_text(title, limit=160),
-                metadata=metadata or {},
+                metadata=task_metadata,
+                patience_budget=normalized_budget,
             )
         task: JsonDict = {
             "id": task_id,
@@ -451,8 +473,10 @@ class ReflectionService:
                 if str(item or "").strip()
             ],
             "event_id": _clean_text(event_id, limit=200),
-            "metadata": dict(metadata or {}),
+            "metadata": task_metadata,
         }
+        if judgment:
+            task["initial_judgment"] = judgment
         self._refresh_task_scores(task)
         self._save_task(task)
         return task
@@ -533,13 +557,87 @@ class ReflectionService:
                 "task": task,
                 "reason": self._not_runnable_reason(task),
             }
-        context = self._retrieve_context(task)
-        reflection = self._run_reflection_pass(task, context)
-        output = str(reflection.get("output") or "")
-        evaluation = self._evaluate_reflection(task, output, context)
+        started = self.now()
+        budget = normalize_reflection_patience_budget(
+            task.get("patience_budget"), legacy=task.get("patience")
+        )
+        deadline = (
+            started + budget["max_runtime_seconds"]
+            if budget["max_runtime_seconds"]
+            else None
+        )
+        context: JsonDict = {}
+        try:
+            context = self._retrieve_context(task)
+            if deadline is not None and self.now() >= deadline:
+                raise ReflectionFailure(
+                    "runtime_budget_reached",
+                    "Reflection runtime budget was reached before provider dispatch.",
+                )
+            reflection = self._run_reflection_pass(task, context)
+        except ReflectionFailure as exc:
+            return self._save_failed_run(task, context, exc, started=started)
+        except Exception:
+            return self._save_failed_run(
+                task,
+                context,
+                ReflectionFailure(
+                    "reflection_error", "Reflection could not be completed."
+                ),
+                started=started,
+            )
+        output = str(reflection["output"])
+        # In-process providers cannot be killed here. Keep useful late output,
+        # but do not start another model call after the cooperative deadline.
+        if deadline is not None and self.now() >= deadline:
+            evaluation = self._fallback_evaluation(output, "runtime_budget_reached")
+        else:
+            evaluation = self._evaluate_reflection(task, output, context)
+        if deadline is not None and self.now() >= deadline:
+            reflection["generation"]["termination_category"] = "runtime_budget_reached"
+            evaluation["continue"] = False
+        reflection.update(
+            {"status": "complete", "started_at": started, "finished_at": self.now()}
+        )
         run = self._save_run(task, output, evaluation, context, reflection=reflection)
         updated_task = self._update_task_after_run(task, run, evaluation)
         return {"status": "ran", "task": updated_task, "run": run}
+
+    def _save_failed_run(
+        self,
+        task: JsonDict,
+        context: JsonDict,
+        failure: ReflectionFailure,
+        *,
+        started: float,
+    ) -> JsonDict:
+        error = failure.as_dict()
+        run = self._save_run(
+            task,
+            "",
+            {},
+            context,
+            reflection={
+                "status": "error",
+                "error": error,
+                "started_at": started,
+                "finished_at": self.now(),
+                "generation": {"termination_category": failure.category},
+            },
+        )
+        # Failure is an attempt, not a completed reasoning pass. Persist a short
+        # cooldown so a supervisor cannot retry a broken provider in a tight loop.
+        task.update(
+            {
+                "status": "waiting",
+                "updated_at": self.now(),
+                "last_attempt_at": self.now(),
+                "last_error": error,
+                "cooldown_until": self.now() + FAILED_RUN_RETRY_SECONDS,
+            }
+        )
+        self._save_task(task)
+        return {"status": "error", "task": task, "run": run, "error": error}
 
     def scheduler_tick(
         self,
@@ -576,6 +674,8 @@ class ReflectionService:
         try:
             result = self.run_task(str(selected["id"]), force=force)
             tick["status"] = result.get("status") or "complete"
+            if result.get("error"):
+                tick["error"] = result["error"]["message"]
             tick["result"] = {
                 "task_id": result.get("task", {}).get("id"),
                 "run_id": result.get("run", {}).get("id"),
@@ -641,6 +741,8 @@ class ReflectionService:
     ) -> JsonDict:
         created = self.now()
         reflection_payload = reflection if isinstance(reflection, dict) else {}
+        status = str(reflection_payload.get("status") or "complete")
+        error = reflection_payload.get("error") if status == "error" else None
         thought_trace = (
             reflection_payload.get("thought_trace")
             if isinstance(reflection_payload.get("thought_trace"), list)
@@ -651,10 +753,17 @@ class ReflectionService:
             "task_id": task["id"],
             "input_context_ids": context.get("input_context_ids") or [],
             "output": output,
-            "compact_note": self._compact_note(task, output, evaluation),
-            "novelty": _safe_float(evaluation.get("novelty"), 0.45),
-            "uncertainty_delta": _safe_float(evaluation.get("uncertainty_delta"), 0.35),
-            "usefulness": _safe_float(evaluation.get("usefulness"), 0.45),
+            "status": status,
+            "started_at": reflection_payload.get("started_at", created),
+            "finished_at": reflection_payload.get("finished_at", created),
+            "compact_note": (
+                error["message"]
+                if isinstance(error, dict)
+                else self._compact_note(task, output, evaluation)
+            ),
+            "novelty": _safe_float(evaluation.get("novelty"), 0.0),
+            "uncertainty_delta": _safe_float(evaluation.get("uncertainty_delta"), 0.0),
+            "usefulness": _safe_float(evaluation.get("usefulness"), 0.0),
             "repetition": _safe_float(evaluation.get("repetition"), 0.0),
             "should_continue": bool(evaluation.get("continue")),
             "should_surface_to_user": bool(evaluation.get("should_surface_to_user")),
@@ -669,6 +778,8 @@ class ReflectionService:
                 else {}
             ),
         }
+        if error:
+            run["error"] = error
         with self._connect() as conn:
             conn.execute(
                 """
@@ -689,7 +800,8 @@ class ReflectionService:
             )
             conn.commit()
         self._record_work_run(task, run)
-        self._mirror_reflection_note(task, run)
+        if status == "complete":
+            self._mirror_reflection_note(task, run)
         return run
 
     def _record_work_run(self, task: JsonDict, run: JsonDict) -> None:
@@ -906,6 +1018,10 @@ class ReflectionService:
             name = str(item.get("name") or item.get("path") or "").strip()
             if not name:
                 continue
+            # Reflection notes and their retrieval mirrors do not yet preserve
+            # graph custody. Do not seed work from these conversations.
+            if self._source_has_graph_context(name, item):
+                continue
             sensitivity = str(item.get("sensitivity") or "").strip().lower()
             privacy = str(item.get("privacy_mode") or "").strip().lower()
             if sensitivity in {"protected", "secret"} or privacy in {
@@ -998,6 +1114,7 @@ class ReflectionService:
         question: str,
         title: str,
         metadata: JsonDict,
+        patience_budget: Optional[JsonDict] = None,
     ) -> JsonDict:
         ctx = ModelContext(
             system_prompt=(
@@ -1013,30 +1130,56 @@ class ReflectionService:
                 }
             },
         )
-        prompt = (
-            f"Title: {title or '(none)'}\n"
-            f"Question: {question}\n"
-            f"Metadata: {_clean_text(_json_dumps(metadata), limit=800)}\n\n"
+        prefix = f"Title: {title or '(none)'}\nQuestion: {question}\nMetadata: "
+        suffix = (
+            "\n\n"
             'Return JSON: {"utility": number, "uncertainty": number, '
             '"reason": string}.'
         )
-        response = self._generate(
-            prompt,
-            context=ctx,
-            session_id="reflection-task-scorer",
-            response_format="json_object",
-        )
+        fallback_reason = "invalid_evaluation"
+        try:
+            prompt, kwargs, _budget = self._prepare_generation(
+                {"patience_budget": patience_budget},
+                ctx,
+                prefix,
+                _clean_text(_json_dumps(metadata), limit=800),
+                suffix=suffix,
+            )
+            response = self._generate(
+                prompt,
+                context=ctx,
+                session_id="reflection-task-scorer",
+                response_format="json_object",
+                **kwargs,
+            )
+        except ReflectionFailure as exc:
+            response = None
+            fallback_reason = exc.category
+        except Exception:
+            response = None
+            fallback_reason = "provider_error"
+        if isinstance(response, dict) and (
+            response.get("error") or response.get("status") in {"error", "failed"}
+        ):
+            response = None
+            fallback_reason = "provider_error"
         parsed = _extract_json_object(_response_text(response)) or {}
         return {
             "utility": _safe_float(parsed.get("utility"), 0.55),
             "uncertainty": _safe_float(parsed.get("uncertainty"), 0.55),
-            "reason": _clean_text(parsed.get("reason"), limit=300),
+            "reason": _clean_text(parsed.get("reason"), limit=300)
+            if parsed
+            else fallback_reason,
+            "method": "model" if parsed else "deterministic",
         }
 
     def _retrieve_context(self, task: JsonDict) -> JsonDict:
         context_parts: List[str] = []
         input_ids: List[str] = []
         source_thread_id = str(task.get("source_thread_id") or "").strip()
+        self._require_reflection_safe_source(task, source_thread_id)
+        prior_runs = self.list_runs(str(task.get("id") or ""), limit=4)
+        self._require_reflection_safe_lineage(task, prior_runs)
         if not source_thread_id and isinstance(task.get("metadata"), dict):
             source_mode = str(task["metadata"].get("source_mode") or "").lower()
             if source_mode == "recent":
@@ -1044,6 +1187,7 @@ class ReflectionService:
                 if recent:
                     source_thread_id = str(recent[0].get("name") or "")
         if source_thread_id:
+            self._require_reflection_safe_source(task, source_thread_id)
             try:
                 compaction = build_compaction(
                     source_thread_id,
@@ -1052,6 +1196,10 @@ class ReflectionService:
                     summary_mode="deterministic",
                     summary_workflow="conversation_handoff",
                 )
+                if conversation_store.context_graph_local_only(
+                    source_thread_id, compaction.get("messages"), compaction
+                ):
+                    raise self._graph_context_failure()
                 summary = _clean_text(compaction.get("summary_preview"), limit=3000)
                 if summary:
                     context_parts.append(f"Conversation carry-over:\n{summary}")
@@ -1070,6 +1218,8 @@ class ReflectionService:
                         "Recent thread tail:\n" + "\n".join(tail_lines)
                     )
                     input_ids.append(f"conversation:{source_thread_id}:tail")
+            except ReflectionFailure:
+                raise
             except Exception:
                 pass
 
@@ -1094,7 +1244,6 @@ class ReflectionService:
             context_parts.append(rag_snippets["text"])
             input_ids.extend(rag_snippets["ids"])
 
-        prior_runs = self.list_runs(str(task.get("id") or ""), limit=4)
         if prior_runs:
             notes = [
                 _clean_text(run.get("compact_note") or run.get("output"), limit=700)
@@ -1110,7 +1259,139 @@ class ReflectionService:
         return {
             "text": "\n\n".join(part for part in context_parts if part).strip(),
             "input_context_ids": input_ids,
+            "source_thread_id": source_thread_id,
         }
+
+    def _require_reflection_safe_lineage(
+        self, task: JsonDict, prior_runs: Sequence[JsonDict]
+    ) -> None:
+        # Four notes enter the prompt, but their sources can be much older.
+        # Separate active and completed nodes allow shared ancestors, not cycles.
+        stack = []
+        roots = {}
+        for run in prior_runs:
+            run_id = run.get("id") if isinstance(run, dict) else None
+            if not isinstance(run_id, str) or not run_id.strip():
+                raise self._lineage_context_failure()
+            if run_id in roots and roots[run_id] != run:
+                raise self._lineage_context_failure()
+            roots[run_id] = run
+            stack.append((run_id, False))
+        active: set[str] = set()
+        complete: set[str] = set()
+        checked_sources: set[str] = set()
+        ref_count = 0
+        try:
+            with self._connect() as conn:
+                while stack:
+                    run_id, exiting = stack.pop()
+                    if exiting:
+                        active.remove(run_id)
+                        complete.add(run_id)
+                        continue
+                    if run_id in active:
+                        raise self._lineage_context_failure()
+                    if run_id in complete:
+                        continue
+                    if len(active) + len(complete) >= MAX_REFLECTION_LINEAGE_RUNS:
+                        raise self._lineage_context_failure()
+                    row = conn.execute(
+                        "SELECT task_id, payload FROM reflection_runs WHERE id = ?",
+                        (run_id,),
+                    ).fetchone()
+                    if row is None:
+                        raise self._lineage_context_failure()
+                    try:
+                        run = json.loads(row["payload"])
+                    except (TypeError, ValueError):
+                        raise self._lineage_context_failure() from None
+                    if (
+                        not isinstance(run, dict)
+                        or run.get("id") != run_id
+                        or run.get("task_id") != row["task_id"]
+                        or row["task_id"] != task.get("id")
+                        or (run_id in roots and run != roots[run_id])
+                    ):
+                        raise self._lineage_context_failure()
+                    refs = run.get("input_context_ids")
+                    if not isinstance(refs, list):
+                        raise self._lineage_context_failure()
+                    ref_count += len(refs)
+                    if ref_count > MAX_REFLECTION_LINEAGE_REFS:
+                        raise self._lineage_context_failure()
+                    active.add(run_id)
+                    stack.append((run_id, True))
+                    for context_id in refs:
+                        if not isinstance(context_id, str) or not context_id.strip():
+                            raise self._lineage_context_failure()
+                        context_id = context_id.strip()
+                        if context_id in {"reflection_run", "conversation"}:
+                            raise self._lineage_context_failure()
+                        if context_id.startswith("reflection_run:"):
+                            ancestor_id = context_id[len("reflection_run:") :]
+                            if not ancestor_id.strip():
+                                raise self._lineage_context_failure()
+                            stack.append((ancestor_id, False))
+                        elif context_id.startswith("conversation:"):
+                            source_ref, _, kind = context_id[
+                                len("conversation:") :
+                            ].rpartition(":")
+                            if not source_ref.strip() or kind not in {
+                                "summary",
+                                "tail",
+                            }:
+                                raise self._lineage_context_failure()
+                            if source_ref not in checked_sources:
+                                self._require_reflection_safe_source(task, source_ref)
+                                checked_sources.add(source_ref)
+                        # Other IDs can be opaque RAG sources, not run ancestry.
+        except sqlite3.Error:
+            raise self._lineage_context_failure() from None
+
+    @staticmethod
+    def _lineage_context_failure() -> ReflectionFailure:
+        return ReflectionFailure(
+            "context_provenance_unavailable",
+            "Reflection cannot verify the source history of its saved notes. "
+            "No background generation was started.",
+        )
+
+    @staticmethod
+    def _source_has_graph_context(source_thread_id: str, metadata: Any = None) -> bool:
+        restricted = conversation_store.context_graph_local_only(
+            source_thread_id, [], metadata
+        )
+        if source_thread_id and not restricted:
+            # Older transcripts can retain raw tool receipts without a sidecar
+            # marker. Inspect before scoring, summarizing or selecting a source.
+            restricted = conversation_store.context_graph_local_only(
+                None, conversation_store.load_conversation(source_thread_id)
+            )
+        if source_thread_id and restricted:
+            conversation_store.mark_graph_local_only(source_thread_id)
+        return restricted
+
+    @staticmethod
+    def _graph_context_failure() -> ReflectionFailure:
+        return ReflectionFailure(
+            "local_only_context",
+            "Reflection cannot process local-only graph context because its notes "
+            "and retrieval mirrors do not preserve that restriction. Continue in "
+            "the original conversation with a local model.",
+        )
+
+    def _require_reflection_safe_source(
+        self, task: JsonDict, source_thread_id: str = ""
+    ) -> None:
+        if self._source_has_graph_context(
+            source_thread_id or str(task.get("source_thread_id") or ""),
+            task.get("metadata"),
+        ):
+            # Failed run receipts must not age a confirmed restriction out.
+            metadata = task.get("metadata")
+            task["metadata"] = dict(metadata) if isinstance(metadata, dict) else {}
+            task["metadata"][conversation_store.GRAPH_LOCAL_ONLY_KEY] = True
+            raise self._graph_context_failure()
 
     def _memory_context(self, task: JsonDict) -> Optional[JsonDict]:
         keys = [
@@ -1198,20 +1479,92 @@ class ReflectionService:
                 response_format=response_format,
                 **kwargs,
             )
-        try:
-            from app import routes as routes_module
+        from app import routes as routes_module
 
-            return routes_module.llm_service.generate(
-                prompt,
-                context=context,
-                session_id=session_id,
-                response_format=response_format,
-                **kwargs,
-            )
-        except Exception:
-            return None
+        return routes_module.llm_service.generate(
+            prompt,
+            context=context,
+            session_id=session_id,
+            response_format=response_format,
+            **kwargs,
+        )
+
+    def _prepare_generation(
+        self,
+        task: JsonDict,
+        context: ModelContext,
+        prefix: str,
+        optional_text: str,
+        *,
+        suffix: str = "",
+    ) -> tuple[str, JsonDict, JsonDict]:
+        """Fit optional context without truncating the task or instructions.
+
+        The context ceiling uses Float's Harmony reference tokenizer, includes
+        a 12-token allowance per message, and reserves the larger of the output
+        cap and requested output reserve. Provider-specific framing may differ.
+        """
+        budget = normalize_reflection_patience_budget(
+            task.get("patience_budget"), legacy=task.get("patience")
+        )
+        cap = budget["max_context_tokens"]
+        output_cap = budget["max_output_tokens"]
+        reserve = max(output_cap, budget["reserve_output_tokens"])
+        prompt = prefix + optional_text + suffix
+        evidence: JsonDict = {
+            "max_context_tokens": cap,
+            "max_output_tokens": output_cap,
+            "reserve_output_tokens": reserve,
+            "context_truncated": False,
+            "runtime_enforcement": "cooperative_between_calls",
+        }
+        if cap:
+            try:
+                tokenizer = CustomTokenizer()
+                fixed_tokens = len(tokenizer.encode(context.system_prompt)) + 24
+                available = cap - reserve - fixed_tokens
+                if len(tokenizer.encode(prefix + suffix)) > available:
+                    raise ReflectionFailure(
+                        "context_budget_exceeded",
+                        "Reflection context budget cannot fit the required task and instructions.",
+                    )
+                if len(tokenizer.encode(prompt)) > available:
+                    tokens = tokenizer.encode(optional_text)
+                    remaining = min(len(tokens), max(0, available))
+                    while True:
+                        prompt = prefix + tokenizer.decode(tokens[:remaining]) + suffix
+                        excess = len(tokenizer.encode(prompt)) - available
+                        if excess <= 0:
+                            break
+                        remaining = max(0, remaining - max(1, excess))
+                    evidence["context_truncated"] = True
+                evidence.update(
+                    {
+                        "input_tokens": fixed_tokens + len(tokenizer.encode(prompt)),
+                        "tokenizer": "o200k_harmony",
+                    }
+                )
+            except ReflectionFailure:
+                raise
+            except Exception as exc:
+                raise ReflectionFailure(
+                    "context_budget_unavailable",
+                    "Reflection context budget could not be checked; provider work was not started.",
+                ) from exc
+        kwargs: JsonDict = {}
+        # A reserve also caps generation when it is the only explicit output
+        # allocation inside a bounded context window.
+        resolved_output_cap = output_cap or (reserve if cap else 0)
+        if resolved_output_cap:
+            kwargs["output_token_limit"] = resolved_output_cap
+        evidence["output_token_limit"] = resolved_output_cap or None
+        context.metadata["patience_budget"] = evidence
+        return prompt, kwargs, evidence
 
     def _run_reflection_pass(self, task: JsonDict, context: JsonDict) -> JsonDict:
+        self._require_reflection_safe_source(
+            task, str(context.get("source_thread_id") or "")
+        )
         task_metadata = (
             task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
         )
@@ -1251,22 +1604,35 @@ class ReflectionService:
                 "proposal_target": task_metadata.get("skill_id") or None,
             },
         )
-        prompt = (
+        prefix = (
             f"Thought task: {task.get('title')}\n"
             f"Question: {task.get('question')}\n\n"
-            f"Relevant context:\n{context.get('text') or '(none)'}"
+            "Relevant context:\n"
         )
-        generation_kwargs: JsonDict = {}
+        prompt, generation_kwargs, budget = self._prepare_generation(
+            task, ctx, prefix, str(context.get("text") or "(none)")
+        )
         requested_model = _clean_text(task_metadata.get("requested_model"), limit=500)
         if requested_model:
             generation_kwargs["model"] = requested_model
-        response = self._generate(
-            prompt,
-            context=ctx,
-            session_id=f"reflection:{task.get('id')}",
-            response_format=None,
-            **generation_kwargs,
-        )
+        try:
+            response = self._generate(
+                prompt,
+                context=ctx,
+                session_id=f"reflection:{task.get('id')}",
+                response_format=None,
+                **generation_kwargs,
+            )
+        except Exception as exc:
+            raise ReflectionFailure(
+                "provider_error", "Reflection provider call failed."
+            ) from exc
+        if isinstance(response, dict) and (
+            response.get("error") or response.get("status") in {"error", "failed"}
+        ):
+            raise ReflectionFailure(
+                "provider_error", "Reflection provider call failed."
+            )
         cleaner = _skill_markdown_proposal if is_skill_proposal else _clean_text
         text = cleaner(_response_text(response), limit=8000)
         thought_trace = _response_thought_trace(response)
@@ -1276,16 +1642,12 @@ class ReflectionService:
             "thought_trace": thought_trace,
             "generation": _response_generation_metadata(response),
         }
+        reflection["generation"]["patience_budget"] = budget
         if text:
             return reflection
-        if is_skill_proposal:
-            return reflection
-        reflection["output"] = (
-            "Current best synthesis: not enough model output was available for a "
-            "substantive pass.\nWhat changed: no new structure.\nRemaining "
-            "uncertainty: high.\nAnother pass: no.\nSurface to user: no."
+        raise ReflectionFailure(
+            "empty_output", "Reflection provider returned no usable output."
         )
-        return reflection
 
     def _evaluate_reflection(
         self, task: JsonDict, output: str, context: JsonDict
@@ -1305,35 +1667,39 @@ class ReflectionService:
                 "reflection_task_id": task.get("id"),
             },
         )
-        prompt = (
-            f"Task question: {task.get('question')}\n\n"
-            f"Reflection output:\n{output}\n\n"
+        prefix = f"Task question: {task.get('question')}\n\nReflection output:\n"
+        suffix = (
+            "\n\n"
             "Score 0-1: novelty, usefulness, uncertainty_delta, repetition. "
             "Set continue and should_surface_to_user as booleans."
         )
-        response = self._generate(
-            prompt,
-            context=ctx,
-            session_id=f"reflection-eval:{task.get('id')}",
-            response_format="json_object",
-        )
+        try:
+            self._require_reflection_safe_source(
+                task, str(context.get("source_thread_id") or "")
+            )
+            prompt, kwargs, _budget = self._prepare_generation(
+                task, ctx, prefix, output, suffix=suffix
+            )
+            response = self._generate(
+                prompt,
+                context=ctx,
+                session_id=f"reflection-eval:{task.get('id')}",
+                response_format="json_object",
+                **kwargs,
+            )
+        except ReflectionFailure as exc:
+            return self._fallback_evaluation(output, exc.category)
+        except Exception:
+            return self._fallback_evaluation(output, "provider_error")
+        if isinstance(response, dict) and (
+            response.get("error") or response.get("status") in {"error", "failed"}
+        ):
+            return self._fallback_evaluation(output, "provider_error")
         parsed = _extract_json_object(_response_text(response)) or {}
         if not parsed:
-            # Deterministic fallback used when the model cannot provide JSON.
-            word_count = len(output.split())
-            parsed = {
-                "novelty": 0.45 if word_count >= 80 else 0.25,
-                "usefulness": 0.45 if word_count >= 80 else 0.30,
-                "uncertainty_delta": 0.35
-                if "remaining uncertainty" in output.lower()
-                else 0.25,
-                "repetition": 0.25,
-                "continue": False,
-                "should_surface_to_user": False,
-                "reason": "fallback evaluator",
-                "cooldown_seconds": 24 * 60 * 60,
-            }
+            return self._fallback_evaluation(output, "invalid_evaluation")
         evaluation = {
+            "method": "model",
             "novelty": _safe_float(parsed.get("novelty"), 0.35),
             "usefulness": _safe_float(parsed.get("usefulness"), 0.35),
             "uncertainty_delta": _safe_float(parsed.get("uncertainty_delta"), 0.25),
@@ -1349,6 +1715,24 @@ class ReflectionService:
             evaluation["should_surface_to_user"] = False
         return evaluation
 
+    def _fallback_evaluation(self, output: str, reason: str) -> JsonDict:
+        """Keep real output when scoring is unavailable, without claiming model verification."""
+        word_count = len(output.split())
+        return {
+            "method": "deterministic",
+            "fallback_reason": reason,
+            "novelty": 0.45 if word_count >= 80 else 0.25,
+            "usefulness": 0.45 if word_count >= 80 else 0.30,
+            "uncertainty_delta": 0.35
+            if "remaining uncertainty" in output.lower()
+            else 0.25,
+            "repetition": 0.25,
+            "continue": False,
+            "should_surface_to_user": False,
+            "reason": "fallback evaluator",
+            "cooldown_seconds": 24 * 60 * 60,
+        }
+
     # ------------------------------------------------------------------
     # Post-run state
     # ------------------------------------------------------------------
@@ -1359,6 +1743,7 @@ class ReflectionService:
         evaluation: JsonDict,
     ) -> JsonDict:
         now = self.now()
+        task.pop("last_error", None)
         run_count = int(task.get("run_count") or 0) + 1
         task["run_count"] = run_count
         task["last_run_at"] = now
@@ -1417,6 +1802,10 @@ class ReflectionService:
         )
 
     def _mirror_reflection_note(self, task: JsonDict, run: JsonDict) -> None:
+        try:
+            self._require_reflection_safe_source(task)
+        except ReflectionFailure:
+            return
         note = str(run.get("compact_note") or "").strip()
         if not note:
             return

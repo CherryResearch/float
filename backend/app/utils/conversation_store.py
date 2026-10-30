@@ -24,6 +24,7 @@ from uuid import uuid4
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 SERVER_RUNTIME_RECEIPTS_KEY = "server_runtime_receipts"
+GRAPH_LOCAL_ONLY_KEY = "graph_local_only"
 CLIENT_SAVED_TOOL_MARKER = "client_saved_untrusted"
 CONTINUATION_TRUST_KEY = "continuation_trust"
 CONTINUATION_TRUST_INVALIDATED = "invalidated"
@@ -419,6 +420,71 @@ def get_metadata(name: str) -> Dict[str, Any]:
     return _ensure_metadata(name)
 
 
+def _graph_metadata_names(name: str) -> tuple[str, ...]:
+    normalized = _normalize_name(name)
+    without_suffix = normalized[:-5] if normalized.endswith(".json") else normalized
+    if without_suffix and _path(without_suffix) == _path(normalized):
+        return (without_suffix, without_suffix + ".json")
+    return (normalized,)
+
+
+def graph_local_only(name: str) -> bool:
+    """Read sticky custody across equivalent transcript filename spellings."""
+    if not name:
+        return False
+    # A and A.json load the same transcript but legacy metadata may use either
+    # sidecar name. Reading an alias must never drop an existing restriction.
+    return any(
+        get_metadata(alias).get(GRAPH_LOCAL_ONLY_KEY)
+        for alias in _graph_metadata_names(name)
+        if _meta_path(alias).exists()
+    )
+
+
+def context_graph_local_only(
+    session_id: Optional[str], messages: Any, metadata: Any = None
+) -> bool:
+    """Keep graph custody through saved history, warm contexts and compaction."""
+    if session_id and graph_local_only(session_id):
+        return True
+    if isinstance(metadata, dict) and metadata.get(GRAPH_LOCAL_ONLY_KEY):
+        return True
+    for message in messages if isinstance(messages, (list, tuple)) else []:
+        if not isinstance(message, dict) and callable(
+            getattr(message, "model_dump", None)
+        ):
+            message = message.model_dump()
+        if not isinstance(message, dict):
+            continue
+        meta = message.get("metadata")
+        meta = meta if isinstance(meta, dict) else {}
+        if meta.get(GRAPH_LOCAL_ONLY_KEY):
+            return True
+        for tool in message.get("tools") or []:
+            if (
+                isinstance(tool, dict)
+                and str(tool.get("name") or "").strip() == "graph.query"
+                and str(tool.get("status") or "").strip().lower()
+                in {"invoked", "ok", "success", "succeeded", "complete", "completed"}
+            ):
+                return True
+        if meta.get("tool_results") is True and (
+            meta.get("graph_result_refs")
+            or re.search(
+                r'"name"\s*:\s*"graph\.query"',
+                str(message.get("content") or message.get("text") or ""),
+            )
+        ):
+            return True
+    return False
+
+
+def mark_graph_local_only(name: str) -> None:
+    """Keep graph-derived conversation text local even after summary/replacement."""
+    if name:
+        merge_metadata(_graph_metadata_names(name)[0], {GRAPH_LOCAL_ONLY_KEY: True})
+
+
 def set_display_name(
     name: str,
     display_name: str,
@@ -452,7 +518,10 @@ def merge_metadata(name: str, updates: Dict[str, Any]) -> Dict[str, Any]:
     with _METADATA_LOCK:
         meta = _ensure_metadata(name)
         if isinstance(updates, dict):
+            graph_restricted = bool(meta.get(GRAPH_LOCAL_ONLY_KEY))
             meta = _merge(meta, updates)
+            if graph_restricted:
+                meta[GRAPH_LOCAL_ONLY_KEY] = True
             _write_meta(name, meta)
         return meta
 
@@ -566,6 +635,14 @@ def save_conversation(name: str, messages: List[Dict[str, Any]]) -> None:
         # Keep the sidecar read-modify-write atomic with transcript saves so a
         # concurrent runtime-receipt merge cannot be overwritten by stale meta.
         meta = _ensure_metadata(name)
+        if any(
+            isinstance(message, dict)
+            and isinstance(message.get("metadata"), dict)
+            and message["metadata"].get(GRAPH_LOCAL_ONLY_KEY)
+            for message in messages
+        ):
+            # Imported derived text may tighten its destination, never loosen it.
+            meta[GRAPH_LOCAL_ONLY_KEY] = True
         fp = _path(name)
         fp.parent.mkdir(parents=True, exist_ok=True)
         with fp.open("w", encoding="utf-8") as f:

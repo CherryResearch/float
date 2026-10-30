@@ -7,12 +7,15 @@ import { GlobalContext } from "../main";
 import { normalizeBackgroundJobPolicy } from "../utils/backgroundJobPolicy";
 import { dateToZonedInput, zonedInputToDate } from "../utils/zonedDateTime";
 
-const slugify = (value) =>
-  (value || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 60);
+let fallbackEventIdSequence = 0;
+const createEventId = () => {
+  if (typeof globalThis.crypto?.randomUUID === "function") {
+    return `evt-${globalThis.crypto.randomUUID()}`;
+  }
+  // LAN browsers may lack randomUUID; keep same-millisecond creates distinct.
+  fallbackEventIdSequence += 1;
+  return `evt-${Date.now()}-${fallbackEventIdSequence}-${Math.random().toString(36).slice(2, 10)}`;
+};
 
 const getNoteValue = (notes, key) =>
   Array.isArray(notes)
@@ -111,7 +114,7 @@ const EventForm = ({
             5,
           )
         : 60;
-    setId(event?.id || `evt-${Date.now()}`);
+    setId(event?.id || createEventId());
     setTitle(event?.title || event?.summary || "");
     setDescription(event?.description || getNoteValue(notes, "description"));
     const existingActions = Array.isArray(event?.actions) ? event.actions : null;
@@ -142,18 +145,6 @@ const EventForm = ({
     setShowAdvanced(false);
     setError("");
   }, [event, notes, defaultTz, anchorDate, isOpen]);
-
-  useEffect(() => {
-    if (!isOpen || isEditing) return;
-    setId((prev) => {
-      const slug = slugify(title);
-      if (!slug) return prev || `draft-${Date.now()}`;
-      if (!prev || prev.startsWith("evt-") || prev.startsWith("draft-")) {
-        return slug;
-      }
-      return prev;
-    });
-  }, [title, isEditing, isOpen]);
 
   useEffect(() => {
     if (!isOpen) return undefined;
@@ -230,8 +221,10 @@ const EventForm = ({
     if (reviewDate) {
       upsertNote("review", reviewDate.toISOString());
     }
+    const eventId = id || event?.id || createEventId();
+    setId(eventId);
     const payload = {
-      id: id || slugify(title) || `evt-${Date.now()}`,
+      id: eventId,
       title: title.trim(),
       description: description.trim() || null,
       actions: Array.isArray(actions) ? actions : [],
@@ -241,7 +234,7 @@ const EventForm = ({
               ...normalizeBackgroundJobPolicy(backgroundJob),
               ownership: {
                 ...normalizeBackgroundJobPolicy(backgroundJob).ownership,
-                calendar_event_id: id || slugify(title) || undefined,
+                calendar_event_id: eventId,
               },
             }
           : null,

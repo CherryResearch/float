@@ -91,6 +91,47 @@ describe("Full Auto tool loop", () => {
     globalThis.WebSocket = OriginalWebSocket;
   });
 
+  test("keeps distinct approval requests separate and rejects another session's events", async () => {
+    axiosMocks.get.mockResolvedValue({ data: { agents: [] } });
+    axiosMocks.post.mockResolvedValue({ data: {} });
+    const { default: App } = await import("../App");
+    const { GlobalContext } = await import("../../main");
+    let current;
+    let update;
+    function Harness() {
+      const [state, setState] = React.useState({ ...mockState, approvalLevel: "all" });
+      current = state;
+      update = setState;
+      return <GlobalContext.Provider value={{ state, setState }}><App /></GlobalContext.Provider>;
+    }
+    render(<Harness />);
+    await waitFor(() => expect(wsInstances.length).toBeGreaterThan(0));
+    const ws = wsInstances.at(-1);
+    const proposal = { type: "tool", name: "recall", args: { query: "same query" }, status: "proposed", message_id: "msg-1" };
+    await act(async () => {
+      ws.emit({ ...proposal, session_id: "other-session", id: "wrong-tool" });
+      ws.emit({ type: "content", session_id: "other-session", message_id: "msg-1", content: "wrong text" });
+      ws.emit({ type: "thought", session_id: "other-session", message_id: "msg-1", content: "wrong summary" });
+    });
+    expect(current.conversation[0].tools).toEqual([]);
+    expect(current.conversation[0].text).toBe("Requested tools.");
+    expect(current.conversation[0].thoughts || []).toEqual([]);
+    await act(async () => {
+      ws.emit({ type: "content", session_id: "sess-1", message_id: "msg-1", content: " First chunk." });
+      ws.emit({ type: "content", session_id: "sess-1", message_id: "msg-1", content: " Second chunk." });
+    });
+    expect(current.conversation[0].text).toBe("Requested tools. First chunk. Second chunk.");
+    await act(async () => {
+      ws.emit({ ...proposal, session_id: "sess-1", id: "first-tool" });
+      ws.emit({ ...proposal, session_id: "sess-1", id: "second-tool" });
+    });
+    expect(current.conversation[0].tools.map((tool) => tool.request_id)).toEqual(["first-tool", "second-tool"]);
+    expect(axiosMocks.post.mock.calls.filter(([url]) => url === "/api/tools/decision")).toHaveLength(0);
+    act(() => update((previous) => ({ ...previous, conversation: previous.conversation.map((message) => ({ ...message, metadata: { status: "complete" } })) })));
+    await act(async () => ws.emit({ type: "content", session_id: "sess-1", message_id: "msg-1", content: " Late duplicate." }));
+    expect(current.conversation[0].text).toBe("Requested tools. First chunk. Second chunk.");
+  });
+
   test("retries auto-continue after an in-flight continue finishes", async () => {
     const firstContinue = deferred();
     let continueCalls = 0;

@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from app.utils import memory_store
+from app.utils.privacy_policy import (
+    SECRET_MEMORY_REFERENCE,
+    is_secret_memory,
+    secret_memory_metadata,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +259,11 @@ class KnowledgeStore:
             raise ValueError("source is required")
         clean_text = str(text or "")
         clean_metadata = dict(metadata or {})
+        if is_secret_memory(clean_metadata, source_text):
+            clean_text = SECRET_MEMORY_REFERENCE
+            clean_metadata = secret_memory_metadata(clean_metadata, source_text)
+            chunk_texts = [clean_text]
+            summary_text = clean_text
         now = float(clean_metadata.get("updated_at") or time.time())
         existing = None
         if knowledge_id:

@@ -64,7 +64,15 @@ def test_background_autonomy_status_exposes_attention_snapshot(tmp_path):
 
     assert status["enabled"] is False
     assert status["sandbox_processes"] is True
-    assert status["capabilities"]["sandbox_background_processes"] is True
+    assert status["capabilities"]["sandbox_background_processes"] is False
+    assert status["capabilities"]["hard_runtime_limit"] is False
+    assert status["isolation"] == {
+        "requested": True,
+        "available": False,
+        "active": False,
+        "scope": "reflection",
+        "runtime_enforcement": "cooperative_between_calls",
+    }
     assert status["configured_mode"] == "overnight"
     assert status["max_runtime_seconds"] == 1800
     assert status["basic_tick_count"] == 2
@@ -154,3 +162,19 @@ def test_background_autonomy_extended_mode_stops_when_satisfied(tmp_path):
     assert result["stop_reason"] == "satisfied_threshold"
     assert autonomy.should_stop_session("extended") is True
     assert autonomy.status()["session"]["stop_reason"] == "satisfied_threshold"
+
+
+def test_background_autonomy_failed_reflection_is_not_completed_or_satisfied(tmp_path):
+    reflection, autonomy = _services(tmp_path)
+    reflection.llm_generate = lambda *args, **kwargs: None
+    reflection.create_task(
+        question="A provider-unavailable reflection", utility=0.8, uncertainty=0.7
+    )
+
+    result = autonomy.tick(mode="manual")
+
+    assert result["status"] == "error"
+    assert result["ran_reflections"] == 0
+    assert result["attempted_reflections"] == 1
+    assert result["satisfied"] is False
+    assert result["error"] == "Reflection provider returned no usable output."

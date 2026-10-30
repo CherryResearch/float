@@ -877,6 +877,43 @@ _BUILTIN_TOOL_CATALOG: Dict[str, Dict[str, Any]] = {
             "Protected and secret values are not mirrored into vector search by default."
         ],
     ),
+    "graph.query": _entry(
+        category="memory",
+        summary="Read complete, source-attributed current or audit graph claims.",
+        description=(
+            "Requires an explicit local data-policy destination. "
+            "Current mode filters lifecycle and present validity before limits; audit retains history. "
+            "Exact predicate and role/node filtering with complete literal roles, "
+            "provenance and epistemic status. Complementary to semantic recall. "
+            "Retains contradictory values and distinguishes proposals from adoption metadata."
+        ),
+        runtime={"executor": "backend_python", "network": False, "filesystem": False},
+        limits={
+            "default_limit": 50,
+            "max_limit": 100,
+            "max_role_filters": 8,
+            "max_response_bytes": 262144,
+            "max_roles": 1000,
+            "max_filter_chars": 512,
+        },
+        freshness={"type": "live_local_state"},
+        persistence={"writes_state": False},
+        safety={"risk_level": "medium", "default_approval": "confirm"},
+        can_access=["shared durable graph nodes, complete claims and source metadata"],
+        cannot_access=[
+            "semantic search",
+            "database-as-of knowledge history",
+            "external data-policy destinations",
+            "conflict resolution",
+        ],
+        limit_hints=[
+            "Stable claim-ID order with matched count and truncation flag; filters run before limit.",
+            "Results exceeding 1000 roles or 262144 UTF-8 JSON bytes fail explicitly; no incomplete claims returned.",
+            "Time filters use finite Unix seconds. Validity is half-open and needs an explicit start.",
+            "occurred_at is stored event/source time, not a universal source-message or recorded-at contract.",
+            "No metadata value proves user adoption; inspect source attribution and epistemic status.",
+        ],
+    ),
     "graph.update": _entry(
         category="memory",
         summary="Create or update durable graph nodes and claims.",

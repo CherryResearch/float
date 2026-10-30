@@ -529,8 +529,16 @@ const formatStreamLabel = (entry) => {
 const resolveTerminalStreamState = (entry, message = null) => {
   if (!entry || entry.type !== "stream") return null;
   const entryStatus = normalizeStatusValue(entry.status);
-  const metadata =
+  const savedMetadata =
     message?.metadata && typeof message.metadata === "object" ? message.metadata : {};
+  const savedStateAt = normalizeRuntimeTimestamp(
+    savedMetadata.timing?.completed_at || message?.updated_at || message?.timestamp,
+  );
+  const eventAt = normalizeRuntimeTimestamp(entry.timestamp);
+  const newerAttempt = savedStateAt && eventAt && eventAt > savedStateAt &&
+    (!entry.request_id || entry.request_id !== savedMetadata.request_id);
+  // A new regeneration/continuation must not inherit the prior attempt's end state.
+  const metadata = newerAttempt ? {} : savedMetadata;
   const messageStatus = normalizeStatusValue(metadata.status);
   const terminalStatus = [entryStatus, messageStatus].find(
     (status) => status === "error" || status === "timeout",
@@ -562,6 +570,20 @@ const resolveTerminalStreamState = (entry, message = null) => {
       summary: "partial response",
       retry: "Retry from chat.",
     };
+  }
+  const finishedStatus = [messageStatus, entryStatus].find((status) =>
+    ["complete", "completed", "cancelled", "canceled"].includes(status),
+  );
+  if (finishedStatus) {
+    const cancelled = finishedStatus === "cancelled" || finishedStatus === "canceled";
+    return {
+      status: cancelled ? "cancelled" : "complete",
+      summary: cancelled ? "response stopped" : "response complete",
+      retry: "",
+    };
+  }
+  if (metadata.tool_response_pending || ["awaiting_tools", "pending"].includes(entryStatus)) {
+    return { status: "pending", summary: "waiting for tools", retry: "" };
   }
   return null;
 };
@@ -3305,13 +3327,15 @@ const AgentConsole = ({
   }, [backendReady, fetchRuntimeStatus]);
 
   const applyContinuation = React.useCallback(
-    (assistantId, continuation, md) => {
+    (assistantId, continuation, md, ownerSessionId) => {
       if (!assistantId || !continuation) return;
       setState((prev) => {
+        if (ownerSessionId && prev.sessionId !== ownerSessionId) return prev;
         const updatedConversation = Array.isArray(prev.conversation)
           ? [...prev.conversation]
           : [];
         const mIdx = updatedConversation.findIndex((m) => m && m.id === assistantId);
+        if (mIdx === -1) return prev;
         if (mIdx !== -1) {
           const existingText = updatedConversation[mIdx]?.text || "";
           const joined = mergeContinuationText(
@@ -3442,7 +3466,6 @@ const AgentConsole = ({
     }
     const key = `${normalizedFocus.chainId || ""}:${normalizedFocus.toolId || ""}:${normalizedFocus.ts}`;
     if (focusTokenRef.current === key) return;
-    focusTokenRef.current = key;
     const selectors = [];
     if (normalizedFocus.toolId) {
       selectors.push(`[data-tool-id="${escapeSelector(normalizedFocus.toolId)}"]`);
@@ -3457,8 +3480,10 @@ const AgentConsole = ({
     const root = sidebarRef.current;
     if (!root || typeof root.querySelector !== "function") return;
     const target = root.querySelector(selectors.join(", "));
+    if (!target) return;
+    focusTokenRef.current = key;
     scrollConsoleTargetIntoView(target, "smooth");
-  }, [normalizedFocus, scrollConsoleTargetIntoView]);
+  }, [normalizedFocus, scrollConsoleTargetIntoView, collapsedAgents, expandedAgents, hiddenAgents, collapsedToolChats]);
 
   React.useEffect(() => {
     if (typeof window === "undefined") return undefined;
@@ -3975,6 +4000,28 @@ const AgentConsole = ({
       return changed ? next : prev;
     });
   }, [agents]);
+  React.useEffect(() => {
+    if (!normalizedFocus) return;
+    const matching = displayAgents.filter((agent) =>
+      (normalizedFocus.agentId && String(agent.id) === normalizedFocus.agentId) ||
+      (agent.events || []).some(matchesFocus),
+    );
+    if (!matching.length) return;
+    const agentIds = matching.map((agent) => String(agent.id));
+    const chatKeys = matching.map((agent) => resolveAgentToolChatKey(agent, state.sessionId)).filter(Boolean);
+    const setFlags = (setter, keys, value) => setter((previous) => {
+      if (keys.every((key) => previous[key] === value)) return previous;
+      const next = { ...previous };
+      keys.forEach((key) => { next[key] = value; });
+      return next;
+    });
+    // Review links must reveal the actual controls, even in compact/hidden cards.
+    setFlags(setCollapsedAgents, agentIds, false);
+    setFlags(setExpandedAgents, agentIds, true);
+    setFlags(setHiddenAgents, agentIds, false);
+    setFlags(setCollapsedToolChats, chatKeys, false);
+    if (normalizedFocus.chainId) setFlags(setCollapsedChains, [normalizedFocus.chainId], false);
+  }, [normalizedFocus, matchesFocus, displayAgents, state.sessionId]);
   React.useEffect(() => {
     if (!activeBrowserSession?.sessionId) return;
     setBrowserNavigateDraft(activeBrowserSession.currentUrl || "");
@@ -4607,7 +4654,7 @@ const AgentConsole = ({
                   tool_continue_semantic_signature: semanticBatchSignature,
                 }
               : {}),
-          });
+          }, sessionId);
         }
       } catch (err) {
         console.error("Auto-continue failed", err);
@@ -5972,8 +6019,24 @@ const AgentConsole = ({
 
   const renderAgentCard = (agent) => {
     if (!agent) return null;
-    const tone = statusTone(agent.status);
     const filteredActivity = getRenderableAgentActivity(agent, { showToolEntries });
+    const latestActivity = filteredActivity.reduce((latest, entry) =>
+      !latest || normalizeRuntimeTimestamp(entry.timestamp) >= normalizeRuntimeTimestamp(latest.timestamp)
+        ? entry : latest, null);
+    const latestMessageId = latestActivity?.message_id || latestActivity?.chain_id;
+    const latestSessionId = latestActivity?.session_id || agent.session_id;
+    const latestMessage = latestMessageId && (!latestSessionId || latestSessionId === state.sessionId)
+      ? conversationById.get(latestMessageId) : null;
+    // Old snapshots can retain "active" after the saved response finished.
+    // Reconcile only this conversation, retaining newer attempts as active.
+    const savedLifecycle = latestActivity && latestMessage
+      ? resolveTerminalStreamState({
+          ...latestActivity,
+          type: "stream",
+          status: latestActivity.type === "stream" ? latestActivity.status : "",
+        }, latestMessage) : null;
+    const cardStatus = savedLifecycle?.status || agent.status;
+    const tone = statusTone(cardStatus);
     const latestThought = [...filteredActivity]
       .reverse()
       .find((entry) => entry.type === "thought");
@@ -6036,7 +6099,7 @@ const AgentConsole = ({
       normalizedFocus &&
       ((normalizedFocus.agentId && agentKeyString === normalizedFocus.agentId) ||
         filteredActivity.some((entry) => matchesFocus(entry)));
-    const activeClass = agent.status === "active" ? " active" : "";
+    const activeClass = cardStatus === "active" ? " active" : "";
     const cardClass = `agent-card${activeClass}${cardHasFocus ? " focused" : ""}${
       isCompact ? " compact" : ""
     }`;
@@ -6139,7 +6202,7 @@ const AgentConsole = ({
           </div>
           <div className="agent-card-actions">
             <div className="agent-card-submeta">
-              {agent.status && <span className="agent-status-label">{tone.label}</span>}
+              {cardStatus && <span className="agent-status-label">{tone.label}</span>}
               {agent.updatedAt && (
                 <time className="agent-updated-at" dateTime={new Date(agent.updatedAt * 1000).toISOString()}>
                   {formatTimestamp(agent.updatedAt)}
@@ -6614,17 +6677,17 @@ const AgentConsole = ({
                     ) : entry.type === "stream" ? (
                       <div className="agent-activity-stream">
                         <div className="agent-activity-text">{bodyText}</div>
-                        {terminalStreamState ? (
+                        {terminalStreamState?.retry ? (
                           <div className="agent-activity-text" role="status">
                             {terminalStreamState.retry}
                           </div>
-                        ) : (
+                        ) : !terminalStreamState ? (
                           <div
                             className="agent-stream-progress"
                             role="progressbar"
                             aria-label="Streaming response"
                           />
-                        )}
+                        ) : null}
                       </div>
                     ) : (
                       <div className="agent-activity-text">{bodyText}</div>

@@ -85,7 +85,12 @@ def _role_node_id(role: Dict[str, Any], node_refs: Dict[str, str]) -> Optional[s
         return node_id
     node_ref = _text(role.get("node_ref") or role.get("ref"))
     if node_ref:
-        return node_refs.get(node_ref)
+        if node_ref not in node_refs:
+            raise ValueError(
+                f"unresolved node_ref {node_ref!r}; use an existing node_id "
+                "or include the referenced node in this update"
+            )
+        return node_refs[node_ref]
     return None
 
 
@@ -180,7 +185,11 @@ def apply_graph_payload(
                 ),
                 status=_text(raw_claim.get("status"), "active"),
                 epistemic_status=_text(raw_claim.get("epistemic_status"), "asserted"),
-                confidence=float(raw_claim.get("confidence", 1.0) or 1.0),
+                confidence=float(
+                    1.0
+                    if raw_claim.get("confidence") is None
+                    else raw_claim["confidence"]
+                ),
                 valid_from=raw_claim.get("valid_from"),
                 valid_to=raw_claim.get("valid_to"),
                 occurred_at=raw_claim.get("occurred_at"),

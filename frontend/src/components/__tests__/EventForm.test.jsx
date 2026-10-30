@@ -12,6 +12,74 @@ describe("EventForm", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it.each([true, false])(
+    "creates distinct events with repeated titles and incremental typing (UUID available: %s)",
+    async (uuidAvailable) => {
+      vi.spyOn(Date, "now").mockReturnValue(1788307200000);
+      if (!uuidAvailable) vi.stubGlobal("crypto", {});
+      const post = vi.spyOn(axios, "post").mockResolvedValue({ data: { status: "saved" } });
+      const createdIds = [];
+
+      for (let eventIndex = 0; eventIndex < 2; eventIndex += 1) {
+        const view = render(
+          <EventForm
+            event={null}
+            selectedDate={new Date("2026-09-12T09:00:00")}
+            isOpen
+            onSaved={() => {}}
+            onCancel={() => {}}
+          />,
+        );
+        fireEvent.click(screen.getByRole("button", { name: /advanced settings/i }));
+        const idInput = screen.getByPlaceholderText(/auto-generated/i);
+        const originalId = idInput.value;
+        const titleInput = screen.getByPlaceholderText("Event name");
+        const title = "Morning review";
+        for (let length = 1; length <= title.length; length += 1) {
+          fireEvent.change(titleInput, { target: { value: title.slice(0, length) } });
+        }
+        expect(idInput).toHaveValue(originalId);
+        fireEvent.click(screen.getByRole("button", { name: /create event/i }));
+        await waitFor(() => expect(post).toHaveBeenCalledTimes(eventIndex + 1));
+        const [url, payload] = post.mock.calls[eventIndex];
+        expect(payload).toMatchObject({ id: originalId, title });
+        expect(url).toBe(`/api/calendar/events/${encodeURIComponent(originalId)}`);
+        createdIds.push(payload.id);
+        view.unmount();
+      }
+
+      expect(createdIds[0]).not.toBe(createdIds[1]);
+    },
+  );
+
+  it("preserves an explicit new-event ID while the title changes", async () => {
+    const post = vi.spyOn(axios, "post").mockResolvedValue({ data: { status: "saved" } });
+    render(
+      <EventForm
+        event={null}
+        selectedDate={new Date("2026-09-12T09:00:00")}
+        isOpen
+        onSaved={() => {}}
+        onCancel={() => {}}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /advanced settings/i }));
+    fireEvent.change(screen.getByPlaceholderText(/auto-generated/i), {
+      target: { value: "custom-review-id" },
+    });
+    fireEvent.change(screen.getByPlaceholderText("Event name"), {
+      target: { value: "Renamed review" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /create event/i }));
+    await waitFor(() => {
+      expect(post).toHaveBeenCalledWith(
+        "/api/calendar/events/custom-review-id",
+        expect.objectContaining({ id: "custom-review-id", title: "Renamed review" }),
+      );
+    });
   });
 
   it("does not reset fields while typing", () => {
@@ -96,11 +164,15 @@ describe("EventForm", () => {
     fireEvent.change(screen.getByLabelText(/repeat/i), {
       target: { value: "once" },
     });
+    fireEvent.change(screen.getByPlaceholderText("Event name"), {
+      target: { value: "Renamed reminder" },
+    });
     fireEvent.click(screen.getByRole("button", { name: /update event/i }));
 
     await waitFor(() => expect(post).toHaveBeenCalled());
     expect(post.mock.calls[0][1]).toMatchObject({
       id: "nightly-reminder",
+      title: "Renamed reminder",
       rrule: null,
       background_job: null,
       start_time: Date.parse("2026-07-26T03:00:00Z") / 1000,

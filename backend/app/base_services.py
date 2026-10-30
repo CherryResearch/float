@@ -37,12 +37,19 @@ from urllib.parse import urlparse, urlunparse
 
 import requests
 from app import hooks
+from app.provider_transports.model_capabilities import (
+    is_gpt_reasoning_family,
+    supports_openai_reasoning_summary,
+)
 from app.provider_transports.openai_responses_ws import (
     OpenAIResponsesWebSocketError,
     OpenAIResponsesWebSocketTransport,
 )
 from app.provider_transports.openai_responses_ws import (
     extract_response_function_calls as _extract_responses_function_calls,
+)
+from app.provider_transports.openai_responses_ws import (
+    extract_response_reasoning_summary as _extract_responses_reasoning_summary,
 )
 from app.provider_transports.openai_responses_ws import (
     extract_response_text as _extract_responses_visible_text,
@@ -59,6 +66,15 @@ from app.utils.hardware import gpu_memory_snapshot, system_memory_snapshot
 from app.utils.http_client import http_session as _real_http_session
 from app.utils.llm_server_log import log_event as log_llm_server_event
 from app.utils.oai_api_capture import write_capture as write_oai_api_capture
+from app.utils.privacy_policy import (
+    DataPolicy,
+    PrivacyCleanupError,
+    data_policy_scope,
+    local_only_transport_required,
+    policy_for_destination,
+    require_allowed_endpoint,
+    transport_privacy_options,
+)
 from app.utils.stream_sanitize import InlineToolStreamFilter
 from packaging.version import InvalidVersion, Version
 
@@ -2502,6 +2518,7 @@ class LLMService:
                 json=payload,
                 timeout=self._compose_timeout(streaming=True),
                 stream=True,
+                **transport_privacy_options(),
             )
             # Some OpenAI-compatible servers (notably LM Studio) omit charset
             # headers; Requests may default to latin-1, producing mojibake.
@@ -2628,6 +2645,7 @@ class LLMService:
             ]
 
         def _merge_response_metadata(candidate: Any) -> None:
+            nonlocal usage
             nonlocal response_model
             nonlocal response_id
             nonlocal previous_response_id
@@ -2658,6 +2676,9 @@ class LLMService:
                 final_response_payload = dict(candidate)
 
             for source in sources:
+                source_usage = source.get("usage")
+                if isinstance(source_usage, dict) and source_usage:
+                    usage = dict(source_usage)
                 raw_response_id = source.get("id")
                 if isinstance(raw_response_id, str) and raw_response_id.strip():
                     response_id = raw_response_id.strip()
@@ -3066,6 +3087,8 @@ class LLMService:
                                         response_tool_text_parts.append(text_done)
                         elif lowered in {"response.completed", "response.done"}:
                             pass
+                        elif is_reasoning and lowered.endswith(".done") and saw_thought:
+                            pass
                         # Avoid double-counting Responses API "done" payloads after deltas.
                         elif is_reasoning or is_delta or not text_parts:
                             current_source = "responses"
@@ -3320,6 +3343,10 @@ class LLMService:
                 tool_calls_accum = lm_tool_calls
 
         if isinstance(final_response_payload, dict) and final_response_payload:
+            if not saw_thought:
+                summary = _extract_responses_reasoning_summary(final_response_payload)
+                if summary:
+                    _emit_thought(summary)
             final_visible_text = _extract_responses_visible_text(final_response_payload)
             final_tool_text = _extract_responses_tool_text(final_response_payload)
             for function_call in _extract_responses_function_calls(
@@ -3587,9 +3614,31 @@ class LLMService:
         response_format: Optional[str] = None,
         stream_consumer: Optional[Callable[[Dict[str, Any]], None]] = None,
         stream_message_id: Optional[str] = None,
+        _data_policy: Optional[DataPolicy] = None,
         **kwargs,
     ):
         """Generate text using the selected mode and context."""
+        with data_policy_scope(_data_policy):
+            return self._generate_for_destination(
+                prompt,
+                context,
+                session_id,
+                response_format,
+                stream_consumer,
+                stream_message_id,
+                **kwargs,
+            )
+
+    def _generate_for_destination(
+        self,
+        prompt,
+        context,
+        session_id,
+        response_format,
+        stream_consumer,
+        stream_message_id,
+        **kwargs,
+    ):
         if context:
             self.set_context(context, session_id)
 
@@ -3938,7 +3987,11 @@ class LLMService:
             return details
 
         def _local_vision_fallback_part(
-            att: Dict[str, Any], attachment_ordinal: int
+            att: Dict[str, Any],
+            attachment_ordinal: int,
+            *,
+            scope: str,
+            source_message_id: Optional[str],
         ) -> Dict[str, Any]:
             label = att.get("display_name") or att.get("name") or "image"
             ref = att.get("url") or att.get("remoteUrl") or ""
@@ -4042,6 +4095,8 @@ class LLMService:
                         "caption_origin": (
                             "stored" if used_stored_caption else "generated_for_chat"
                         ),
+                        "scope": scope,
+                        "source_message_id": source_message_id,
                     }
                 )
             if placeholder:
@@ -4119,7 +4174,12 @@ class LLMService:
             return {"type": "text", "text": "; ".join(details)}
 
         def _attachment_to_part(
-            att: Dict[str, Any], allow_inline_image: bool, attachment_ordinal: int
+            att: Dict[str, Any],
+            allow_inline_image: bool,
+            attachment_ordinal: int,
+            *,
+            scope: str,
+            source_message_id: Optional[str],
         ) -> Optional[Dict[str, Any]]:
             att_type = (att.get("type") or "").lower()
             if not att_type:
@@ -4131,7 +4191,12 @@ class LLMService:
                     inline = _inline_image_part(att, att_type)
                     if inline:
                         return inline
-                return _local_vision_fallback_part(att, attachment_ordinal)
+                return _local_vision_fallback_part(
+                    att,
+                    attachment_ordinal,
+                    scope=scope,
+                    source_message_id=source_message_id,
+                )
             label = att.get("display_name") or att.get("name") or "attachment"
             ref = att.get("url") or att.get("remoteUrl") or ""
             text = f"[Attachment: {label}]".strip()
@@ -4143,6 +4208,9 @@ class LLMService:
             att_list: Sequence[Dict[str, Any]] | None,
             seen_keys: Set[str],
             inline_slots: Optional[int],
+            *,
+            scope: str,
+            source_message_id: Optional[str],
         ) -> List[Dict[str, Any]]:
             if not att_list:
                 return []
@@ -4163,6 +4231,8 @@ class LLMService:
                     att,
                     allow_inline_image=allow_inline,
                     attachment_ordinal=next_ordinal,
+                    scope=scope,
+                    source_message_id=source_message_id,
                 )
                 if not part:
                     continue
@@ -4192,6 +4262,9 @@ class LLMService:
             message_dict: Dict[str, Any],
             attachment_list: Sequence[Dict[str, Any]] | None,
             seen_keys: Optional[Set[str]] = None,
+            *,
+            scope: str = "current",
+            source_message_id: Optional[str] = None,
         ) -> Tuple[Dict[str, Any], Set[str]]:
             seen = seen_keys or set()
             existing_content = _ensure_list_content(message_dict.get("content"))
@@ -4201,7 +4274,13 @@ class LLMService:
                 if isinstance(item, dict) and item.get("type") == "image_url"
             )
             remaining_slots = max(0, MAX_INLINE_ATTACHMENTS - inline_count)
-            parts = _build_attachment_parts(attachment_list, seen, remaining_slots)
+            parts = _build_attachment_parts(
+                attachment_list,
+                seen,
+                remaining_slots,
+                scope=scope,
+                source_message_id=source_message_id,
+            )
             if parts:
                 existing_content.extend(parts)
                 message_dict["content"] = existing_content
@@ -4242,6 +4321,7 @@ class LLMService:
             configured_url = self._normalize_server_url(server_url)
         else:
             configured_url = api_url
+        require_allowed_endpoint(configured_url)
         if isinstance(api_key_override, str):
             api_key = api_key_override
         elif use_server:
@@ -4360,6 +4440,11 @@ class LLMService:
                 msg_dict,
                 history_attachments,
                 history_attachment_seen_keys,
+                scope="history",
+                source_message_id=(
+                    (metadata.get("message_id") if isinstance(metadata, dict) else None)
+                    or (msg.get("id") if isinstance(msg, dict) else None)
+                ),
             )
             iso_text = _coerce_iso_timestamp(metadata)
             msg_dict = _inject_timestamp_content(msg_dict, iso_text)
@@ -4391,6 +4476,7 @@ class LLMService:
                     prompt_entry,
                     attachment_queue,
                     set(),
+                    source_message_id=stream_message_id,
                 )
                 attachment_queue = []
                 messages.append(prompt_entry)
@@ -4401,6 +4487,7 @@ class LLMService:
                     prompt_entry,
                     attachment_queue,
                     set(),
+                    source_message_id=stream_message_id,
                 )
                 attachment_queue = []
             prompt_entry = _inject_timestamp_content(
@@ -4487,6 +4574,40 @@ class LLMService:
                 normalized_messages.append({"role": "user", "content": str(msg)})
         messages = normalized_messages
 
+        def _with_vision_metadata(result: Dict[str, Any]) -> Dict[str, Any]:
+            native_image_parts = _count_native_image_message_parts(messages)
+            if (
+                native_image_parts
+                or vision_fallback_details
+                or vision_workflow != "auto"
+            ):
+                vision_meta: Dict[str, Any] = {
+                    "workflow": vision_workflow,
+                    "native_image_input": native_image_parts > 0,
+                    "fallback_used": bool(vision_fallback_details),
+                    "fallback_images": len(vision_fallback_details),
+                    "current_request_images": request_image_attachment_count,
+                }
+                if vision_fallback_details:
+                    vision_meta["fallback_attachments"] = [
+                        {
+                            key: item.get(key)
+                            for key in (
+                                "name",
+                                "content_hash",
+                                "capture_id",
+                                "caption",
+                                "placeholder",
+                                "caption_model",
+                                "scope",
+                                "source_message_id",
+                            )
+                        }
+                        for item in vision_fallback_details
+                    ]
+                result.setdefault("metadata", {})["vision"] = vision_meta
+            return result
+
         if (
             supports_native_images
             and request_image_attachment_count > 0
@@ -4497,6 +4618,7 @@ class LLMService:
                 "native_image_input": False,
                 "fallback_used": bool(vision_fallback_details),
                 "fallback_images": len(vision_fallback_details),
+                "current_request_images": request_image_attachment_count,
                 "error": "image_attachment_resolution_failed",
             }
             if vision_fallback_details:
@@ -4508,6 +4630,8 @@ class LLMService:
                         "caption": item.get("caption"),
                         "placeholder": item.get("placeholder"),
                         "caption_model": item.get("caption_model"),
+                        "scope": item.get("scope"),
+                        "source_message_id": item.get("source_message_id"),
                     }
                     for item in vision_fallback_details
                 ]
@@ -4541,9 +4665,10 @@ class LLMService:
             lower_model = (model or "").lower() if isinstance(model, str) else ""
         except Exception:
             lower_model = ""
-        # Prefer Responses API for GPT‑5; honor explicit /responses in URL
-        use_responses = configured_url.endswith(suffix_resp) or lower_model.startswith(
-            "gpt-5"
+        # Preserve compatible server routing; newer cloud GPT models use Responses.
+        use_responses = configured_url.endswith(suffix_resp) or (
+            is_gpt_reasoning_family(lower_model)
+            and (not use_server or lower_model.startswith("gpt-5"))
         )
         tool_source = (
             native_tool_definitions
@@ -4682,6 +4807,8 @@ class LLMService:
                 reasoning_effort = reasoning.get("effort")
                 if reasoning_effort is not None and str(reasoning_effort).strip():
                     payload["reasoning"] = {"effort": reasoning_effort}
+            if supports_openai_reasoning_summary(model):
+                payload.setdefault("reasoning", {})["summary"] = "auto"
             if output_token_limit is not None:
                 payload["max_output_tokens"] = output_token_limit
             if send_response_format:
@@ -4744,6 +4871,8 @@ class LLMService:
         )
         if (
             self._openai_responses_ws_enabled()
+            # Local-only requests use HTTP, where redirects are disabled below.
+            and not local_only_transport_required()
             and self.mode == "api"
             and not use_server
             and url.endswith(suffix_resp)
@@ -4785,7 +4914,7 @@ class LLMService:
                             capture_path = None
                         if capture_path:
                             meta["oai_api_log_path"] = capture_path
-                    return ws_result
+                    return _with_vision_metadata(ws_result)
             except OpenAIResponsesWebSocketError as exc:
                 logger.warning(
                     "LLMService: OpenAI Responses WebSocket failed (%s); %s",
@@ -4921,7 +5050,7 @@ class LLMService:
                             )
                         except Exception:
                             pass
-                    return streamed
+                    return _with_vision_metadata(streamed)
             except requests.exceptions.RequestException as exc:
                 if use_server:
                     try:
@@ -4989,6 +5118,7 @@ class LLMService:
                             else None
                         ),
                     ),
+                    **transport_privacy_options(),
                 )
                 if getattr(self, "mode", None) == "server":
                     try:
@@ -5272,6 +5402,7 @@ class LLMService:
         if url.endswith(suffix_resp):
             # OpenAI Responses API style payload
             text = _extract_responses_visible_text(data)
+            thought = _extract_responses_reasoning_summary(data)
             response_tool_text = _extract_responses_tool_text(data)
             if str(data.get("status") or "").strip().lower() == "incomplete":
                 incomplete_details = data.get("incomplete_details")
@@ -5434,6 +5565,13 @@ class LLMService:
             "metadata": {},
             "thought_trace": trace,
         }
+        response_usage = data.get("usage") if isinstance(data, dict) else None
+        if not isinstance(response_usage, dict) and isinstance(data, dict):
+            nested_response = data.get("response")
+            if isinstance(nested_response, dict):
+                response_usage = nested_response.get("usage")
+        if isinstance(response_usage, dict):
+            result["metadata"]["usage"] = dict(response_usage)
         requested_model = model if isinstance(model, str) else None
         if requested_model:
             requested_model = requested_model.strip() or None
@@ -5483,28 +5621,7 @@ class LLMService:
             result["metadata"]["inline_tool_payload"] = inline_tool_payloads[0]
             if len(inline_tool_payloads) > 1:
                 result["metadata"]["inline_tool_payloads"] = inline_tool_payloads
-        native_image_parts = _count_native_image_message_parts(messages)
-        if native_image_parts or vision_fallback_details or vision_workflow != "auto":
-            vision_meta: Dict[str, Any] = {
-                "workflow": vision_workflow,
-                "native_image_input": native_image_parts > 0,
-                "fallback_used": bool(vision_fallback_details),
-                "fallback_images": len(vision_fallback_details),
-            }
-            if vision_fallback_details:
-                vision_meta["fallback_attachments"] = [
-                    {
-                        "name": item.get("name"),
-                        "content_hash": item.get("content_hash"),
-                        "capture_id": item.get("capture_id"),
-                        "caption": item.get("caption"),
-                        "placeholder": item.get("placeholder"),
-                        "caption_model": item.get("caption_model"),
-                    }
-                    for item in vision_fallback_details
-                ]
-            result["metadata"]["vision"] = vision_meta
-        return result
+        return _with_vision_metadata(result)
 
     def _load_local_model(self, override_model_name: str | None = None) -> None:
         """Lazily load a local transformers model and tokenizer."""
@@ -6179,10 +6296,15 @@ class LLMService:
         if not url:
             port = self.config.get("dynamic_port", 8000)
             url = f"http://localhost:{port}/generate"
+        require_allowed_endpoint(url)
         payload = self._prepare_payload(prompt, ctx, **kwargs)
         try:
             response = requests.post(
-                url, json=payload, stream=True, timeout=self.timeout
+                url,
+                json=payload,
+                stream=True,
+                timeout=self.timeout,
+                **transport_privacy_options(),
             )
             response.raise_for_status()
             chunks: List[str] = []
@@ -6830,7 +6952,7 @@ class MemoryManager:
     ) -> None:
         self._review_executor = executor
 
-    def _drop_vector_record(self, key: str) -> None:
+    def _drop_vector_record(self, key: str, *, canonical: bool = True) -> None:
         try:
             from app.services.rag_provider import get_rag_service
 
@@ -6840,7 +6962,12 @@ class MemoryManager:
         if not service:
             return
         try:
-            service.delete_source(f"memory:{key}")
+            if canonical:
+                service.delete_source(f"memory:{key}")
+            else:
+                service.delete_retrieval_mirror(f"memory:{key}")
+        except PrivacyCleanupError:
+            raise
         except Exception:
             logger.debug("memory vector delete failed for %s", key, exc_info=True)
 
@@ -7216,7 +7343,7 @@ class MemoryManager:
         elif item.get("vectorize") is False:
             item["vectorized_at"] = None
             item["rag_doc_id"] = None
-            self._drop_vector_record(key)
+            self._drop_vector_record(key, canonical=False)
         self.store[key] = item
         self._persist()
         self._emit_memory_hook(key, "update_item_fields", item)
@@ -7339,6 +7466,24 @@ class MemoryManager:
         except Exception:
             pass
         verify_signature(signature, user, name, kwargs)
+        if name == "reflect" and _action_context:
+            from app.utils import conversation_store
+
+            source_session = str(
+                _action_context.get("session_id")
+                or _action_context.get("conversation_id")
+                or ""
+            ).strip()
+            if source_session and conversation_store.context_graph_local_only(
+                source_session, conversation_store.load_conversation(source_session)
+            ):
+                # The model may omit or replace source_thread_id. Its question
+                # still derives from the host's conversation and cannot lose custody.
+                conversation_store.mark_graph_local_only(source_session)
+                raise ValueError(
+                    "Reflection cannot receive local-only graph context because "
+                    "its notes and retrieval mirrors do not preserve that restriction."
+                )
         action_service = getattr(self, "_action_history_service", None)
         action_token = None
         should_journal = False
@@ -7366,7 +7511,15 @@ class MemoryManager:
             except Exception:
                 action_token = None
         try:
-            result = self.tools[name](user=user, signature=signature, **kwargs)
+            policy = (
+                policy_for_destination(
+                    _action_context.get("mode"), _action_context.get("endpoint")
+                )
+                if _action_context is not None
+                else None
+            )
+            with data_policy_scope(policy):
+                result = self.tools[name](user=user, signature=signature, **kwargs)
         except Exception as exc:
             if action_token is not None:
                 try:

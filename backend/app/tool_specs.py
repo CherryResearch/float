@@ -1905,6 +1905,68 @@ BUILTIN_TOOL_SPECS: Dict[str, Dict[str, Any]] = {
             }
         },
     ),
+    "graph.query": _spec(
+        "graph.query",
+        "Local-only: requires an explicit local data-policy destination. Default current mode excludes inactive, cancelled, superseded and out-of-validity claims before limits. Audit mode retains history. Read complete graph claims with literals, roles and provenance. Complement to recall, not semantic search. Exact filters run before limit; conflicts remain unresolved. Dates address retained claim validity or stored occurred_at, never database-as-of history.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["current", "audit"],
+                    "default": "current",
+                    "description": "current: eligible active claims now, not verified facts or user adoption. audit: all retained statuses and supplied history",
+                },
+                "node_id": {
+                    "type": "string",
+                    "maxLength": 512,
+                    "description": "Incident node ID, in any role",
+                },
+                "predicate": {
+                    "type": "string",
+                    "maxLength": 512,
+                    "description": "Exact relation predicate",
+                },
+                "role_nodes": {
+                    "type": "object",
+                    "maxProperties": 8,
+                    "propertyNames": {"maxLength": 512},
+                    "additionalProperties": {"type": "string", "maxLength": 512},
+                    "description": "All exact role-name to node-ID filters must match; subject and object are not reversed",
+                },
+                "epistemic_status": {
+                    "type": "string",
+                    "maxLength": 512,
+                    "enum": _GRAPH_CLAIM_SCHEMA["properties"]["epistemic_status"][
+                        "enum"
+                    ],
+                },
+                "valid_at": {
+                    "type": "number",
+                    "description": "Audit mode only. Unix seconds. Requires explicit valid_from <= t < valid_to. Unknown start, or superseded without end, is excluded",
+                },
+                "occurred_from": {
+                    "type": "number",
+                    "description": "Inclusive stored occurred_at lower bound in Unix seconds; not database knowledge time",
+                },
+                "occurred_before": {
+                    "type": "number",
+                    "description": "Exclusive stored occurred_at upper bound in Unix seconds; unknown times excluded",
+                },
+                "known_at": {
+                    "type": "number",
+                    "description": "UNSUPPORTED database-as-of time: raises a clear error because same-ID writes overwrite records",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "default": 50,
+                },
+            },
+        },
+    ),
     "graph.update": _spec(
         "graph.update",
         "Create or update durable graph nodes and multi-role claims.",

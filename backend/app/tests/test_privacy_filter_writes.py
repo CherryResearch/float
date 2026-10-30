@@ -1,3 +1,4 @@
+import pytest
 from app.base_services import MemoryManager
 from app.services import privacy_filter_service as privacy_filter
 from app.services.rag_service import RAGService
@@ -84,13 +85,16 @@ def test_write_file_reports_privacy_filter_choice(monkeypatch, tmp_path):
     assert (tmp_path / "workspace" / "note.txt").read_text() == "Call 555-123-4567"
 
 
-def test_rag_ingest_adds_privacy_metadata(monkeypatch, tmp_path):
+@pytest.mark.parametrize("canonical", [True, False])
+def test_rag_ingest_keeps_secret_metadata_out_of_vector_mirrors(
+    monkeypatch, tmp_path, canonical
+):
     _enable_fake_filter(monkeypatch, label="secret")
     service = RAGService(
         backend="chroma",
         persist_dir=str(tmp_path / "chroma"),
         sqlite_path=str(tmp_path / "memory.sqlite3"),
-        enable_canonical_store=False,
+        enable_canonical_store=canonical,
     )
 
     doc_id = service.ingest_text(
@@ -99,11 +103,17 @@ def test_rag_ingest_adds_privacy_metadata(monkeypatch, tmp_path):
     )
     trace = service.trace(doc_id)
 
+    assert service.backend.list_docs()["ids"] == []
+    if not canonical:
+        assert doc_id == ""
+        assert trace is None
+        return
     assert trace is not None
     metadata = trace["metadata"]
     assert metadata["sensitivity"] == "secret"
     assert metadata["sensitivity_source"] == "privacy_filter"
     assert metadata["privacy_filter_detected_labels"] == "secret"
+    assert metadata["retrieval_mirror_status"] == "skipped_privacy"
 
 
 def test_conversation_privacy_filter_updates_metadata(monkeypatch, tmp_path):

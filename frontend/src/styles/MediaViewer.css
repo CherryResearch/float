@@ -79,7 +79,7 @@
   border: none;
   background: transparent;
   overscroll-behavior: contain;
-  z-index: 3700;
+  z-index: var(--layer-modal);
 }
 
 .viewer-dialog::backdrop {

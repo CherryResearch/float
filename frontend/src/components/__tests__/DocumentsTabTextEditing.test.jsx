@@ -3,20 +3,6 @@ import { MemoryRouter } from "react-router-dom";
 import "@testing-library/jest-dom";
 import axios from "axios";
 
-vi.mock("../FilterBar", () => ({
-  default: ({ children, onSearch, searchPlaceholder, searchValue }) => (
-    <div>
-      <input
-        aria-label="Search documents"
-        placeholder={searchPlaceholder}
-        value={searchValue}
-        onChange={(event) => onSearch(event.target.value)}
-      />
-      {children}
-    </div>
-  ),
-}));
-
 vi.mock("../MediaViewer", () => ({
   default: () => <div data-testid="media-viewer" />,
 }));
@@ -101,7 +87,8 @@ describe("DocumentsTab text editing", () => {
     });
 
     await act(async () => {
-      fireEvent.change(screen.getByDisplayValue("folders"), {
+      fireEvent.click(screen.getByText("Filters"));
+      fireEvent.change(screen.getByLabelText("Layout"), {
         target: { value: "list" },
       });
     });

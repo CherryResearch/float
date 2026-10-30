@@ -16,15 +16,15 @@ float leverages language models and a modular architecture to provide a platform
 
 ### Working now (alpha)
 - Multi-mode chat (API, local, server) with model selection and conversation history stored under `data/conversations/`.
-- Privacy levels for memories to prevent automatic RAG uploading secrets to cloud.
+- Memory sensitivity labels and external-retrieval controls (alpha; cross-store and per-request privacy enforcement still need hardening).
 - Built-in tools with approvals and scheduling; tool calls and thought/tool streams show up in the Agent Console.
 - Browser-first computer use with shared session-backed tools, screenshot results in chat, native OpenAI computer-tool passthrough for API mode, and an experimental Windows desktop runtime.
 - Memory + RAG with Knowledge UI, plus `threads` semantic tagging. Text-based durable memories and flexible embeddings work in tandem.
 - Attachments + media viewer for images, PDFs, and common audio formats.
-- Calendar events + scheduled actions/tasks.
+- Calendar events + scheduled actions/tasks, with durable Activity receipts, scheduled-tool permission/approval enforcement, bounded retries, cooperative stop, prompt restart checkpoints, and opt-in provider process isolation. Unknown external effects require reconciliation; non-cooperative tool isolation and enforcement across other execution lanes remain incomplete.
 - Conversation export/import (markdown/json/text) and history management, including OpenAI-style export ZIP ingest from the History sidebar via file upload (MD/JSON/text/ZIP), currently by selecting a zip and saving a new conversation, but this flow is not yet manually tested.
 - Reflections: bounded background thought tasks can review recent chats, memories, or a user-supplied question, then store useful notes or follow-ups without becoming an always-on autonomous process.
-- Write history: action/write tracking with tunable retention helps inspect and recover from tool-side changes.
+- Write history: action/write tracking with tunable retention helps inspect tool-side changes. Graph undo/redo restores captured values and complete claim roles transactionally for the selected graph records. Mixed-section undo and Action History JSON are outside that transaction; cross-store crash recovery and incomplete historical snapshots remain limitations.
 
 ### Planned / In progress
 - *workflows* chain together models to create a smooth and customizable experience; bounded recursion allows for more complex behavior.
@@ -51,7 +51,7 @@ These inline tokens remain clickable until you delete the trailing space or the 
 - **Data Store**: SQLite is the canonical store for durable memory, knowledge chunks, and the lightweight graph/claim substrate; Chroma is the local retrieval mirror, and Weaviate remains an optional vector backend. Using tool calls or manual user input, float can update, edit, store, and reason about memories. Ideally, long-form content is preserved without forcing everything into a naive vector-only search path. File-system interaction with markdown in a float workspace is being tested.
 - **Tool Calling**: Built-in tools cover discovery, memory, retrieval, web, managed file access, compaction, reflections, action history, and guarded computer/capture surfaces. MCP remains available for external tool servers but is not required for built-ins.
 - **Modular Design**: Allows for easy replacement of internal models and features.
-- **Privacy**: Locally managed data with encrypted memories and selectively masked API calls allows you to use the same knowledge base across models. 
+- **Privacy**: `FLOAT_MEM_KEY` enables encryption of secret values in the memory store. New secret-memory Knowledge copies contain references, and protected/secret text is excluded from remote retrieval mirrors. Chat retrieval and recall results use the request's destination policy. Existing derived data, previously saved conversation text, and diagnostic captures still need separate review; this is not a blanket encryption or automatic redaction guarantee.
 - **Workspaces**: each float deployment is based around an internal workspace folder that contains these databases and files, which can be synced selectively, including as nested source-owned workspaces, between devices or instances.
 
 
@@ -82,11 +82,11 @@ npm install
 ```bash
 poetry env activate
 # This prints the command to activate the associated environment.
-poetry run uv pip install --upgrade --force-reinstall --index-url https://download.pytorch.org/whl/cu128 torch==2.10.0 torchvision==0.25.0
+poetry run python -m pip install --upgrade --force-reinstall --index-url https://download.pytorch.org/whl/cu128 torch==2.10.0 torchvision==0.25.0
 ```
 CPU-only fallback (fixes `torchvision::nms` mismatch errors):
 ```bash
-poetry run uv pip install --upgrade --force-reinstall --index-url https://download.pytorch.org/whl/cpu torch==2.10.0 torchvision==0.25.0
+poetry run python -m pip install --upgrade --force-reinstall --index-url https://download.pytorch.org/whl/cpu torch==2.10.0 torchvision==0.25.0
 ```
 Do not mix a Torch wheel from one release pair with torchvision from another.
 `torchaudio` is not a Float dependency and does not need to be installed.
@@ -106,7 +106,7 @@ This installs the Playwright browser runtime, installs Chromium, and runs direct
 
 once launched, navigate to settings, and ensure the url points to https://api.openai.com/v1/responses
 then add your openai API key from platform.openai.com
-  - Float keeps only `chat-latest` as a static API fallback and polls the configured provider through `/api/openai/models` for concrete choices. The catalog prevents new selection of known deprecated or removed ids while preserving an old saved choice long enough to show a migration target. `chat-latest` is displayed as `GPT latest (model)` when provider inventory can infer the current concrete GPT family model.
+  - Float keeps only `chat-latest` as a static API fallback and polls the configured provider through `/api/openai/models` for concrete choices. The catalog prevents new selection of known deprecated or removed ids while preserving an old saved choice long enough to show a migration target. The model selector displays `GPT latest (model)` when provider inventory can infer the current concrete GPT family model. Message details use that response's recorded model identity; if no concrete model was reported, they say `GPT latest (model not reported)`.
   - Under **Settings → Models & Retrieval → Model library**, paste a Hugging Face model URL or `owner/repo` to add it to your personal catalog. Choose **Direct Transformers** for compatible checkpoints or **Provider / GGUF** for weights intended for LM Studio, Ollama, or another provider. Adding the link does not download weights until you use the model download control.
 
 ### Hugging Face tokens (for gated model downloads)
@@ -313,10 +313,11 @@ Python3 -m pipx ensurepath
 
 ### Running Tests
 
-Backend tests are located under `backend/app/tests`. Use Poetry to run them:
+Backend tests are collected from `backend/app/tests`, `backend/app/services/tests`,
+and `backend/services/tests` through `pytest.ini`. Use Poetry to run them:
 
 ```bash
-poetry run pytest -vv backend/app/tests
+poetry run pytest
 
 # Run API tests (marked `api`)
 poetry run pytest -vv -m api backend/app/tests

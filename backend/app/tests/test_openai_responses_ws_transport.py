@@ -1,5 +1,6 @@
 import json
 
+import pytest
 from app.provider_transports.openai_responses_ws import (
     OpenAIResponsesWebSocketTransport,
     extract_response_function_calls,
@@ -86,6 +87,8 @@ def test_transport_sends_response_create_and_streams_text():
     assert result["text"] == "hi"
     assert result["metadata"]["response_id"] == "resp_1"
     assert result["metadata"]["transport"] == "openai_responses_ws"
+    assert result["metadata"]["model_requested"] == "gpt-5.4"
+    assert result["metadata"]["model_received"] == "gpt-5.4"
     assert ws.sent[0]["type"] == "response.create"
     assert ws.sent[0]["model"] == "gpt-5.4"
     assert events == [
@@ -188,3 +191,135 @@ def test_transport_executes_tool_call_and_continues_with_output():
             "output": '{"forecast": "sunny"}',
         }
     ]
+
+
+class RequestAwareSummaryWebSocket(FakeWebSocket):
+    """Return summaries only when the actual outbound request enables them."""
+
+    def __init__(self, delivery):
+        super().__init__([])
+        self.delivery = delivery
+
+    def send(self, data):
+        super().send(data)
+        request = self.sent[-1]
+        summary_enabled = request.get("reasoning", {}).get("summary") == "auto"
+        summary = [{"type": "summary_text", "text": "Checked the request."}]
+        if summary_enabled and self.delivery == "delta":
+            # No final summary fallback: deleting delta emission must fail this case.
+            self.frames.append(
+                {
+                    "type": "response.reasoning_summary_text.delta",
+                    "delta": "Checked the request.",
+                }
+            )
+        self.frames.extend(
+            [
+                {"type": "response.output_text.delta", "delta": "Done."},
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp-request-aware",
+                        "model": "gpt-6.1-sol",
+                        "usage": {
+                            "input_tokens": 21,
+                            "output_tokens": 6,
+                            "output_tokens_details": {"reasoning_tokens": 3},
+                            "total_tokens": 27,
+                        },
+                        "output": [
+                            {
+                                "type": "reasoning",
+                                "summary": (
+                                    summary
+                                    if summary_enabled and self.delivery == "final"
+                                    else []
+                                ),
+                                "encrypted_content": "not-visible",
+                            },
+                            {
+                                "type": "message",
+                                "content": [{"type": "output_text", "text": "Done."}],
+                            },
+                        ],
+                    },
+                },
+            ]
+        )
+
+
+@pytest.mark.parametrize("delivery", ["delta", "final"])
+@pytest.mark.parametrize(
+    "model,expect_summary", [("gpt-6.1-sol", True), ("chat-latest", False)]
+)
+def test_service_ws_summary_request_emission_and_provider_identity(
+    monkeypatch, delivery, model, expect_summary
+):
+    from app.base_services import LLMService
+
+    ws = RequestAwareSummaryWebSocket(delivery)
+    transport = OpenAIResponsesWebSocketTransport(
+        api_key="fixture-key",
+        connect_factory=lambda *args, **kwargs: ws,
+    )
+    service = LLMService(
+        mode="api",
+        config={
+            "api_url": "https://example.test/v1/responses",
+            "api_key": "fixture-key",
+            "api_model": model,
+            "openai_responses_ws_enabled": True,
+            "openai_responses_ws_fallback_to_http": False,
+        },
+    )
+    monkeypatch.setattr(
+        service, "_get_openai_responses_ws_transport", lambda **_: transport
+    )
+
+    def forbid_http(*_args, **_kwargs):
+        raise AssertionError("WS regression must not silently pass through HTTP")
+
+    monkeypatch.setattr("app.base_services.http_session.post", forbid_http)
+    events = []
+    result = service.generate(
+        "Check this.",
+        session_id="summary-session",
+        stream_message_id="summary-message",
+        stream_consumer=events.append,
+    )
+
+    assert len(ws.sent) == 1
+    assert ws.sent[0]["type"] == "response.create"
+    assert ws.sent[0]["model"] == model
+    if expect_summary:
+        assert ws.sent[0]["reasoning"] == {"summary": "auto"}
+    else:
+        assert "reasoning" not in ws.sent[0]
+    expected_thought = "Checked the request." if expect_summary else ""
+    assert result["text"] == "Done."
+    assert result["thought"] == expected_thought
+    assert result["thought_trace"] == (
+        [{"index": 0, "text": expected_thought}] if expect_summary else []
+    )
+    assert [event for event in events if event["type"] == "thought"] == (
+        [
+            {
+                "type": "thought",
+                "content": expected_thought,
+                "offset": 0,
+                "session_id": "summary-session",
+                "message_id": "summary-message",
+                "transport": "openai_responses_ws",
+            }
+        ]
+        if expect_summary
+        else []
+    )
+    assert result["metadata"]["model_requested"] == model
+    assert result["metadata"]["model_received"] == "gpt-6.1-sol"
+    assert result["metadata"]["usage"] == {
+        "input_tokens": 21,
+        "output_tokens": 6,
+        "output_tokens_details": {"reasoning_tokens": 3},
+        "total_tokens": 27,
+    }

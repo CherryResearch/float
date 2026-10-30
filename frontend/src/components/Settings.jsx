@@ -27,6 +27,7 @@ import {
   THEME_SLOT_KEYS,
 } from "../theme";
 import ModelJobsPanel from "./ModelJobsPanel";
+import { ControlField, DisclosurePanel } from "./ui/UiControls";
 import { normalizeToolDisplayMode } from "../utils/toolDisplayModes";
 
 import { registerPush, unregisterPush } from "../utils/push";
@@ -560,6 +561,38 @@ const SettingsInfoTip = ({ text, label = "More information" }) => (
   </span>
 );
 
+const StatusRefreshControls = ({
+  label,
+  automatic,
+  onAutomaticChange,
+  onRefresh,
+  busy = false,
+  intervalSeconds,
+}) => (
+  <div className="settings-status-refresh">
+    <label
+      className="settings-toggle-row settings-toggle-row--compact"
+      title={`Refresh ${label.toLowerCase()} every ${intervalSeconds} seconds`}
+    >
+      <input
+        type="checkbox"
+        aria-label={`Auto-refresh ${label.toLowerCase()}`}
+        checked={automatic}
+        onChange={(event) => onAutomaticChange(event.target.checked)}
+      />
+      <span>Auto-refresh</span>
+    </label>
+    <button
+      type="button"
+      onClick={onRefresh}
+      disabled={busy}
+      aria-label={`Refresh ${label.toLowerCase()}`}
+    >
+      {busy ? "Refreshing…" : "Refresh"}
+    </button>
+  </div>
+);
+
 const Settings = () => {
 
   const location = useLocation();
@@ -573,13 +606,11 @@ const Settings = () => {
 
   const { state, setState } = useContext(GlobalContext);
 
-  // Service status indicators (duplicated from top bar, plus MCP/Backend)
+  // Detailed service checks also feed the compact diagnostics summary.
 
   const [svcApi, setSvcApi] = useState("loading"); // online | offline | loading
 
   const [svcBackend, setSvcBackend] = useState("loading"); // online | offline | loading
-
-  const [svcWs, setSvcWs] = useState(state.wsStatus || "offline");
 
   const [svcMcpUrl, setSvcMcpUrl] = useState(null);
 
@@ -1249,8 +1280,6 @@ const Settings = () => {
     } finally {
       setBackgroundAutonomyLoading(false);
     }
-
-    setSvcWs(state.wsStatus || "offline");
 
   };
 
@@ -2686,16 +2715,6 @@ const Settings = () => {
 
 
 
-  // Keep ws indicator in sync with global
-
-  useEffect(() => {
-
-    setSvcWs(state.wsStatus || "offline");
-
-  }, [state.wsStatus]);
-
-
-
   // Keep API status in sync when it changes globally
 
   useEffect(() => {
@@ -3694,7 +3713,8 @@ const Settings = () => {
       wsErrorMessage && wsErrorMessage.length > 200
         ? `${wsErrorMessage.slice(0, 197)}...`
         : wsErrorMessage;
-    const rawWsStatus = normalizeStatus(svcWs);
+    // Read the live socket state; a slower service refresh must not replace it.
+    const rawWsStatus = normalizeStatus(state.wsStatus || "offline");
     const wsLastActivityAt = Math.max(
       Number(state.wsLastEventAt || 0),
       Number(state.wsLastErrorAt || 0),
@@ -3776,39 +3796,56 @@ const Settings = () => {
     const autonomyStopReason = autonomySession.stop_reason
       ? String(autonomySession.stop_reason).replace(/_/g, " ")
       : "";
+    const serviceChecks = [
+      { label: "API", status: normalizeStatus(svcApi) },
+      { label: "Backend", status: normalizeStatus(svcBackend) },
+      { label: "Live updates", status: normalizedWsStatus },
+      { label: "MCP", status: svcMcpUrl ? mcpState : "unconfigured" },
+      { label: "Vector store", status: ragStateNormalized },
+      { label: "Background jobs", status: celeryStatusNormalized },
+      { label: "Autonomy", status: autonomyState },
+    ];
+    const unavailableServices = serviceChecks
+      .filter(({ status }) => ["offline", "degraded", "unknown"].includes(status))
+      .map(({ label, status }) => `${label} ${status === "offline" ? "unavailable" : status}`);
+    if (celeryError || failuresError) unavailableServices.push("Job details unavailable");
+    const checkingServices = serviceChecks.some(({ status }) => status === "loading");
+    const diagnosticsSummary = unavailableServices.length
+      ? unavailableServices.join(" · ")
+      : checkingServices
+        ? "Checking services…"
+        : "Services ready · View health and background jobs";
     return (
 
-      <div className="settings-section">
+      <DisclosurePanel
+        id="settings-diagnostics"
+        className="settings-diagnostics"
+        title="Diagnostics"
+        summary={
+          <span
+            className={`settings-diagnostics-summary${unavailableServices.length ? " settings-diagnostics-summary--attention" : ""}`}
+            role="status"
+          >
+            {diagnosticsSummary}
+          </span>
+        }
+      >
 
         <div className="status-header">
 
-          <h2 className="mb-sm" style={{ margin: 0 }}>Service status</h2>
+          <h2>Service status</h2>
 
-          <div className="inline-flex" style={{ gap: 8 }}>
-
-            <label className="inline-flex" style={{ gap: 6 }} title="Auto-refresh status every ~15s">
-
-              <input
-
-                type="checkbox"
-
-                checked={statusAuto}
-
-                onChange={(e) => setStatusAuto(!!e.target.checked)}
-
-              />
-
-              Auto-refresh
-
-            </label>
-
-            <button type="button" onClick={() => refreshStatus()}>Refresh</button>
-
-          </div>
+          <StatusRefreshControls
+            label="Services"
+            automatic={statusAuto}
+            onAutomaticChange={setStatusAuto}
+            onRefresh={() => refreshStatus()}
+            intervalSeconds={15}
+          />
 
         </div>
 
-        <p className="status-summary-copy" role="status">
+        <p className="status-summary-copy">
           API, websocket, background queue, provider bridge, and storage health.
         </p>
 
@@ -4033,55 +4070,30 @@ const Settings = () => {
 
             <div className="celery-toolbar-controls">
 
-              <select
+              <ControlField label="Job view" className="settings-diagnostic-field">
+                <select
+                  value={celeryView}
+                  onChange={(event) => {
+                    const view = event.target.value;
+                    setCeleryView(view);
+                    refreshCeleryTasks(view);
+                  }}
+                >
+                  <option value="active">Running</option>
+                  <option value="scheduled">Scheduled</option>
+                  <option value="reserved">Waiting</option>
+                  <option value="all">All jobs</option>
+                </select>
+              </ControlField>
 
-                value={celeryView}
-
-                onChange={(e) => {
-
-                  const v = e.target.value;
-
-                  setCeleryView(v);
-
-                  refreshCeleryTasks(v);
-
-                }}
-
-                title="Task view"
-
-              >
-
-                <option value="active">active</option>
-
-                <option value="scheduled">scheduled</option>
-
-                <option value="reserved">reserved</option>
-
-                <option value="all">all</option>
-
-              </select>
-
-              <label className="settings-toggle-row settings-toggle-row--compact">
-
-                <input
-
-                  type="checkbox"
-
-                  checked={celeryAuto}
-
-                  onChange={(e) => setCeleryAuto(!!e.target.checked)}
-
-                />
-
-                <span>Auto-refresh</span>
-
-              </label>
-
-              <button type="button" onClick={() => refreshCeleryTasks()} disabled={celeryLoading}>
-
-                {celeryLoading ? 'Refreshing…' : 'Refresh'}
-
-              </button>
+              <StatusRefreshControls
+                label="Background jobs"
+                automatic={celeryAuto}
+                onAutomaticChange={setCeleryAuto}
+                onRefresh={() => refreshCeleryTasks()}
+                busy={celeryLoading}
+                intervalSeconds={8}
+              />
 
             </div>
 
@@ -4103,27 +4115,18 @@ const Settings = () => {
 
               <div className="celery-action-group">
 
-                <label className="celery-control-label" title="Queue name to purge">
-                  Queue
-                </label>
-
-                <input
-
-                  className="celery-input celery-input--queue"
-
-                  type="text"
-
-                  value={purgeQueue}
-
-                  onChange={(e) => setPurgeQueue(e.target.value)}
-
-                  placeholder="celery"
-
-                />
+                <ControlField label="Queue" className="settings-diagnostic-field">
+                  <input
+                    className="celery-input celery-input--queue"
+                    type="text"
+                    value={purgeQueue}
+                    onChange={(event) => setPurgeQueue(event.target.value)}
+                    placeholder="celery"
+                  />
+                </ControlField>
 
                 <label
-                  className="inline-flex celery-check"
-                  style={{ gap: 6 }}
+                  className="settings-toggle-row settings-toggle-row--compact celery-check"
                   title="Terminate running tasks too"
                 >
 
@@ -4193,7 +4196,7 @@ const Settings = () => {
 
                 >
 
-                  Purge
+                  Clear queue
 
                 </button>
 
@@ -4201,9 +4204,11 @@ const Settings = () => {
 
               <div className="celery-action-group celery-action-group--retry">
 
-                <label className="celery-control-label" title="Retry a task by name">
-                  Retry name
-                </label>
+                <ControlField
+                  label="Retry task"
+                  hint="Enter a task name and press Enter to queue it again."
+                  className="settings-diagnostic-field settings-diagnostic-field--retry"
+                >
 
                 <input
 
@@ -4240,6 +4245,7 @@ const Settings = () => {
                   }}
 
                 />
+                </ControlField>
 
               </div>
 
@@ -4562,7 +4568,7 @@ const Settings = () => {
 
           </div>
 
-        </div>
+        </DisclosurePanel>
 
     );
 
@@ -7180,18 +7186,7 @@ const Settings = () => {
 
         refreshStatus();
 
-      })
-
-      .catch(() => {
-
-        setMessage("Error saving settings.");
-
-      })
-
-      .finally(() => {
-
-        setSaving(false);
- 
+        // Apply staged runtime choices only after the backend accepts the save.
         setState((prev) => ({
  
           ...prev,
@@ -7248,6 +7243,18 @@ const Settings = () => {
           ramSwap: settings.ram_swap,
 
         }));
+
+      })
+
+      .catch(() => {
+
+        setMessage("Error saving settings.");
+
+      })
+
+      .finally(() => {
+
+        setSaving(false);
 
       });
 
@@ -7511,13 +7518,13 @@ const Settings = () => {
               </button>
             </div>
           </section>
-          <p className="status-note settings-toolbar-note" aria-live="polite">
-            {settingsSearchTerms.length
-              ? `Showing ${visibleSettingsSections.length} of ${SETTINGS_SECTIONS.length} sections for "${settingsSearch.trim()}".`
-              : "Use the pinned bar to search, jump between sections, and save without leaving the current scroll position."}
-          </p>
+          {settingsSearchTerms.length > 0 && (
+            <p className="status-note settings-toolbar-note" role="status">
+              {`Showing ${visibleSettingsSections.length} of ${SETTINGS_SECTIONS.length} sections for "${settingsSearch.trim()}".`}
+            </p>
+          )}
           <div className="settings-content settings-content--full">
-            {/* Consolidated runtime status indicators */}
+            {/* Keep current issues visible while details stay collapsed. */}
             {renderStatusSection()}
 
           {settingsSearchTerms.length > 0 && visibleSettingsSections.length === 0 && (

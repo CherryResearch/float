@@ -883,6 +883,40 @@ describe("Chat", () => {
     expect(screen.getByText("in 10 / out 4 / total 14")).toBeInTheDocument();
   });
 
+  it.each([
+    ["provider", "Usage"],
+    ["mixed", "Usage (partly estimated)"],
+  ])("shows verified model resolution and lifecycle timing in message metadata (%s usage)", (source, usageLabel) => {
+    renderChat({
+      conversation: [{
+        role: "ai",
+        id: "msg-metadata-lifecycle",
+        text: "A completed response.",
+        timestamp: "2026-10-29T18:00:00Z",
+        metadata: {
+          status: "complete",
+          mode: "api",
+          model: "chat-latest",
+          model_requested: "chat-latest",
+          model_received: "gpt-6.1-sol",
+          timing: { accepted_at: "2026-10-29T18:00:00Z", completed_at: "2026-10-29T18:02:00Z" },
+          usage: { source, prompt_tokens: 10, completion_tokens: 600, total_tokens: 610, output_tokens_details: { reasoning_tokens: 512 } },
+        },
+      }],
+      history: [],
+    });
+
+    expect(screen.getByText("api:GPT latest (gpt-6.1-sol)")).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("Show message metadata"));
+    expect(screen.getByText("GPT latest (gpt-6.1-sol)")).toBeInTheDocument();
+    expect(screen.getByText("Accepted")).toBeInTheDocument();
+    expect(screen.getByText("Completed")).toBeInTheDocument();
+    expect(screen.getByText("120.0 s")).toBeInTheDocument();
+    expect(screen.getByText(usageLabel)).toBeInTheDocument();
+    expect(screen.getByText("Reasoning tokens (provider)")).toBeInTheDocument();
+    expect(screen.getByText("512")).toBeInTheDocument();
+  });
+
   it("allows attachment-only sends without inventing prompt text", () => {
     expect(prepareComposerSubmission("   ", 1)).toEqual({
       displayMessage: "",
@@ -2191,23 +2225,47 @@ describe("Chat", () => {
     });
   });
 
-  it("keeps the composer to record, live, attach, and send primary actions", () => {
+  it("labels voice actions clearly and keeps capture actions in the attachment menu", () => {
     const { getAllByRole, getByRole, queryByRole } = renderChat({
       sessionId: "sess-actions",
       apiStatus: "online",
     });
 
-    expect(getAllByRole("button", { name: /record audio message/i }).length).toBeGreaterThan(0);
-    expect(getAllByRole("button", { name: /live streaming mode/i }).length).toBeGreaterThan(0);
+    expect(getAllByRole("button", { name: /record voice message/i }).length).toBeGreaterThan(0);
+    expect(getAllByRole("button", { name: /live voice/i }).length).toBeGreaterThan(0);
     const attachmentButtons = getAllByRole("button", { name: /open attachments/i });
     expect(attachmentButtons.length).toBeGreaterThan(0);
     expect(getAllByRole("button", { name: /send message/i }).length).toBeGreaterThan(0);
-    expect(queryByRole("button", { name: /capture from camera/i })).not.toBeInTheDocument();
+    expect(queryByRole("button", { name: /take photo/i })).not.toBeInTheDocument();
 
     fireEvent.click(attachmentButtons[0]);
 
-    expect(getByRole("button", { name: /capture from camera/i })).toBeInTheDocument();
-    expect(getByRole("button", { name: /capture from desktop/i })).toBeInTheDocument();
+    expect(getByRole("button", { name: "Take photo" })).toHaveTextContent("Take photo");
+    expect(getByRole("button", { name: "Take screenshot" })).toHaveTextContent("Take screenshot");
+  });
+
+  it("shows one composer menu at a time and keeps the draft when hidden", async () => {
+    renderChat({ sessionId: "sess-composer-toolbar", apiStatus: "online" });
+    fireEvent.change(screen.getByRole("textbox", { name: "Message" }), {
+      target: { value: "Keep this draft while I review settings." },
+    });
+    const settings = screen.getByRole("button", { name: "Chat settings" });
+    const attachments = screen.getByRole("button", { name: "Open attachments" });
+
+    fireEvent.click(settings);
+    expect(await screen.findByRole("dialog", { name: "Chat settings" })).toBeInTheDocument();
+    fireEvent.click(attachments);
+    expect(screen.queryByRole("dialog", { name: "Chat settings" })).not.toBeInTheDocument();
+    expect(screen.getByRole("toolbar", { name: "Attachment actions" })).toBeInTheDocument();
+    fireEvent.click(settings);
+    expect(screen.queryByRole("toolbar", { name: "Attachment actions" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Hide composer" }));
+    expect(screen.queryByRole("dialog", { name: "Chat settings" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open chat input" }));
+    expect(screen.getByRole("textbox", { name: "Message" })).toHaveValue(
+      "Keep this draft while I review settings.",
+    );
   });
 
   it("shows one stop control while a response is streaming", async () => {
@@ -2241,7 +2299,7 @@ describe("Chat", () => {
 
   it("keeps a closed composer closed while the pointer explores its opener", async () => {
     renderChat({ sessionId: "sess-hover-closed-composer", apiStatus: "online" });
-    fireEvent.click(screen.getByRole("button", { name: /close chat input/i }));
+    fireEvent.click(screen.getByRole("button", { name: /hide composer/i }));
     const openButton = await screen.findByRole("button", { name: /open chat input/i });
     vi.useFakeTimers();
 
@@ -2268,7 +2326,7 @@ describe("Chat", () => {
     expect(document.querySelector(".input-box .attach-popover")).toBeNull();
     expect(trigger).toHaveAttribute("aria-expanded", "true");
     await waitFor(() => expect(menu.style.position).toBe("fixed"));
-    expect(menu.style.zIndex).toBe("3610");
+    expect(menu.style.zIndex).toBe("var(--layer-popover)");
 
     fireEvent.keyDown(document, { key: "Escape" });
 
@@ -2294,7 +2352,7 @@ describe("Chat", () => {
     fireEvent.change(fileInput, { target: { files: [unsupported] } });
 
     expect(await screen.findByRole("alert")).toHaveTextContent("Unsupported file type");
-    fireEvent.click(screen.getByRole("button", { name: /close chat input/i }));
+    fireEvent.click(screen.getByRole("button", { name: /hide composer/i }));
 
     await waitFor(() => {
       expect(screen.queryByLabelText("Composer notices")).not.toBeInTheDocument();
@@ -3549,7 +3607,7 @@ describe("Chat", () => {
         history: [{ role: "user", text: "Hi" }],
       });
 
-      fireEvent.click(screen.getByLabelText("Close chat input"));
+      fireEvent.click(screen.getByLabelText("Hide composer"));
       expect(screen.queryByPlaceholderText("Type your message...")).not.toBeInTheDocument();
 
       await act(async () => {
@@ -3592,7 +3650,7 @@ describe("Chat", () => {
       });
 
       const liveButton = screen.getAllByRole("button", {
-        name: /live streaming mode/i,
+        name: /live voice/i,
       })[0];
 
       fireEvent.click(liveButton);
@@ -3788,13 +3846,13 @@ describe("Chat", () => {
         apiStatus: "online",
       });
 
-      fireEvent.click(screen.getAllByRole("button", { name: /record audio message/i })[0]);
+      fireEvent.click(screen.getAllByRole("button", { name: /record voice message/i })[0]);
 
       await waitFor(() => {
         expect(recorderInstance?.start).toHaveBeenCalled();
       });
 
-      fireEvent.click(screen.getAllByRole("button", { name: /live streaming mode/i })[0]);
+      fireEvent.click(screen.getAllByRole("button", { name: /live voice/i })[0]);
 
       await waitFor(() => {
         expect(recorderInstance?.stop).toHaveBeenCalled();
@@ -3838,7 +3896,7 @@ describe("Chat", () => {
 
       fireEvent.click(
         screen.getAllByRole("button", {
-          name: /live streaming mode/i,
+          name: /live voice/i,
         })[0],
       );
 
@@ -3881,7 +3939,7 @@ describe("Chat", () => {
 
       fireEvent.click(
         screen.getAllByRole("button", {
-          name: /live streaming mode/i,
+          name: /live voice/i,
         })[0],
       );
 
@@ -4067,7 +4125,7 @@ describe("Chat", () => {
 
       fireEvent.click(
         screen.getAllByRole("button", {
-          name: /live streaming mode/i,
+          name: /live voice/i,
         })[0],
       );
 

@@ -130,6 +130,28 @@ def test_streaming_prefers_first_output_source(monkeypatch):
     assert out.get("thought") == "Think"
 
 
+def test_reasoning_summary_done_does_not_repeat_deltas(monkeypatch):
+    lines = _build_sse_lines(
+        {"type": "response.reasoning_summary_text.delta", "delta": "Checked."},
+        {"type": "response.reasoning_summary_text.done", "text": "Checked."},
+        {"type": "response.output_text.delta", "delta": "Done."},
+        {
+            "type": "response.completed",
+            "response": {
+                "output": [
+                    {
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": "Checked."}],
+                    }
+                ]
+            },
+        },
+    )
+    out = _run_stream(monkeypatch, lines)
+    assert out["text"] == "Done."
+    assert out["thought"] == "Checked."
+
+
 def test_streaming_dedupes_repeated_scalar_response_text_within_chunk(monkeypatch):
     lines = _build_sse_lines(
         {

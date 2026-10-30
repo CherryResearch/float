@@ -9,6 +9,7 @@ from typing import Any, Dict, Mapping, Optional
 from uuid import uuid4
 
 from app.agent_workflows import build_agent_provenance, build_handoff_artifact
+from app.services import process_isolation
 from app.services.calendar_jobs import (
     coerce_epoch_seconds as _shared_coerce_epoch_seconds,
 )
@@ -33,7 +34,8 @@ from app.services.scheduled_action_authorization import (
 from app.services.scheduled_action_cancellation import cancellation_requested
 from app.services.work_run_projection import project_calendar_event
 from app.services.work_run_store import WorkRunStore
-from app.utils import calendar_store
+from app.utils import calendar_store, conversation_store
+from app.utils.privacy_policy import current_data_policy
 from app.utils.security import generate_signature, sanitize_args
 from fastapi import FastAPI
 
@@ -46,6 +48,19 @@ class _ProviderOutputCheckpointError(RuntimeError):
 
 class _WorkRunProjectionError(RuntimeError):
     """Calendar saved the claim, but its initial Activity receipt is unavailable."""
+
+
+class _GraphLocalOnlyContextError(PermissionError):
+    """A content-free error safe for scheduled action receipts."""
+
+    category = "local_only_context"
+    message = (
+        "Scheduled generation cannot use local-only graph context until "
+        "calendar results and retrieval mirrors preserve its restriction."
+    )
+
+    def __init__(self):
+        super().__init__(self.message)
 
 
 class _ScheduledDispatchBlocked(RuntimeError):
@@ -394,6 +409,27 @@ def _provider_retry_limit(event: Dict[str, Any]) -> int:
     return max(0, min(retries, 10))
 
 
+def _provider_process_isolation_enabled(event: Dict[str, Any]) -> bool:
+    """Honor only an explicit per-job opt-in so legacy records keep their lane."""
+
+    policy = event.get("background_job")
+    policy = policy if isinstance(policy, dict) else {}
+    execution = policy.get("execution")
+    execution = execution if isinstance(execution, dict) else {}
+    return execution.get("sandbox_processes") is True
+
+
+def _scheduled_provider_model(event: Dict[str, Any]) -> Optional[str]:
+    """Return an explicit execution model without treating ``inherit`` as one."""
+
+    policy = event.get("background_job")
+    policy = policy if isinstance(policy, dict) else {}
+    execution = policy.get("execution")
+    execution = execution if isinstance(execution, dict) else {}
+    model = str(execution.get("model") or "").strip()
+    return model if model and model.lower() != "inherit" else None
+
+
 def _canonical_digest(value: Any) -> str:
     """Hash structured state without copying its raw contents into the ledger."""
 
@@ -556,7 +592,8 @@ def _safe_error_code(exc: BaseException) -> str:
             return f"http_{int(status)}"
     except (TypeError, ValueError, OverflowError):
         pass
-    name = re.sub(r"[^a-z0-9]+", "_", type(exc).__name__.lower()).strip("_")
+    error_name = str(getattr(exc, "error_type", None) or type(exc).__name__)
+    name = re.sub(r"[^a-z0-9]+", "_", error_name.lower()).strip("_")
     return name[:128] or "provider_error"
 
 
@@ -571,7 +608,7 @@ def _provider_error_category(exc: BaseException) -> tuple[str, str, bool]:
         status_value = int(status) if status is not None else None
     except (TypeError, ValueError, OverflowError):
         status_value = None
-    error_type = type(exc).__name__.lower()
+    error_type = str(getattr(exc, "error_type", None) or type(exc).__name__).lower()
     if (
         isinstance(exc, (TimeoutError, asyncio.TimeoutError))
         or "timeout" in error_type
@@ -802,6 +839,35 @@ async def _close_provider_attempt_without_dispatch(
         "error_code": "user_cancelled" if cancelled else "claim_lost",
         "state_delta_certainty": state_delta_certainty,
         "finished_at": finished_at,
+    }
+    await asyncio.to_thread(store.record_attempt, closed)
+    return closed
+
+
+async def _close_terminated_provider_attempt(
+    store: WorkRunStore,
+    attempt: Dict[str, Any],
+    result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Record that an opted-in provider child was deliberately stopped."""
+
+    cancelled = str(result.get("status") or "").strip().lower() == "cancelled"
+    closed = {
+        **attempt,
+        "status": "cancelled" if cancelled else "skipped",
+        "retryable": False,
+        "error_category": (
+            "provider_cancelled" if cancelled else "provider_dispatch_blocked"
+        ),
+        "error_code": (
+            "user_cancelled"
+            if cancelled
+            else str(result.get("phase") or "provider_process_terminated")
+        ),
+        "state_delta_certainty": str(
+            result.get("state_delta_certainty") or "confirmed_no_change"
+        ),
+        "finished_at": time.time(),
     }
     await asyncio.to_thread(store.record_attempt, closed)
     return closed
@@ -2501,6 +2567,169 @@ async def _persist_post_dispatch_truth(
     return outcome
 
 
+async def _persist_completed_prompt_truth(
+    app: FastAPI,
+    *,
+    event_id: str,
+    event: Dict[str, Any],
+    action: Dict[str, Any],
+    action_id: str,
+    result_text: str,
+) -> Optional[Dict[str, Any]]:
+    """Terminalize a prompt whose canonical output survived a control edit.
+
+    Provider output and its attempt receipt are durable before the ordinary
+    Calendar terminal write. If a user changes execution controls in that small
+    window, preserve the newer definition while replacing the exact run's stale
+    ``running`` receipt with the already-known prompt outcome.
+    """
+
+    run_id = str(action.get("run_id") or "").strip()
+    prompt_checkpoint = action.get("prompt_checkpoint")
+    prompt_checkpoint = (
+        dict(prompt_checkpoint) if isinstance(prompt_checkpoint, Mapping) else {}
+    )
+    receipt_id = str(prompt_checkpoint.get("receipt_id") or "").strip()
+    session_id = str(prompt_checkpoint.get("session_id") or "").strip()
+    output_message_id = str(prompt_checkpoint.get("output_message_id") or "").strip()
+    checkpoint_digest = str(prompt_checkpoint.get("checkpoint_digest") or "").strip()
+    occurrence_time = _coerce_epoch_seconds(prompt_checkpoint.get("occurrence_at"))
+    store = getattr(app.state, "work_run_store", None)
+    if not all(
+        (
+            run_id,
+            receipt_id,
+            session_id,
+            output_message_id,
+            checkpoint_digest,
+        )
+    ) or not isinstance(store, WorkRunStore):
+        return None
+
+    receipt = await asyncio.to_thread(store.get, receipt_id)
+    attempts = await asyncio.to_thread(store.list_attempts, receipt_id, limit=500)
+    canonical_output = _load_conversation_entry(session_id, output_message_id)
+    if not isinstance(receipt, dict) or not bool(
+        str(receipt.get("event_id") or "") == str(event_id)
+        and str(receipt.get("action_id") or "") == str(action_id)
+        and str(receipt.get("run_id") or "") == run_id
+    ):
+        return None
+    completed_attempts = [
+        item
+        for item in attempts
+        if isinstance(item, dict)
+        and str(item.get("status") or "").strip().lower() == "complete"
+        and str(item.get("run_id") or "") == run_id
+        and str(item.get("receipt_id") or "") == receipt_id
+        and str(item.get("checkpoint_digest") or "") == checkpoint_digest
+    ]
+    if not completed_attempts or not _conversation_entry_is_complete(canonical_output):
+        return None
+    canonical_text = str(canonical_output.get("text") or "")
+    if canonical_text != str(result_text or ""):
+        return None
+
+    completed_at = (
+        max(
+            (
+                _coerce_epoch_seconds(item.get("finished_at")) or 0.0
+                for item in completed_attempts
+            ),
+            default=0.0,
+        )
+        or time.time()
+    )
+    accepted = False
+    stored_action: Dict[str, Any] = {}
+    stored_action_index: Optional[int] = None
+    outcome: Dict[str, Any] = {}
+
+    def publish(latest: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        nonlocal accepted, stored_action, stored_action_index, outcome
+        latest_actions = latest.get("actions")
+        latest_actions = latest_actions if isinstance(latest_actions, list) else []
+        matches: list[tuple[int, Dict[str, Any]]] = []
+        for index, candidate in enumerate(latest_actions):
+            if not isinstance(candidate, dict):
+                continue
+            candidate_id = str(
+                candidate.get("request_id")
+                or candidate.get("id")
+                or f"{event_id}:tool:{index}"
+            )
+            if candidate_id == action_id:
+                matches.append((index, candidate))
+        if len(matches) != 1:
+            return None
+        index, candidate = matches[0]
+        current_action = dict(candidate)
+        if str(current_action.get("run_id") or "").strip() != run_id:
+            return None
+
+        control_changed = bool(
+            run_control_revision(current_action) is None
+            or external_control_revision(current_action)
+            != run_control_revision(current_action)
+        )
+        current_action["status"] = "prompted"
+        current_action["result"] = canonical_text
+        current_action["prompt_invoked"] = True
+        current_action["executed_at"] = completed_at
+        current_action.pop("error", None)
+        current_action.pop("reconcile_required", None)
+        _mark_action_occurrence(current_action, occurrence_time)
+        _mark_event_prompted(latest)
+        outcome = {
+            "status": "prompted",
+            "phase": "post_dispatch",
+            "event_id": event_id,
+            "action_id": action_id,
+            "occurrence_at": occurrence_time,
+            "result": canonical_text,
+            "prompt_invoked": True,
+            "state_delta_certainty": "confirmed_output",
+            "control_changed": control_changed,
+        }
+        receipt_record = _append_run_record(
+            latest,
+            event_id=event_id,
+            action=current_action,
+            action_id=action_id,
+            occurrence_time=occurrence_time,
+            result=outcome,
+        )
+        receipt_record["summary"] = (
+            "Provider output completed; newer control state remains authoritative."
+            if control_changed
+            else "Scheduled prompt completed."
+        )
+        updated_actions = list(latest_actions)
+        updated_actions[index] = current_action
+        latest["actions"] = updated_actions
+        stored_action = current_action
+        stored_action_index = index
+        accepted = True
+        return latest
+
+    stored = calendar_store.update_event(event_id, publish)
+    if not stored or not accepted or stored_action_index is None:
+        return None
+    actions = stored.get("actions")
+    if not isinstance(actions, list):
+        return None
+    action.clear()
+    action.update(stored_action)
+    event.clear()
+    event.update(stored)
+    refreshed_actions = list(actions)
+    refreshed_actions[stored_action_index] = action
+    event["actions"] = refreshed_actions
+    outcome["receipt_durable"] = await _project_event_work_runs(app, event_id, event)
+    await _reindex_calendar_event(app, event_id, event)
+    return outcome
+
+
 async def _persist_claimed_or_post_dispatch_truth(
     app: FastAPI,
     *,
@@ -2545,6 +2774,7 @@ async def _checkpoint_cooperative_cancellation(
     phase: str,
     tool_invoked: bool,
     provider_dispatch_uncertain: bool = False,
+    provider_process_terminated: bool = False,
     effect_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Atomically acknowledge cancellation at one exact pre-dispatch boundary.
@@ -2678,7 +2908,10 @@ async def _checkpoint_cooperative_cancellation(
                     result_status = "invoked"
                     state_delta_certainty = effect_certainty or "not_applicable"
                     summary = (
-                        "Tool completed; the changed action blocked its remaining "
+                        "Tool completed; its provider follow-up process stopped after "
+                        "the action changed."
+                        if provider_process_terminated
+                        else "Tool completed; the changed action blocked its remaining "
                         "provider follow-up."
                     )
                 current_action["tool_invoked"] = True
@@ -2696,6 +2929,7 @@ async def _checkpoint_cooperative_cancellation(
                     "reconcile_required": uncertain,
                     "dispatch_blocked": True,
                     "partial_work": True,
+                    "provider_process_terminated": bool(provider_process_terminated),
                 }
             else:
                 authorization = current_action.get("authorization")
@@ -2720,14 +2954,18 @@ async def _checkpoint_cooperative_cancellation(
                     "action_id": action_id,
                     "occurrence_at": occurrence_time,
                     "tool_invoked": False,
-                    "prompt_invoked": False,
+                    "prompt_invoked": bool(provider_process_terminated),
+                    "provider_process_terminated": bool(provider_process_terminated),
                     "state_delta_certainty": "confirmed_no_change",
                     "reconcile_required": False,
                     "dispatch_blocked": True,
                     "retryable": True,
                 }
                 summary = (
-                    "Action changed before dispatch; nothing ran and the latest "
+                    "Provider process stopped after the action changed; no canonical "
+                    "output was saved and the latest definition remains scheduled."
+                    if provider_process_terminated
+                    else "Action changed before dispatch; nothing ran and the latest "
                     "definition remains scheduled."
                 )
 
@@ -2863,14 +3101,22 @@ async def _checkpoint_cooperative_cancellation(
                     current_effect_certainty or "no_change_since_checkpoint"
                 )
                 summary = (
-                    "Tool completed; the remaining provider follow-up was cancelled."
+                    "Tool completed; its provider follow-up process was stopped."
+                    if provider_process_terminated
+                    else "Tool completed; the remaining provider follow-up was "
+                    "cancelled."
                 )
             else:
                 current_action["executed_at"] = acknowledged_at
-                current_action["prompt_invoked"] = False
+                current_action["prompt_invoked"] = bool(provider_process_terminated)
                 current_action["effect_certainty"] = "confirmed_no_change"
                 state_delta_certainty = "confirmed_no_change"
-                summary = "Scheduled action cancelled before dispatch."
+                summary = (
+                    "Scheduled provider process was stopped; no canonical output "
+                    "was saved."
+                    if provider_process_terminated
+                    else "Scheduled action cancelled before dispatch."
+                )
             if effect_id and not tool_invoked:
                 current_action["effect_id"] = effect_id
                 current_action["effect_status"] = "not_dispatched"
@@ -2884,7 +3130,8 @@ async def _checkpoint_cooperative_cancellation(
                 "action_id": action_id,
                 "occurrence_at": occurrence_time,
                 "tool_invoked": bool(tool_invoked),
-                "prompt_invoked": False,
+                "prompt_invoked": bool(provider_process_terminated),
+                "provider_process_terminated": bool(provider_process_terminated),
                 "followup_invoked": False,
                 "state_delta_certainty": state_delta_certainty,
                 "cancel_requested": True,
@@ -3608,6 +3855,221 @@ async def _invoke_tool(
     )
 
 
+def _provider_termination_reason(
+    *,
+    event_id: str,
+    action_id: str,
+    expected_run_id: str,
+    expected_run_control_revision: Optional[int],
+    expected_status: str,
+) -> Optional[str]:
+    """Read the exact Calendar claim while an isolated provider call runs."""
+
+    latest = calendar_store.load_event(event_id)
+    if not isinstance(latest, dict):
+        return "claim_lost"
+    matches: list[Dict[str, Any]] = []
+    for index, candidate in enumerate(_iter_actions(latest)):
+        candidate_id = str(
+            candidate.get("request_id")
+            or candidate.get("id")
+            or f"{event_id}:tool:{index}"
+        )
+        if candidate_id == action_id:
+            matches.append(candidate)
+    if len(matches) != 1:
+        return "claim_lost"
+    current_action = matches[0]
+    if (
+        str(current_action.get("run_id") or "").strip() != expected_run_id
+        or str(current_action.get("status") or "").strip().lower() != expected_status
+    ):
+        return "claim_lost"
+    if cancellation_requested(current_action, expected_run_id=expected_run_id):
+        return "cancel_requested"
+    current_run_control_revision = run_control_revision(current_action)
+    if (
+        expected_run_control_revision is None
+        or current_run_control_revision is None
+        or current_run_control_revision != expected_run_control_revision
+        or external_control_revision(current_action) != current_run_control_revision
+    ):
+        return "control_changed"
+    return None
+
+
+async def _close_terminated_provider_ui(
+    app: FastAPI,
+    *,
+    session_id: Optional[str],
+    chain_id: Optional[str],
+    message_id: str,
+    event_id: str,
+    action_id: str,
+    result: Dict[str, Any],
+) -> None:
+    cancelled = str(result.get("status") or "").strip().lower() == "cancelled"
+    status = "cancelled" if cancelled else "skipped"
+    _update_conversation_entry(
+        session_id=session_id,
+        message_id=message_id,
+        updates={
+            "text": "",
+            "thought": "",
+            "metadata": {
+                "status": status,
+                "scheduled": True,
+                "provider_process_terminated": True,
+            },
+        },
+    )
+    await _publish_content(
+        app,
+        content=(
+            "Scheduled prompt cancelled."
+            if cancelled
+            else "Scheduled prompt stopped after the action changed."
+        ),
+        chain_id=chain_id,
+        message_id=message_id,
+        session_id=session_id,
+        metadata={
+            "scheduled": True,
+            "event_id": event_id,
+            "action_id": action_id,
+            "run_id": message_id,
+            "run_status": "complete",
+            "provider_process_terminated": True,
+        },
+    )
+
+
+def _require_background_safe_graph_context(
+    session_id: Optional[str], context: Any
+) -> None:
+    local_graph_context = conversation_store.context_graph_local_only(
+        session_id,
+        getattr(context, "messages", None),
+        getattr(context, "metadata", None),
+    )
+    if not local_graph_context and session_id:
+        # Legacy saved receipts can carry the restriction before a sidecar has
+        # been written. History hydration omits top-level tool records.
+        local_graph_context = conversation_store.context_graph_local_only(
+            session_id, conversation_store.load_conversation(session_id)
+        )
+    if local_graph_context:
+        context.metadata[conversation_store.GRAPH_LOCAL_ONLY_KEY] = True
+        if session_id:
+            conversation_store.mark_graph_local_only(session_id)
+        # Calendar results and retrieval mirrors cannot yet retain graph custody.
+        # Even a local generation would produce an unlabelled reusable derivative.
+        raise _GraphLocalOnlyContextError()
+
+
+async def _generate_provider_response(
+    app: FastAPI,
+    *,
+    event: Dict[str, Any],
+    event_id: str,
+    action: Dict[str, Any],
+    action_id: str,
+    occurrence_time: Optional[float],
+    phase: str,
+    tool_invoked: bool,
+    session_id: Optional[str],
+    response_format: Optional[str],
+    context: Any,
+    routes_module: Any,
+) -> Any:
+    """Generate in the legacy thread lane or an explicitly opted-in process."""
+
+    service = routes_module.llm_service
+    provider_model = _scheduled_provider_model(event)
+    _require_background_safe_graph_context(session_id, context)
+    generate_kwargs: Dict[str, Any] = {
+        "session_id": session_id,
+        "response_format": response_format,
+        "context": context,
+    }
+    if provider_model:
+        generate_kwargs["model"] = provider_model
+    policy = current_data_policy()
+    if policy is not None:
+        generate_kwargs["_data_policy"] = policy
+    if not _provider_process_isolation_enabled(event):
+        return await asyncio.to_thread(
+            service.generate,
+            [],
+            **generate_kwargs,
+        )
+
+    expected_run_id = str(action.get("run_id") or "").strip()
+    expected_status = "followup_running" if phase == "followup" else "running"
+    expected_run_control_revision = run_control_revision(action)
+    request = {
+        "mode": str(getattr(service, "mode", None) or "api"),
+        "config": dict(getattr(service, "config", None) or {}),
+        "session_id": session_id or "default",
+        "response_format": response_format,
+        "context": context.to_dict(),
+    }
+    if provider_model:
+        request["model"] = provider_model
+    if policy is not None:
+        request["data_policy"] = {
+            "external": policy.external,
+            "allow_remote_query": policy.allow_remote_query,
+            "local_only": policy.local_only,
+        }
+
+    def termination_check() -> Optional[str]:
+        return _provider_termination_reason(
+            event_id=event_id,
+            action_id=action_id,
+            expected_run_id=expected_run_id,
+            expected_run_control_revision=expected_run_control_revision,
+            expected_status=expected_status,
+        )
+
+    try:
+        return await process_isolation.run_isolated_process(
+            "app.services.process_isolation",
+            "generate_with_fresh_service",
+            request,
+            termination_check=termination_check,
+            poll_interval=0.1,
+        )
+    except asyncio.CancelledError:
+        # The isolation helper has synchronously reaped its child at this point.
+        action["_provider_process_terminated"] = True
+        raise
+    except process_isolation.IsolatedProcessTerminated as exc:
+        result = await _checkpoint_cooperative_cancellation(
+            app,
+            event_id=event_id,
+            event=event,
+            action=action,
+            action_id=action_id,
+            occurrence_time=occurrence_time,
+            phase=phase,
+            tool_invoked=tool_invoked,
+            provider_process_terminated=True,
+        )
+        if result is None:
+            result = {
+                "status": "already_claimed",
+                "phase": exc.reason,
+                "event_id": event_id,
+                "action_id": action_id,
+                "occurrence_at": occurrence_time,
+                "tool_invoked": bool(tool_invoked),
+                "provider_process_terminated": True,
+                "dispatch_blocked": True,
+            }
+        raise _ScheduledDispatchBlocked(result) from exc
+
+
 async def _run_prompt_followup(
     app: FastAPI,
     *,
@@ -3641,6 +4103,10 @@ async def _run_prompt_followup(
     except Exception:
         logger.warning("Scheduled follow-up runtime unavailable", exc_info=True)
         return {"status": "error", "error": "follow-up runtime unavailable"}
+
+    _require_background_safe_graph_context(
+        session_id, routes_module.llm_service.get_context(session_id)
+    )
 
     now_ts = time.time()
     followup_id = followup_message_id or _stable_composite_id(
@@ -4013,13 +4479,41 @@ async def _run_prompt_followup(
                 },
             )
         try:
-            response = await asyncio.to_thread(
-                routes_module.llm_service.generate,
-                [],
+            response = await _generate_provider_response(
+                app,
+                event=event,
+                event_id=event_id,
+                action=action,
+                action_id=action_id,
+                occurrence_time=followup_occurrence,
+                phase="followup",
+                tool_invoked=True,
                 session_id=session_id,
                 response_format=response_format,
                 context=attempt_ctx,
+                routes_module=routes_module,
             )
+        except _ScheduledDispatchBlocked as blocked:
+            try:
+                await _close_terminated_provider_attempt(
+                    store, attempt_record, blocked.result
+                )
+            except Exception:
+                logger.warning(
+                    "Could not close terminated provider attempt %s",
+                    attempt_id,
+                    exc_info=True,
+                )
+            await _close_terminated_provider_ui(
+                app,
+                session_id=session_id,
+                chain_id=chain_id,
+                message_id=followup_id,
+                event_id=event_id,
+                action_id=action_id,
+                result=blocked.result,
+            )
+            raise
         except Exception as exc:
             final_error = exc
             error_category, error_code, retryable = _provider_error_category(exc)
@@ -4326,10 +4820,17 @@ async def _resume_pending_tool_followup(
         except _ScheduledDispatchBlocked as blocked:
             return dict(blocked.result)
         except asyncio.CancelledError:
+            provider_process_terminated = bool(
+                action.pop("_provider_process_terminated", False)
+            )
             detail = (
                 "Float stopped waiting for the scheduled follow-up during shutdown "
-                "or after the wait cap; its provider call may still finish outside "
-                "the scheduler. The tool was not repeated."
+                "or after the wait cap; its isolated provider process was terminated. "
+                "The tool was not repeated."
+                if provider_process_terminated
+                else "Float stopped waiting for the scheduled follow-up during "
+                "shutdown or after the wait cap; its provider call may still finish "
+                "outside the scheduler. The tool was not repeated."
             )
             action["status"] = "interrupted_unknown"
             action["followup_status"] = "interrupted_unknown"
@@ -4364,6 +4865,12 @@ async def _resume_pending_tool_followup(
                 )
             )
             raise
+        except _GraphLocalOnlyContextError:
+            followup = {
+                "status": "error",
+                "error": _GraphLocalOnlyContextError.message,
+                "error_category": _GraphLocalOnlyContextError.category,
+            }
         except Exception:
             logger.warning("Scheduled follow-up failed", exc_info=True)
             followup = {"status": "error", "error": "follow-up runtime error"}
@@ -4395,6 +4902,11 @@ async def _resume_pending_tool_followup(
                 "unknown" if reconcile_required else _attempt_state_certainty(action)
             ),
         }
+        if followup.get("error_category") == _GraphLocalOnlyContextError.category:
+            result_payload.update(
+                error=_GraphLocalOnlyContextError.message,
+                error_category=_GraphLocalOnlyContextError.category,
+            )
     else:
         action["followup_status"] = "complete"
         action.pop("followup_error", None)
@@ -4456,6 +4968,10 @@ async def _run_prompt_action(
         from app.utils import conversation_store
     except Exception:
         return None
+
+    _require_background_safe_graph_context(
+        session_id, routes_module.llm_service.get_context(session_id)
+    )
 
     now_ts = time.time()
     run_id = str(action.get("run_id") or "")
@@ -4829,13 +5345,41 @@ async def _run_prompt_action(
                 },
             )
         try:
-            response = await asyncio.to_thread(
-                routes_module.llm_service.generate,
-                [],
+            response = await _generate_provider_response(
+                app,
+                event=event,
+                event_id=event_id,
+                action=action,
+                action_id=action_id,
+                occurrence_time=checkpoint_occurrence,
+                phase="prompt",
+                tool_invoked=False,
                 session_id=session_id,
                 response_format=response_format,
                 context=attempt_ctx,
+                routes_module=routes_module,
             )
+        except _ScheduledDispatchBlocked as blocked:
+            try:
+                await _close_terminated_provider_attempt(
+                    store, attempt_record, blocked.result
+                )
+            except Exception:
+                logger.warning(
+                    "Could not close terminated provider attempt %s",
+                    attempt_id,
+                    exc_info=True,
+                )
+            await _close_terminated_provider_ui(
+                app,
+                session_id=session_id,
+                chain_id=chain_id,
+                message_id=followup_id,
+                event_id=event_id,
+                action_id=action_id,
+                result=blocked.result,
+            )
+            raise
         except Exception as exc:
             final_error = exc
             error_category, error_code, retryable = _provider_error_category(exc)
@@ -6364,16 +6908,45 @@ async def _run_scheduled_tools_for_event(
                                     occurrence_time=prompt_occurrence_time,
                                     result=result,
                                 )
-                                await _persist_claimed_event(
+                                persisted = await _persist_claimed_event(
                                     app,
                                     event_id,
                                     event,
                                     action=action,
                                     action_id=resolved_id,
                                 )
+                                if not persisted:
+                                    repaired = await _persist_completed_prompt_truth(
+                                        app,
+                                        event_id=event_id,
+                                        event=event,
+                                        action=action,
+                                        action_id=resolved_id,
+                                        result_text=response_text,
+                                    )
+                                    if repaired is not None:
+                                        result = repaired
+                                    else:
+                                        result = {
+                                            "status": "error",
+                                            "phase": "terminal_projection",
+                                            "event_id": event_id,
+                                            "action_id": resolved_id,
+                                            "occurrence_at": prompt_occurrence_time,
+                                            "prompt_invoked": True,
+                                            "state_delta_certainty": "confirmed_output",
+                                            "error": (
+                                                "The prompt output was saved, but its "
+                                                "Calendar terminal state could not be "
+                                                "repaired."
+                                            ),
+                                        }
                             except _ScheduledDispatchBlocked as blocked:
                                 result = dict(blocked.result)
                             except asyncio.CancelledError:
+                                provider_process_terminated = bool(
+                                    action.pop("_provider_process_terminated", False)
+                                )
                                 _record_interrupted_action(
                                     event,
                                     event_id=event_id,
@@ -6383,8 +6956,12 @@ async def _run_scheduled_tools_for_event(
                                     detail=(
                                         "Float stopped waiting for the scheduled "
                                         "prompt during shutdown or after the wait cap; "
-                                        "its provider call may "
-                                        "still finish outside the scheduler."
+                                        "its isolated provider process was terminated."
+                                        if provider_process_terminated
+                                        else "Float stopped waiting for the scheduled "
+                                        "prompt during shutdown or after the wait cap; "
+                                        "its provider call may still finish outside "
+                                        "the scheduler."
                                     ),
                                     status="interrupted_unknown",
                                 )
@@ -6418,6 +6995,10 @@ async def _run_scheduled_tools_for_event(
                                         "unknown" if reconcile_required else None
                                     ),
                                 }
+                                if isinstance(exc, _GraphLocalOnlyContextError):
+                                    result[
+                                        "error_category"
+                                    ] = _GraphLocalOnlyContextError.category
                                 _append_run_record(
                                     event,
                                     event_id=event_id,

@@ -21,8 +21,8 @@ import DOMPurify from "dompurify";
 import { marked } from "marked";
 import IconButton from "@mui/material/IconButton";
 import TextField from "@mui/material/TextField";
-import Button from "@mui/material/Button";
 import Tooltip from "@mui/material/Tooltip";
+import { IconAction } from "./ui/UiControls";
 import Divider from "@mui/material/Divider";
 import ToolEditorModal from "./ToolEditorModal";
 import ToolPayloadView, {
@@ -35,7 +35,7 @@ import CloseIcon from "@mui/icons-material/Close";
 import SendIcon from "@mui/icons-material/Send";
 import StopIcon from "@mui/icons-material/Stop";
 import MicIcon from "@mui/icons-material/Mic";
-import FiberManualRecordIcon from "@mui/icons-material/FiberManualRecord";
+import GraphicEqIcon from "@mui/icons-material/GraphicEq";
 import RefreshRoundedIcon from "@mui/icons-material/RefreshRounded";
 import EditOutlinedIcon from "@mui/icons-material/EditOutlined";
 import VolumeUpIcon from "@mui/icons-material/VolumeUp";
@@ -75,6 +75,12 @@ import {
   resolveRequestModelForMode,
 } from "../utils/modelUtils";
 import { getMessageVisionNotice } from "../utils/visionDelivery";
+import {
+  getMessageModelLabel,
+  getMessageTimingRows,
+  getMessageUsageLabel,
+  getProviderReasoningTokens,
+} from "../utils/messageMetadata";
 import {
   canResizeChatWindow,
   CHAT_WINDOW_KEYBOARD_STEP,
@@ -560,6 +566,7 @@ const buildComposerOverlayStyle = ({
   popoverRect,
   maxWidth,
   gap,
+  align,
   zIndex,
 }) => {
   if (!anchorRect || typeof window === "undefined") {
@@ -571,6 +578,7 @@ const buildComposerOverlayStyle = ({
     viewport: getComposerViewportBounds(),
     maxWidth,
     gap,
+    align,
   });
   return {
     position: "fixed",
@@ -585,6 +593,7 @@ const buildComposerOverlayStyle = ({
 const createApiWrapperError = (result) => {
   const detail = String(result?.error || "API request failed");
   const error = new Error(detail);
+  if (result?.code) error.code = result.code;
   const status = Number(result?.status);
   if (Number.isFinite(status) && status > 0) {
     error.response = { status, data: { detail } };
@@ -2311,10 +2320,8 @@ const buildMessageMetadataRows = (
           .filter(Boolean)
           .join(" / ")
       : "";
-  const usageLabel =
-    String(metadata.usage?.source || "").trim().toLowerCase() === "estimate"
-      ? "Usage (estimated)"
-      : "Usage";
+  const usageLabel = getMessageUsageLabel(metadata.usage);
+  const reasoningTokens = getProviderReasoningTokens(metadata.usage);
   const reasoning =
     metadata.reasoning && typeof metadata.reasoning === "object"
       ? metadata.reasoning
@@ -2340,7 +2347,8 @@ const buildMessageMetadataRows = (
     { label: "Status", value: metadata.status },
     { label: "Source", value: sourceLabel },
     { label: "Mode", value: metadata.mode },
-    { label: "Model", value: metadata.model || metadata.model_received || metadata.model_requested },
+    { label: "Model", value: getMessageModelLabel(metadata) },
+    ...getMessageTimingRows(msg),
     { label: "Workflow", value: workflow },
     { label: "Reasoning", value: reasoningLabel },
     {
@@ -2363,6 +2371,7 @@ const buildMessageMetadataRows = (
     { label: "Response", value: compactMetadataValue(metadata.response_id, 42) },
     { label: "Request", value: compactMetadataValue(metadata.request_id, 42) },
     { label: usageLabel, value: usage },
+    { label: "Reasoning tokens (provider)", value: reasoningTokens === null ? "" : String(reasoningTokens) },
   ].filter((row) => compactMetadataValue(row.value));
 };
 
@@ -2402,6 +2411,28 @@ const Chat = ({
   const [commandMenuStyle, setCommandMenuStyle] = useState(null);
   const [loading, setLoading] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
+  const visibleRequestOwnerRef = useRef(null);
+  const latestRequestBySessionRef = useRef(new Map());
+  const requestSessionRef = useRef(state.sessionId);
+  const currentConversationRef = useRef(state.conversation);
+  currentConversationRef.current = state.conversation;
+  const canApplyOwnedResponse = useCallback((owner, sessionId, originalMessage, conversation = currentConversationRef.current) => {
+    if (activeComposerSessionRef.current !== sessionId || latestRequestBySessionRef.current.get(sessionId) !== owner) return false;
+    const current = conversation?.find((entry) => entry?.id === originalMessage.id);
+    if (!current) return false;
+    if (visibleRequestOwnerRef.current === owner) return true;
+    const status = String(current.metadata?.status || "").toLowerCase();
+    if (!["complete", "completed", "cancelled", "canceled", "error", "timeout", "partial"].includes(status)) return true;
+    // Reopening may hydrate a newer finished turn while the older HTTP request
+    // is still pending. Legacy records can share a completion time, so include text.
+    const savedRevision = (message) => JSON.stringify([
+      message.text, message.timestamp, message.updated_at,
+      message.metadata?.status, message.metadata?.request_id,
+      message.metadata?.timing?.completed_at,
+      message.metadata?.timing?.continuation_started_at,
+    ]);
+    return savedRevision(current) === savedRevision(originalMessage);
+  }, []);
   const [regeneratingMessageId, setRegeneratingMessageId] = useState(null);
   const [error, setError] = useState(null);
   const [banner, setBanner] = useState(null);
@@ -3001,6 +3032,7 @@ const Chat = ({
     (msg, idx) => {
       if (!inlineToolsEnabled) return false;
       if (toolDisplayMode === "inline" || toolDisplayMode === "both") return true;
+      if (resolveMessageTools(msg).some(isActionableToolStatus)) return true;
       if (!msg?.id) return false;
       if (activeMessageId && msg.id === activeMessageId) return true;
       if (highlightChainId && msg.id === highlightChainId) return true;
@@ -3216,19 +3248,7 @@ const Chat = ({
       const liveLabel = resolveLiveStreamSourceLabel(meta);
       if (liveLabel) return liveLabel;
       const mode = typeof meta.mode === "string" ? meta.mode : "";
-      const modelCandidates = [
-        meta.model_received,
-        meta.model_resolved,
-        meta.effective_model_id,
-        meta.effective_model,
-        meta.model,
-      ];
-      const resolvedModel =
-        modelCandidates.find(
-          (value) => typeof value === "string" && value.trim(),
-        ) || "";
-      const model =
-        typeof resolvedModel === "string" ? resolvedModel.trim() : "";
+      const model = getMessageModelLabel(meta);
       const provider =
         typeof meta.provider === "string" ? meta.provider.trim() : "";
       return formatRuntimeSourceLabel(mode, model || provider, provider);
@@ -3719,7 +3739,7 @@ const Chat = ({
     setChatSettingsPopoverStyle(buildComposerOverlayStyle({
       anchorRect: trigger.getBoundingClientRect(),
       popoverRect: chatSettingsPopoverRef.current?.getBoundingClientRect(),
-      zIndex: 3600,
+      zIndex: "var(--layer-popover)",
     }));
   }, []);
 
@@ -3732,7 +3752,8 @@ const Chat = ({
       popoverRect: attachmentPopoverRef.current?.getBoundingClientRect(),
       maxWidth: 240,
       gap: 8,
-      zIndex: 3610,
+      align: "start",
+      zIndex: "var(--layer-popover)",
     }));
   }, []);
 
@@ -3745,7 +3766,7 @@ const Chat = ({
       popoverRect: inputAlertStackRef.current?.getBoundingClientRect(),
       maxWidth: 980,
       gap: 10,
-      zIndex: 3620,
+      zIndex: "var(--layer-popover)",
     }));
   }, []);
 
@@ -5013,6 +5034,20 @@ const Chat = ({
       activeRequestRef.current = null;
     }
   }, []);
+  useEffect(() => {
+    // A request belongs to its original conversation even if its HTTP response
+    // arrives after the user navigates away.
+    if (requestSessionRef.current === state.sessionId) return;
+    requestSessionRef.current = state.sessionId;
+    visibleRequestOwnerRef.current = null;
+    clearActiveRequest();
+    setLoading(false);
+    setIsStreaming(false);
+    setRegeneratingMessageId(null);
+    setError(null);
+    setBanner(null);
+    setActiveMessageId?.(null);
+  }, [state.sessionId, clearActiveRequest, setActiveMessageId]);
   const abortActiveRequest = useCallback((reason = "user_cancelled") => {
     if (activeRequestRef.current && typeof activeRequestRef.current.abort === "function") {
       const controller = activeRequestRef.current;
@@ -5774,6 +5809,8 @@ const Chat = ({
   useEffect(() => {
     if (typeof document === "undefined" || !setActiveMessageId) return undefined;
     const handleOutsideClick = (event) => {
+      // The Send click also bubbles here; keep the running request selectable.
+      if (visibleRequestOwnerRef.current) return;
       const target = event?.target;
       if (!(target instanceof Element)) return;
       if (target.closest(".user-msg") || target.closest(".ai-msg")) return;
@@ -6306,6 +6343,9 @@ const Chat = ({
       return;
     }
     const submissionSessionId = state.sessionId;
+    const requestOwner = {};
+    visibleRequestOwnerRef.current = requestOwner;
+    latestRequestBySessionRef.current.set(submissionSessionId, requestOwner);
     const submittedAttachments = attachments.map((attachment) => ({
       ...attachment,
     }));
@@ -6517,6 +6557,10 @@ const Chat = ({
           if (res.error) {
             throw createApiWrapperError(res);
           }
+          if (activeComposerSessionRef.current !== submissionSessionId) {
+            clearComposerAttachments({ sessionId: submissionSessionId, attachments: submittedAttachments });
+            return;
+          }
           aiResponse = res.message;
           responseThought = res.thought || "";
           responseTools = Array.isArray(res?.tools_used) ? res.tools_used : [];
@@ -6564,6 +6608,10 @@ const Chat = ({
           // Retrying the same turn here duplicates backend work and can scramble ordering.
           allowRetry: false,
         });
+        if (activeComposerSessionRef.current !== submissionSessionId) {
+          clearComposerAttachments({ sessionId: submissionSessionId, attachments: submittedAttachments });
+          return;
+        }
         aiResponse = r.data?.message || "";
         responseThought = r.data?.thought || "";
         responseTools = Array.isArray(r.data?.tools_used) ? r.data.tools_used : [];
@@ -6605,12 +6653,28 @@ const Chat = ({
         (responseMetadata.session_display_name ||
           responseMetadata.display_name ||
           responseMetadata.session_title);
+      if (activeComposerSessionRef.current !== submissionSessionId) return;
       if (metadataDisplayName) {
         applySessionDisplayName(metadataDisplayName);
       }
 
       memoryStore["last_ai_response"] = { content: aiResponse, importance: 4 };
       setState((prev) => {
+        if (prev.sessionId !== submissionSessionId) return prev;
+        const existingMessage = prev.conversation.find((entry) => entry?.id === msgId);
+        if (!existingMessage) return prev;
+        if (
+          existingMessage.metadata?.tool_continued ||
+          existingMessage.metadata?.timing?.continuation_started_at
+        ) return prev;
+        // Reopening can already hydrate the completed response (or a newer
+        // continuation). A late HTTP response must not append it to history again.
+        if (
+          visibleRequestOwnerRef.current !== requestOwner &&
+          ["complete", "completed", "cancelled", "canceled", "error", "timeout", "partial"].includes(
+            existingMessage.metadata?.status,
+          )
+        ) return prev;
         const updatedConversation = acknowledgeClientOutboxPair(
           prev.conversation,
           msgId,
@@ -6693,6 +6757,28 @@ const Chat = ({
       });
       stopCameraCapture();
     } catch (err) {
+      if (activeComposerSessionRef.current !== submissionSessionId) return;
+      const savedMessage = currentConversationRef.current?.find((entry) => entry?.id === msgId);
+      // A failed delivery can arrive after reopening or a tool continuation,
+      // just like a successful delivery. Keep the newer saved outcome.
+      if (
+        savedMessage?.metadata?.tool_continued ||
+        savedMessage?.metadata?.timing?.continuation_started_at ||
+        (visibleRequestOwnerRef.current !== requestOwner &&
+          ["complete", "completed", "cancelled", "canceled", "error", "timeout", "partial"].includes(savedMessage?.metadata?.status))
+      ) return;
+      if (err?.code === "REQUEST_OUTCOME_UNKNOWN") {
+        setError(null);
+        setBanner({
+          message: err.message,
+          category: "response_unknown",
+          actions: [{
+            label: "Check saved response",
+            onClick: () => onOpenConversation?.(submissionSessionId),
+          }],
+        });
+        return;
+      }
       if (isUserCancelledError(err)) {
         setError(null);
         setBanner(null);
@@ -6761,6 +6847,7 @@ const Chat = ({
       }
       console.error("Chat API Error:", err);
       setState((prev) => {
+        if (prev.sessionId !== submissionSessionId) return prev;
         const updated = Array.isArray(prev.conversation) ? [...prev.conversation] : [];
         const idx = updated.findIndex((entry) => entry && entry.id === msgId);
         const timestampIso = new Date().toISOString();
@@ -6794,10 +6881,13 @@ const Chat = ({
         return { ...prev, conversation: updated };
       });
     } finally {
-      setLoading(false);
-      setIsStreaming(false);
-      setActiveMessageId && setActiveMessageId(null);
-      clearActiveRequest();
+      if (visibleRequestOwnerRef.current === requestOwner) {
+        visibleRequestOwnerRef.current = null;
+        setLoading(false);
+        setIsStreaming(false);
+        setActiveMessageId && setActiveMessageId(null);
+        clearActiveRequest();
+      }
     }
   }; 
 
@@ -6855,6 +6945,10 @@ const Chat = ({
     const previousVisionWorkflow =
       state.conversation[idx - 1]?.metadata?.vision?.workflow || "auto";
     if (!userText.trim()) return;
+    const submissionSessionId = state.sessionId;
+    const requestOwner = {};
+    visibleRequestOwnerRef.current = requestOwner;
+    latestRequestBySessionRef.current.set(submissionSessionId, requestOwner);
     abortActiveRequest();
     clearActiveRequest();
     setError(null);
@@ -6897,6 +6991,7 @@ const Chat = ({
             },
             { signal: controller?.signal },
           );
+          if (!canApplyOwnedResponse(requestOwner, submissionSessionId, msg)) return;
           if (res?.cancelled) {
             const userCancelError = new Error("Generation cancelled");
             userCancelError.code = "USER_CANCELLED";
@@ -6956,6 +7051,7 @@ const Chat = ({
           endpoint: "/api/chat",
           allowRetry: false,
         });
+        if (!canApplyOwnedResponse(requestOwner, submissionSessionId, msg)) return;
         aiResponse = r.data?.message || "";
         responseThought = r.data?.thought || "";
         responseTools = Array.isArray(r.data?.tools_used) ? r.data.tools_used : [];
@@ -6984,6 +7080,7 @@ const Chat = ({
         }
       }
 
+      if (!canApplyOwnedResponse(requestOwner, submissionSessionId, msg)) return;
       // Reasoning and retrieval context are diagnostics, not a replacement
       // answer. Keep the saved response unless regeneration produced text or
       // an actionable tool proposal the transcript can actually render.
@@ -6999,6 +7096,7 @@ const Chat = ({
       }
 
       setState((prev) => {
+        if (prev.sessionId !== submissionSessionId || !canApplyOwnedResponse(requestOwner, submissionSessionId, msg, prev.conversation)) return prev;
         const updated = [...prev.conversation];
         const mIdx = updated.findIndex((m) => m.id === msg.id);
         if (mIdx !== -1) {
@@ -7104,6 +7202,7 @@ const Chat = ({
         return { ...prev, conversation: updated, history: hist };
       });
     } catch (err) {
+      if (!canApplyOwnedResponse(requestOwner, submissionSessionId, msg)) return;
       if (isUserCancelledError(err)) {
         setError(null);
         setBanner(null);
@@ -7184,11 +7283,14 @@ const Chat = ({
         setBanner(null);
       }
     } finally {
-      setLoading(false);
-      setIsStreaming(false);
-      setRegeneratingMessageId(null);
-      setActiveMessageId && setActiveMessageId(null);
-      clearActiveRequest();
+      if (visibleRequestOwnerRef.current === requestOwner) {
+        visibleRequestOwnerRef.current = null;
+        setLoading(false);
+        setIsStreaming(false);
+        setRegeneratingMessageId(null);
+        setActiveMessageId && setActiveMessageId(null);
+        clearActiveRequest();
+      }
     }
   };
 
@@ -7237,14 +7339,10 @@ const Chat = ({
   const continueGenerating = useCallback(
     async (msg, options = {}) => {
       if (!msg || !msg.id) return;
+      const submissionSessionId = state.sessionId;
+      const requestOwner = {};
       let continuationLockKey = "";
       let continuationLockAcquired = false;
-      abortActiveRequest();
-      clearActiveRequest();
-      setError(null);
-      setLoading(true);
-      setIsStreaming(true);
-      setActiveMessageId && setActiveMessageId(msg.id);
       try {
         const overrideTarget =
           options && typeof options === "object" ? options.continueTarget : null;
@@ -7320,6 +7418,15 @@ const Chat = ({
         continuationLockAcquired =
           !continuationLockKey || acquireToolContinuationLock(continuationLockKey);
         if (!continuationLockAcquired) return;
+        // A blocked duplicate must not replace the in-flight request's owner.
+        visibleRequestOwnerRef.current = requestOwner;
+        latestRequestBySessionRef.current.set(submissionSessionId, requestOwner);
+        abortActiveRequest();
+        clearActiveRequest();
+        setError(null);
+        setLoading(true);
+        setIsStreaming(true);
+        setActiveMessageId && setActiveMessageId(msg.id);
         const res = await axios.post("/api/chat/continue", {
           session_id: state.sessionId,
           message_id: msg.id,
@@ -7330,6 +7437,7 @@ const Chat = ({
           tools: toolPayload,
           ...generationControlPayload,
         });
+        if (!canApplyOwnedResponse(requestOwner, submissionSessionId, msg)) return;
         if (res?.data?.error) {
           throw new Error(res.data.error);
         }
@@ -7338,6 +7446,7 @@ const Chat = ({
         const md = res.data?.metadata || {};
         const returnedTools = Array.isArray(res.data?.tools_used) ? res.data.tools_used : [];
         setState((prev) => {
+          if (prev.sessionId !== submissionSessionId || !canApplyOwnedResponse(requestOwner, submissionSessionId, msg, prev.conversation)) return prev;
           const updated = Array.isArray(prev.conversation) ? [...prev.conversation] : [];
           const mIdx = updated.findIndex((m) => m && m.id === msg.id);
           if (mIdx !== -1) {
@@ -7458,6 +7567,7 @@ const Chat = ({
         });
         applySubchatControlFromTools(returnedTools);
       } catch (err) {
+        if (!canApplyOwnedResponse(requestOwner, submissionSessionId, msg)) return;
         const detail =
           (err && err.response && err.response.data && (err.response.data.detail || err.response.data.message)) ||
           err?.message ||
@@ -7467,15 +7577,19 @@ const Chat = ({
         if (continuationLockAcquired) {
           releaseToolContinuationLock(continuationLockKey);
         }
-        setLoading(false);
-        setIsStreaming(false);
-        setActiveMessageId && setActiveMessageId(null);
+        if (visibleRequestOwnerRef.current === requestOwner) {
+          visibleRequestOwnerRef.current = null;
+          setLoading(false);
+          setIsStreaming(false);
+          setActiveMessageId && setActiveMessageId(null);
+        }
       }
     },
   [
     abortActiveRequest,
     applySubchatControlFromTools,
     buildToolOutcomeResult,
+    canApplyOwnedResponse,
     clearActiveRequest,
     setActiveMessageId,
     setState,
@@ -9113,12 +9227,16 @@ const Chat = ({
       ? Math.max(0, compactionNowMs - compactionStartedAt)
       : null;
   const audioRecorderStatus = audioRecording
-    ? "Recording microphone input"
+    ? "Recording a voice message. Stop to transcribe and send."
     : audioTranscribing
       ? "Transcribing microphone input"
       : "";
   const liveStreamingActive =
     recording || liveSessionPending || liveStreamingPhase === "connecting";
+  const attachmentCameraLabel = recording
+    ? "Live camera"
+    : cameraOpen ? "Close camera" : "Take photo";
+  const attachmentScreenLabel = recording ? "Share screen" : "Take screenshot";
   const liveTranscriptVisible =
     liveStreamingActive &&
     state.liveTranscriptEnabled !== false &&
@@ -9179,10 +9297,9 @@ const Chat = ({
                 <strong>Chat settings</strong>
                 <span>Controls for this composer and active chat.</span>
               </div>
-              <button
-                type="button"
+              <IconAction
                 className="chat-settings-close"
-                aria-label="Close chat settings"
+                label="Close chat settings"
                 onClick={() => {
                   setChatSettingsOpen(false);
                   window.requestAnimationFrame(() =>
@@ -9191,7 +9308,7 @@ const Chat = ({
                 }}
               >
                 <CloseIcon fontSize="small" />
-              </button>
+              </IconAction>
             </header>
             <div className="chat-settings-body">
             <div className="chat-settings-list" role="tablist" aria-label="Chat setting sections">
@@ -9731,14 +9848,15 @@ const Chat = ({
     },
     maxWidth: 980,
     gap: 10,
-    zIndex: 3620,
+    zIndex: "var(--layer-popover)",
   });
   const attachmentPopoverFallbackStyle = buildComposerOverlayStyle({
     anchorRect: attachmentTriggerRef.current?.getBoundingClientRect(),
-    popoverRect: { width: 145, height: 48 },
+    popoverRect: { width: 216, height: 144 },
     maxWidth: 240,
     gap: 8,
-    zIndex: 3610,
+    align: "start",
+    zIndex: "var(--layer-popover)",
   });
   const inputAlertsPopover =
     entryOpen && inputAlerts.length > 0 && typeof document !== "undefined"
@@ -9967,7 +10085,12 @@ const Chat = ({
               : [];
           const messageVisionNotice =
             isAssistantMessage && !isRegeneratingMessage
-              ? getMessageVisionNotice(displayMsg)
+              ? getMessageVisionNotice(displayMsg, {
+                  currentTurnAttachments: state.conversation
+                    .slice(0, idx)
+                    .reverse()
+                    .find((entry) => entry?.role === "user")?.attachments || [],
+                })
               : null;
           const messageId = msg?.id || msg?.message_id || null;
           const subchatLinks =
@@ -10053,7 +10176,9 @@ const Chat = ({
                 attachmentsList.forEach((att, index) => {
                   const candidateSrc = att.url || att.src;
                   if (!candidateSrc) return;
-                  const candidateType = (att.type || "").toLowerCase();
+                  const candidateType = (
+                    att.type || att.content_type || att.mime_type || att.file?.type || ""
+                  ).toLowerCase();
                   const candidateName = att.name || `attachment-${index + 1}`;
                   const looksMedia =
                     candidateType.startsWith("image/") ||
@@ -10065,6 +10190,7 @@ const Chat = ({
                       index,
                       item: {
                         src: candidateSrc,
+                        type: candidateType,
                         alt: candidateName,
                         file: att.file || null,
                         label: candidateName,
@@ -10098,7 +10224,9 @@ const Chat = ({
                     {attachmentsList.map((att, i) => {
                       const src = att.url || att.src;
                       const name = att.name || `attachment-${i + 1}`;
-                      const t = (att.type || "").toLowerCase();
+                      const t = (
+                        att.type || att.content_type || att.mime_type || att.file?.type || ""
+                      ).toLowerCase();
                       const isMedia =
                         t.startsWith("image/") ||
                         t.startsWith("video/") ||
@@ -10111,6 +10239,7 @@ const Chat = ({
                             <MediaViewer
                               src={src}
                               alt={name}
+                              mediaType={t}
                               file={att.file || null}
                               contextItems={mediaContextItems}
                               contextIndex={typeof mediaIndex === "number" ? mediaIndex : 0}
@@ -10187,6 +10316,27 @@ const Chat = ({
                     )
                   }
                 />
+              )}
+              {!inlineToolsEnabled && resolvedTools.some(isActionableToolStatus) && (
+                <div className="inline-tool-list has-actionable-tools" role="status">
+                  <span>
+                    Approval needed: {resolvedTools.filter(isActionableToolStatus).map((tool) => tool.name || "tool").join(", ")}
+                  </span>{" "}
+                  <button
+                    type="button"
+                    className="tool-action-btn"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      const tool = resolvedTools.find(isActionableToolStatus);
+                      onOpenConsole?.({
+                        chainId: msg.id || msg.message_id,
+                        toolId: tool?.id || tool?.request_id,
+                      });
+                    }}
+                  >
+                    Review in Agent Console
+                  </button>
+                </div>
               )}
               {shouldShowInlineToolsForMessage(msg, idx) && resolvedTools.length > 0 && (() => {
                 const toolCollapseKey = msg.id || msg.message_id || fragmentKey;
@@ -11445,26 +11595,42 @@ const Chat = ({
               )}
               {hasImageAttachments && (
                 <div className="vision-workflow-row">
-                  <label
-                    htmlFor="vision-workflow-select"
-                    className="vision-workflow-label"
-                    title={VISION_WORKFLOW_FIELD_DESCRIPTION}
+                  <Tooltip
+                    title={
+                      <div>
+                        {VISION_WORKFLOW_OPTIONS.map((option) => (
+                          <div key={option.value}>
+                            <strong>{option.label}:</strong> {option.description}
+                          </div>
+                        ))}
+                      </div>
+                    }
+                    describeChild
+                    arrow
                   >
-                    Vision mode
-                  </label>
+                    <label
+                      htmlFor="vision-workflow-select"
+                      className="vision-workflow-label"
+                      tabIndex={0}
+                    >
+                      Vision mode
+                    </label>
+                  </Tooltip>
                   <select
                     id="vision-workflow-select"
                     value={visionWorkflow}
                     onChange={(event) => setVisionWorkflow(event.target.value)}
                     title={`${VISION_WORKFLOW_FIELD_DESCRIPTION} ${selectedVisionWorkflow.description}`}
+                    aria-describedby="vision-workflow-description"
                   >
                     {VISION_WORKFLOW_OPTIONS.map((option) => (
-                      <option key={option.value} value={option.value}>
+                      <option key={option.value} value={option.value} title={option.description}>
                         {option.label}
                       </option>
                     ))}
                   </select>
                   <span
+                    id="vision-workflow-description"
                     className="vision-workflow-current"
                     title={selectedVisionWorkflow.description}
                   >
@@ -11488,6 +11654,7 @@ const Chat = ({
                 inputRef={composerInputRef}
                 inputProps={{
                   className: "composer-rich-input",
+                  "aria-label": "Message",
                   onSelect: handleComposerSelectionChange,
                   onClick: handleComposerSelectionChange,
                   onKeyUp: handleComposerSelectionChange,
@@ -11504,87 +11671,8 @@ const Chat = ({
               multiple
               className="hidden-input"
             />
-            <div className="input-actions">
-              <div className="composer-action-row composer-action-row-top">
-                <Tooltip title="Close chat input">
-                  <button
-                    className="close-entry"
-                    onClick={() => setEntryOpen(false)}
-                    aria-label="Close chat input"
-                  >
-                    <CloseIcon fontSize="small" />
-                  </button>
-                </Tooltip>
-                <div className="chat-settings-menu" ref={chatSettingsMenuRef}>
-                  <Tooltip title="Chat settings">
-                    <button
-                      ref={chatSettingsTriggerRef}
-                      type="button"
-                      className={`chat-settings-trigger${
-                        chatSettingsOpen ? " is-open" : ""
-                      }`}
-                      onClick={() => {
-                        setChatSettingsOpen((prev) => !prev);
-                        setChatSettingsSection((prev) => prev || "camera");
-                      }}
-                      aria-label="Chat settings"
-                      aria-expanded={chatSettingsOpen}
-                      aria-controls={chatSettingsOpen ? "chat-settings-popover" : undefined}
-                      aria-haspopup="dialog"
-                    >
-                      <TuneIcon fontSize="small" />
-                    </button>
-                  </Tooltip>
-                </div>
-              </div>
-              <div className="composer-action-row composer-action-row-bottom">
-                <Tooltip
-                  title={
-                    audioRecording
-                      ? "Stop recording audio message"
-                      : audioTranscribing
-                        ? "Transcribing audio..."
-                        : liveStreamingActive
-                          ? "Live streaming mode is using the microphone"
-                          : "Record audio message"
-                  }
-                >
-                  <span>
-                    <IconButton
-                      onClick={toggleAudioRecording}
-                      color={audioRecording ? "error" : "default"}
-                      aria-label="record audio message"
-                      className={`action-icon audio-record-toggle${
-                        audioRecording ? " is-recording" : ""
-                      }${audioTranscribing ? " is-transcribing" : ""}${
-                        liveStreamingActive ? " is-live-disabled" : ""
-                      }`}
-                      disabled={audioTranscribing || liveStreamingActive}
-                    >
-                      <MicIcon />
-                    </IconButton>
-                  </span>
-                </Tooltip>
-                <Tooltip
-                  title={
-                    liveStreamingActive
-                      ? "Stop live streaming mode"
-                      : "Start live streaming mode"
-                  }
-                >
-                  <IconButton
-                    onClick={toggleRecording}
-                    color={liveStreamingActive ? "secondary" : "default"}
-                    aria-label="live streaming mode"
-                    className={`action-icon live-stream-toggle${
-                      liveStreamingActive ? " is-live-streaming" : ""
-                    }${recording || liveSessionPending ? " is-recording" : ""}${
-                      speaking ? " is-speaking" : ""
-                    }`}
-                  >
-                    <FiberManualRecordIcon />
-                  </IconButton>
-                </Tooltip>
+            <div className="input-actions" role="group" aria-label="Message actions">
+              <div className="composer-action-row composer-action-row-tools">
                 <div className="attach-menu" ref={attachmentMenuRef}>
                   {attachmentMenuOpen &&
                     typeof document !== "undefined" &&
@@ -11597,106 +11685,169 @@ const Chat = ({
                         aria-label="Attachment actions"
                         style={attachmentPopoverStyle || attachmentPopoverFallbackStyle}
                       >
-                        <Tooltip title="Attach file">
-                          <IconButton
-                            onClick={handleAttachmentFileAction}
-                            aria-label="attach file"
-                            className="action-icon"
-                          >
-                            <AttachFileIcon />
-                          </IconButton>
-                        </Tooltip>
-                        <Tooltip
-                          title={
+                        <IconAction
+                          label="Attach file"
+                          onClick={handleAttachmentFileAction}
+                          className="action-icon attachment-action"
+                        >
+                          <AttachFileIcon />
+                          <span>Attach file</span>
+                        </IconAction>
+                        <IconAction
+                          label={attachmentCameraLabel}
+                          tooltip={
                             recording
                               ? liveVisualMode === "camera"
                                 ? "Turn live camera off"
                                 : "Turn live camera on"
                               : cameraOpen
                                 ? "Close camera capture"
-                                : "Capture from camera"
+                                : "Take a photo to attach to this message"
                           }
+                          onClick={handleAttachmentCameraAction}
+                          className={`action-icon attachment-action visual-stream-toggle${
+                            recording ? " is-live-option" : ""
+                          }${
+                            recording && liveVisualMode !== "camera" ? " is-off" : ""
+                          }${
+                            recording && liveVisualMode === "camera" ? " is-on" : ""
+                          }`}
+                          disabled={cameraBusy}
                         >
-                          <span>
-                            <IconButton
-                              onClick={handleAttachmentCameraAction}
-                              aria-label="capture from camera"
-                              className={`action-icon visual-stream-toggle${
-                                recording ? " is-live-option" : ""
-                              }${
-                                recording && liveVisualMode !== "camera" ? " is-off" : ""
-                              }${
-                                recording && liveVisualMode === "camera" ? " is-on" : ""
-                              }`}
-                              disabled={cameraBusy}
-                            >
-                              <PhotoCameraIcon />
-                            </IconButton>
-                          </span>
-                        </Tooltip>
-                        <Tooltip
-                          title={
+                          <PhotoCameraIcon />
+                          <span>{attachmentCameraLabel}</span>
+                        </IconAction>
+                        <IconAction
+                          label={attachmentScreenLabel}
+                          tooltip={
                             recording
                               ? liveVisualMode === "screen"
-                                ? "Turn desktop capture off"
-                                : "Turn desktop capture on"
-                              : "Capture from desktop"
+                                ? "Stop sharing your screen"
+                                : "Share your screen in live voice"
+                              : "Capture a screenshot to attach to this message"
                           }
+                          onClick={handleAttachmentScreenAction}
+                          className={`action-icon attachment-action visual-stream-toggle${
+                            recording ? " is-live-option" : ""
+                          }${
+                            recording && liveVisualMode !== "screen" ? " is-off" : ""
+                          }${
+                            recording && liveVisualMode === "screen" ? " is-on" : ""
+                          }`}
+                          disabled={screenCaptureBusy}
                         >
-                          <span>
-                            <IconButton
-                              onClick={handleAttachmentScreenAction}
-                              aria-label="capture from desktop"
-                              className={`action-icon visual-stream-toggle${
-                                recording ? " is-live-option" : ""
-                              }${
-                                recording && liveVisualMode !== "screen" ? " is-off" : ""
-                              }${
-                                recording && liveVisualMode === "screen" ? " is-on" : ""
-                              }`}
-                              disabled={screenCaptureBusy}
-                            >
-                              <ScreenShareIcon />
-                            </IconButton>
-                          </span>
-                        </Tooltip>
+                          <ScreenShareIcon />
+                          <span>{attachmentScreenLabel}</span>
+                        </IconAction>
                       </div>,
                       document.body,
                     )}
-                  <Tooltip title="Attachments">
-                    <IconButton
-                      ref={attachmentTriggerRef}
-                      onClick={() => setAttachmentMenuOpen((prev) => !prev)}
-                      aria-label="open attachments"
-                      aria-haspopup="true"
-                      aria-expanded={attachmentMenuOpen}
-                      aria-controls={attachmentMenuOpen ? "chat-attachment-menu" : undefined}
-                      className={`action-icon attach-trigger${
-                        attachmentMenuOpen ? " is-open" : ""
-                      }`}
-                    >
-                      <AttachFileIcon />
-                    </IconButton>
-                  </Tooltip>
+                  <IconAction
+                    ref={attachmentTriggerRef}
+                    label="Open attachments"
+                    tooltip="Attach a file, photo, or screenshot"
+                    onClick={() => {
+                      setChatSettingsOpen(false);
+                      setAttachmentMenuOpen((prev) => !prev);
+                    }}
+                    aria-haspopup="true"
+                    aria-expanded={attachmentMenuOpen}
+                    aria-controls={attachmentMenuOpen ? "chat-attachment-menu" : undefined}
+                    className={`action-icon attach-trigger${
+                      attachmentMenuOpen ? " is-open" : ""
+                    }`}
+                  >
+                    <AttachFileIcon />
+                  </IconAction>
                 </div>
+                <IconAction
+                  label={audioRecording ? "Stop and send voice message" : "Record voice message"}
+                  tooltip={
+                    audioRecording
+                      ? "Stop recording, transcribe, and send this message"
+                      : audioTranscribing
+                        ? "Transcribing and sending your voice message..."
+                        : liveStreamingActive
+                          ? "Live voice is using the microphone"
+                          : "Record one message. Stopping transcribes and sends it."
+                  }
+                  onClick={toggleAudioRecording}
+                  aria-pressed={audioRecording}
+                  className={`action-icon composer-voice-action audio-record-toggle${
+                    audioRecording ? " is-recording" : ""
+                  }${audioTranscribing ? " is-transcribing" : ""}${
+                    liveStreamingActive ? " is-live-disabled" : ""
+                  }`}
+                  disabled={audioTranscribing || liveStreamingActive}
+                >
+                  <MicIcon />
+                  <span className="composer-action-label">
+                    {audioRecording ? "Stop & send" : audioTranscribing ? "Sending..." : "Voice message"}
+                  </span>
+                </IconAction>
+                <IconAction
+                  label={liveStreamingActive ? "Stop live voice" : "Start live voice"}
+                  tooltip={
+                    liveStreamingActive
+                      ? "End the live voice conversation"
+                      : "Start an ongoing voice conversation with spoken replies"
+                  }
+                  onClick={toggleRecording}
+                  aria-pressed={liveStreamingActive}
+                  className={`action-icon composer-voice-action live-stream-toggle${
+                    liveStreamingActive ? " is-live-streaming" : ""
+                  }${recording || liveSessionPending ? " is-recording" : ""}${
+                    speaking ? " is-speaking" : ""
+                  }`}
+                >
+                  <GraphicEqIcon />
+                  <span className="composer-action-label">Live voice</span>
+                </IconAction>
+              </div>
+              <div className="composer-action-row composer-action-row-end">
+                <div className="chat-settings-menu" ref={chatSettingsMenuRef}>
+                  <IconAction
+                    ref={chatSettingsTriggerRef}
+                    label="Chat settings"
+                    tooltip="Adjust voice, camera, and chat behavior"
+                    className={`chat-settings-trigger${chatSettingsOpen ? " is-open" : ""}`}
+                    onClick={() => {
+                      setAttachmentMenuOpen(false);
+                      setChatSettingsOpen((prev) => !prev);
+                      setChatSettingsSection((prev) => prev || "camera");
+                    }}
+                    aria-expanded={chatSettingsOpen}
+                    aria-controls={chatSettingsOpen ? "chat-settings-popover" : undefined}
+                    aria-haspopup="dialog"
+                  >
+                    <TuneIcon fontSize="small" />
+                  </IconAction>
+                </div>
+                <IconAction
+                  className="close-entry"
+                  label="Hide composer"
+                  tooltip="Hide the composer. Your draft is kept."
+                  onClick={() => {
+                    setAttachmentMenuOpen(false);
+                    setChatSettingsOpen(false);
+                    setEntryOpen(false);
+                  }}
+                >
+                  <CloseIcon fontSize="small" />
+                </IconAction>
                 <div className="send-stack">
-                  <Tooltip title={sendTooltip}>
-                    <span>
-                      <Button
-                        onClick={() => (isStreaming ? cancelGeneration() : sendMessage())}
-                        disabled={sendDisabled}
-                        variant="contained"
-                        color="primary"
-                        className={`send-btn ${isStreaming ? "is-stopping" : ""}${
-                          sendDisabled && !isStreaming ? " is-idle-disabled" : ""
-                        }`}
-                        sx={{ minWidth: "32px", padding: "4px" }}
-                        aria-label={isStreaming ? "Stop generation" : "Send message"}
-                      >
-                        {isStreaming ? <StopIcon /> : <SendIcon />}
-                      </Button>
-                    </span>
-                  </Tooltip>
+                  <IconAction
+                    label={isStreaming ? "Stop generation" : "Send message"}
+                    tooltip={sendTooltip}
+                    onClick={() => (isStreaming ? cancelGeneration() : sendMessage())}
+                    disabled={sendDisabled}
+                    className={`send-btn ${isStreaming ? "is-stopping" : ""}${
+                      sendDisabled && !isStreaming ? " is-idle-disabled" : ""
+                    }`}
+                  >
+                    {isStreaming ? <StopIcon /> : <SendIcon />}
+                    <span className="composer-send-label">{isStreaming ? "Stop" : "Send"}</span>
+                  </IconAction>
                 </div>
               </div>
             </div>

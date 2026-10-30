@@ -7,6 +7,39 @@ from app.utils import deployment_event_store
 from scripts import create_release_snapshot, deploy_release_snapshot
 
 
+def test_release_snapshot_preserves_test_collection_config(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    config = (
+        "[pytest]\n"
+        "testpaths =\n"
+        "    backend/app/tests\n"
+        "    backend/app/services/tests\n"
+        "    backend/services/tests\n"
+    )
+    (source / "pytest.ini").write_text(config, encoding="utf-8")
+    for relative in (
+        "backend/app/tests/test_app.py",
+        "backend/app/services/tests/test_services.py",
+        "backend/services/tests/test_legacy_services.py",
+        "data/workspace/export/test_runtime_copy.py",
+    ):
+        path = source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("def test_placeholder(): pass\n", encoding="utf-8")
+    monkeypatch.setattr(create_release_snapshot, "REPO_ROOT", source)
+    files, _missing = create_release_snapshot.iter_manifest_files()
+
+    snapshot = tmp_path / "snapshot"
+    create_release_snapshot.copy_snapshot(files, snapshot, force=False)
+
+    assert (snapshot / "pytest.ini").read_text(encoding="utf-8") == config
+    assert (snapshot / "backend/app/tests/test_app.py").is_file()
+    assert (snapshot / "backend/app/services/tests/test_services.py").is_file()
+    assert (snapshot / "backend/services/tests/test_legacy_services.py").is_file()
+    assert not (snapshot / "data").exists()
+
+
 def _snapshot(tmp_path: Path) -> Path:
     snapshot = tmp_path / "snapshot"
     (snapshot / "backend").mkdir(parents=True)

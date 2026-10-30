@@ -1,6 +1,6 @@
 # Architecture Map
 
-Updated: 2026-07-15
+Updated: 2026-09-04
 
 This map summarizes Float's current code layout, runtime lanes, storage model, and request flow. It is intentionally shorter than the route table; use `docs/api_reference.md` for the public endpoint overview and the routers included by `backend/app/routes.py` for the implementation source of truth.
 
@@ -11,6 +11,7 @@ This map summarizes Float's current code layout, runtime lanes, storage model, a
   - `app/routes.py`: Compatibility route aggregate for chat, memory, knowledge, attachments, computer use, calendar, sync, settings, model jobs, actions, and diagnostics. New domain routers should be included here while legacy clients/tests still import this aggregate.
   - `app/routers/`: Domain HTTP routers. This name deliberately avoids colliding with the compatibility `app/routes.py` module.
     - `provider.py`: provider status, inventory, lifecycle, logs, and generic OpenAI-compatible server inventory routes. The router is built with the aggregate's shared provider-manager instance.
+    - `model_catalog.py`: cloud inventory/catalog responses. Other extracted domain routers remain mounted through the compatibility aggregate.
   - `app/routes_graph.py`: Graph request models plus schema, projection, and update routes; this was the first behavior-preserving extraction and can move under `app/routers/` in a later mechanical cleanup.
   - `app/routes_tools.py`: Tool catalog/specification routes.
   - `app/base_services.py`: LLM service orchestration, context assembly, API/local/server dispatch, multimodal payload handling, Harmony handling, and direct-local loading helpers.
@@ -21,7 +22,6 @@ This map summarizes Float's current code layout, runtime lanes, storage model, a
   - `app/local_providers/`: Managed provider adapters for LM Studio and Ollama, provider-manager behavior, and pure provider-selection policy in `selection.py`.
   - `app/model_catalog/`: Provider-model lifecycle policy, shutdown metadata, and persisted-selection migration hints.
   - `app/utils/user_model_catalog.py`: User-owned Hugging Face model registrations persisted in `user_settings.json`; these dynamically extend central alias resolution and download-job availability without modifying the shipped built-in registry.
-  - `app/routers/`: Extracted domain routers. `model_catalog.py` owns cloud inventory/catalog responses and `provider.py` owns managed/local provider controls while `app/routes.py` remains the compatibility aggregate.
   - `app/services/`: Business services for sync, RAG, live/voice transport, model jobs, computer runtime, conversations, graph payload normalization, provider-agnostic model inventory, and related subsystems.
   - `app/utils/`: Shared stores, blob resolution, graph store, deployment/build status, time resolution, argument normalization, device visibility, and other helpers.
   - `app/tests/`: Backend regression tests.
@@ -85,6 +85,10 @@ The deployment event ledger is deliberately separate from synced user content an
 
 SQLite is the durable source of truth for memory/knowledge text rows and chunks. Chroma mirrors searchable vector snippets. Weaviate remains optional.
 
+Graph payload writes resolve `node_ref` only within the current update; later calls must use a persisted `node_id`. An unresolved reference rejects the affected claim and appears in the partial-result errors; other valid records in the batch may already be written. Zero confidence is preserved through payload writes and graph sync.
+
+Graph undo/redo restores captured node/claim values and complete role sets for the selected graph records in one SQLite transaction, preserving typed literals, explicit null, false, and zero. Conflict, topology and postcondition checks guard the restore; failures roll back the graph transaction. Sync remains a separate newer-record-wins merge. Other undo sections and the JSON Action History store do not share this transaction, so crash recovery across those stores remains separate. The restore cannot reconstruct already incomplete historical snapshots; ambiguous legacy null roles fail closed.
+
 ## Chat Request Flow
 
 1. The user sends a message from `Chat.jsx`, optionally with attachments, inline command tokens, workflow/mode settings, and selected runtime/model state.
@@ -124,7 +128,7 @@ Important caption rule from the 2026-04-12 sync consolidation: imported/manual i
 - Capability metadata comes from `backend/app/tool_catalog.py`.
 - The Agent Console hydrates from `/api/agents/console` and streams live state from `/api/stream/thoughts`.
 - Calendar is canonical for background-work start time, time zone, recurrence, and series bounds. `app/services/calendar_jobs.py` supplies the shared timezone-aware occurrence expansion used by both the Calendar UI API and the scheduled-action runner.
-- `CalendarEvent.background_job` keeps patience, execution preferences, and ownership/lineage separate from schedule fields. Calendar shows future occurrences, Agent Console shows current-session agents/jobs, and `/api/work/runs` reads durable Calendar/reflection receipts from `work_runs.sqlite3`. The scheduled-action runner writes a receipt before tool/provider work, records provider attempts, journals mutating or unknown-effect tool intent before dispatch, and advances stable ids through retry, effect-certainty, follow-up, and recovery phases. Effects progress from `intent` to `dispatched` and then `acknowledged`, `unknown`, or `not_dispatched`; exceptions or error-shaped results after dispatch remain unknown and are never automatically replayed. `acknowledged` records a successful tool return, while `confirmed` is reserved for future independent remote-state verification. Calendar `run_history` and reflection rows remain compatibility sources for idempotent startup/read backfill, so deleting a Calendar event no longer deletes its Activity history. This journal currently covers the scheduled runner only; protected checkpoint capsules, prompt-only process-loss resume, hard cancellation, permission enforcement, and external reconciliation remain open.
+- `CalendarEvent.background_job` keeps patience, execution preferences, and ownership/lineage separate from schedule fields. Calendar shows future occurrences, Agent Console shows current-session agents/jobs, and `/api/work/runs` reads durable Calendar/reflection receipts from `work_runs.sqlite3`. The scheduled-action runner writes a receipt before tool/provider work, records provider attempts, journals mutating or unknown-effect tool intent before dispatch, and advances stable ids through retry, effect-certainty, follow-up, and recovery phases. Effects progress from `intent` to `dispatched` and then `acknowledged`, `unknown`, or `not_dispatched`; exceptions or error-shaped results after dispatch remain unknown and are never automatically replayed. `acknowledged` records a successful tool return, while `confirmed` is reserved for future independent remote-state verification. Calendar `run_history` and reflection rows remain compatibility sources for idempotent startup/read backfill, so deleting a Calendar event no longer deletes its Activity history. This journal covers the scheduled runner. Merged follow-ups add scheduled-tool permission/approval enforcement, cooperative stop and reconciliation UI, content-free prompt restart checkpoints, terminal repair, and opt-in provider process isolation. Non-cooperative tool isolation, enforcement across other execution lanes, and access/retention policy for content-bearing checkpoints remain open.
 - The bounded autonomy supervisor wraps reflection scheduler ticks with a durable heartbeat, dry-run planning, attention-ranked candidates, and an opt-in loop controlled by `FLOAT_BACKGROUND_AUTONOMY_ENABLED` plus Settings background controls. Legacy `manual`, `basic`, `overnight`, `extended`, and `always_on` values remain accepted, while the UI frames them as termination/budget posture. `FLOAT_BACKGROUND_AUTONOMY_SANDBOX_PROCESSES` records an isolation preference when a sandbox backend is available.
 - Live container orchestration/API background-response checks live in `backend/app/tests/integration/test_autonomy_container_orchestration.py` and are skipped unless `FLOAT_RUN_AUTONOMY_INTEGRATION_TESTS=1` is set. Use `scripts/run_autonomy_integration_tests.ps1` to run that suite separately from normal Poetry test passes.
 - Browser-first computer-use sessions and guarded Windows desktop sessions are exposed through the shared tool/API surface and keep screenshots/captures in managed storage.

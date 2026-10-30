@@ -198,24 +198,28 @@ const WriteHistoryPage = ({
   const [stopRequestErrors, setStopRequestErrors] = useState({});
   const [stopRequestWarnings, setStopRequestWarnings] = useState({});
   const detailRequestVersion = useRef(0);
+  const listRequestVersion = useRef(0);
 
   const loadRuns = useCallback(
     async (offset = 0) => {
       if (!backendReady) return;
+      const requestVersion = ++listRequestVersion.current;
       setRunsLoading(true);
       setRunsError("");
       try {
         const params = { limit: RUN_PAGE_SIZE, offset };
         if (jobFilter) params.job_id = jobFilter;
         const response = await axios.get("/api/work/runs", { params });
+        if (requestVersion !== listRequestVersion.current) return;
         const nextRuns = Array.isArray(response?.data?.runs) ? response.data.runs : [];
         setRuns((current) => (offset ? [...current, ...nextRuns] : nextRuns));
         setRunsTotal(Number(response?.data?.count) || nextRuns.length);
       } catch (error) {
+        if (requestVersion !== listRequestVersion.current) return;
         console.error("Failed to load background run history", error);
         setRunsError("Run history is unavailable right now.");
       } finally {
-        setRunsLoading(false);
+        if (requestVersion === listRequestVersion.current) setRunsLoading(false);
       }
     },
     [backendReady, jobFilter],
@@ -225,7 +229,16 @@ const WriteHistoryPage = ({
     detailRequestVersion.current += 1;
     setExpandedRunIds(new Set());
     setRunDetails({});
+    setRuns([]);
+    setRunsTotal(0);
+    setRunsError("");
+    setRunsLoading(false);
     loadRuns(0);
+    // Changing jobs or disconnecting invalidates both list and detail responses.
+    return () => {
+      listRequestVersion.current += 1;
+      detailRequestVersion.current += 1;
+    };
   }, [loadRuns]);
 
   const refreshAll = () => {
@@ -585,8 +598,8 @@ const WriteHistoryPage = ({
                   ? "Authorization cards are paused before dispatch. Reconciliation cards ask you to record what you verified after dispatch; they never retry the effect."
                   : "Agent Console shows current-session work. This list records attempts and available effect evidence."}
                 {jobFilter ? ` Filtered to job ${jobFilter}.` : ""} Times use {displayTimezone}.{" "}
-                Run evidence contains status, retry, and effect metadata; never prompts, raw
-                errors, arguments, or results.
+                Run evidence records status, retries, and effects. Summaries can include
+                result or error text; treat this history as local user data.
               </span>
             </div>
             {runsError ? <p className="status-note error">{runsError}</p> : null}

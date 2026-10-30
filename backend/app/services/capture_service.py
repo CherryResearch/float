@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -350,11 +351,26 @@ class CaptureService:
 
     def get_capture(self, capture_id: str) -> Optional[Dict[str, Any]]:
         self.prune_expired()
+        return self.peek_capture(capture_id)
+
+    def peek_capture(self, capture_id: str) -> Optional[Dict[str, Any]]:
+        """Resolve a live capture without pruning unrelated runtime captures."""
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", str(capture_id or "")):
+            return None
         payload = self._read_meta(capture_id)
         if not isinstance(payload, dict):
             return None
+        expires_at = payload.get("expires_at")
+        if (
+            not payload.get("promoted")
+            and isinstance(expires_at, (int, float))
+            and expires_at <= time.time()
+        ):
+            return None
         target = self._resolve_path(payload)
-        if target is None or not target.exists():
+        if target is None or not target.is_file():
+            return None
+        if not target.is_relative_to(self.files_root):
             return None
         return self._descriptor(payload)
 

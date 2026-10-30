@@ -24,7 +24,7 @@
   /* Leave breathing room at the bottom; on small screens we increase this to avoid the input bubble */
   bottom: var(--space-sm);
   overflow: hidden;
-  z-index: 2100;
+  z-index: var(--layer-sidebar);
   /* Subtle theme-tinted glass to match the app's palette */
   background:
     linear-gradient(
@@ -1423,7 +1423,7 @@ body.dark-mode .conversation-item.is-active {
   align-items: center;
   justify-content: center;
   overflow-y: auto;
-  z-index: 10000;
+  z-index: var(--layer-modal);
 }
 
 .history-modal {
@@ -1558,6 +1558,12 @@ body.dark-mode .conversation-item.is-active {
 .history-modal-field input,
 .history-modal-field select,
 .history-modal-field textarea {
+  box-sizing: border-box;
+  min-width: 0;
+  min-height: var(--control-height);
+  font-family: var(--font-stack);
+  font-size: var(--text-sm);
+  line-height: 1.5;
   background: var(--color-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
@@ -4674,7 +4680,7 @@ body.dark-mode .agent-card {
 
 .agent-tasks-panel > .task-composer-overlay {
   position: fixed;
-  z-index: 1200;
+  z-index: var(--layer-modal);
 }
 .tasks-panel-header {
   display: flex;
@@ -4768,7 +4774,7 @@ body.dark-mode .agent-card {
   justify-content: center;
   align-items: center;
   padding: clamp(0.75rem, 2vw, 1.5rem);
-  z-index: 1200;
+  z-index: var(--layer-modal);
 }
 
 .task-composer {

@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from io import BytesIO
 from typing import Any, Dict, List, Optional
 
+from .conversation_store import GRAPH_LOCAL_ONLY_KEY
+
 _HEADER_RE = re.compile(r"^### \[(?P<role>[^\]]+)\](?P<rest>.*)$")
 _TEXT_HEADER_RE = re.compile(r"^\[(?P<role>[^\]]+)\](?:[ \t](?P<text>.*))?$")
 _MARKDOWN_EXPORT_VERSION_LINE = "- format_version: 2"
@@ -158,6 +160,8 @@ def export_conversation_json(
     include_thoughts: bool = True,
     include_tools: bool = True,
 ) -> Dict[str, Any]:
+    if metadata and metadata.get(GRAPH_LOCAL_ONLY_KEY):
+        messages = _mark_graph_restricted_messages(messages)
     if not include_chat or not include_thoughts or not include_tools:
         filtered: List[Dict[str, Any]] = []
         for msg in messages:
@@ -524,6 +528,9 @@ def _normalise_openai_content(content_obj: Any) -> Optional[Dict[str, Any]]:
     if text is None:
         return None
     out: Dict[str, Any] = {"role": role, "content": text, "text": text}
+    metadata = message_content.get("metadata")
+    if isinstance(metadata, dict) and metadata.get(GRAPH_LOCAL_ONLY_KEY):
+        out["metadata"] = {GRAPH_LOCAL_ONLY_KEY: True}
     if attachments:
         out["attachments"] = attachments
     return out
@@ -737,6 +744,9 @@ def import_openai_conversation_json(payload_obj: Any) -> List[Dict[str, Any]]:
                 if msg:
                     messages.append(msg)
             if messages:
+                metadata = payload_obj.get("metadata")
+                if isinstance(metadata, dict) and metadata.get(GRAPH_LOCAL_ONLY_KEY):
+                    return _mark_graph_restricted_messages(messages)
                 return messages
         if isinstance(payload_obj.get("mapping"), dict):
             messages: List[Dict[str, Any]] = []
@@ -900,8 +910,32 @@ def import_openai_conversation_zip(
         return []
 
 
+def _mark_graph_restricted_messages(
+    messages: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    return [
+        {
+            **message,
+            "metadata": {
+                **(
+                    message.get("metadata")
+                    if isinstance(message.get("metadata"), dict)
+                    else {}
+                ),
+                GRAPH_LOCAL_ONLY_KEY: True,
+            },
+        }
+        if isinstance(message, dict)
+        else message
+        for message in messages
+    ]
+
+
 def import_conversation_json_raw(data: Any) -> List[Dict[str, Any]]:
     if isinstance(data, dict) and isinstance(data.get("messages"), list):
+        metadata = data.get("metadata")
+        if isinstance(metadata, dict) and metadata.get(GRAPH_LOCAL_ONLY_KEY):
+            return _mark_graph_restricted_messages(data["messages"])
         return data.get("messages") or []
     if isinstance(data, list):
         return data

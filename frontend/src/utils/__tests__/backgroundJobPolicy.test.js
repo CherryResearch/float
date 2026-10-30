@@ -6,7 +6,11 @@ import {
   previewOccurrences,
   recurrenceSummary,
 } from "../backgroundJobPolicy";
-import { dateToZonedInput, defaultSeriesEndInput } from "../zonedDateTime";
+import {
+  dateToZonedInput,
+  defaultSeriesEndInput,
+  zonedInputToDate,
+} from "../zonedDateTime";
 
 describe("background job policy", () => {
   it("keeps schedule, patience, execution, and ownership independent", () => {
@@ -94,17 +98,39 @@ describe("background job policy", () => {
 
   it("uses the next compatible instant for a DST gap without shifting later days", () => {
     const timeZone = "America/Vancouver";
+    // Use a historical gap: Vancouver stopped changing clocks in March 2026.
     const preview = previewOccurrences(
-      "2027-03-13T02:30:00",
+      "2025-03-08T02:30:00",
       "FREQ=DAILY;INTERVAL=1;COUNT=3",
       3,
       timeZone,
     );
 
     expect(preview.map((item) => dateToZonedInput(item, timeZone))).toEqual([
-      "2027-03-13T02:30",
-      "2027-03-14T03:30",
-      "2027-03-15T02:30",
+      "2025-03-08T02:30",
+      "2025-03-09T03:30",
+      "2025-03-10T02:30",
     ]);
+    expect(zonedInputToDate("2025-03-09T02:30:00", timeZone)).toBeNull();
+    expect(preview[1].getTime() - preview[0].getTime()).toBe(24 * 60 * 60 * 1000);
+    expect(preview[2].getTime() - preview[1].getTime()).toBe(23 * 60 * 60 * 1000);
+  });
+
+  it("keeps ordinary UTC occurrences at the requested time across the same dates", () => {
+    const timeZone = "UTC";
+    const preview = previewOccurrences(
+      "2025-03-08T02:30:00",
+      "FREQ=DAILY;INTERVAL=1;COUNT=3",
+      3,
+      timeZone,
+    );
+
+    expect(preview.map((item) => dateToZonedInput(item, timeZone))).toEqual([
+      "2025-03-08T02:30",
+      "2025-03-09T02:30",
+      "2025-03-10T02:30",
+    ]);
+    expect(preview[1].getTime() - preview[0].getTime()).toBe(24 * 60 * 60 * 1000);
+    expect(preview[2].getTime() - preview[1].getTime()).toBe(24 * 60 * 60 * 1000);
   });
 });

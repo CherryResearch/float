@@ -812,6 +812,12 @@ def build_compaction(
     messages = conversation_store.load_conversation(source)
     if not isinstance(messages, list) or not messages:
         raise FileNotFoundError(f"Conversation not found or empty: {source}")
+    graph_restricted = conversation_store.graph_local_only(source)
+    if graph_restricted and requested_mode == SUMMARY_MODE_LLM:
+        raise ValueError(
+            "This conversation contains local-only graph.query results. "
+            "Use deterministic compaction; LLM compaction has no verified local destination."
+        )
     messages = compaction_relevant_messages(messages)
     if not messages:
         raise FileNotFoundError(f"Conversation not found or empty: {source}")
@@ -883,7 +889,16 @@ def build_compaction(
         "text": summary_text,
         "metadata": {"conversation_compaction": summary_metadata},
     }
+    if graph_restricted:
+        summary_message["metadata"][conversation_store.GRAPH_LOCAL_ONLY_KEY] = True
     compacted = [summary_message, *retained] if omitted else list(retained)
+    if graph_restricted and compacted:
+        first = dict(compacted[0])
+        first["metadata"] = {
+            **(first.get("metadata") or {}),
+            conversation_store.GRAPH_LOCAL_ONLY_KEY: True,
+        }
+        compacted[0] = first
     retained_start_index = len(omitted)
     target_id = default_target_conversation_id(source, created_at_epoch)
     target_name = (
@@ -916,6 +931,7 @@ def build_compaction(
         "proposed_target_conversation_id": target_id,
         "proposed_target_conversation_name": target_name,
         "messages": compacted,
+        conversation_store.GRAPH_LOCAL_ONLY_KEY: graph_restricted,
     }
 
 
@@ -967,6 +983,9 @@ def write_compaction(
                 compaction["replace"] = bool(replace)
                 if isinstance(context_budget_plan, dict):
                     compaction["budget_plan"] = context_budget_plan
+    if result.get(conversation_store.GRAPH_LOCAL_ONLY_KEY):
+        # Persist before writing derived text, including into a different conversation.
+        conversation_store.mark_graph_local_only(target)
     conversation_store.replace_conversation_content(target, compacted)
     display_name = str(result.get("proposed_target_conversation_name") or "").strip()
     if display_name:

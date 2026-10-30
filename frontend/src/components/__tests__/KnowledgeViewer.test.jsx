@@ -53,6 +53,7 @@ beforeAll(async () => {
 describe("KnowledgeViewer", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    localStorage.clear();
     vi.spyOn(axios, "get").mockResolvedValue({
       data: {
         ids: [],
@@ -60,6 +61,23 @@ describe("KnowledgeViewer", () => {
       },
     });
   });
+
+  it.each(["threads", "documents"])(
+    "opens %s without waiting for an unrelated knowledge listing",
+    async (tab) => {
+      axios.get.mockImplementation(() => new Promise(() => {}));
+      render(
+        <MemoryRouter initialEntries={[`/knowledge?tab=${tab}`]}>
+          <Routes>
+            <Route path="/knowledge" element={<KnowledgeViewer />} />
+          </Routes>
+        </MemoryRouter>,
+      );
+
+      expect(await screen.findByText(`${tab} tab body`)).toBeInTheDocument();
+      expect(axios.get).not.toHaveBeenCalled();
+    },
+  );
 
   it("switches away from tab=threads without snapping back", async () => {
     render(

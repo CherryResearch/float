@@ -1,5 +1,5 @@
 import React from "react";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import "@testing-library/jest-dom";
 import { vi } from "vitest";
@@ -487,6 +487,15 @@ describe("Settings tools browser", () => {
         /API, websocket, background queue, provider bridge, and storage health\./i,
       ),
     ).toBeInTheDocument();
+    const diagnostics = document.getElementById("settings-diagnostics");
+    expect(diagnostics).not.toHaveAttribute("open");
+    expect(
+      within(diagnostics.querySelector("summary")).getByText(
+        /Live updates unavailable · Background jobs unavailable/,
+      ),
+    ).toBeVisible();
+    fireEvent.click(diagnostics.querySelector("summary"));
+    expect(diagnostics).toHaveAttribute("open");
     expect(
       screen.getByText("Live thought stream not connected.", {
         selector: ".status-note--primary",
@@ -499,6 +508,40 @@ describe("Settings tools browser", () => {
     expect(
       screen.queryByText("Worker controls appear when the queue is reachable or tasks exist."),
     ).not.toBeInTheDocument();
+  });
+
+  it("keeps diagnostics collapsed and settings visible, with distinct refresh controls", async () => {
+    renderWithState();
+
+    expect(await screen.findByRole("heading", { name: /connections & access/i }))
+      .toBeVisible();
+    const diagnostics = document.getElementById("settings-diagnostics");
+    const summary = diagnostics.querySelector("summary");
+    expect(diagnostics).not.toHaveAttribute("open");
+    expect(summary.querySelector("button, input, select, a")).toBeNull();
+    expect(within(diagnostics).getByText("Service status")).not.toBeVisible();
+
+    fireEvent.click(summary);
+    expect(within(diagnostics).getByRole("heading", { name: "Service status" }))
+      .toBeVisible();
+    expect(within(diagnostics).getByRole("button", { name: "Refresh services" }))
+      .toBeVisible();
+    expect(within(diagnostics).getByRole("button", { name: "Refresh background jobs" }))
+      .toBeVisible();
+    expect(within(diagnostics).getByRole("combobox", { name: "Job view" }))
+      .toHaveDisplayValue("Running");
+
+    fireEvent.click(within(diagnostics).getByRole("checkbox", {
+      name: "Auto-refresh services",
+    }));
+    expect(within(diagnostics).getByRole("checkbox", {
+      name: "Auto-refresh background jobs",
+    })).not.toBeChecked();
+
+    fireEvent.click(summary);
+    expect(diagnostics).not.toHaveAttribute("open");
+    expect(modelJobsPanelMock.mounts).toBe(1);
+    expect(modelJobsPanelMock.unmounts).toBe(0);
   });
 
   it("names the review-all tool approval mode consistently", async () => {
@@ -522,6 +565,39 @@ describe("Settings tools browser", () => {
         selector: ".status-note--primary",
       }),
     ).toBeInTheDocument();
+  });
+
+  it("keeps a reconnected websocket online when an older service refresh completes", async () => {
+    const defaultGet = axios.get.getMockImplementation();
+    const pendingAutonomy = [];
+    axios.get.mockImplementation((url, ...args) => {
+      if (url === "/api/background/autonomy/status") {
+        return new Promise((resolve) => pendingAutonomy.push(resolve));
+      }
+      return defaultGet(url, ...args);
+    });
+    const setState = vi.fn();
+    const renderState = (wsStatus) => (
+      <MemoryRouter>
+        <GlobalContext.Provider value={{ state: { ...baseState, wsStatus }, setState }}>
+          <Settings />
+        </GlobalContext.Provider>
+      </MemoryRouter>
+    );
+    const view = render(renderState("offline"));
+    await screen.findByRole("heading", { name: "settings" });
+    await waitFor(() => expect(pendingAutonomy.length).toBeGreaterThan(0));
+
+    view.rerender(renderState("online"));
+    await act(async () => {
+      pendingAutonomy.forEach((resolve) => resolve({ data: { autonomy: { enabled: false } } }));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Live thought stream connected.")).toBeInTheDocument();
+      expect(document.querySelector(".settings-diagnostics-summary"))
+        .not.toHaveTextContent("Live updates unavailable");
+    });
   });
 
   it("explains when a provider server is running outside Float", async () => {
@@ -691,6 +767,47 @@ describe("Settings tools browser", () => {
         }),
       );
     });
+  });
+
+  it("keeps rejected runtime settings staged until a successful retry", async () => {
+    const SettingsHarness = () => {
+      const [state, setState] = React.useState({ ...baseState, backendMode: "api" });
+      return (
+        <MemoryRouter>
+          <GlobalContext.Provider value={{ state, setState }}>
+            <output data-testid="applied-harmony-mode">{state.harmonyFormatMode}</output>
+            <Settings />
+          </GlobalContext.Provider>
+        </MemoryRouter>
+      );
+    };
+    let saveAttempts = 0;
+    axios.post.mockImplementation((url) => {
+      if (url === "/api/settings" && saveAttempts++ === 0) {
+        return Promise.reject(new Error("Settings validation rejected"));
+      }
+      return Promise.resolve({ data: {} });
+    });
+    render(<SettingsHarness />);
+
+    const modeSelect = await screen.findByLabelText("Mode", {
+      selector: "#harmony-mode-select",
+    });
+    fireEvent.change(modeSelect, { target: { value: "disabled" } });
+    const saveButton = screen.getByRole("button", { name: /^save$/i });
+    await waitFor(() => expect(saveButton).toBeEnabled());
+    fireEvent.click(saveButton);
+
+    expect(await screen.findByText("Error saving settings.")).toBeInTheDocument();
+    expect(screen.getByTestId("applied-harmony-mode")).toHaveTextContent("auto");
+    expect(modeSelect).toHaveValue("disabled");
+    expect(saveButton).toBeEnabled();
+
+    fireEvent.click(saveButton);
+    expect(await screen.findByText("Settings saved successfully.")).toBeInTheDocument();
+    expect(screen.getByTestId("applied-harmony-mode")).toHaveTextContent("disabled");
+    expect(saveAttempts).toBe(2);
+    await waitFor(() => expect(saveButton).toBeDisabled());
   });
 
   it("hides a missing selected model when downloaded-only is enabled", async () => {

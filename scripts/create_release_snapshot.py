@@ -54,6 +54,7 @@ INCLUDE_PATHS = [
     "package.json",
     "poetry.lock",
     "pyproject.toml",
+    "pytest.ini",
     "scripts",
 ]
 

@@ -49,50 +49,6 @@ body {
     background-color: var(--color-background-secondary);
   }
 
-  /* Input Box */
-  .input-box {
-    display: flex;
-    padding: var(--space-sm);
-    margin: var(--space-sm);
-    background: var(--glass-tint);
-    border-radius: var(--radius-md);
-    box-shadow: var(--shadow-md);
-  }
-
-  .input-box input {
-    flex: 1;
-    padding: var(--space-sm);
-    border: 1px solid var(--color-border);
-    border-radius: 5px;
-    font-size: 1rem;
-    font-family: var(--font-stack);
-  }
-
-  .input-box textarea {
-    flex: 1;
-    padding: var(--space-sm);
-    border: 1px solid var(--color-border);
-    border-radius: 5px;
-    font-size: 1rem;
-    resize: vertical;
-    font-family: var(--font-stack);
-  }
-
-  .input-box button {
-    margin-left: var(--space-sm);
-    padding: var(--space-sm) var(--space-md);
-    background-color: var(--color-primary-dark);
-    color: white;
-    border: none;
-    border-radius: 5px;
-    cursor: pointer;
-    font-family: var(--font-stack);
-  }
-
-  .input-box button:hover {
-    background-color: var(--color-primary);
-  }
-
   /* Visualization Tab */
   .visualization-container {
     flex: 1;

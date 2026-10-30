@@ -243,6 +243,13 @@ def normalize_tool_args(tool_name: str, raw_args: Any) -> Dict[str, Any]:
     required = schema.get("required")
     required_keys = [str(k) for k in required] if isinstance(required, list) else []
 
+    if normalized_tool_name == "graph.query":
+        # Graph dates and limits are strict: do not turn True into a date,
+        # clamp an invalid limit, or silently ignore unsupported history.
+        from app.utils.graph_store import validate_graph_query_filters
+
+        validate_graph_query_filters(base)
+
     additional = schema.get("additionalProperties")
     if additional is False:
         base = {k: v for k, v in base.items() if k in properties}

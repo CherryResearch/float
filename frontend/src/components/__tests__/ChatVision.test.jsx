@@ -164,6 +164,29 @@ describe("Chat vision integration", () => {
     ).toBeNull();
   });
 
+  it("does not repeat a legacy camera notice on an unrelated tool continuation", () => {
+    renderChat({
+      conversation: [
+        {
+          id: "earlier:user", role: "user", text: "Read this image",
+          attachments: [{ name: "camera.png", type: "image/png", capture_id: "earlier-camera" }],
+        },
+        { id: "earlier", role: "ai", text: "I can read the image." },
+        { id: "recall:user", role: "user", text: "Recall our previous project notes." },
+        {
+          id: "recall", role: "ai", text: "The recall request has finished.",
+          metadata: {
+            vision: {
+              native_image_input: false, fallback_used: true,
+              fallback_attachments: [{ name: "camera.png", capture_id: "earlier-camera", placeholder: false }],
+            },
+          },
+        },
+      ],
+    });
+    expect(screen.queryByRole("status", { name: "Image delivery notice" })).not.toBeInTheDocument();
+  });
+
   afterEach(() => {
     cleanup();
     sessionStorage.clear();
@@ -399,9 +422,14 @@ describe("Chat vision integration", () => {
     expect(
       screen.queryByRole("button", { name: /explain vision modes/i }),
     ).not.toBeInTheDocument();
-    expect(
-      screen.getByText("Vision mode"),
-    ).toHaveAttribute("title", "How the image will be interpreted by the model.");
+    fireEvent.mouseOver(screen.getByText("Vision mode"));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("prioritize reading visible text");
+    expect(screen.getByRole("tooltip")).toHaveTextContent("Compare two or more attached images");
+    expect(screen.getByRole("option", { name: "ocr" })).toHaveAttribute(
+      "title", "Treat the image like a document and prioritize reading visible text.",
+    );
+    expect(select).toHaveAttribute("aria-describedby", "vision-workflow-description");
+    fireEvent.mouseLeave(screen.getByText("Vision mode"));
     expect(select).toHaveAttribute(
       "title",
       expect.stringContaining("How the image will be interpreted by the model."),
@@ -868,10 +896,13 @@ describe("Chat vision integration", () => {
 
     renderChat();
     fireEvent.click(screen.getByRole("button", { name: /open attachments/i }));
-    fireEvent.click(await screen.findByRole("button", { name: /capture from camera/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /take photo/i }));
 
     expect(getUserMedia).toHaveBeenCalledTimes(1);
     await screen.findByRole("button", { name: "capture" });
+    fireEvent.click(screen.getByRole("button", { name: /open attachments/i }));
+    expect(screen.getByRole("button", { name: "Close camera" })).toHaveTextContent("Close camera");
+    fireEvent.click(screen.getByRole("button", { name: /open attachments/i }));
     expect(
       screen.getByRole("separator", { name: /drag to resize composer/i }),
     ).toHaveAttribute("aria-disabled", "true");
@@ -906,7 +937,7 @@ describe("Chat vision integration", () => {
 
     const view = renderChat();
     fireEvent.click(screen.getByRole("button", { name: /open attachments/i }));
-    fireEvent.click(await screen.findByRole("button", { name: /capture from camera/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /take photo/i }));
     fireEvent.click(await screen.findByRole("button", { name: "capture" }));
 
     await waitFor(() =>
@@ -956,7 +987,7 @@ describe("Chat vision integration", () => {
 
     renderChat();
     fireEvent.click(screen.getByRole("button", { name: /open attachments/i }));
-    fireEvent.click(await screen.findByRole("button", { name: /capture from camera/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /take photo/i }));
 
     expect(getUserMedia).toHaveBeenCalledTimes(1);
     const alert = await screen.findByRole("alert");
@@ -967,7 +998,7 @@ describe("Chat vision integration", () => {
     expect(alertStack?.parentElement).toBe(document.body);
     expect(document.querySelector(".input-box .input-alert-stack")).toBeNull();
     await waitFor(() => expect(alertStack?.style.position).toBe("fixed"));
-    expect(alertStack?.style.zIndex).toBe("3620");
+    expect(alertStack?.style.zIndex).toBe("var(--layer-popover)");
   });
 
   it("pastes image clipboard items into attachments", async () => {
@@ -1010,7 +1041,7 @@ describe("Chat vision integration", () => {
 
     renderChat();
     fireEvent.click(screen.getByRole("button", { name: /open attachments/i }));
-    fireEvent.click(await screen.findByRole("button", { name: /capture from camera/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /take photo/i }));
 
     const closeButton = await screen.findByRole("button", {
       name: /close camera preview/i,

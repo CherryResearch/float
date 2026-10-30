@@ -64,6 +64,8 @@ def _prepare_chat_runtime(monkeypatch, tmp_path, messages, *, scope_messages=Tru
 
 
 def _record_terminal_tools(app, *, session_id, message_id, tools):
+    from app import routes
+
     registry = getattr(app.state, "pending_tools", None)
     if not isinstance(registry, dict):
         registry = {}
@@ -78,6 +80,16 @@ def _record_terminal_tools(app, *, session_id, message_id, tools):
             "message_id": message_id,
             "chain_id": message_id,
         }
+        if tool.get("name") == "recall" and tool.get("status") == "invoked":
+            # These fixtures represent completed, filtered external reads.
+            routes._record_tool_data_policy(
+                app,
+                request_id,
+                session_id,
+                message_id,
+                routes._request_data_destination(app, tool.get("mode") or "api"),
+                completed=True,
+            )
 
 
 def _post_recorded_continuation(app, *, json):

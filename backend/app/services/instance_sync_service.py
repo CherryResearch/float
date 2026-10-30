@@ -38,6 +38,7 @@ from app.utils.blob_store import BLOBS_DIR, find_asset_path
 from app.utils.blob_store import iter_attachment_hashes as iter_stored_attachment_hashes
 from app.utils.blob_store import managed_relative_path, resolve_managed_path
 from app.utils.deployment_status import deployment_identity_summary
+from app.utils.privacy_policy import project_knowledge_record
 from app.utils.sync_paths import sync_attachment_relative_path
 from app.utils.workspace_registry import (
     resolve_workspace_selection,
@@ -3722,7 +3723,9 @@ class InstanceSyncService:
         return items
 
     def _knowledge_snapshot(self) -> List[Dict[str, Any]]:
-        return self._knowledge_records()
+        return [
+            project_knowledge_record(record) for record in self._knowledge_records()
+        ]
 
     def _knowledge_records(self) -> List[Dict[str, Any]]:
         knowledge_store_module.KnowledgeStore()
@@ -3797,6 +3800,7 @@ class InstanceSyncService:
             for record in payload:
                 if not isinstance(record, dict):
                     continue
+                record = project_knowledge_record(record)
                 knowledge_id = str(
                     record.get("knowledge_id") or record.get("sync_id") or ""
                 ).strip()
@@ -4006,6 +4010,7 @@ class InstanceSyncService:
                     "ordinal": int(role["ordinal"]),
                     "node_id": role["node_id"],
                     "value": graph_store_module._json_loads_any(role["value_json"]),
+                    "value_present": role["value_json"] is not None,
                     "metadata": graph_store_module._json_loads(role["metadata_json"]),
                 }
             )
@@ -4147,7 +4152,11 @@ class InstanceSyncService:
                         str(claim.get("predicate") or ""),
                         str(claim.get("status") or "active"),
                         str(claim.get("epistemic_status") or "asserted"),
-                        float(claim.get("confidence") or 1.0),
+                        float(
+                            1.0
+                            if claim.get("confidence") is None
+                            else claim["confidence"]
+                        ),
                         claim.get("valid_from"),
                         claim.get("valid_to"),
                         claim.get("occurred_at"),
@@ -4177,8 +4186,12 @@ class InstanceSyncService:
                             str(role.get("role_name") or ""),
                             int(role.get("ordinal") or 0),
                             role.get("node_id"),
-                            _json_dumps(role.get("value"))
-                            if role.get("value") is not None
+                            json.dumps(
+                                role.get("value"),
+                                ensure_ascii=False,
+                                default=memory_store._default_serializer,
+                            )
+                            if role.get("value_present", role.get("value") is not None)
                             else None,
                             _json_dumps(role.get("metadata") or {}),
                         ),

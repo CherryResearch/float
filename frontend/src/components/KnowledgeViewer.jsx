@@ -1,5 +1,4 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import axios from "axios";
 import { useLocation, useNavigate } from "react-router-dom";
 import "../styles/KnowledgeViewer.css";
 import CalendarTab from "./CalendarTab";
@@ -13,10 +12,7 @@ import { Line, Rect } from "./Skeleton";
 const KnowledgeVisualizationsTab = React.lazy(() => import("./KnowledgeVisualizationsTab"));
 
 const KnowledgeViewer = () => {
-  const [, setMemoryDocs] = useState([]);
-  const [loading, setLoading] = useState(false);
   const [tab, setTab] = useState(() => localStorage.getItem("knowledge-tab") || "memory");
-  const table = "default";
   const tabsRef = useRef(null);
   const [tabsHeight, setTabsHeight] = useState(0);
   const location = useLocation();
@@ -26,22 +22,6 @@ const KnowledgeViewer = () => {
   const focusMemoryKey = params.get("key");
   const focusDocId = params.get("id");
   const focusEventId = params.get("event_id");
-
-  const loadDocs = () => {
-    setLoading(true);
-    axios
-      .get(`/api/knowledge/list?table=${table}`)
-      .then((res) => {
-        const ids = res.data.ids || [];
-        const metas = res.data.metadatas || [];
-        const list = ids.map((id, idx) => ({ id, metadata: metas[idx] || {} }));
-        setMemoryDocs(list);
-      })
-      .catch((err) => console.error("Failed to load knowledge", err))
-      .finally(() => setLoading(false));
-  };
-
-  useEffect(loadDocs, [table]);
 
   useEffect(() => {
     const measure = () => {
@@ -79,7 +59,7 @@ const KnowledgeViewer = () => {
     if (activeTab && typeof activeTab.scrollIntoView === "function") {
       activeTab.scrollIntoView({ block: "nearest", inline: "center" });
     }
-  }, [tab]);
+  }, [tab, tabsHeight]);
 
   return (
     <div
@@ -146,16 +126,9 @@ const KnowledgeViewer = () => {
         ) : tab === "calendar" ? (
           <CalendarTab focusEventId={focusEventId} />
         ) : tab === "threads" ? (
-          loading ? (
-            <div className="threads-panel">
-              <Line width="40%" />
-              <Rect height={220} />
-            </div>
-          ) : (
-            <div className="threads-panel">
-              <ThreadsTab />
-            </div>
-          )
+          <div className="threads-panel">
+            <ThreadsTab />
+          </div>
         ) : tab === "visualizations" ? (
           <React.Suspense
             fallback={
@@ -173,14 +146,7 @@ const KnowledgeViewer = () => {
         ) : tab === "sync" ? (
           <KnowledgeSyncTab />
         ) : (
-          loading ? (
-            <div className="docs-panel">
-              <Line width="50%" />
-              <Rect height={180} />
-            </div>
-          ) : (
-            <DocumentsTab focusId={focusDocId} />
-          )
+          <DocumentsTab focusId={focusDocId} />
         )}
       </div>
     </div>

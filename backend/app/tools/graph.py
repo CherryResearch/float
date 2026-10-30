@@ -3,9 +3,10 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from app.services.graph_payload_service import apply_graph_payload
-from app.utils import verify_signature
+from app.utils import privacy_policy, verify_signature
 
 _GRAPH_STORE = None
+_DEFAULT = object()
 
 
 def set_graph_store(store) -> None:
@@ -53,4 +54,46 @@ def update_graph(
     }
 
 
-__all__ = ["set_graph_store", "update_graph"]
+def query_graph(
+    mode: str | object = _DEFAULT,
+    node_id: Optional[str] | object = _DEFAULT,
+    predicate: Optional[str] | object = _DEFAULT,
+    role_nodes: Optional[Dict[str, str]] | object = _DEFAULT,
+    epistemic_status: Optional[str] | object = _DEFAULT,
+    valid_at: Optional[float] | object = _DEFAULT,
+    occurred_from: Optional[float] | object = _DEFAULT,
+    occurred_before: Optional[float] | object = _DEFAULT,
+    known_at: Optional[float] | object = _DEFAULT,
+    limit: int | object = _DEFAULT,
+    *,
+    user: str,
+    signature: str,
+) -> Dict[str, Any]:
+    """Query retained graph claims without changing state or resolving conflicts."""
+    payload = {
+        key: value
+        for key, value in {
+            "mode": mode,
+            "node_id": node_id,
+            "predicate": predicate,
+            "role_nodes": role_nodes,
+            "epistemic_status": epistemic_status,
+            "valid_at": valid_at,
+            "occurred_from": occurred_from,
+            "occurred_before": occurred_before,
+            "known_at": known_at,
+            "limit": limit,
+        }.items()
+        if value is not _DEFAULT
+    }
+    verify_signature(signature, user, "graph.query", payload)
+    policy = privacy_policy.current_data_policy()
+    if policy is None or policy.external is not False:
+        raise PermissionError(
+            "graph.query is local-only: sensitivity inheritance is not enforced; "
+            "an explicit local data-policy destination is required"
+        )
+    return {"status": "ok", **_store().query_claims(**payload)}
+
+
+__all__ = ["set_graph_store", "update_graph", "query_graph"]

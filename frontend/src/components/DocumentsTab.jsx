@@ -6,7 +6,7 @@ import CsvTableEditor from "./CsvTableEditor";
 import CsvTablePreview from "./CsvTablePreview";
 import MarkdownPreview from "./MarkdownPreview";
 import MediaViewer from "./MediaViewer";
-import FilterBar from "./FilterBar";
+import { ControlField, DisclosurePanel } from "./ui/UiControls";
 import { TABULAR_DOC_EXTENSIONS } from "../utils/csvPreview";
 import {
   EDITABLE_TEXT_DOC_EXTENSIONS,
@@ -19,6 +19,30 @@ const DOC_SEARCH_MODES = {
   CATALOG: "catalog",
   SEMANTIC: "semantic",
 };
+
+const DOC_SEARCH_OPTIONS = [
+  [DOC_SEARCH_MODES.CATALOG, "Names and paths"],
+  [DOC_SEARCH_MODES.SEMANTIC, "Meaning and images"],
+];
+const DOC_RETRIEVAL_OPTIONS = [
+  ["hybrid", "Text and images"],
+  ["clip", "Images"],
+  ["text", "Text"],
+];
+const DOC_LAYOUT_OPTIONS = [["folders", "Folders"], ["list", "List"]];
+const DOC_SORT_OPTIONS = [
+  ["id:asc", "ID, ascending"],
+  ["id:desc", "ID, descending"],
+  ["title:asc", "Title, A to Z"],
+  ["title:desc", "Title, Z to A"],
+  ["folder:asc", "Folder, A to Z"],
+  ["folder:desc", "Folder, Z to A"],
+];
+const DOC_ADD_ACTIONS = [
+  { key: "file", label: "Upload file", hint: "Choose a file from your device." },
+  { key: "folder", label: "Import folder", hint: "Add files from a folder in Float's data/files." },
+  { key: "note", label: "Quick note", hint: "Write or paste text." },
+];
 
 const ATTACHMENT_FOLDER_ASSIGNMENTS_STORAGE_KEY =
   "documentsAttachmentFolderAssignments";
@@ -516,6 +540,7 @@ const DocumentsTab = ({ focusId = null }) => {
   const [showDerivedItems, setShowDerivedItems] = useState(false);
   const [actionStatus, setActionStatus] = useState("");
   const [activeActionModal, setActiveActionModal] = useState(null);
+  const [addMenuOpen, setAddMenuOpen] = useState(false);
   const [docsInfoOpen, setDocsInfoOpen] = useState(false);
 
   const [uploadFile, setUploadFile] = useState(null);
@@ -619,7 +644,26 @@ const DocumentsTab = ({ focusId = null }) => {
   const [activeDocError, setActiveDocError] = useState("");
   const docsInfoButtonRef = useRef(null);
   const docsInfoPanelRef = useRef(null);
+  const addMenuRef = useRef(null);
   const focusedDocRef = useRef("");
+
+  useEffect(() => {
+    if (!addMenuOpen) return undefined;
+    const closeOnOutside = (event) => {
+      if (!addMenuRef.current?.contains(event.target)) setAddMenuOpen(false);
+    };
+    const closeOnEscape = (event) => {
+      if (event.key !== "Escape") return;
+      setAddMenuOpen(false);
+      addMenuRef.current?.querySelector("summary")?.focus();
+    };
+    document.addEventListener("pointerdown", closeOnOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [addMenuOpen]);
 
   const clearUploadState = useCallback(() => {
     if (uploadPreview) {
@@ -1868,7 +1912,7 @@ const DocumentsTab = ({ focusId = null }) => {
     if (activeActionModal === "file") {
       return (
         <>
-          <h3>Ingest file</h3>
+          <h3>Upload file</h3>
           <div className="history-modal-body">
             <label className="history-modal-field">
               <span>File</span>
@@ -1885,7 +1929,7 @@ const DocumentsTab = ({ focusId = null }) => {
               </div>
             )}
             {uploadStatus === "error" && (
-              <div className="status-note warn">File ingest failed.</div>
+              <div className="status-note warn">Upload failed. Try again.</div>
             )}
           </div>
           <div className="history-modal-actions">
@@ -1898,7 +1942,7 @@ const DocumentsTab = ({ focusId = null }) => {
               onClick={uploadDocument}
               disabled={!uploadFile || uploadStatus === "ingesting"}
             >
-              {uploadStatus === "ingesting" ? "Ingesting..." : "Ingest"}
+              {uploadStatus === "ingesting" ? "Uploading..." : "Upload"}
             </button>
           </div>
         </>
@@ -1907,7 +1951,7 @@ const DocumentsTab = ({ focusId = null }) => {
     if (activeActionModal === "folder") {
       return (
         <>
-          <h3>Ingest folder</h3>
+          <h3>Import folder</h3>
           <div className="history-modal-body">
             <label className="history-modal-field">
               <span>Folder path (under data/files)</span>
@@ -1944,7 +1988,7 @@ const DocumentsTab = ({ focusId = null }) => {
                   checked={ingestRecursive}
                   onChange={(event) => setIngestRecursive(!!event.target.checked)}
                 />{" "}
-                recurse subfolders
+                Include subfolders
               </span>
             </label>
             {ingestResult ? (
@@ -1969,7 +2013,7 @@ const DocumentsTab = ({ focusId = null }) => {
               onClick={ingestFolder}
               disabled={ingestBusy || !ingestFolderPath.trim()}
             >
-              {ingestBusy ? "Ingesting..." : "Ingest"}
+              {ingestBusy ? "Importing..." : "Import"}
             </button>
           </div>
         </>
@@ -2033,89 +2077,94 @@ const DocumentsTab = ({ focusId = null }) => {
     return null;
   };
 
+  const sourceFilters = [
+    { label: "Archived documents", checked: showArchived, onChange: setShowArchived },
+    { label: "Memories", checked: showMemoryItems, onChange: setShowMemoryItems },
+    { label: "External paths", checked: showExternalItems, onChange: setShowExternalItems },
+    { label: "Generated captions", checked: showDerivedItems, onChange: setShowDerivedItems },
+  ];
+  const sortValue = `${sortBy}:${sortDir}`;
+  const filterSummary = [
+    DOC_SEARCH_OPTIONS.find(([value]) => value === searchMode)?.[1],
+    searchMode === DOC_SEARCH_MODES.SEMANTIC
+      ? DOC_RETRIEVAL_OPTIONS.find(([value]) => value === semanticMode)?.[1]
+      : null,
+    DOC_LAYOUT_OPTIONS.find(([value]) => value === docViewMode)?.[1],
+    DOC_SORT_OPTIONS.find(([value]) => value === sortValue)?.[1],
+    ...sourceFilters.filter((filter) => filter.checked).map((filter) => filter.label),
+  ].filter(Boolean).join(" · ");
+  const filterFields = [
+    { label: "Search method", value: searchMode, onChange: setSearchMode, options: DOC_SEARCH_OPTIONS },
+    ...(searchMode === DOC_SEARCH_MODES.SEMANTIC ? [{
+      label: "Search content", value: semanticMode, onChange: setSemanticMode, options: DOC_RETRIEVAL_OPTIONS,
+    }] : []),
+    { label: "Layout", value: docViewMode, onChange: setDocViewMode, options: DOC_LAYOUT_OPTIONS },
+    {
+      label: "Sort documents", value: sortValue, options: DOC_SORT_OPTIONS,
+      onChange: (value) => {
+        const [nextSort, nextDirection] = value.split(":");
+        setSortBy(nextSort);
+        setSortDir(nextDirection);
+      },
+    },
+  ];
+
   return (
     <div className="documents-tab">
-      <FilterBar
-        searchPlaceholder={
-          searchMode === DOC_SEARCH_MODES.SEMANTIC
-            ? "Semantic search docs and captions"
-            : "Search docs by id, title, source, or folder"
-        }
-        searchValue={searchQuery}
-        onSearch={setSearchQuery}
-      >
-        <label>
-          mode
-          <select value={searchMode} onChange={(event) => setSearchMode(event.target.value)}>
-            <option value={DOC_SEARCH_MODES.CATALOG}>catalog</option>
-            <option value={DOC_SEARCH_MODES.SEMANTIC}>semantic</option>
-          </select>
-        </label>
-        {searchMode === DOC_SEARCH_MODES.SEMANTIC && (
-          <label>
-            mode
-            <select value={semanticMode} onChange={(event) => setSemanticMode(event.target.value)}>
-              <option value="hybrid">hybrid (clip + text)</option>
-              <option value="clip">clip (images)</option>
-              <option value="text">text</option>
-            </select>
-          </label>
-        )}
-        <label>
-          layout
-          <select value={docViewMode} onChange={(event) => setDocViewMode(event.target.value)}>
-            <option value="list">list</option>
-            <option value="folders">folders</option>
-          </select>
-        </label>
-        <label>
-          sort
-          <select value={sortBy} onChange={(event) => setSortBy(event.target.value)}>
-            <option value="id">id</option>
-            <option value="title">title</option>
-            <option value="folder">folder</option>
-          </select>
-        </label>
-        <label>
-          order
-          <select value={sortDir} onChange={(event) => setSortDir(event.target.value)}>
-            <option value="asc">asc</option>
-            <option value="desc">desc</option>
-          </select>
-        </label>
-        <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <input
-            type="checkbox"
-            checked={showArchived}
-            onChange={(event) => setShowArchived(!!event.target.checked)}
-          />
-          archived
-        </label>
-        <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <input
-            type="checkbox"
-            checked={showMemoryItems}
-            onChange={(event) => setShowMemoryItems(!!event.target.checked)}
-          />
-          memories
-        </label>
-        <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <input
-            type="checkbox"
-            checked={showExternalItems}
-            onChange={(event) => setShowExternalItems(!!event.target.checked)}
-          />
-          external paths
-        </label>
-        <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <input
-            type="checkbox"
-            checked={showDerivedItems}
-            onChange={(event) => setShowDerivedItems(!!event.target.checked)}
-          />
-          derived captions
-        </label>
-      </FilterBar>
+      <section className="documents-toolbar" aria-label="Document controls">
+        <div className="documents-toolbar-main">
+          <ControlField label="Search documents" className="documents-search-field">
+            <input
+              type="search"
+              placeholder={searchMode === DOC_SEARCH_MODES.SEMANTIC
+                ? "Describe text or an image to find"
+                : "Search by title, ID, source, or folder"}
+              value={searchQuery}
+              onChange={(event) => setSearchQuery(event.target.value)}
+            />
+          </ControlField>
+          <div ref={addMenuRef} className="documents-add-menu">
+            <DisclosurePanel title="Add" open={addMenuOpen} onToggle={setAddMenuOpen}>
+              {DOC_ADD_ACTIONS.map((action) => (
+                <button
+                  type="button"
+                  key={action.key}
+                  onClick={() => {
+                    setAddMenuOpen(false);
+                    setActiveActionModal(action.key);
+                  }}
+                >
+                  <span>{action.label}</span>
+                  <span className="documents-add-hint">{action.hint}</span>
+                </button>
+              ))}
+            </DisclosurePanel>
+          </div>
+        </div>
+        <DisclosurePanel title="Filters" summary={filterSummary} className="documents-filters">
+          <div className="documents-filter-grid">
+            {filterFields.map((field) => (
+              <ControlField key={field.label} label={field.label}>
+                <select value={field.value} onChange={(event) => field.onChange(event.target.value)}>
+                  {field.options.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                </select>
+              </ControlField>
+            ))}
+          </div>
+          <fieldset className="documents-source-filters">
+            <legend>Also show</legend>
+            {sourceFilters.map((filter) => (
+              <ControlField key={filter.label} label={filter.label}>
+                <input
+                  type="checkbox"
+                  checked={filter.checked}
+                  onChange={(event) => filter.onChange(event.target.checked)}
+                />
+              </ControlField>
+            ))}
+          </fieldset>
+        </DisclosurePanel>
+      </section>
 
       <section className="docs-summary">
         <div className="docs-summary-head">
@@ -2125,7 +2174,6 @@ const DocumentsTab = ({ focusId = null }) => {
             type="button"
             className={`docs-summary-help${docsInfoOpen ? " is-open" : ""}`}
             title={docsSummaryTooltip}
-            data-tooltip={docsSummaryTooltip}
             aria-expanded={docsInfoOpen}
             onClick={() => {
               setDocsInfoOpen((prev) => {
@@ -2137,7 +2185,7 @@ const DocumentsTab = ({ focusId = null }) => {
               });
             }}
           >
-            info
+            Details
           </button>
         </div>
         {docsInfoOpen ? (
@@ -2156,30 +2204,6 @@ const DocumentsTab = ({ focusId = null }) => {
             </p>
           </div>
         ) : null}
-      </section>
-
-      <section className="documents-actions-bar">
-        <button
-          type="button"
-          onClick={() => setActiveActionModal("file")}
-          title="Ingest a local file"
-        >
-          ingest file
-        </button>
-        <button
-          type="button"
-          onClick={() => setActiveActionModal("folder")}
-          title="Ingest a folder from data/files"
-        >
-          ingest folder
-        </button>
-        <button
-          type="button"
-          onClick={() => setActiveActionModal("note")}
-          title="Create a quick text note"
-        >
-          quick note
-        </button>
       </section>
 
       {actionStatus ? <p className="status-note">{actionStatus}</p> : null}

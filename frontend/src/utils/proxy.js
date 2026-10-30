@@ -1,4 +1,5 @@
 import axios from "axios";
+import { waitForChatResponse } from "./chatResponseRecovery";
 
 const RAW_API_BASE = import.meta.env.VITE_API_BASE_URL || "/api";
 const API_BASE_URL = RAW_API_BASE.endsWith("/")
@@ -325,12 +326,25 @@ export const apiWrapper = new Proxy(
         debugLog(`API Call: ${endpoint}`, params);
 
         try {
-          const res = await axios.post(
+          const request = axios.post(
             `${API_BASE_URL}/${endpoint}`,
             params,
             signal ? { signal } : undefined,
           );
-          return res.data;
+          if (endpoint === "chat" && params.session_id && params.message_id && !params.regenerate) {
+            return await waitForChatResponse(request.then((res) => res.data), {
+              messageId: params.message_id,
+              signal,
+              readConversation: async () => {
+                const response = await axios.get(
+                  `${API_BASE_URL}/conversations/${encodeURIComponent(params.session_id)}`,
+                  { timeout: 15000, signal },
+                );
+                return response.data;
+              },
+            });
+          }
+          return (await request).data;
         } catch (err) {
           const cancelled =
             (signal && signal.aborted) ||
@@ -350,7 +364,7 @@ export const apiWrapper = new Proxy(
               ? "Request failed (502). The backend or dev proxy was unavailable for a moment."
               : err?.message) ||
             "API request failed";
-          return { error: detail, status };
+          return { error: detail, status, code: err?.code };
         }
       };
     },

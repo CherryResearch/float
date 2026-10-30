@@ -14,6 +14,7 @@ from app import config as app_config
 from app import hooks
 from app.services import privacy_filter_service
 from app.services.text_chunks import chunk_text as shared_chunk_text
+from app.utils import privacy_policy
 from app.utils.knowledge_store import KnowledgeStore
 from services.weaviate_client import create_client
 from watchdog.events import FileSystemEventHandler
@@ -173,6 +174,16 @@ class _VectorBackendError(RuntimeError):
     """Raised when the configured vector backend cannot be initialized."""
 
 
+def _metadata_matches_source(metadata, source: str) -> bool:
+    meta = metadata if isinstance(metadata, dict) else {}
+    value = str(meta.get("source") or "").strip()
+    return (
+        value == source
+        or str(meta.get("root_source") or "").strip() == source
+        or value.startswith(f"{source}#chunk:")
+    )
+
+
 class _WeaviateBackend:
     def __init__(
         self,
@@ -323,6 +334,28 @@ class _WeaviateBackend:
             "ids": [o["id"] for o in objs],
             "metadatas": [o.get("properties", {}) for o in objs],
         }
+
+    def delete_source_strict(self, source: str) -> None:
+        collection = (
+            self._ensure_v4_collection() if self._uses_collections_api else None
+        )
+        iterator = getattr(collection, "iterator", None)
+        if not callable(iterator):
+            raise _VectorBackendError(
+                "This Weaviate adapter cannot enumerate all rows to verify private mirror cleanup"
+            )
+        for item in iterator():
+            doc_id, props = self._v4_object_payload(item)
+            if doc_id == _doc_id_for_source(source) or _metadata_matches_source(
+                props, source
+            ):
+                self.delete_doc(doc_id)
+        for item in iterator():
+            doc_id, props = self._v4_object_payload(item)
+            if doc_id == _doc_id_for_source(source) or _metadata_matches_source(
+                props, source
+            ):
+                raise _VectorBackendError("Retrieval rows remain after deletion")
 
     def get_doc(self, doc_id: str):
         if self._uses_collections_api:
@@ -575,11 +608,13 @@ class _ChromaBackend:
         except BaseException:
             return None
 
-    def _all_collection_names(self) -> list[str]:
+    def _all_collection_names(self, *, strict: bool = False) -> list[str]:
         names: list[str] = []
         try:
             listed = self.client.list_collections()
-        except BaseException:
+        except BaseException as exc:
+            if strict or _is_fatal_base_exception(exc):
+                raise
             listed = []
         for entry in listed or []:
             name = None
@@ -597,18 +632,25 @@ class _ChromaBackend:
                 names.append(name)
         return names
 
-    def _iter_candidate_collections(self) -> list:
+    def _iter_candidate_collections(self, *, strict: bool = False) -> list:
         collections = []
         seen_names: set[str] = set()
-        preferred_names = [self.collection_name, self._root_collection_name]
+        listed_names = self._all_collection_names(strict=strict)
+        preferred_names = [self.collection_name]
+        if not strict or self._root_collection_name in listed_names:
+            preferred_names.append(self._root_collection_name)
         dim_prefix = f"{self._root_collection_name}_dim"
-        for name in self._all_collection_names():
+        for name in listed_names:
             if name.startswith(dim_prefix):
                 preferred_names.append(name)
         for name in preferred_names:
             if not name or name in seen_names:
                 continue
-            coll = self._get_collection_if_exists(name)
+            coll = (
+                self.client.get_collection(name)
+                if strict
+                else self._get_collection_if_exists(name)
+            )
             if coll is None:
                 continue
             collections.append(coll)
@@ -783,6 +825,25 @@ class _ChromaBackend:
             metadatas=[meta],
             embeddings=[self._embed_text(text)],
         )
+
+    def delete_source_strict(self, source: str) -> None:
+        """Verify removal across every mirror collection, including old dimensions."""
+        for collection in self._iter_candidate_collections(strict=True):
+            data = collection.get(include=["metadatas"])
+            ids = data.get("ids") or []
+            metas = data.get("metadatas") or []
+            matched = [
+                doc_id
+                for index, doc_id in enumerate(ids)
+                if doc_id == _doc_id_for_source(source)
+                or _metadata_matches_source(
+                    metas[index] if index < len(metas) else {}, source
+                )
+            ]
+            if matched:
+                collection.delete(ids=matched)
+                if collection.get(ids=matched, include=["metadatas"]).get("ids"):
+                    raise _VectorBackendError("Retrieval rows remain after deletion")
 
     def query(self, text: str, top_k: int = 5) -> list[Dict[str, Any]]:
         query_embedding = None
@@ -1394,18 +1455,34 @@ class RAGService:
             return chunks
         return [str(text or "")]
 
-    def _delete_vector_only_by_source(self, source: str) -> None:
+    def _delete_vector_only_by_source(
+        self, source: str, *, require_success=False
+    ) -> None:
         if not source:
             return
+        strict_delete = getattr(self.backend, "delete_source_strict", None)
+        if require_success and callable(strict_delete):
+            try:
+                strict_delete(str(source))
+            except BaseException as exc:
+                if _is_fatal_base_exception(exc):
+                    raise
+                raise privacy_policy.PrivacyCleanupError(
+                    "Removal of an older retrieval copy could not be verified. "
+                    "The local record may already have changed. Restore the retrieval store and retry."
+                ) from exc
+            return
+        errors = []
         delete_by_source = getattr(self.backend, "delete_source", None)
         if callable(delete_by_source):
             try:
                 delete_by_source(str(source))
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(exc)
         try:
             docs = self.backend.list_docs() or {}
-        except Exception:
+        except Exception as exc:
+            errors.append(exc)
             docs = {}
         ids = docs.get("ids") or []
         metas = docs.get("metadatas") or []
@@ -1418,8 +1495,13 @@ class RAGService:
                 continue
             try:
                 self.backend.delete_doc(str(doc_id))
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(exc)
+        if require_success and errors:
+            raise privacy_policy.PrivacyCleanupError(
+                "Removal of an older retrieval copy could not be verified. "
+                "The local record may already have changed. Restore the retrieval store and retry."
+            ) from errors[0]
 
     def rehydrate_canonical_document(
         self,
@@ -1446,6 +1528,17 @@ class RAGService:
         base_meta["source"] = source
         if knowledge_id:
             base_meta["knowledge_id"] = str(knowledge_id)
+        if privacy_policy.is_secret_memory(base_meta, source):
+            self.canonical_store.upsert_document(
+                source=source,
+                text=clean_text,
+                metadata=base_meta,
+                chunk_texts=[clean_text],
+                knowledge_id=knowledge_id,
+            )
+        if not self._mirror_allowed(base_meta):
+            self._delete_vector_only_by_source(source, require_success=True)
+            return False
         chunk_texts = self._chunk_texts(clean_text)
         chunk_count = len(chunk_texts)
         self._delete_vector_only_by_source(source)
@@ -1480,7 +1573,20 @@ class RAGService:
             purpose=str(metadata.get("kind") or metadata.get("type") or "knowledge"),
         )
         source = str(metadata.get("source") or "").strip()
+        if privacy_policy.is_secret_memory(metadata, source):
+            text = privacy_policy.SECRET_MEMORY_REFERENCE
+            metadata = privacy_policy.secret_memory_metadata(metadata, source)
+        if not self._mirror_allowed(metadata):
+            mirror_vector = False
+            metadata["retrieval_mirror_status"] = "skipped_privacy"
+        else:
+            metadata.pop("retrieval_mirror_status", None)
         if self.canonical_store is None:
+            if not mirror_vector:
+                self._delete_vector_only_by_source(
+                    source, require_success=not self._mirror_allowed(metadata)
+                )
+                return ""
             doc_id = self._add_text(text, source, metadata)
             self._emit_ingestion_hook(metadata, source, text)
             return doc_id
@@ -1492,7 +1598,9 @@ class RAGService:
             embedding_model=self.embedding_model,
             knowledge_id=knowledge_id,
         )
-        self._delete_vector_only_by_source(source)
+        self._delete_vector_only_by_source(
+            source, require_success=not self._mirror_allowed(metadata)
+        )
         if mirror_vector:
             for chunk in stored.get("chunks", []):
                 if not isinstance(chunk, dict):
@@ -1593,9 +1701,23 @@ class RAGService:
         )
         return self._store_text(text, meta, mirror_vector=mirror_vector)
 
+    def _mirror_allowed(self, metadata: Optional[Dict[str, Any]]) -> bool:
+        level = privacy_policy.sensitivity(metadata)
+        if level == "secret":
+            return False
+        return level != "protected" or not self._remote_retrieval()
+
+    def _remote_retrieval(self) -> bool:
+        return self.embedding_model.lower().startswith("api:") or isinstance(
+            self.backend, _WeaviateBackend
+        )
+
     def _add_text(
         self, text: str, source: str, metadata: Optional[Dict[str, Any]]
     ) -> str:
+        if not self._mirror_allowed(metadata):
+            self._delete_vector_only_by_source(source, require_success=True)
+            return ""
         return self.backend.add_text(text, source, metadata)
 
     # ------------------------ folder watching -----------------------------
@@ -1711,6 +1833,10 @@ class RAGService:
                 return
         self.backend.delete_doc(doc_id)
 
+    def delete_retrieval_mirror(self, source: str) -> None:
+        """Remove derived vectors while retaining the durable Knowledge document."""
+        self._delete_vector_only_by_source(source, require_success=True)
+
     def delete_source(self, source: str) -> None:
         """Delete all documents associated with a stable `metadata.source` key."""
         if not source:
@@ -1728,7 +1854,7 @@ class RAGService:
         self, doc_id: str, text: str, metadata: Optional[Dict[str, Any]] = None
     ):
         if self.canonical_store is None:
-            self.backend.update_doc(doc_id, text, metadata)
+            self._update_vector_document(doc_id, text, metadata)
             return
         existing = self.canonical_store.resolve_identifier(doc_id)
         merged = dict(metadata or {})
@@ -1743,7 +1869,7 @@ class RAGService:
             or ""
         ).strip()
         if not source:
-            self.backend.update_doc(doc_id, text, metadata)
+            self._update_vector_document(doc_id, text, metadata)
             return
         merged["source"] = source
         self._store_text(
@@ -1759,6 +1885,23 @@ class RAGService:
             knowledge_id=str((existing or {}).get("knowledge_id") or doc_id),
         )
 
+    def _update_vector_document(self, doc_id: str, text: str, metadata=None):
+        previous = self.trace(doc_id) or {}
+        merged = dict(previous.get("metadata") or {})
+        merged.update(metadata or {})
+        merged = privacy_filter_service.apply_to_metadata(
+            text, merged, purpose="knowledge"
+        )
+        if not self._mirror_allowed(merged):
+            try:
+                self.backend.delete_doc(doc_id)
+            except Exception as exc:
+                raise privacy_policy.PrivacyCleanupError(
+                    "The prohibited retrieval copy could not be removed; retry when its store is available."
+                ) from exc
+            return
+        self.backend.update_doc(doc_id, text, merged)
+
     def search_canonical(self, text: str, top_k: int = 5) -> list[Dict[str, Any]]:
         if self.canonical_store is None:
             return []
@@ -1769,6 +1912,22 @@ class RAGService:
             return []
 
     def query(self, text: str, top_k: int = 5) -> list[Dict[str, Any]]:
+        policy = privacy_policy.current_data_policy()
+        if (
+            policy is not None
+            and not policy.allow_remote_query
+            and self._remote_retrieval()
+        ):
+            return self._filter_query_matches(self.search_canonical(text, top_k))
+        if self._remote_retrieval():
+            decision = privacy_filter_service.decide_sensitivity(
+                text, purpose="retrieval_query"
+            )
+            if (
+                decision.applied_sensitivity in {"protected", "secret"}
+                or decision.status == "unavailable"
+            ):
+                return self._filter_query_matches(self.search_canonical(text, top_k))
         try:
             raw_matches = self.backend.query(text, top_k)
         except AttributeError:
@@ -1793,14 +1952,40 @@ class RAGService:
                 )
                 continue
             metadata = item.get("metadata") or {}
-            if self.canonical_store is not None and item.get("id"):
-                trace = self.canonical_store.trace(str(item.get("id")))
+            if self.canonical_store is not None:
+                trace = (
+                    self.canonical_store.trace(str(item["id"]))
+                    if item.get("id")
+                    else None
+                )
+                if isinstance(metadata, dict):
+                    parent = None
+                    if metadata.get("knowledge_id"):
+                        parent = self.canonical_store.get_item(
+                            str(metadata["knowledge_id"])
+                        )
+                    root_source = metadata.get("root_source") or metadata.get("source")
+                    if parent is None and root_source:
+                        parent = self.canonical_store.get_item_by_source(
+                            str(root_source)
+                        )
+                    if (
+                        parent is None
+                        and root_source
+                        and not metadata.get("root_source")
+                    ):
+                        parent = self.canonical_store.get_item_by_source(
+                            str(root_source).split("#chunk:", 1)[0]
+                        )
+                    if parent is not None:
+                        trace = parent
                 if isinstance(trace, dict):
                     trace_meta = trace.get("metadata")
                     if isinstance(trace_meta, dict):
-                        merged_meta = dict(trace_meta)
-                        if isinstance(metadata, dict):
-                            merged_meta.update(metadata)
+                        merged_meta = (
+                            dict(metadata) if isinstance(metadata, dict) else {}
+                        )
+                        merged_meta.update(trace_meta)
                         metadata = merged_meta
             normalized.append(
                 {
@@ -1810,7 +1995,19 @@ class RAGService:
                     "score": item.get("score"),
                 }
             )
-        return normalized
+        return self._filter_query_matches(normalized)
+
+    @staticmethod
+    def _filter_query_matches(matches):
+        policy = privacy_policy.current_data_policy()
+        if policy is None or not policy.external:
+            return matches
+        return [
+            match
+            for match in matches
+            if privacy_policy.sensitivity(match.get("metadata"))
+            not in {"protected", "secret"}
+        ]
 
     def trace(self, doc_id: str) -> Optional[Dict[str, Any]]:
         if self.canonical_store is not None:

@@ -174,7 +174,7 @@ body.dark-mode .chat-container {
 }
 
 .conversation-compaction-progress span {
-  font-size: 0.74rem;
+  font-size: var(--text-xs);
   color: var(--color-text-muted);
 }
 
@@ -211,7 +211,7 @@ body.dark-mode .chat-container {
 }
 
 .conversation-compaction-meta {
-  font-size: 0.74rem;
+  font-size: var(--text-xs);
   color: var(--color-text-muted);
 }
 
@@ -1117,7 +1117,7 @@ body.dark-mode .ai-msg {
 .message-editor-overlay {
   position: fixed;
   inset: 0;
-  z-index: 1300;
+  z-index: var(--layer-modal);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1319,95 +1319,43 @@ body.dark-mode .ai-msg {
 
 /* Input area styling */
 .input-box {
-    /* float centered near the bottom like TopBar */
-    position: fixed;
-    left: var(--chat-composer-center, 50%);
-    transform: translateX(-50%);
+  box-sizing: border-box;
+  position: fixed;
+  left: var(--chat-composer-center, 50%);
+  transform: translateX(-50%);
   bottom: max(var(--space-md), env(safe-area-inset-bottom, 0px));
   display: flex;
   flex-direction: column;
-    gap: var(--space-sm);
-    --input-action-size: 29px;
-    --input-action-gap: 6px;
-    --input-send-size: 40px;
-    --input-action-top-width: calc((2 * var(--input-action-size)) + var(--input-action-gap) + 12px);
-    --input-action-bottom-width: calc((3 * var(--input-action-size)) + var(--input-send-size) + (3 * var(--input-action-gap)));
-    --input-action-rail-width: max(var(--input-action-top-width), var(--input-action-bottom-width));
-    width: min(
-      max(
-        320px,
-        var(--chat-composer-width, calc(var(--center-rail-width, var(--center-rail-max)) - 24px))
-      ),
-      calc(100vw - 16px)
-    );
-    padding: calc(var(--space-sm) * 0.7) calc(var(--space-sm) * 0.7) calc(var(--space-sm) * 0.7) calc(1.2rem * 0.7);
-    background:
-      var(--glass-sheen),
-      radial-gradient(
-        520px 320px at 6% 6%,
-        color-mix(in oklab, var(--color-lavender) 32%, transparent),
-        transparent 78%
-      ),
-      radial-gradient(
-        1200px 720px at 10% 8%,
-        color-mix(in oklab, var(--color-lavender) 30%, transparent),
-        transparent 72%
-      ),
-      radial-gradient(
-        1050px 660px at 92% 110%,
-        color-mix(in oklab, var(--color-mint-green) 12%, transparent),
-        transparent 76%
-      ),
-      radial-gradient(
-        880px 520px at 90% 118%,
-        color-mix(in oklab, var(--color-lavender) 18%, transparent),
-        transparent 78%
-      ),
-      linear-gradient(180deg, var(--glass-tint-strong), transparent),
-      radial-gradient(at top left, color-mix(in oklab, var(--glass-tint) 60%, transparent), transparent 70%);
-    border: 1px solid var(--glass-border);
-    border-radius: 22px; /* More rounded bubble shape */
-    box-shadow: var(--glass-shadow), inset 0 1px 1px rgba(255,255,255,0.25);
-    backdrop-filter: blur(20px) saturate(190%);
-    -webkit-backdrop-filter: blur(20px) saturate(190%);
-    max-height: calc(100vh - var(--topbar-total-height) - 10px);
-    z-index: 2150; /* keep composer independent from sidebar open/close state */
-    overflow-x: visible;
-    overflow-y: auto;
-    overscroll-behavior: contain;
-  }
+  gap: var(--space-sm);
+  --input-action-size: var(--control-hit-size);
+  --input-action-gap: 4px;
+  --input-send-size: var(--control-hit-size);
+  width: min(
+    max(320px, var(--chat-composer-width, calc(var(--center-rail-width, var(--center-rail-max)) - 24px))),
+    calc(100vw - 16px)
+  );
+  padding: 12px;
+  background: color-mix(in oklab, var(--glass-tint) 96%, var(--color-surface));
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-lg, 18px);
+  box-shadow: var(--glass-shadow);
+  backdrop-filter: blur(20px) saturate(150%);
+  -webkit-backdrop-filter: blur(20px) saturate(150%);
+  max-height: calc(100dvh - var(--topbar-total-height) - 24px);
+  z-index: var(--layer-composer);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
 
 .input-box.camera-open {
   max-height: calc(100vh - var(--topbar-total-height) - 12px);
 }
 
-  body:not(.dark-mode) .input-box::after {
-    content: "";
-    position: absolute;
-    inset: 0;
-    border-radius: inherit;
-    pointer-events: none;
-    background-image: var(--card-noise-texture);
-    background-size: 120px 120px;
-    opacity: 0.035;
-    mix-blend-mode: soft-light;
-  }
-
-  .input-box:focus-within {
-    box-shadow:
-      var(--glass-shadow),
-      0 0 0 1px color-mix(in oklab, var(--color-lavender) 38%, transparent),
-      0 0 0 6px color-mix(in oklab, var(--color-mint-green) 16%, transparent),
-      inset 0 1px 1px rgba(255,255,255,0.35);
-  }
-
-  body.dark-mode .input-box:focus-within {
-    box-shadow:
-      var(--glass-shadow),
-      0 0 0 1px color-mix(in oklab, var(--color-purple) 45%, transparent),
-      0 0 0 6px color-mix(in oklab, var(--color-lavender) 42%, transparent),
-      inset 0 1px 1px rgba(255,255,255,0.22);
-  }
+.input-box:focus-within,
+body.dark-mode .input-box:focus-within {
+  border-color: color-mix(in oklab, var(--color-primary) 48%, var(--glass-border));
+  box-shadow: var(--glass-shadow), 0 0 0 2px color-mix(in oklab, var(--color-primary) 12%, transparent);
+}
 
 .scroll-to-bottom-btn {
   position: fixed;
@@ -1448,7 +1396,7 @@ body.dark-mode .scroll-to-bottom-btn {
 .input-alert-stack {
   position: absolute;
   left: 0;
-  right: calc(var(--input-action-rail-width) + 12px);
+  right: 0;
   bottom: calc(100% + 10px);
   display: flex;
   flex-direction: column;
@@ -1462,7 +1410,7 @@ body.dark-mode .scroll-to-bottom-btn {
   right: auto;
   bottom: auto;
   width: min(calc(100vw - 24px), 980px);
-  z-index: 3620;
+  z-index: var(--layer-popover);
 }
 
 .input-error {
@@ -1509,13 +1457,15 @@ body.dark-mode .input-error {
 
 .input-banner-copy {
   display: flex;
-  align-items: baseline;
-  gap: 8px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
   min-width: 0;
 }
 
 .input-banner-actions {
-  display: inline-flex;
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;
   gap: 6px;
@@ -1528,23 +1478,16 @@ body.dark-mode .input-error {
 }
 
 .input-status-strip {
-  position: absolute;
-  left: 16px;
-  bottom: 14px;
-  display: inline-flex;
+  display: flex;
   align-items: center;
   gap: 8px;
-  max-width: calc(100% - var(--input-action-rail-width) - 40px);
-  padding: 5px 10px;
-  border-radius: 999px;
-  border: 1px solid color-mix(in oklab, var(--color-accent) 36%, var(--glass-border) 64%);
-  background: color-mix(in oklab, var(--glass-tint) 88%, transparent);
-  color: color-mix(in oklab, var(--color-text) 82%, var(--color-accent) 18%);
-  font-size: 0.78rem;
-  font-weight: 700;
-  pointer-events: none;
-  z-index: 3;
-  box-shadow: 0 8px 20px rgba(8, 10, 20, 0.12);
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in oklab, var(--color-accent) 10%, transparent);
+  color: var(--color-text);
+  font-size: var(--text-sm);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
 .input-status-dot {
@@ -1555,106 +1498,30 @@ body.dark-mode .input-error {
   box-shadow: 0 0 0 4px color-mix(in oklab, var(--color-accent) 18%, transparent);
 }
 
-
 /* Dark mode: use indigo/violet/black mix per UI spec */
 body.dark-mode .input-box {
-  background:
-    var(--glass-sheen-strong),
-    /* primary subtle dark base with a hint of indigo */
-    linear-gradient(180deg,
-      color-mix(in oklab, var(--color-black) 90%, var(--color-indigo) 10%),
-      transparent
-    ),
-    /* soft lavender glow top-left */
-    radial-gradient(520px 260px at 12% 0%,
-      color-mix(in oklab, var(--color-lavender) 18%, transparent),
-      transparent 70%
-    ),
-    /* gentle indigo glow bottom-right */
-    radial-gradient(520px 260px at 88% 100%,
-      color-mix(in oklab, var(--color-indigo) 14%, transparent),
-      transparent 72%
-    ),
-    radial-gradient(460px 240px at 90% 112%,
-      color-mix(in oklab, var(--color-accent) 12%, transparent),
-      transparent 78%
-    ),
-    color-mix(in oklab, var(--glass-tint-strong) 94%, transparent);
-    border: 1px solid color-mix(in oklab, var(--color-lavender) 28%, var(--glass-border) 72%);
-  }
+  background: color-mix(in oklab, var(--glass-tint-strong) 96%, var(--color-surface));
+  border-color: var(--glass-border);
+}
 
 .input-row {
   display: flex;
-  align-items: flex-end;
+  flex-direction: column;
+  align-items: stretch;
   gap: var(--space-sm);
-  position: relative; /* allow absolute actions */
+  min-width: 0;
 }
 
 .input-main {
   position: relative;
+  min-width: 0;
   width: 100%;
-}
-
-.composer-overlay {
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  z-index: 1;
-  overflow: hidden;
-  border-radius: inherit;
-}
-
-.composer-overlay-content {
-  min-height: 100%;
-  padding: 16.5px 14px;
-  padding-right: calc(var(--input-action-rail-width) + 18px);
-  color: var(--color-text);
-  font: inherit;
-  line-height: 1.4375em;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-.composer-overlay-segment.tool-link,
-.composer-overlay-segment.file-link,
-.composer-overlay-segment.memory-link {
-  text-decoration: underline;
-  text-underline-offset: 0.14em;
-  text-decoration-thickness: 1.5px;
-}
-
-.composer-overlay-segment.tool-link {
-  color: color-mix(in oklab, var(--color-lavender) 74%, var(--color-indigo) 26%);
-}
-
-.composer-overlay-segment.file-link {
-  color: color-mix(in oklab, var(--color-indigo) 66%, var(--color-accent) 34%);
-}
-
-.composer-overlay-segment.memory-link {
-  color: color-mix(in oklab, var(--color-accent) 72%, var(--color-pear-green) 28%);
-}
-
-.composer-overlay-placeholder {
-  color: var(--color-text-muted);
-}
-
-body.dark-mode .composer-overlay-segment.tool-link {
-  color: color-mix(in oklab, var(--color-lavender) 82%, white 18%);
-}
-
-body.dark-mode .composer-overlay-segment.file-link {
-  color: color-mix(in oklab, var(--color-mint-green) 36%, var(--color-lavender) 64%);
-}
-
-body.dark-mode .composer-overlay-segment.memory-link {
-  color: color-mix(in oklab, var(--color-accent) 54%, var(--color-mint-green) 46%);
 }
 
 .composer-command-menu {
   position: absolute;
   left: 0;
-  right: calc(var(--input-action-rail-width) + 12px);
+  right: 0;
   bottom: calc(100% + 10px);
   display: flex;
   flex-direction: column;
@@ -1684,7 +1551,7 @@ body.dark-mode .composer-overlay-segment.memory-link {
   max-height: min(280px, 45vh);
   overflow-y: auto;
   transform: translateY(-100%);
-  z-index: 3605;
+  z-index: var(--layer-popover);
 }
 
 .composer-command-option {
@@ -1824,83 +1691,53 @@ body.dark-mode .composer-resize-edge::before {
   flex: 1;
 }
 
-  .input-box .MuiInputBase-root {
-    max-height: min(86vh, calc(100vh - var(--topbar-total-height) - 24px));
-    background: transparent !important;
-    padding-right: var(--input-action-rail-width);
-  }
+.input-box .MuiInputBase-root {
+  max-height: min(76vh, calc(100dvh - var(--topbar-total-height) - 140px));
+  background: transparent;
+  padding: 4px;
+  font-family: var(--font-stack);
+  font-size: var(--text-base);
+  line-height: 1.5;
+}
 
-  .input-box .MuiInputBase-input {
-    max-height: min(76vh, calc(100vh - var(--topbar-total-height) - 56px));
-    overflow-y: auto !important;
-    color: var(--color-text, #f0f3ff) !important;
-    caret-color: var(--color-text);
-    position: relative;
-    z-index: 2;
-    -webkit-text-fill-color: var(--color-text, #f0f3ff);
-  }
-  .input-box .MuiOutlinedInput-notchedOutline {
-    border: none !important;
-  }
+.input-box .MuiInputBase-input {
+  max-height: min(76vh, calc(100dvh - var(--topbar-total-height) - 140px));
+  overflow-y: auto !important;
+  overflow-wrap: anywhere;
+  color: var(--color-text) !important;
+  caret-color: var(--color-text);
+  position: relative;
+  z-index: 2;
+  -webkit-text-fill-color: var(--color-text);
+}
 
-  .input-box .MuiIconButton-root,
-  .input-box .MuiButton-root {
-    height: var(--input-action-size);
-    border-radius: 16px;
-  }
-  .input-box .MuiButton-root {
-    background: var(--color-primary);
-  }
-
-  .input-box .MuiIconButton-root:hover,
-  .input-box .MuiButton-root:hover {
-    filter: brightness(1.05);
-    box-shadow: 0 6px 16px rgba(0,0,0,0.15);
-  }
+.input-box .MuiOutlinedInput-notchedOutline {
+  border: none;
+}
 
 /* Group action buttons for responsive layout */
 .input-actions {
   display: flex;
-  flex-direction: column;
-  align-items: flex-end;
+  align-items: center;
   justify-content: space-between;
-  gap: calc(var(--input-action-gap) + 6px);
-  position: absolute;
-  right: 12px;
-  top: var(--input-action-gap);
-  bottom: var(--input-action-gap);
-  width: var(--input-action-rail-width);
-  z-index: 3;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  width: 100%;
+  min-width: 0;
+  padding-top: 8px;
+  border-top: 1px solid color-mix(in oklab, var(--glass-border) 70%, transparent);
 }
 
 .input-actions .composer-action-row {
   display: flex;
   align-items: center;
   gap: var(--input-action-gap);
-  justify-content: flex-end;
-  width: 100%;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
+  min-width: 0;
 }
 
-.input-actions .composer-action-row-top {
-  width: fit-content;
-  max-width: 100%;
+.input-actions .composer-action-row-end {
   margin-left: auto;
-  padding: 6px;
-  border-radius: 14px;
-  border: 1px solid color-mix(in oklab, var(--color-lavender) 32%, var(--glass-border) 68%);
-  background:
-    linear-gradient(
-      180deg,
-      color-mix(in oklab, var(--glass-tint-strong) 82%, transparent),
-      color-mix(in oklab, var(--color-lavender) 10%, transparent)
-    ),
-    color-mix(in oklab, var(--color-surface) 36%, var(--glass-tint) 64%);
-  box-shadow: 0 10px 20px rgba(10, 8, 28, 0.18);
-}
-
-.input-actions .composer-action-row-bottom {
-  white-space: nowrap;
 }
 
 .input-actions .composer-action-row > * {
@@ -1913,31 +1750,26 @@ body.dark-mode .composer-resize-edge::before {
 }
 
 .attach-popover {
-  position: absolute;
-  right: 0;
-  bottom: calc(100% + var(--input-action-gap) + 4px);
+  position: fixed;
   display: flex;
-  align-items: center;
-  gap: var(--input-action-gap);
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  width: 216px;
   padding: 8px;
-  border-radius: 999px;
-  border: 1px solid color-mix(in oklab, var(--color-lavender) 40%, var(--glass-border) 60%);
-  background:
-    linear-gradient(180deg, color-mix(in oklab, var(--glass-tint-strong) 86%, transparent), transparent),
-    color-mix(in oklab, var(--glass-tint) 94%, transparent);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--glass-border);
+  background: var(--color-surface);
   box-shadow: var(--glass-shadow);
-  backdrop-filter: blur(16px) saturate(150%);
-  -webkit-backdrop-filter: blur(16px) saturate(150%);
-  z-index: 4;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  z-index: var(--layer-popover);
 }
 
 .attach-popover.attach-popover-floating {
   position: fixed;
-  right: auto;
-  bottom: auto;
-  --input-action-size: 29px;
-  --input-action-gap: 6px;
-  z-index: 3610;
+  --input-action-size: var(--control-hit-size);
+  --input-action-gap: 4px;
 }
 
 .attach-trigger.is-open {
@@ -1949,34 +1781,6 @@ body.dark-mode .composer-resize-edge::before {
 .chat-settings-menu {
   position: relative;
   display: inline-flex;
-}
-
-.chat-settings-trigger {
-  width: var(--input-action-size);
-  height: var(--input-action-size);
-  border: 1px solid color-mix(in oklab, var(--theme-c2-med) 34%, var(--glass-border) 66%);
-  background:
-    linear-gradient(
-      180deg,
-      color-mix(in oklab, var(--glass-tint-strong) 88%, transparent),
-      color-mix(in oklab, var(--theme-c1-glow) 16%, transparent)
-    ),
-    color-mix(in oklab, var(--glass-tint) 84%, transparent);
-  color: color-mix(in oklab, var(--theme-c1-dark) 64%, var(--theme-c2-med) 36%);
-  border-radius: 50%;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  box-shadow: 0 10px 24px color-mix(in oklab, var(--theme-c1-shadow) 22%, transparent);
-  transition: transform 120ms ease, box-shadow 120ms ease, filter 120ms ease;
-}
-
-.chat-settings-trigger:hover,
-.chat-settings-trigger.is-open {
-  transform: translateY(-1px);
-  filter: brightness(1.04);
-  box-shadow: 0 6px 16px rgba(0,0,0,0.15);
 }
 
 .chat-settings-popover {
@@ -1995,7 +1799,7 @@ body.dark-mode .composer-resize-edge::before {
   box-shadow: var(--glass-shadow);
   backdrop-filter: blur(18px) saturate(160%);
   -webkit-backdrop-filter: blur(18px) saturate(160%);
-  z-index: 3600;
+  z-index: var(--layer-popover);
 }
 
 .chat-settings-header {
@@ -2020,23 +1824,12 @@ body.dark-mode .composer-resize-edge::before {
 
 .chat-settings-header span {
   color: var(--color-text-muted);
-  font-size: 0.74rem;
+  font-size: var(--text-xs);
   line-height: 1.35;
 }
 
 .chat-settings-close {
-  width: 30px;
-  height: 30px;
   flex: 0 0 auto;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-  border: 1px solid transparent;
-  border-radius: 10px;
-  background: transparent;
-  color: var(--color-text-muted);
-  cursor: pointer;
 }
 
 .chat-settings-close:hover {
@@ -2075,6 +1868,10 @@ body.dark-mode .composer-resize-edge::before {
 }
 
 .chat-settings-item {
+  min-height: var(--control-hit-size);
+  font: inherit;
+  font-size: var(--text-sm);
+  line-height: 1.4;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -2103,10 +1900,8 @@ body.dark-mode .composer-resize-edge::before {
 }
 
 .chat-settings-panel label {
-  font-size: 0.76rem;
-  font-weight: 700;
-  text-transform: lowercase;
-  letter-spacing: 0.03em;
+  font-size: var(--text-sm);
+  font-weight: 600;
   color: var(--color-text-muted);
 }
 
@@ -2114,10 +1909,14 @@ body.dark-mode .composer-resize-edge::before {
 .chat-settings-panel input[type="range"],
 .chat-settings-panel input[type="number"] {
   width: 100%;
+  min-width: 0;
 }
 
 .chat-settings-panel select,
 .chat-settings-panel input[type="number"] {
+  min-height: var(--control-height);
+  font: inherit;
+  font-size: var(--text-sm);
   border: 1px solid var(--glass-border);
   border-radius: 12px;
   background: color-mix(in oklab, var(--glass-tint) 84%, transparent);
@@ -2128,7 +1927,7 @@ body.dark-mode .composer-resize-edge::before {
 .chat-settings-warning {
   display: block;
   color: var(--color-warning, #f2b45b);
-  font-size: 0.76rem;
+  font-size: var(--text-sm);
   line-height: 1.35;
 }
 
@@ -2165,16 +1964,18 @@ body.dark-mode .composer-resize-edge::before {
 
 .chat-settings-inline {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  min-height: 28px;
+  min-height: var(--control-height);
 }
 
 .chat-settings-note,
 .chat-settings-slider-value {
-  font-size: 0.76rem;
+  font-size: var(--text-sm);
   color: var(--color-text-muted);
   line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
 .chat-settings-meter {
@@ -2198,23 +1999,21 @@ body.dark-mode .composer-resize-edge::before {
 
 .chat-settings-choice-row {
   display: grid;
-  grid-template-columns: repeat(7, minmax(0, 1fr));
-  gap: 3px;
+  grid-template-columns: repeat(auto-fit, minmax(64px, 1fr));
+  gap: 4px;
 }
 
 .chat-settings-choice {
   min-width: 0;
-  min-height: 28px;
+  min-height: var(--control-height);
   padding: 4px 2px;
   border-radius: 9px;
   border: 1px solid var(--glass-border);
   background: transparent;
   color: var(--color-text);
   font: inherit;
-  font-size: 0.67rem;
-  font-weight: 650;
-  letter-spacing: -0.015em;
-  text-transform: lowercase;
+  font-size: var(--text-xs);
+  font-weight: 600;
   white-space: nowrap;
   cursor: pointer;
 }
@@ -2231,7 +2030,7 @@ body.dark-mode .composer-resize-edge::before {
   border: 1px solid color-mix(in oklab, var(--color-accent) 44%, var(--glass-border) 56%);
   background: color-mix(in oklab, var(--color-accent) 12%, transparent);
   color: var(--color-text);
-  font-size: 0.78rem;
+  font-size: var(--text-sm);
   font-weight: 600;
   text-align: center;
   cursor: pointer;
@@ -2269,7 +2068,7 @@ body.dark-mode .composer-resize-edge::before {
   background: transparent;
   color: var(--color-text-muted);
   font: inherit;
-  font-size: 0.72rem;
+  font-size: var(--text-sm);
   font-weight: 700;
   cursor: help;
 }
@@ -2296,8 +2095,9 @@ body.dark-mode .composer-resize-edge::before {
 
 .chat-settings-capacity {
   color: var(--color-text-muted);
-  font-size: 0.7rem;
-  line-height: 1.25;
+  font-size: var(--text-sm);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
 .chat-settings-rag-card {
@@ -2331,20 +2131,21 @@ body.dark-mode .composer-resize-edge::before {
 
 .chat-settings-rag-toggle strong {
   min-width: 0;
-  font-size: 0.78rem;
+  font-size: var(--text-sm);
   font-weight: 700;
-  line-height: 1.2;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
 .chat-settings-rag-card select {
   min-width: 0;
   width: 100%;
-  min-height: 28px;
+  min-height: var(--control-height);
   border-radius: 8px;
   border: 1px solid color-mix(in oklab, var(--glass-border) 80%, transparent);
   background: color-mix(in oklab, var(--glass-tint) 88%, transparent);
   color: var(--color-text);
-  font-size: 0.72rem;
+  font-size: var(--text-sm);
   padding: 3px 7px;
 }
 
@@ -2356,7 +2157,7 @@ body.dark-mode .composer-resize-edge::before {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 0.78rem;
+  font-size: var(--text-sm);
   color: var(--color-text);
 }
 
@@ -2365,9 +2166,6 @@ body.dark-mode .composer-resize-edge::before {
 }
 
 .input-actions .send-stack {
-  position: relative;
-  width: var(--input-send-size);
-  height: var(--input-send-size);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -2387,43 +2185,23 @@ body.dark-mode .composer-resize-edge::before {
 }
 
 .input-actions .send-btn {
-  height: var(--input-send-size);
-  width: var(--input-send-size);
   min-width: var(--input-send-size);
   min-height: var(--input-send-size);
-  border-radius: 50%;
-  padding: 0;
-  background: linear-gradient(
-    135deg,
-    var(--color-accent),
-    color-mix(in oklab, var(--color-success-dark) 82%, var(--color-accent) 18%)
-  );
-  color: var(--color-white);
-  border: 1px solid color-mix(in oklab, var(--color-mint-green) 22%, var(--color-success-dark) 78%);
-  box-shadow:
-    0 0 0 1px color-mix(in oklab, var(--color-accent) 32%, transparent),
-    0 14px 26px rgba(28, 92, 48, 0.2);
+  width: auto;
+  height: auto;
+  gap: 8px;
+  border-radius: var(--radius-sm);
+  padding: 8px 14px;
+  background: var(--control-primary-bg);
+  color: var(--control-primary-text);
+  border: 1px solid transparent;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  box-shadow: none;
 }
 
-body.dark-mode .input-actions .send-btn {
-  background: linear-gradient(
-    135deg,
-    color-mix(in oklab, var(--color-primary) 76%, var(--color-purple) 24%),
-    color-mix(in oklab, var(--color-purple-deep) 52%, var(--color-primary) 48%)
-  );
-  border-color: color-mix(in oklab, var(--color-primary) 44%, var(--glass-border) 56%);
-  box-shadow:
-    0 0 0 1px color-mix(in oklab, var(--color-primary) 36%, transparent),
-    0 14px 28px rgba(0, 0, 0, 0.3);
-}
-
-.input-actions .send-btn.is-stopping {
-  background: var(--color-accent);
-  color: var(--color-black);
-  box-shadow:
-    0 0 0 2px color-mix(in oklab, var(--color-accent) 40%, transparent),
-    0 10px 18px rgba(0,0,0,0.18);
-  animation: stop-pulse 1.2s ease-in-out infinite;
+.input-actions .send-btn:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--control-primary-bg) 90%, var(--control-primary-text));
 }
 
 .input-actions .send-btn.is-idle-disabled {
@@ -2432,24 +2210,7 @@ body.dark-mode .input-actions .send-btn {
   box-shadow: none;
 }
 
-body.dark-mode .input-actions .send-btn.is-stopping {
-  background: color-mix(in oklab, var(--color-purple) 78%, var(--color-indigo) 22%);
-  color: var(--color-white);
-  box-shadow:
-    0 0 0 2px color-mix(in oklab, var(--color-purple) 55%, transparent),
-    0 10px 18px rgba(0,0,0,0.25);
-}
-
-@keyframes stop-pulse {
-  0% { transform: scale(1); }
-  50% { transform: scale(1.05); }
-  100% { transform: scale(1); }
-}
-
 @media (prefers-reduced-motion: reduce) {
-  .input-actions .send-btn.is-stopping {
-    animation: none;
-  }
   .live-streaming-indicator-pulse,
   .input-actions .action-icon.live-stream-toggle.is-speaking {
     animation: none;
@@ -2458,19 +2219,40 @@ body.dark-mode .input-actions .send-btn.is-stopping {
 
 .input-actions .action-icon,
 .attach-popover .action-icon {
-  width: var(--input-action-size);
-  height: var(--input-action-size);
-  padding: 0;
-  border: 1px solid color-mix(in oklab, var(--theme-c2-med) 34%, var(--glass-border) 66%);
-  background:
-    linear-gradient(
-      180deg,
-      color-mix(in oklab, var(--glass-tint-strong) 88%, transparent),
-      color-mix(in oklab, var(--theme-c1-glow) 16%, transparent)
-    ),
-    color-mix(in oklab, var(--glass-tint) 84%, transparent);
-  color: color-mix(in oklab, var(--theme-c1-dark) 64%, var(--theme-c2-med) 36%);
-  box-shadow: 0 10px 24px color-mix(in oklab, var(--theme-c1-shadow) 22%, transparent);
+  min-width: var(--input-action-size);
+  min-height: var(--input-action-size);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
+}
+
+.input-actions .composer-voice-action,
+.attach-popover .attachment-action {
+  width: auto;
+  gap: 6px;
+  padding: 8px;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.attach-popover > *,
+.attach-popover .attachment-action {
+  width: 100%;
+}
+
+.attach-popover .attachment-action {
+  justify-content: flex-start;
+  white-space: normal;
+  text-align: left;
+}
+
+.attach-popover .attachment-action svg,
+.input-status-dot {
+  flex-shrink: 0;
+}
+
+.chat-settings-trigger.is-open {
+  background: color-mix(in oklab, var(--color-primary) 12%, transparent);
+  color: var(--color-text);
 }
 
 .input-actions .action-icon.visual-stream-toggle.is-live-option,
@@ -2572,6 +2354,8 @@ body.dark-mode .input-actions .stop-chip {
 /* Composer attachment chips */
 .composer-meta-row {
   display: flex;
+  flex-wrap: wrap;
+  min-width: 0;
   align-items: flex-start;
   gap: 10px;
   margin-top: 2px;
@@ -2594,7 +2378,7 @@ body.dark-mode .input-actions .stop-chip {
   margin-left: auto;
   white-space: nowrap;
   flex: 0 0 auto;
-  max-width: min(56%, 640px);
+  max-width: 100%;
 }
 
 .vision-workflow-row select {
@@ -2742,7 +2526,8 @@ body.dark-mode .input-actions .stop-chip {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  max-width: 320px;
+  max-width: min(320px, 100%);
+  min-width: 0;
   padding: 2px 4px;
   border-radius: 9999px;
   border: 1px solid var(--glass-border);
@@ -2760,6 +2545,7 @@ body.dark-mode .input-actions .stop-chip {
 }
 
 .chip-preview {
+  flex: 1 1 auto;
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -2791,14 +2577,17 @@ body.dark-mode .input-actions .stop-chip {
 .chip-name {
   display: inline-block;
   max-width: 150px;
+  min-width: 0;
+  font-size: var(--text-sm);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
 .chip-remove {
-  min-width: 36px;
-  min-height: 36px;
+  flex: 0 0 auto;
+  min-width: var(--control-hit-size);
+  min-height: var(--control-hit-size);
   padding: 0;
   border: none;
   background: transparent;
@@ -2819,7 +2608,8 @@ body.dark-mode .input-actions .stop-chip {
 }
 
 .chip-retry {
-  min-height: 36px;
+  flex: 0 0 auto;
+  min-height: var(--control-height);
   padding: 2px 10px;
   border: 1px solid color-mix(in oklab, var(--color-error) 44%, var(--glass-border));
   border-radius: 999px;
@@ -2828,34 +2618,6 @@ body.dark-mode .input-actions .stop-chip {
   font: inherit;
   font-size: 12px;
   cursor: pointer;
-}
-
-.close-entry {
-  width: var(--input-action-size);
-  height: var(--input-action-size);
-  border: 1px solid color-mix(in oklab, var(--theme-c2-med) 34%, var(--glass-border) 66%);
-  background:
-    linear-gradient(
-      180deg,
-      color-mix(in oklab, var(--glass-tint-strong) 88%, transparent),
-      color-mix(in oklab, var(--theme-c1-glow) 16%, transparent)
-    ),
-    color-mix(in oklab, var(--glass-tint) 84%, transparent);
-  color: color-mix(in oklab, var(--theme-c1-dark) 64%, var(--theme-c2-med) 36%);
-  border-radius: 50%;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  box-shadow: 0 10px 24px color-mix(in oklab, var(--theme-c1-shadow) 22%, transparent);
-  pointer-events: auto;
-  transition: transform 120ms ease, box-shadow 120ms ease, filter 120ms ease;
-}
-
-.close-entry:hover {
-  transform: translateY(-1px);
-  box-shadow: 0 6px 16px rgba(0,0,0,0.15);
-  filter: brightness(1.05);
 }
 
 .open-entry-btn {
@@ -2880,7 +2642,7 @@ body.dark-mode .input-actions .stop-chip {
   height: 48px;
   cursor: pointer;
   box-shadow: 0 10px 24px rgba(28, 92, 48, 0.14);
-  z-index: 2150;
+  z-index: var(--layer-composer);
 }
 
 body.dark-mode .open-entry-btn {
@@ -2893,38 +2655,6 @@ body.dark-mode .open-entry-btn {
   border-color: color-mix(in oklab, var(--color-primary) 42%, var(--glass-border) 58%);
 }
 
-body.dark-mode .chat-settings-trigger,
-body.dark-mode .input-actions .action-icon,
-body.dark-mode .attach-popover .action-icon,
-body.dark-mode .close-entry {
-  border-color: color-mix(in oklab, var(--theme-c2-med) 36%, var(--glass-border) 64%);
-  background:
-    linear-gradient(
-      180deg,
-      color-mix(in oklab, var(--theme-c1-dark) 30%, transparent),
-      color-mix(in oklab, var(--theme-c2-med) 18%, transparent)
-    ),
-    color-mix(in oklab, var(--glass-tint) 88%, transparent);
-  color: color-mix(in oklab, var(--theme-c2-light) 74%, var(--theme-c1-dark) 26%);
-  box-shadow:
-    0 10px 24px color-mix(in oklab, var(--theme-c1-shadow) 28%, transparent),
-    0 0 0 1px color-mix(in oklab, var(--theme-c2-light) 16%, transparent);
-}
-
-body.dark-mode .input-actions .composer-action-row-top {
-  border-color: color-mix(in oklab, var(--theme-c2-med) 28%, var(--glass-border) 72%);
-  background:
-    linear-gradient(
-      180deg,
-      color-mix(in oklab, var(--theme-c1-dark) 26%, transparent),
-      color-mix(in oklab, var(--theme-c2-med) 12%, transparent)
-    ),
-    color-mix(in oklab, var(--theme-warm-black) 26%, var(--glass-tint) 74%);
-  box-shadow:
-    0 10px 22px color-mix(in oklab, var(--theme-warm-black) 74%, transparent),
-    0 0 0 1px color-mix(in oklab, var(--theme-c2-light) 10%, transparent);
-}
-
 /* Small/portrait: nearly full width and compact controls */
 @media (max-width: 600px), (orientation: portrait) and (max-width: 900px) {
   .chat-window-resizer {
@@ -2932,14 +2662,11 @@ body.dark-mode .input-actions .composer-action-row-top {
   }
   .input-box {
     width: min(96vw, calc(100vw - 16px));
-    padding-right: 12px;
-    --input-action-size: 26px;
-    --input-action-gap: 4px;
-    --input-send-size: 36px;
+    padding: 10px;
   }
   .attach-popover.attach-popover-floating {
     right: auto;
-    --input-action-size: 26px;
+    --input-action-size: var(--control-hit-size);
     --input-action-gap: 4px;
   }
   .user-msg,
@@ -2948,31 +2675,6 @@ body.dark-mode .input-actions .composer-action-row-top {
   }
   .input-box.camera-open {
     width: min(98vw, calc(100vw - 10px));
-  }
-  .input-actions .action-icon,
-  .attach-popover .action-icon,
-  .input-actions .send-btn {
-    width: var(--input-action-size);
-    height: var(--input-action-size);
-  }
-  .input-actions .action-icon {
-    min-width: var(--input-action-size);
-    min-height: var(--input-action-size);
-  }
-  .attach-popover .action-icon {
-    min-width: var(--input-action-size);
-    min-height: var(--input-action-size);
-  }
-  .input-actions .send-btn {
-    width: var(--input-send-size);
-    height: var(--input-send-size);
-    min-width: var(--input-send-size);
-    min-height: var(--input-send-size);
-  }
-  .input-box .MuiInputBase-root { padding-right: var(--input-action-rail-width); }
-  .composer-drag-handle {
-    width: var(--input-action-size);
-    height: var(--input-action-size);
   }
   .scroll-to-bottom-btn {
     top: calc(var(--topbar-total-height) + 6px);
@@ -3009,7 +2711,7 @@ body.dark-mode .input-actions .composer-action-row-top {
   }
   .attach-popover {
     right: -4px;
-    max-width: min(80vw, 220px);
+    max-width: calc(100vw - 24px);
     padding: 6px;
   }
   .chat-settings-header {

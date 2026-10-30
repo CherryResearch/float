@@ -3,27 +3,26 @@ ENV=.venv
 FRONTEND_DIR=frontend
 
 # Targets
+.PHONY: setup run build start run-frontend clean test all
+
 setup:
-        # Set up backend environment
-        poetry install
-        # Set up frontend environment
-        cd $(FRONTEND_DIR) && npm install
+	# Set up the backend and root frontend workspace
+	poetry install
+	npm install
 
 run:
-        # Run backend on BACKEND_PORT (default 8000)
-        poetry run uvicorn app.main:app --reload --port $${BACKEND_PORT:-8000}
+	# Launch the backend and frontend with Float's shared port/runtime setup
+	poetry run float
 
 build:
 	# Build frontend
-	cd $(FRONTEND_DIR) && npm run build
+	npm run frontend:build
 
-start:
-	# Run frontend and backend
-	make -j2 run run-frontend
+start: run
 
 run-frontend:
 	# Run frontend
-	cd $(FRONTEND_DIR) && npm run dev
+	npm run frontend:dev
 
 clean:
 	# Clean backend and frontend artifacts
@@ -33,8 +32,8 @@ clean:
 	cd $(FRONTEND_DIR) && rm -rf node_modules dist
 
 test:
-        # Run tests for backend
-        poetry run pytest backend/app/tests
+	# Run all backend test roots configured in pytest.ini
+	poetry run pytest
 
 all:
 	# Full setup and run

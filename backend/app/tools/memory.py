@@ -20,6 +20,7 @@ import html
 import json
 import re
 import time
+import uuid
 from typing import Any, Dict, Optional
 
 from app.services import privacy_filter_service
@@ -29,7 +30,7 @@ from app.services.rag_provider import (
     get_rag_service,
     try_ingest_text,
 )
-from app.utils import verify_signature
+from app.utils import privacy_policy, verify_signature
 from app.utils.workspace_registry import (
     load_workspace_state,
     workspace_item_exclusion_reason,
@@ -196,7 +197,12 @@ def _vectorize_memory_entry(
     rag_excluded: Optional[bool] = None,
     privacy_metadata: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
-    value_text = _value_to_text(value)
+    secret = str(sensitivity or "").strip().lower() == "secret"
+    if secret:
+        mirror_vector = False
+    value_text = (
+        privacy_policy.SECRET_MEMORY_REFERENCE if secret else _value_to_text(value)
+    )
     if not value_text:
         return None
     parts = [f"key: {key}"]
@@ -245,6 +251,13 @@ def _vectorize_memory_entry(
     for field, value in dict(privacy_metadata or {}).items():
         if field == "sensitivity_source" or str(field).startswith("privacy_filter_"):
             metadata[field] = value
+    if secret:
+        cleaned = privacy_policy.SECRET_MEMORY_REFERENCE
+        metadata = privacy_policy.secret_memory_metadata(metadata, f"memory:{key}")
+    elif str(sensitivity or "").strip().lower() == "protected" and mirror_vector:
+        service = get_rag_service(raise_http=False)
+        if service is not None and not service._mirror_allowed(metadata):
+            mirror_vector = False
     doc_id = try_ingest_text(cleaned, metadata, mirror_vector=mirror_vector)
     if _MANAGER is not None and doc_id:
         try:
@@ -256,6 +269,8 @@ def _vectorize_memory_entry(
                     "rag_doc_id": doc_id,
                 },
             )
+        except privacy_policy.PrivacyCleanupError:
+            raise
         except Exception:
             pass
     return doc_id
@@ -359,7 +374,6 @@ def legacy_memory_save(*, user: str, signature: str, **payload: Any) -> Dict[str
 
     if _MANAGER is None:
         raise RuntimeError("memory manager not available")
-    key = _derive_memory_key(_MANAGER, key_hint, namespace, text)
     explicit_sensitivity = _privacy_to_sensitivity(privacy)
     privacy_decision = privacy_filter_service.decide_sensitivity(
         text,
@@ -372,6 +386,9 @@ def legacy_memory_save(*, user: str, signature: str, **payload: Any) -> Dict[str
         else explicit_sensitivity
     )
 
+    if not key_hint and effective_sensitivity == "secret":
+        key_hint = f"secret-{uuid.uuid4().hex}"
+    key = _derive_memory_key(_MANAGER, key_hint, namespace, text)
     record: Dict[str, Any] = {"text": text.strip()}
     if namespace:
         record["namespace"] = namespace
@@ -671,6 +688,11 @@ def recall(
     allow_protected_flag = (
         bool(allow_protected) if allow_protected is not _DEFAULT else False
     )
+    policy = privacy_policy.current_data_policy()
+    if policy is not None and policy.external:
+        for_external_flag = True
+        # Tool arguments are model-controlled, not independent user consent.
+        allow_protected_flag = False
     normalized_mode = (
         str(mode or "hybrid").strip().lower() if mode is not _DEFAULT else "hybrid"
     )

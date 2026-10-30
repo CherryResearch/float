@@ -998,17 +998,17 @@ class ActionHistoryService:
             InstanceSyncService()._merge_knowledge([snapshot])  # type: ignore[attr-defined]
             return
         if section == "graph":
-            graph = GraphStore()
-            if snapshot is None:
-                if resource_type == "graph_node":
-                    graph.delete_node(resource_id.split(":", 1)[-1])
-                else:
-                    graph.delete_claim(resource_id.split(":", 1)[-1])
-                return
-            if resource_type == "graph_node":
-                InstanceSyncService()._merge_graph({"nodes": [snapshot], "claims": []})  # type: ignore[attr-defined]
-            else:
-                InstanceSyncService()._merge_graph({"nodes": [], "claims": [snapshot]})  # type: ignore[attr-defined]
+            if resource_type not in {"graph_node", "graph_claim"}:
+                raise ValueError("Unknown graph history resource type")
+            kind = "nodes" if resource_type == "graph_node" else "claims"
+            GraphStore().restore_records(
+                nodes={resource_id.split(":", 1)[-1]: snapshot}
+                if kind == "nodes"
+                else {},
+                claims={resource_id.split(":", 1)[-1]: snapshot}
+                if kind == "claims"
+                else {},
+            )
             return
         if section == "attachments":
             if snapshot is None:
@@ -1083,6 +1083,61 @@ class ActionHistoryService:
             return f"Reverted {target.get('summary') or target.get('name') or 'action'}"
         return f"Reverted {len(targets)} actions"
 
+    def _restore_graph_items(
+        self, targets: List[Dict[str, Any]], *, force: bool
+    ) -> Dict[str, Any]:
+        desired: Dict[str, Dict[str, Any]] = {"nodes": {}, "claims": {}}
+        expected: Dict[str, Dict[str, Any]] = {"nodes": {}, "claims": {}}
+        descriptors: Dict[tuple[str, str], Dict[str, Any]] = {}
+        for action in targets:
+            for item in reversed(action.get("items") or []):
+                if not isinstance(item, dict) or item.get("section") != "graph":
+                    continue
+                resource_type = item.get("resource_type")
+                if resource_type not in {"graph_node", "graph_claim"}:
+                    raise ValueError("Unknown graph history resource type")
+                kind = "nodes" if resource_type == "graph_node" else "claims"
+                prefix = "node:" if kind == "nodes" else "claim:"
+                resource_id = str(item.get("resource_id") or "")
+                if not resource_id.startswith(prefix):
+                    raise ValueError("Invalid graph history resource identity")
+                record_id = resource_id[len(prefix) :]
+                expected[kind].setdefault(record_id, item.get("after"))
+                desired[kind][record_id] = item.get("before")
+                descriptors[(kind, record_id)] = item
+        if not any(desired.values()):
+            return {"items": [], "integrity": None}
+        if force:
+            # Force authorizes overwriting a known conflict, not a race after this read.
+            current = InstanceSyncService()._graph_snapshot()
+            for kind, id_key in (("nodes", "node_id"), ("claims", "claim_id")):
+                records = {record[id_key]: record for record in current[kind]}
+                expected[kind] = {key: records.get(key) for key in desired[kind]}
+        restored = GraphStore().restore_records(
+            nodes=desired["nodes"],
+            claims=desired["claims"],
+            expected_nodes=expected["nodes"],
+            expected_claims=expected["claims"],
+        )
+        items = []
+        for change in restored["changes"]:
+            item = descriptors[(change["kind"], change["record_id"])]
+            items.append(
+                {
+                    "id": f"revert:{item.get('resource_key')}",
+                    "section": "graph",
+                    "resource_type": item.get("resource_type"),
+                    "resource_id": item.get("resource_id"),
+                    "resource_key": item.get("resource_key"),
+                    "label": item.get("label"),
+                    "operation": self._operation_for(change["before"], change["after"]),
+                    "before": change["before"],
+                    "after": change["after"],
+                    "revertible": True,
+                }
+            )
+        return {"items": items, "integrity": restored["integrity"]}
+
     def revert_actions(
         self,
         *,
@@ -1155,12 +1210,15 @@ class ActionHistoryService:
                     event_id,
                     guard=guard_active_run,
                 )
-        revert_items: List[Dict[str, Any]] = []
+        graph_restore = self._restore_graph_items(ordered_targets, force=force)
+        revert_items: List[Dict[str, Any]] = graph_restore["items"]
         for action in ordered_targets:
             items = [
                 item for item in (action.get("items") or []) if isinstance(item, dict)
             ]
             for item in reversed(items):
+                if item.get("section") == "graph":
+                    continue
                 current_before = self._current_snapshot_for_item(item)
                 desired = item.get("before")
                 if self._operation_for(current_before, desired) is None:
@@ -1190,6 +1248,7 @@ class ActionHistoryService:
                 "reverted_action_ids": [],
                 "conflicts": conflicts,
                 "action": None,
+                "graph_integrity": graph_restore["integrity"],
             }
         revert_action_id = str(uuid4())
         reverted_at = _now_iso()
@@ -1227,6 +1286,7 @@ class ActionHistoryService:
                     str(item.get("id") or "") for item in ordered_targets
                 ],
                 "conflicts": conflicts,
+                "graph_integrity": graph_restore["integrity"],
             },
             "items": revert_items,
             "revertible": True,
@@ -1246,6 +1306,7 @@ class ActionHistoryService:
             ],
             "conflicts": conflicts,
             "action": self._summary_from_action(saved),
+            "graph_integrity": graph_restore["integrity"],
         }
 
 

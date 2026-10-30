@@ -470,8 +470,14 @@ export const appendAgentEvent = (events, event) => {
     return list;
   }
   if (event.type === "stream") {
-    const last = list[list.length - 1];
-    const sameMessage = eventsShareMessageScope(last, event, { type: "stream" });
+    // Provider chunks can interleave with thoughts and tools. Reconcile the
+    // matching request, rather than leaving each earlier chunk "streaming".
+    const streamIndex = list.findLastIndex((item) =>
+      eventsShareMessageScope(item, event, { type: "stream" }) &&
+      (!item.request_id || !event.request_id || item.request_id === event.request_id),
+    );
+    const last = streamIndex >= 0 ? list[streamIndex] : null;
+    const sameMessage = streamIndex >= 0;
     const name = typeof event.name === "string" ? event.name.trim() : "";
     const callIndex =
       typeof event.call_index === "number" && Number.isFinite(event.call_index)
@@ -497,10 +503,14 @@ export const appendAgentEvent = (events, event) => {
       if (callIndex !== null && !streamCallIndices.includes(callIndex)) {
         streamCallIndices.push(callIndex);
       }
-      list[list.length - 1] = {
+      const finished = ["complete", "completed", "cancelled", "canceled", "error", "timeout", "awaiting_tools", "pending"];
+      const nextStatus = finished.includes(last.status) && !finished.includes(event.status)
+        ? last.status
+        : event.status || last.status || "streaming";
+      list[streamIndex] = {
         ...last,
         ...event,
-        status: event.status || last.status || "streaming",
+        status: nextStatus,
         content: event.content || last.content,
         stream_chunks: streamChunks,
         stream_names: streamNames,
@@ -565,7 +575,24 @@ const reduceAgentState = (prev, event) => {
     updatedAt: event.timestamp,
     events: [],
   };
-  const events = appendAgentEvent(existing.events || [], event);
+  const previousEvents = existing.events || [];
+  const isGenerationEvent = event.request_id && ["stream", "thought", "content"].includes(event.type);
+  const currentRequestId = existing.generation_request_id || previousEvents.findLast(
+    (entry) => entry.request_id && ["stream", "thought", "content"].includes(entry.type),
+  )?.request_id;
+  const isPreviousRequest = isGenerationEvent && currentRequestId &&
+    event.request_id !== currentRequestId && previousEvents.some(
+      (entry) => entry.request_id === event.request_id && ["stream", "thought", "content"].includes(entry.type),
+    );
+  const events = appendAgentEvent(previousEvents, event);
+  const terminalStream = event.type !== "tool" && event.request_id
+    ? events.findLast((entry) =>
+        entry.type === "stream" &&
+        entry.request_id === event.request_id &&
+        eventsShareMessageScope(entry, event) &&
+        ["complete", "completed", "cancelled", "canceled", "error", "timeout", "pending", "awaiting_tools"].includes(entry.status),
+      )
+    : null;
   if (events.length > MAX_AGENT_EVENTS) {
     events.splice(0, events.length - MAX_AGENT_EVENTS);
   }
@@ -577,7 +604,12 @@ const reduceAgentState = (prev, event) => {
   const nextAgent = {
     ...existing,
     label: event.agent_label || event.agent_name || existing.label || fallbackLabel,
-    status: event.agent_status || existing.status,
+    status: isPreviousRequest
+      ? existing.status
+      : terminalStream?.status || event.agent_status || existing.status,
+    generation_request_id: isGenerationEvent && !isPreviousRequest
+      ? event.request_id
+      : currentRequestId,
     summary,
     updatedAt,
     workflow:
@@ -1208,6 +1240,7 @@ const AppContent = () => {
             payload?.type === "tool_call_delta" ? "tool" : event.type;
           if (
             ["content", "thought", "tool"].includes(activityType) &&
+            (!event.session_id || event.session_id === currentState?.sessionId) &&
             (event.message_id || event.chain_id)
           ) {
             setStreamActivity({
@@ -1257,6 +1290,7 @@ const AppContent = () => {
             const messageId = event.message_id || event.chain_id;
             const activeId = activeMessageIdRef.current;
             setState((prev) => {
+              if (event.session_id && event.session_id !== prev.sessionId) return prev;
               const conversation = Array.isArray(prev.conversation)
                 ? [...prev.conversation]
                 : [];
@@ -1266,10 +1300,10 @@ const AppContent = () => {
               if (idx === -1) return prev;
               const existing = conversation[idx];
               if (!existing || existing.role !== "ai") return prev;
-              if (activeId && messageId !== activeId) return prev;
-              if (!activeId && typeof existing.text === "string" && existing.text.trim()) {
-                return prev;
-              }
+              // Selection is a UI concern, not a stream subscription. Reopened
+              // partial responses still receive chunks; saved final ones do not.
+              const terminal = ["complete", "completed", "cancelled", "canceled", "error", "timeout", "partial"].includes(existing.metadata?.status);
+              if (terminal && activeId !== messageId) return prev;
               const joined = `${existing.text || ""}${event.content}`;
               conversation[idx] = { ...existing, text: joined };
               return { ...prev, conversation };
@@ -1283,6 +1317,7 @@ const AppContent = () => {
           ) {
             const messageId = event.message_id || event.chain_id;
             setState((prev) => {
+              if (event.session_id && event.session_id !== prev.sessionId) return prev;
               const conversation = Array.isArray(prev.conversation)
                 ? [...prev.conversation]
                 : [];
@@ -1301,20 +1336,28 @@ const AppContent = () => {
           if (event.type === "tool" && (event.message_id || event.chain_id)) {
             const mid = event.message_id || event.chain_id;
             setState((prev) => {
+              if (event.session_id && event.session_id !== prev.sessionId) return prev;
               const conv = Array.isArray(prev.conversation) ? [...prev.conversation] : [];
               const idx = conv.findIndex((m) => m && typeof m === "object" && m.id === mid);
               if (idx === -1) return prev;
               const msg = { ...conv[idx] };
               const tools = Array.isArray(msg.tools) ? [...msg.tools] : [];
               const sig = JSON.stringify({ name: event.name, args: event.args || {} });
+              const eventToolId = event.id || event.request_id;
               let tIdx = -1;
-              if (event.id) tIdx = tools.findIndex((t) => t && t.id === event.id);
+              if (eventToolId) tIdx = tools.findIndex((t) =>
+                t && String(t.id || t.request_id || "") === String(eventToolId),
+              );
               if (tIdx === -1)
                 tIdx = tools.findIndex(
-                  (t) => JSON.stringify({ name: t?.name, args: t?.args || {} }) === sig,
+                  (t) => (!eventToolId || !(t?.id || t?.request_id)) &&
+                    JSON.stringify({ name: t?.name, args: t?.args || {} }) === sig,
                 );
               const entry = {
-                id: event.id,
+                id: eventToolId,
+                request_id: eventToolId,
+                session_id: event.session_id || prev.sessionId,
+                message_id: mid,
                 name: event.name,
                 args: event.args || {},
                 result:
@@ -1573,10 +1616,12 @@ const AppContent = () => {
                     ? res.data.tools_used
                     : [];
                   setState((prev) => {
+                    if (prev.sessionId !== sessionId) return prev;
                     const updated = Array.isArray(prev.conversation)
                       ? [...prev.conversation]
                       : [];
                     const mIdx = updated.findIndex((m) => m && m.id === messageId);
+                    if (mIdx === -1) return prev;
                     if (mIdx !== -1) {
                       const existingText = updated[mIdx]?.text || "";
                       const joined = mergeContinuationText(

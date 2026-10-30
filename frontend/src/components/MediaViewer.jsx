@@ -31,7 +31,7 @@ const MAX_WRAPPER_HEIGHT_VH = 84;
 
 const cleanExtension = (value) => {
   if (typeof value !== "string") return "";
-  const clean = value.split("?")[0].split("#")[0];
+  const clean = value.split("?")[0].split("#")[0].split("/").pop();
   const dot = clean.lastIndexOf(".");
   if (dot === -1) return "";
   return clean.slice(dot + 1).toLowerCase();
@@ -42,6 +42,20 @@ const classifyMedia = (extension) => {
   if (extension === "pdf") return "pdf";
   if (VIDEO_EXTENSIONS.includes(extension)) return "video";
   if (AUDIO_EXTENSIONS.includes(extension)) return "audio";
+  return "other";
+};
+
+const mediaKind = ({ src, mediaType, file, filename, alt }) => {
+  const mime = String(mediaType || file?.type || "").split(";")[0].trim().toLowerCase();
+  if (mime.startsWith("image/")) return "image";
+  if (mime.startsWith("video/")) return "video";
+  if (mime.startsWith("audio/")) return "audio";
+  if (mime === "application/pdf") return "pdf";
+  // Capture routes and browser previews have no filename in their URL.
+  for (const candidate of [filename, file?.name, src, alt]) {
+    const kind = classifyMedia(cleanExtension(candidate));
+    if (kind !== "other") return kind;
+  }
   return "other";
 };
 
@@ -84,6 +98,7 @@ const normalizeItems = (items, fallback) => {
         src: item.src,
         alt: item.alt || "",
         file: item.file || null,
+        mediaType: item.mediaType || item.type || item.content_type || item.mime_type || "",
         label: item.label || item.alt || "",
         filename: item.filename || item.alt || "",
         displayName: item.displayName || item.display_name || "",
@@ -371,6 +386,7 @@ const MediaViewer = forwardRef(function MediaViewer(
     alt = "",
     showLink = true,
     file = null,
+    mediaType = "",
     contextItems = null,
     contextIndex = 0,
     onAttachmentChange = null,
@@ -409,8 +425,8 @@ const MediaViewer = forwardRef(function MediaViewer(
   const activeMediaRef = useRef(null);
 
   const fallbackItem = useMemo(
-    () => [{ src, alt, file, label: alt || fileNameFromMedia(src, alt) }],
-    [src, alt, file],
+    () => [{ src, alt, file, mediaType, label: alt || fileNameFromMedia(src, alt) }],
+    [src, alt, file, mediaType],
   );
   const viewerItems = useMemo(
     () => normalizeItems(contextItems, fallbackItem),
@@ -499,8 +515,14 @@ const MediaViewer = forwardRef(function MediaViewer(
   const activeSrc = activeItem?.src || src;
   const activeAlt = activeItem?.alt || alt;
   const activeFile = activeItem?.file || file;
-  const activeExtension = cleanExtension(activeSrc);
-  const activeKind = classifyMedia(activeExtension);
+  const activeExtension = cleanExtension(activeItem?.filename || activeFile?.name || activeSrc);
+  const activeKind = mediaKind({
+    src: activeSrc,
+    alt: activeAlt,
+    filename: activeItem?.filename,
+    file: activeFile,
+    mediaType: activeItem?.mediaType || (activeSrc === src ? mediaType : ""),
+  });
   const isZoomable = activeKind === "image" || activeKind === "pdf";
   const isZoomed = zoom > 1.01;
   const activeHash =
@@ -1273,8 +1295,14 @@ const MediaViewer = forwardRef(function MediaViewer(
     return <span className="generic-placeholder">{displayAlt || "file"}</span>;
   };
 
-  const previewExtension = cleanExtension(src);
-  const previewKind = classifyMedia(previewExtension);
+  const previewItem = viewerItems.find((item) => item.src === src);
+  const previewKind = mediaKind({
+    src,
+    alt,
+    file,
+    mediaType: mediaType || previewItem?.mediaType,
+    filename: previewItem?.filename,
+  });
   const showCaptionEditButton = activeKind === "image" && displayCaption && !captionEditOpen;
   const replaceGeneratedCaption =
     String(activeCaptionStatus || "").trim().toLowerCase() === "generated";

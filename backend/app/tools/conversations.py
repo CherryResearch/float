@@ -20,7 +20,18 @@ from app.services.conversation_compaction import (
     source_conversation_name,
     write_compaction,
 )
-from app.utils import conversation_store, verify_signature
+from app.utils import conversation_store, privacy_policy, verify_signature
+
+
+def _require_graph_compaction_policy(conversation_id: str) -> None:
+    if not conversation_store.graph_local_only(conversation_id):
+        return
+    policy = privacy_policy.current_data_policy()
+    if policy is None or policy.external is not False:
+        raise PermissionError(
+            "This conversation contains local-only graph.query results. "
+            "Compaction tools require an explicit local data-policy destination."
+        )
 
 
 def _llm_summarizer(request: Dict[str, Any]) -> Any:
@@ -153,6 +164,7 @@ def compact_conversation_plan(
         summary_model=summary_model,
     )
     verify_signature(signature, user, "compact_conversation_plan", payload)
+    _require_graph_compaction_policy(conversation_id)
     messages = conversation_store.load_conversation(conversation_id)
     if not isinstance(messages, list) or not messages:
         raise FileNotFoundError(f"Conversation not found or empty: {conversation_id}")
@@ -213,6 +225,7 @@ def compact_conversation_preview(
         summary_model=summary_model,
     )
     verify_signature(signature, user, "compact_conversation_preview", payload)
+    _require_graph_compaction_policy(conversation_id)
     use_llm = str(summary_mode or "").strip().lower() == "llm"
     return build_compaction(
         conversation_id,
@@ -254,6 +267,7 @@ def compact_conversation_write(
         replace=replace,
     )
     verify_signature(signature, user, "compact_conversation_write", payload)
+    _require_graph_compaction_policy(conversation_id)
     use_llm = str(summary_mode or "").strip().lower() == "llm"
     return write_compaction(
         conversation_id,
@@ -304,6 +318,7 @@ def compact_conversation(
         write=write,
     )
     verify_signature(signature, user, "compact_conversation", payload)
+    _require_graph_compaction_policy(conversation_id)
     use_llm = str(summary_mode or "").strip().lower() == "llm"
     if write:
         return write_compaction(
