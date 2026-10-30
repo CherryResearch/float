@@ -108,8 +108,6 @@ body:not(.dark-mode)
     .input-box
   ) {
   border-color: var(--card-border-inner);
-  outline: 1px solid var(--card-border-outer);
-  outline-offset: 2px;
 }
 
 body.dark-mode
@@ -124,8 +122,6 @@ body.dark-mode
     .input-box
   ) {
   border-color: color-mix(in oklab, var(--color-lavender) 60%, var(--glass-border) 40%);
-  outline: 1px solid color-mix(in oklab, var(--color-lavender) 65%, transparent);
-  outline-offset: 2px;
 }
 
 body:not(.dark-mode)
@@ -251,7 +247,7 @@ body.dark-mode .topbar-inner {
     transform 120ms ease,
     box-shadow 120ms ease,
     opacity 120ms ease;
-  z-index: 1300; /* below TopBar (1350), above chat */
+  z-index: var(--layer-sidebar);
 }
 
 body.dark-mode .show-sidebar-btn {
@@ -341,7 +337,7 @@ body.dark-mode .show-sidebar-btn {
     scrollbar-gutter: stable both-edges;
   }
 
-.show-sidebar-btn { top: calc(var(--topbar-total-height) + 8px); z-index: 2100; }
+.show-sidebar-btn { top: calc(var(--topbar-total-height) + 8px); }
 }
 
 /* Skeletons */
@@ -377,5 +373,5 @@ body.dark-mode .skeleton {
   }
   .center-rail { padding-left: 8px; padding-right: 8px; }
   .main-chat { padding-top: var(--topbar-total-height); }
-  .show-sidebar-btn { top: calc(var(--topbar-total-height) + 8px); z-index: 2100; }
+  .show-sidebar-btn { top: calc(var(--topbar-total-height) + 8px); }
 }

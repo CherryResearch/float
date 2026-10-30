@@ -5,9 +5,34 @@ import {
   buildParentConversationLink,
   buildSubchatLinksByMessage,
   eventsShareMessageScope,
+  reduceAgentState,
 } from "../App";
 
 describe("App event merging", () => {
+  it("does not reactivate a completed agent when an earlier request's thought arrives late", () => {
+    const scope = { session_id: "s", message_id: "m", agent_id: "m", request_id: "r1" };
+    let state = reduceAgentState({ byId: {}, order: [] }, { ...scope, type: "stream", status: "complete", agent_status: "complete" });
+    state = reduceAgentState(state, { ...scope, type: "thought", content: "late summary", agent_status: "active" });
+    expect(state.byId.m.status).toBe("complete");
+    state = reduceAgentState(state, { ...scope, request_id: "r2", type: "thought", content: "new continuation", agent_status: "active" });
+    expect(state.byId.m.status).toBe("active");
+    state = reduceAgentState(state, { ...scope, type: "stream", status: "complete", agent_status: "complete" });
+    expect(state.byId.m.status).toBe("active");
+    expect(state.byId.m.generation_request_id).toBe("r2");
+  });
+  it("closes a stream across interleaved events and ignores late chunks for that request", () => {
+    const scope = { session_id: "s", message_id: "m", agent_id: "m", request_id: "request-1" };
+    let events = appendAgentEvent([], { ...scope, type: "stream", status: "streaming" });
+    events = appendAgentEvent(events, { ...scope, type: "thought", content: "summary" });
+    events = appendAgentEvent(events, { ...scope, type: "stream", status: "complete" });
+    events = appendAgentEvent(events, { ...scope, type: "stream", status: "streaming", fragment: "late" });
+    expect(events).toHaveLength(2);
+    expect(events[0].status).toBe("complete");
+    events = appendAgentEvent(events, { ...scope, request_id: "request-2", type: "stream", status: "streaming" });
+    expect(events).toHaveLength(3);
+    expect(events[2].status).toBe("streaming");
+  });
+
   it("keeps simultaneous sessions from merging the same chain", () => {
     const existing = [
       {

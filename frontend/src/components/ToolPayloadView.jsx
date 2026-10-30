@@ -103,6 +103,8 @@ const normalizeSearchItem = (item) => {
 const extractSearchPayload = (payload, toolName) => {
   if (!payload || typeof payload !== "object") return null;
   const results = Array.isArray(payload.results) ? payload.results : null;
+  // A query alone is not a search result (recall uses a different schema).
+  if (results === null) return null;
   const query = getString(payload.query || payload.search || payload.q || "");
   const region = getString(payload.region || "");
   const maxResults = getNumber(payload.max_results || payload.maxResults);
@@ -139,6 +141,17 @@ const extractSearchPayload = (payload, toolName) => {
     items,
     hasResults: items.length > 0,
   };
+};
+
+const extractRecallPayload = (payload, toolName) => {
+  if (!isPlainObject(payload) || String(toolName || "").toLowerCase() !== "recall") {
+    return null;
+  }
+  return ["matches", "image_matches", "suggestions", "suggestions_detail", "recent_keys"].some(
+    (key) => Array.isArray(payload[key]),
+  )
+    ? payload
+    : null;
 };
 
 const isHelpToolName = (toolName) => {
@@ -433,6 +446,41 @@ const renderTextBody = (payload) => {
   return <div className="tool-payload-text">{text}</div>;
 };
 
+const renderRecallResults = (recall) => {
+  const {
+    query, requested_key: requestedKey, matches, image_matches: imageMatches,
+    suggestions_detail: suggestionDetails, suggestions, recent_keys: recentKeys,
+    ...details
+  } = recall;
+  const matchCount = (matches?.length || 0) + (imageMatches?.length || 0);
+  const sections = [
+    ["Matches", matches],
+    ["Image matches", imageMatches],
+    ["Suggestions", suggestionDetails?.length ? suggestionDetails : suggestions],
+    ["Recent keys", recentKeys],
+  ];
+  return (
+    <>
+      {(query || requestedKey) && (
+        <div className="tool-search-query"><em>Recall:</em> {query || requestedKey}</div>
+      )}
+      {(Array.isArray(matches) || Array.isArray(imageMatches)) && (
+        <div className="tool-search-meta">{matchCount} match{matchCount === 1 ? "" : "es"}</div>
+      )}
+      {!matchCount && Array.isArray(matches) && !details.error && (
+        <div className="tool-payload-empty">No matching memories.</div>
+      )}
+      {sections.filter(([, items]) => Array.isArray(items) && items.length).map(([title, items]) => (
+        <div key={title}>
+          <div className="tool-payload-label">{title}</div>
+          {renderArrayPayload(items)}
+        </div>
+      ))}
+      {Object.keys(details).length > 0 && renderKeyValueList(details)}
+    </>
+  );
+};
+
 const renderSearchResults = (search) => {
   const metaParts = [];
   if (typeof search.count === "number") metaParts.push(`${search.count} results`);
@@ -626,6 +674,12 @@ export const summarizeToolPayload = (value, toolName = null) => {
   if (normalized === null || typeof normalized === "undefined") return "";
   const { payload, message } = unwrapToolOutcome(normalized);
   if (message) return message;
+  const recall = extractRecallPayload(payload, toolName);
+  if (recall) {
+    const count = (recall.matches?.length || 0) + (recall.image_matches?.length || 0);
+    if (recall.error) return `Recall: ${recall.error}`;
+    return `Recall: ${count} match${count === 1 ? "" : "es"}`;
+  }
   const toolMenu = extractToolMenuPayload(payload, toolName);
   if (toolMenu) {
     const names = toolMenu.items.map((item) => item.name).filter(Boolean);
@@ -671,11 +725,16 @@ const ToolPayloadView = ({
 }) => {
   const normalized = normalizeToolPayload(value);
   if (normalized === null || typeof normalized === "undefined") return null;
-  const { payload, status, ok, message } = unwrapToolOutcome(normalized);
-  const search = extractSearchPayload(payload, toolName);
-  const toolMenu = extractToolMenuPayload(payload, toolName);
-  const computer = extractComputerPayload(payload, toolName);
-  const capture = extractCapturePayload(payload, toolName);
+  // Approval arguments must preserve every requested field, even result-shaped ones.
+  const isArguments = kind === "args";
+  const { payload, status, ok, message } = isArguments
+    ? { payload: normalized }
+    : unwrapToolOutcome(normalized);
+  const recall = isArguments ? null : extractRecallPayload(payload, toolName);
+  const search = isArguments ? null : extractSearchPayload(payload, toolName);
+  const toolMenu = isArguments ? null : extractToolMenuPayload(payload, toolName);
+  const computer = isArguments ? null : extractComputerPayload(payload, toolName);
+  const capture = isArguments ? null : extractCapturePayload(payload, toolName);
   const statusKey = status ? String(status).toLowerCase() : "";
   const showStatus = !!status;
   const classes = [
@@ -690,6 +749,7 @@ const ToolPayloadView = ({
     .join(" ");
 
   const content = (() => {
+    if (recall) return renderRecallResults(recall);
     if (toolMenu) return renderToolMenuPayload(toolMenu);
     if (computer) return renderComputerPayload(computer, onOpenComputerSession);
     if (capture) return renderCapturePayload(capture);

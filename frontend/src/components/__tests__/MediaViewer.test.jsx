@@ -1,4 +1,6 @@
 import React, { createRef } from "react";
+import { readFileSync } from "node:fs";
+import { URL as NodeURL } from "node:url";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -36,6 +38,49 @@ describe("MediaViewer caption display", () => {
     axiosMocks.delete.mockResolvedValue({ data: {} });
     axiosMocks.get.mockResolvedValue({ data: {} });
     axiosMocks.post.mockResolvedValue({ data: {} });
+  });
+
+  it("renders a camera content route as an image in chat and the viewer", () => {
+    const src = "/api/captures/camera-test/content";
+    render(
+      <MemoryRouter>
+        <MediaViewer
+          src={src}
+          alt="Camera frame"
+          mediaType="image/png"
+          contextItems={[{ src, alt: "Camera frame", type: "image/png" }]}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByRole("img", { name: "Camera frame" })).toHaveAttribute("src", src);
+    expect(document.querySelector(".generic-placeholder")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /open media viewer/i }));
+    expect(screen.getAllByRole("img", { name: "Camera frame" })).toHaveLength(2);
+    expect(document.querySelector(".viewer-link-out")).toBeNull();
+  });
+
+  it("uses a real PNG file's MIME for a browser preview without an extension", () => {
+    const bytes = readFileSync(new NodeURL("../../../../docs/resources/floatlogo.png", import.meta.url));
+    expect(bytes.length).toBeGreaterThan(1000);
+    expect(bytes.readUInt32BE(16)).toBeGreaterThan(32);
+    expect(bytes.readUInt32BE(20)).toBeGreaterThan(32);
+    const file = new File([bytes], "floatlogo.png", { type: "image/png" });
+    const src = "blob:http://localhost/real-image-preview";
+    render(
+      <MemoryRouter>
+        <MediaViewer src={src} alt="Float logo" file={file} />
+      </MemoryRouter>,
+    );
+    expect(screen.getByRole("img", { name: "Float logo" })).toHaveAttribute("src", src);
+  });
+
+  it("uses the saved filename for old extensionless capture descriptors", () => {
+    render(
+      <MemoryRouter>
+        <MediaViewer src="/api/captures/legacy/content" alt="camera.png" />
+      </MemoryRouter>,
+    );
+    expect(screen.getByRole("img", { name: "camera.png" })).toBeInTheDocument();
   });
 
   it("shows the readable caption with compact status badges", async () => {

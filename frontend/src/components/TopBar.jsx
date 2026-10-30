@@ -916,7 +916,7 @@ const TopBar = () => {
       color="transparent"
       elevation={0}
       className="topbar-appbar"
-      sx={{ zIndex: 2000 }}
+      sx={{ zIndex: "var(--layer-header)" }}
     >
       <Toolbar className="topbar-toolbar">
         <div className="topbar-inner topbar-content center-rail">

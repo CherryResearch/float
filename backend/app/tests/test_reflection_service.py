@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from app.services import reflection_service as reflection_module
 from app.services.reflection_service import ReflectionService
 from app.services.work_run_store import WorkRunStore
@@ -170,7 +171,7 @@ def test_reflection_commit_survives_work_ledger_failure(tmp_path, monkeypatch):
 
     service = ReflectionService(
         {"reflection_store_path": str(tmp_path / "reflections.sqlite3")},
-        llm_generate=lambda *a, **k: None,
+        llm_generate=lambda *a, **k: {"text": "A genuine bounded reflection."},
         work_run_store=FailingWorkRunStore(),  # type: ignore[arg-type]
     )
     task = service.create_task(
@@ -183,6 +184,321 @@ def test_reflection_commit_survives_work_ledger_failure(tmp_path, monkeypatch):
 
     assert result["status"] == "ran"
     assert service.list_runs(task["id"])[0]["id"] == result["run"]["id"]
+
+
+@pytest.mark.parametrize(
+    "failure", ["empty", "exception", "error_payload", "skill_echo"]
+)
+def test_reflection_failure_retains_error_receipt_without_fabricated_work(
+    tmp_path, monkeypatch, failure
+):
+    mirrored = []
+    calls = []
+    monkeypatch.setattr(
+        reflection_module, "try_ingest_text", lambda *a, **k: mirrored.append(a)
+    )
+    monkeypatch.setattr(reflection_module, "get_rag_service", lambda *a, **k: None)
+
+    def failing_generate(prompt, **kwargs):
+        calls.append(kwargs)
+        if failure == "exception":
+            raise RuntimeError("private provider response must not enter Activity")
+        if failure == "error_payload":
+            return {"error": "provider unavailable", "text": "request failed"}
+        if failure == "skill_echo":
+            return {"text": "You said: Thought task: draft this."}
+        return {"text": "   "}
+
+    work_runs = WorkRunStore(path=tmp_path / "work-runs.sqlite3")
+    service = ReflectionService(
+        {"reflection_store_path": str(tmp_path / "reflections.sqlite3")},
+        llm_generate=failing_generate,
+        work_run_store=work_runs,
+    )
+    task = service.create_task(
+        question="A synthetic reflection question",
+        utility=0.8,
+        uncertainty=0.7,
+        metadata={"proposal_kind": "skill_markdown"} if failure == "skill_echo" else {},
+    )
+
+    result = service.run_task(task["id"])
+    run = result["run"]
+    receipt = work_runs.get(run["id"])
+
+    assert result["status"] == "error"
+    assert run["status"] == "error"
+    assert run["output"] == ""
+    assert run["evaluation"] == {}
+    assert result["error"]["category"] in {"provider_error", "empty_output"}
+    assert result["task"]["run_count"] == 0
+    assert result["task"]["status"] == "waiting"
+    assert result["task"]["cooldown_until"] > result["task"]["last_attempt_at"]
+    assert service.list_runs(task["id"])[0]["id"] == run["id"]
+    assert receipt["status"] == "error"
+    assert receipt["phase"] == "error"
+    assert "private provider response" not in str(receipt)
+    assert len(calls) == 1  # Failed generation must not invoke the evaluator.
+    assert not mirrored
+    assert service.run_task(task["id"])["status"] == "not_runnable"
+    restarted = ReflectionService(
+        service.config,
+        llm_generate=lambda *a, **k: {"text": "# Useful retry\n\nA bounded next step."},
+    )
+    retry = restarted.run_task(task["id"], force=True)
+    assert retry["status"] == "ran"
+    assert retry["task"]["run_count"] == 1
+
+
+def test_reflection_evaluator_failure_preserves_real_output_and_labels_fallback(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(reflection_module, "try_ingest_text", lambda *a, **k: None)
+    monkeypatch.setattr(reflection_module, "get_rag_service", lambda *a, **k: None)
+
+    def generate(prompt, **kwargs):
+        if kwargs.get("response_format") == "json_object":
+            raise RuntimeError("synthetic evaluator unavailable")
+        return {"text": "A real useful reflection was generated."}
+
+    service = ReflectionService(
+        {"reflection_store_path": str(tmp_path / "reflections.sqlite3")},
+        llm_generate=generate,
+    )
+    task = service.create_task(
+        question="Evaluate useful work", utility=0.8, uncertainty=0.7
+    )
+    result = service.run_task(task["id"])
+
+    assert result["status"] == "ran"
+    assert result["run"]["status"] == "complete"
+    assert result["run"]["output"] == "A real useful reflection was generated."
+    assert result["run"]["evaluation"]["method"] == "deterministic"
+    assert result["run"]["evaluation"]["fallback_reason"] == "provider_error"
+    assert result["task"]["run_count"] == 1
+
+
+def test_reflection_default_provider_exception_becomes_safe_failed_run(
+    tmp_path, monkeypatch
+):
+    from app import routes
+
+    monkeypatch.setattr(reflection_module, "get_rag_service", lambda *a, **k: None)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("private provider transport detail")
+
+    monkeypatch.setattr(routes.llm_service, "generate", fail)
+    service = ReflectionService(
+        {"reflection_store_path": str(tmp_path / "reflections.sqlite3")}
+    )
+    task = service.create_task(question="Synthetic task", utility=0.8, uncertainty=0.7)
+    result = service.run_task(task["id"])
+
+    assert result["status"] == "error"
+    assert result["error"]["category"] == "provider_error"
+    assert "private provider transport detail" not in str(result)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "Useful synthesis.",
+        {"message": {"content": "Useful synthesis."}},
+        {"text": "", "content": "Useful synthesis."},
+    ],
+)
+def test_reflection_accepts_supported_alternative_success_output(
+    tmp_path, monkeypatch, response
+):
+    monkeypatch.setattr(reflection_module, "try_ingest_text", lambda *a, **k: None)
+    monkeypatch.setattr(reflection_module, "get_rag_service", lambda *a, **k: None)
+    service = ReflectionService(
+        {"reflection_store_path": str(tmp_path / "reflections.sqlite3")},
+        llm_generate=lambda *a, **k: response,
+    )
+    task = service.create_task(question="Synthetic task", utility=0.8, uncertainty=0.7)
+    result = service.run_task(task["id"])
+
+    assert result["status"] == "ran"
+    assert result["run"]["output"] == "Useful synthesis."
+    assert result["run"]["evaluation"]["method"] == "deterministic"
+
+
+def test_reflection_initial_judgment_obeys_budget_and_labels_fallback(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(reflection_module, "try_ingest_text", lambda *a, **k: None)
+    calls = []
+
+    def fail(prompt, **kwargs):
+        calls.append({"prompt": prompt, **kwargs})
+        raise RuntimeError("synthetic scoring unavailable")
+
+    service = ReflectionService(
+        {"reflection_store_path": str(tmp_path / "reflections.sqlite3")},
+        llm_generate=fail,
+    )
+    task = service.create_task(
+        question="A candidate reflection",
+        metadata={"optional_context": "synthetic context " * 2000},
+        patience_budget={"max_context_tokens": 512, "max_output_tokens": 16},
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["output_token_limit"] == 16
+    assert calls[0]["context"].metadata["patience_budget"]["input_tokens"] + 16 <= 512
+    assert task["initial_judgment"]["method"] == "deterministic"
+    assert task["initial_judgment"]["reason"] == "provider_error"
+    assert task["utility"] == 0.55
+    constrained = service.create_task(
+        question="Required task instructions cannot fit",
+        patience_budget={"max_context_tokens": 1},
+    )
+    assert len(calls) == 1
+    assert constrained["initial_judgment"]["reason"] == "context_budget_exceeded"
+
+
+@pytest.mark.parametrize(
+    "context_text", ["A repeated synthetic context. ", "多言語の合成文脈🌊 "]
+)
+def test_reflection_context_and_output_caps_apply_to_generation_and_evaluation(
+    tmp_path, monkeypatch, context_text
+):
+    from app.utils.tokenizer import CustomTokenizer
+
+    monkeypatch.setattr(reflection_module, "try_ingest_text", lambda *a, **k: None)
+    calls = []
+
+    def generate(prompt, **kwargs):
+        calls.append({"prompt": prompt, **kwargs})
+        return {"text": "Useful reflection."}
+
+    service = ReflectionService(
+        {"reflection_store_path": str(tmp_path / "reflections.sqlite3")},
+        llm_generate=generate,
+    )
+    monkeypatch.setattr(
+        service,
+        "_retrieve_context",
+        lambda task: {
+            "text": context_text * 2000,
+            "input_context_ids": [],
+        },
+    )
+    task = service.create_task(
+        question="Preserve this question.",
+        utility=0.8,
+        uncertainty=0.7,
+        patience_budget={
+            "max_context_tokens": 512,
+            "max_output_tokens": 16,
+            "reserve_output_tokens": 32,
+        },
+    )
+    result = service.run_task(task["id"])
+
+    assert result["status"] == "ran"
+    assert len(calls) == 2
+    tokenizer = CustomTokenizer()
+    for call in calls:
+        assert call["output_token_limit"] == 16
+        count = len(tokenizer.encode(call["context"].system_prompt)) + len(
+            tokenizer.encode(call["prompt"])
+        )
+        assert count + 24 + 32 <= 512
+        assert "Preserve this question." in call["prompt"]
+    assert result["run"]["generation"]["patience_budget"]["context_truncated"] is True
+
+
+def test_reflection_too_small_context_budget_fails_before_provider_dispatch(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(reflection_module, "get_rag_service", lambda *a, **k: None)
+    calls = []
+    service = ReflectionService(
+        {"reflection_store_path": str(tmp_path / "reflections.sqlite3")},
+        llm_generate=lambda *a, **k: calls.append(a),
+    )
+    task = service.create_task(
+        question="Keep required instructions.",
+        utility=0.8,
+        uncertainty=0.7,
+        patience_budget={"max_context_tokens": 1},
+    )
+    result = service.run_task(task["id"])
+
+    assert result["status"] == "error"
+    assert result["error"]["category"] == "context_budget_exceeded"
+    assert not calls
+    assert result["task"]["run_count"] == 0
+
+
+def test_reflection_runtime_budget_stops_before_evaluation_but_keeps_real_output(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(reflection_module, "try_ingest_text", lambda *a, **k: None)
+    monkeypatch.setattr(reflection_module, "get_rag_service", lambda *a, **k: None)
+    current = [1000.0]
+    calls = []
+
+    def generate(prompt, **kwargs):
+        calls.append(kwargs)
+        current[0] += 2
+        return {"text": "Useful output returned after the cooperative deadline."}
+
+    service = ReflectionService(
+        {"reflection_store_path": str(tmp_path / "reflections.sqlite3")},
+        llm_generate=generate,
+        now_fn=lambda: current[0],
+    )
+    task = service.create_task(
+        question="One timed reflection",
+        utility=0.8,
+        uncertainty=0.7,
+        patience_budget={"max_runtime_seconds": 1},
+    )
+    result = service.run_task(task["id"])
+
+    assert result["status"] == "ran"
+    assert len(calls) == 1
+    assert result["run"]["output"].startswith("Useful output")
+    assert result["run"]["evaluation"]["fallback_reason"] == "runtime_budget_reached"
+    assert (
+        result["run"]["generation"]["termination_category"] == "runtime_budget_reached"
+    )
+    assert result["run"]["started_at"] == 1000.0
+    assert result["run"]["finished_at"] == 1002.0
+
+
+def test_reflection_context_retrieval_can_exhaust_cooperative_runtime_budget(
+    tmp_path, monkeypatch
+):
+    current = [1000.0]
+    calls = []
+    service = ReflectionService(
+        {"reflection_store_path": str(tmp_path / "reflections.sqlite3")},
+        llm_generate=lambda *a, **k: calls.append(a),
+        now_fn=lambda: current[0],
+    )
+
+    def retrieve(task):
+        current[0] += 2
+        return {"text": "Synthetic context", "input_context_ids": []}
+
+    monkeypatch.setattr(service, "_retrieve_context", retrieve)
+    task = service.create_task(
+        question="Runtime-limited reflection",
+        utility=0.8,
+        uncertainty=0.7,
+        patience_budget={"max_runtime_seconds": 1},
+    )
+    result = service.run_task(task["id"])
+
+    assert result["status"] == "error"
+    assert result["error"]["category"] == "runtime_budget_reached"
+    assert not calls
+    assert result["task"]["run_count"] == 0
 
 
 def test_reflection_priority_echo_damping_and_seeded_sampling(tmp_path, monkeypatch):

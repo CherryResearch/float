@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
 from app import config as app_config
+from app.utils.privacy_policy import PrivacyCleanupError
 from app.utils.time_resolution import resolve_timezone_name
 from fastapi import HTTPException
 
@@ -320,6 +321,9 @@ def try_ingest_text(
     meta.setdefault("created_at", time.time())
     try:
         return service.ingest_text(text, meta, mirror_vector=mirror_vector)
+    except PrivacyCleanupError:
+        # A stale private mirror is a failed privacy change, not optional indexing.
+        raise
     except Exception as exc:  # pragma: no cover - defensive guard
         logger.warning("RAG ingest failed: %s", exc)
         return None

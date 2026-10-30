@@ -7,6 +7,7 @@ export const resolveAnchoredPopoverPosition = ({
   margin = 12,
   gap = 10,
   maxWidth = 460,
+  align = "end",
 }) => {
   const viewportLeft = Number(viewport?.left) || 0;
   const viewportTop = Number(viewport?.top) || 0;
@@ -23,7 +24,10 @@ export const resolveAnchoredPopoverPosition = ({
   const height = Math.min(measuredHeight || maxHeight, maxHeight);
   const minLeft = viewportLeft + margin;
   const maxLeft = Math.max(minLeft, viewportLeft + viewportWidth - width - margin);
-  const left = clamp((Number(anchorRect?.right) || minLeft) - width, minLeft, maxLeft);
+  const desiredLeft = align === "start"
+    ? Number(anchorRect?.left) || minLeft
+    : (Number(anchorRect?.right) || minLeft) - width;
+  const left = clamp(desiredLeft, minLeft, maxLeft);
   const spaceAbove = (Number(anchorRect?.top) || viewportTop) - viewportTop - margin - gap;
   const spaceBelow =
     viewportTop + viewportHeight - (Number(anchorRect?.bottom) || viewportTop) - margin - gap;

@@ -603,6 +603,23 @@ describe("AgentConsole", () => {
     expect(container.querySelector(".agent-activity .agent-chat-group-line")).toBeNull();
   });
 
+  it.each([
+    ["legacy completed response", "sess-123", -10, "complete"],
+    ["newer attempt", "sess-123", 10, "active"],
+    ["another session", "other-session", -10, "active"],
+  ])("reconciles a stale active card only for its saved owner: %s", (_label, sessionId, offset, expectedStatus) => {
+    const now = Date.now() / 1000;
+    const { container } = renderWithGlobalState(
+      <AgentConsole collapsed={false} onToggle={() => {}} streamEnabled onStreamToggle={() => {}}
+        agents={[{ id: "legacy-card", label: "recall", status: "active", session_id: sessionId, updatedAt: now + offset,
+          events: [{ type: "tool", id: "legacy-tool", request_id: "legacy-tool", name: "recall", status: "invoked", result: { matches: [] },
+            session_id: sessionId, message_id: "legacy-message", timestamp: now + offset }] }]}
+        backendReady />,
+      { stateOverrides: { conversation: [{ id: "legacy-message", role: "ai", text: "Saved answer", metadata: { status: "complete", timing: { completed_at: now } } }] } },
+    );
+    expect(container.querySelector(".agent-card-submeta .agent-status-label")).toHaveTextContent(expectedStatus);
+  });
+
   it("stops stream progress for terminal and unresolved conversation responses", () => {
     const now = Date.now() / 1000;
     const streamEvent = (id, status, offset) => ({
@@ -631,6 +648,9 @@ describe("AgentConsole", () => {
               streamEvent("msg-timeout", "timeout", 2),
               streamEvent("msg-unresolved", "active", 3),
               streamEvent("msg-partial", "active", 4),
+              streamEvent("msg-complete", "streaming", 5),
+              streamEvent("msg-cancelled", "streaming", 6),
+              streamEvent("msg-approval", "pending", 7),
             ],
           },
         ]}
@@ -639,21 +659,25 @@ describe("AgentConsole", () => {
       {
         stateOverrides: {
           conversation: [
-            { id: "msg-active", role: "ai", metadata: { status: "streaming" } },
-            { id: "msg-error", role: "ai", metadata: {} },
-            { id: "msg-timeout", role: "ai", metadata: {} },
+            { id: "msg-active", role: "ai", metadata: { status: "complete", timing: { completed_at: now - 10 } } },
+            { id: "msg-error", role: "ai", metadata: { status: "complete", tool_response_pending: true } },
+            { id: "msg-timeout", role: "ai", metadata: { tool_response_pending: true } },
             {
               id: "msg-unresolved",
               role: "ai",
-              metadata: { unresolved_tool_loop: true },
+              metadata: { unresolved_tool_loop: true, tool_response_pending: true },
             },
-            { id: "msg-partial", role: "ai", metadata: { status: "partial" } },
+            { id: "msg-partial", role: "ai", metadata: { status: "partial", tool_response_pending: true } },
+            { id: "msg-complete", role: "ai", metadata: { status: "complete" } },
+            { id: "msg-cancelled", role: "ai", metadata: { status: "cancelled" } },
+            { id: "msg-approval", role: "ai", metadata: { tool_response_pending: true } },
           ],
         },
       },
     );
 
     fireEvent.click(screen.getByRole("button", { name: /expand agent card/i }));
+    fireEvent.click(screen.getByRole("button", { name: /show full activity/i }));
     screen
       .getAllByRole("button", { name: /expand activity details/i })
       .forEach((button) => fireEvent.click(button));
@@ -662,6 +686,9 @@ describe("AgentConsole", () => {
     expect(screen.getByText("response timed out")).toBeInTheDocument();
     expect(screen.getByText("tool follow-up stopped")).toBeInTheDocument();
     expect(screen.getByText("partial response")).toBeInTheDocument();
+    expect(screen.getByText("response complete")).toBeInTheDocument();
+    expect(screen.getByText("response stopped")).toBeInTheDocument();
+    expect(screen.getByText("waiting for tools")).toBeInTheDocument();
     expect(container.querySelectorAll('[role="status"]')).toHaveLength(4);
     expect(
       screen.getAllByRole("progressbar", { name: /streaming response/i }),
@@ -2406,13 +2433,6 @@ describe("AgentConsole", () => {
         }}
       />,
     );
-
-    const expandAgentButtons = screen.queryAllByRole("button", {
-      name: /expand agent card/i,
-    });
-    if (expandAgentButtons[0]) {
-      fireEvent.click(expandAgentButtons[0]);
-    }
 
     const toolRow = container.querySelector(
       '.agent-activity.agent-activity-tool[data-tool-id="proposal-focus-open"]',

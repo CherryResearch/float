@@ -1956,7 +1956,11 @@ def test_generate_api_blocks_supported_model_when_image_bytes_missing(monkeypatc
     )
 
 
-def test_generate_api_uses_local_caption_fallback_for_non_vision_models(monkeypatch):
+@pytest.mark.parametrize("history_only", [False, True])
+@pytest.mark.parametrize("streaming", [False, True])
+def test_generate_api_uses_local_caption_fallback_for_non_vision_models(
+    monkeypatch, history_only, streaming
+):
     captured = {}
     logo_path = (
         Path(__file__).resolve().parents[3] / "docs" / "resources" / "floatlogo.png"
@@ -1974,9 +1978,23 @@ def test_generate_api_uses_local_caption_fallback_for_non_vision_models(monkeypa
             "placeholder": False,
         }
 
-    def fake_post(url, headers=None, json=None, timeout=None):
+    def fake_post(url, headers=None, json=None, timeout=None, stream=False):
         captured["url"] = url
         captured["payload"] = json
+        if stream:
+            return DummyStreamingApiResponse(
+                _build_sse_lines(
+                    {
+                        "model": "text-only-model",
+                        "choices": [
+                            {
+                                "delta": {"content": "fallback ok"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                )
+            )
         return DummyApiResponse(
             {
                 "model": "text-only-model",
@@ -2003,20 +2021,29 @@ def test_generate_api_uses_local_caption_fallback_for_non_vision_models(monkeypa
         },
     )
     content_hash = hashlib.sha256(image_bytes).hexdigest()
+    attachment = {
+        "name": "fallback.png",
+        "type": "image/png",
+        "url": f"/api/attachments/{content_hash}/fallback.png",
+        "content_hash": content_hash,
+    }
+    context = ModelContext()
+    if history_only:
+        context.add_message(
+            "user",
+            "An earlier image",
+            metadata={"attachments": [attachment], "message_id": "earlier-turn"},
+        )
     result = svc.generate(
         "describe the image",
-        attachments=[
-            {
-                "name": "fallback.png",
-                "type": "image/png",
-                "url": f"/api/attachments/{content_hash}/fallback.png",
-                "content_hash": content_hash,
-            }
-        ],
+        context=context,
+        attachments=[] if history_only else [attachment],
+        stream_message_id="current-turn",
+        stream_consumer=(lambda _event: None) if streaming else None,
         vision_workflow="caption",
     )
 
-    content = captured["payload"]["messages"][-1]["content"]
+    content = captured["payload"]["messages"][-2 if history_only else -1]["content"]
     assert not any(
         isinstance(part, dict) and part.get("type") == "image_url" for part in content
     )
@@ -2030,6 +2057,13 @@ def test_generate_api_uses_local_caption_fallback_for_non_vision_models(monkeypa
     assert vision_meta["native_image_input"] is False
     assert vision_meta["fallback_used"] is True
     assert vision_meta["fallback_images"] == 1
+    assert vision_meta["current_request_images"] == (0 if history_only else 1)
+    assert vision_meta["fallback_attachments"][0]["scope"] == (
+        "history" if history_only else "current"
+    )
+    assert vision_meta["fallback_attachments"][0]["source_message_id"] == (
+        "earlier-turn" if history_only else "current-turn"
+    )
     assert vision_meta["fallback_attachments"][0]["caption"] == "Local fallback caption"
     assert vision_meta["fallback_attachments"][0]["caption_model"] == (
         "local-caption-model"

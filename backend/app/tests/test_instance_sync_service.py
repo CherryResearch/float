@@ -1103,7 +1103,8 @@ def test_remote_client_requires_repair_instead_of_re_registering_stale_pair():
 
     session = FakeSession()
     client = RemoteFloatClient(
-        "http://pear.local:54089",
+        # This tests pairing state with a fake transport, not machine-local DNS.
+        "http://192.168.1.25:54089",
         session=session,
         paired_device={
             "id": "peer-1",
@@ -1229,7 +1230,8 @@ def test_remote_client_enriches_legacy_settings_snapshot_with_themes():
             raise AssertionError(f"unexpected request path: {path}")
 
     client = RemoteFloatClient(
-        "http://pear.local:54089",
+        # Keep the fake settings transport independent of local DNS answers.
+        "http://192.168.1.25:54089",
         session=FakeSession(),
         paired_device={
             "remote_device_id": "remote-device",

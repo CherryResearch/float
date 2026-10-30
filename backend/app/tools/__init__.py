@@ -51,6 +51,7 @@ BUILTIN_TOOLS: Dict[str, Callable[..., Any]] = {
     "remember": memory.remember,
     "recall": memory.recall,
     "graph.update": graph_tools.update_graph,
+    "graph.query": graph_tools.query_graph,
     "reflect": reflections.reflect,
     "list_reflections": reflections.list_reflections,
     "list_actions": action_tools.list_actions,

@@ -10,8 +10,7 @@
   background: transparent;
   box-shadow: none;
   border-bottom: none;
-  /* Ensure TopBar layers above sidebars */
-  z-index: 2000;
+  z-index: var(--layer-header);
 }
 
 .topbar-toolbar {

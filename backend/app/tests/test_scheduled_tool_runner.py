@@ -7,6 +7,301 @@ from pathlib import Path
 import pytest
 
 
+class _GraphPrivacyResponse:
+    status_code = 200
+    headers = {}
+    text = ""
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return {
+            "choices": [{"message": {"content": "Synthetic scheduled answer."}}],
+            "model": "synthetic-model",
+        }
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("isolated", [False, True])
+@pytest.mark.parametrize("warm", [False, True])
+@pytest.mark.parametrize("kind", ["prompt", "tool"])
+@pytest.mark.parametrize("marker", ["sidecar", "receipt"])
+@pytest.mark.parametrize("mode", ["api", "server"])
+async def test_scheduled_graph_history_never_reaches_background_transport(
+    app_with_temp_stores, monkeypatch, isolated, warm, kind, marker, mode
+):
+    from app import routes
+    from app.base_services import LLMService
+    from app.utils import calendar_store, conversation_store
+    from workers import scheduled_tool_runner as runner
+
+    app, _manager = app_with_temp_stores
+    _restore_real_scheduled_authorization(monkeypatch)
+    session_id = "synthetic-local-graph"
+    sentinel = "SYNTHETIC_GRAPH_LOCAL_ONLY"
+    entry = {"id": "original", "role": "ai", "text": sentinel}
+    if marker == "receipt":
+        entry["tools"] = [
+            {"name": "graph.query", "status": "invoked", "result": sentinel}
+        ]
+    conversation_store.save_conversation(session_id, [entry])
+    if marker == "sidecar":
+        conversation_store.mark_graph_local_only(session_id)
+    service = LLMService(
+        mode=mode,
+        config={
+            "server_url": "http://127.0.0.1:9876/v1/chat/completions",
+            "api_url": "https://external.invalid/v1/chat/completions",
+            "api_model": "synthetic-model",
+            "api_key": "synthetic-key",
+        },
+    )
+    if warm:
+        service.get_context(session_id).add_message("assistant", sentinel)
+    monkeypatch.setattr(routes, "llm_service", service)
+    http_calls = []
+    process_calls = []
+
+    def post(url, **kwargs):
+        http_calls.append((url, kwargs))
+        return _GraphPrivacyResponse()
+
+    async def spawn(*args, **kwargs):
+        process_calls.append((args, kwargs))
+        return {"text": "Unexpected external process dispatch"}
+
+    monkeypatch.setattr("app.base_services.http_session.post", post)
+    monkeypatch.setattr(runner.process_isolation, "run_isolated_process", spawn)
+    action = {
+        "id": "action",
+        "kind": kind,
+        "prompt": "Summarize the existing context.",
+        "status": "scheduled",
+        "session_id": session_id,
+        "message_id": "original",
+        "conversation_mode": "inline",
+    }
+    if kind == "tool":
+        action.update(name="tool_info", args={"tool_name": "recall"})
+    calendar_store.save_event(
+        "synthetic-graph-event",
+        {
+            "id": "synthetic-graph-event",
+            "title": "Synthetic graph privacy check",
+            "start_time": time.time() - 5,
+            "timezone": "UTC",
+            "status": "scheduled",
+            "background_job": {
+                "execution": {
+                    "sandbox_processes": isolated,
+                    "permissions": ["help.read"],
+                }
+            },
+            "actions": [action],
+        },
+    )
+    result = await runner.run_scheduled_tools_for_event(app, "synthetic-graph-event")
+    assert result["status"] == "error"
+    assert "local-only graph context" in json.dumps(result)
+    assert result["results"][0]["error_category"] == "local_only_context"
+    assert sentinel not in json.dumps(result)
+    if kind == "tool":
+        stored = calendar_store.load_event("synthetic-graph-event")
+        assert (
+            stored["actions"][0]["followup_error"]
+            == runner._GraphLocalOnlyContextError.message
+        )
+        assert [call["name"] for call in _manager.calls] == ["tool_info"]
+        invoked_args = dict(_manager.calls[0]["args"])
+        host_context = invoked_args.pop("_action_context")
+        # Scheduled authorization fills the public tool schema defaults.
+        assert invoked_args == {
+            "tool_name": "recall",
+            "include_schema": True,
+            "failed_tool_name": "",
+            "failed_args": {},
+            "failed_error": "",
+        }
+        assert host_context["session_id"] == session_id
+    else:
+        assert _manager.calls == []
+    assert http_calls == []
+    assert process_calls == []
+    assert conversation_store.graph_local_only(session_id)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("isolated", [False, True])
+@pytest.mark.parametrize("policy_mode", ["external", "local", "local-drift"])
+async def test_scoped_scheduled_generation_crosses_dispatch_boundary(
+    app_with_temp_stores, monkeypatch, isolated, policy_mode
+):
+    from types import SimpleNamespace
+
+    from app.base_services import LLMService
+    from app.services import ModelContext
+    from app.services.process_isolation import generate_with_fresh_service
+    from app.utils.privacy_policy import DataPolicy, data_policy_scope
+    from workers import scheduled_tool_runner as runner
+
+    app, _manager = app_with_temp_stores
+    context = ModelContext()
+    context.add_message("assistant", "SYNTHETIC_GRAPH_LOCAL_ONLY")
+    restricted = policy_mode != "external"
+    service = LLMService(
+        mode="server" if restricted else "api",
+        config={
+            "server_url": (
+                "https://external.invalid/v1/chat/completions"
+                if policy_mode == "local-drift"
+                else "http://127.0.0.1:9876/v1/chat/completions"
+            ),
+            "api_url": "https://external.invalid/v1/chat/completions",
+            "api_model": "synthetic-model",
+            "api_key": "synthetic-key",
+        },
+    )
+    calls = []
+    serialized = []
+
+    def post(url, **kwargs):
+        calls.append((url, kwargs))
+        return _GraphPrivacyResponse()
+
+    async def spawn(_module, _name, request, **_kwargs):
+        # Exercise the actual child entry from serialized data, not a fake LLM.
+        request = json.loads(json.dumps(request))
+        serialized.append(request)
+        return generate_with_fresh_service(request)
+
+    monkeypatch.setattr("app.base_services.http_session.post", post)
+    monkeypatch.setattr(runner.process_isolation, "run_isolated_process", spawn)
+
+    async def generate():
+        return await runner._generate_provider_response(
+            app,
+            event={
+                "background_job": {
+                    "execution": {
+                        "sandbox_processes": isolated,
+                        "model": "synthetic-model",
+                    }
+                }
+            },
+            event_id="synthetic",
+            action={"run_id": "run"},
+            action_id="action",
+            occurrence_time=1.0,
+            phase="prompt",
+            tool_invoked=False,
+            session_id="synthetic-local",
+            response_format=None,
+            context=context,
+            routes_module=SimpleNamespace(llm_service=service),
+        )
+
+    with data_policy_scope(DataPolicy(not restricted, not restricted)):
+        if policy_mode == "local-drift":
+            with pytest.raises(PermissionError):
+                await generate()
+            assert calls == []
+        else:
+            result = await generate()
+            assert result["text"] == "Synthetic scheduled answer."
+            assert len(calls) == 1
+            assert "SYNTHETIC_GRAPH_LOCAL_ONLY" in json.dumps(calls[0][1]["json"])
+            if restricted:
+                assert calls[0][0].startswith("http://127.0.0.1:")
+                assert calls[0][1]["allow_redirects"] is False
+            else:
+                assert calls[0][0].startswith("https://external.invalid/")
+    if isolated:
+        assert serialized[0]["data_policy"] == {
+            "external": not restricted,
+            "allow_remote_query": not restricted,
+            "local_only": False,
+        }
+        assert serialized[0]["model"] == "synthetic-model"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("kind", ["prompt", "tool"])
+async def test_scheduled_graph_blocks_completed_output_recovery(
+    app_with_temp_stores, monkeypatch, kind
+):
+    from app import routes
+    from app.base_services import LLMService
+    from app.utils import conversation_store
+    from workers import scheduled_tool_runner as runner
+
+    app, _manager = app_with_temp_stores
+    session_id = "synthetic-recovery"
+    now = 1_700_000_000.0
+    monkeypatch.setattr(runner.time, "time", lambda: now)
+    output_id = (
+        runner._stable_composite_id(
+            "scheduled-message", "synthetic", "action", int(now * 1000), "prompt"
+        )
+        if kind == "prompt"
+        else "completed-output"
+    )
+    conversation_store.save_conversation(
+        session_id,
+        [
+            {
+                "id": output_id,
+                "role": "ai",
+                "text": "SYNTHETIC_GRAPH_LOCAL_ONLY",
+                "metadata": {"status": "complete"},
+            }
+        ],
+    )
+    conversation_store.mark_graph_local_only(session_id)
+    monkeypatch.setattr(routes, "llm_service", LLMService(mode="api", config={}))
+    recovery_reads = []
+    original_load = runner._load_conversation_entry
+
+    def completed_output(*args):
+        recovery_reads.append(args)
+        return original_load(*args)
+
+    async def journal_already_complete(*_args, **_kwargs):
+        # This fixture represents an already committed attempt. The test checks
+        # custody before reusing its real saved answer, not journal repair.
+        return None
+
+    monkeypatch.setattr(runner, "_load_conversation_entry", completed_output)
+    monkeypatch.setattr(
+        runner, "_close_attempt_from_canonical_output", journal_already_complete
+    )
+    monkeypatch.setattr(
+        runner, "_hydrate_effect_state_from_ledger", journal_already_complete
+    )
+    kwargs = dict(
+        session_id=session_id,
+        chain_id="chain",
+        prompt="Resume the result",
+        event_id="synthetic",
+        event={},
+        action={},
+        action_id="action",
+    )
+    with pytest.raises(PermissionError, match="local-only graph context"):
+        if kind == "prompt":
+            await runner._run_prompt_action(app, **kwargs)
+        else:
+            await runner._run_prompt_followup(
+                app,
+                tool_name="tool_info",
+                tool_args={},
+                tool_result="safe",
+                followup_message_id=output_id,
+                **kwargs,
+            )
+    assert recovery_reads == []
+
+
 def test_run_summary_keeps_structured_tool_receipts_compact():
     from workers.scheduled_tool_runner import _run_summary
 
@@ -1145,6 +1440,95 @@ async def test_scheduled_tool_runner_runs_prompt_action(
     assert agents[message_id]["status"] == "complete"
     assert agents[message_id]["provenance"]["kind"] == "scheduled_prompt"
     assert agents[message_id]["provenance"]["source_event_id"] == event_id
+
+
+@pytest.mark.anyio
+async def test_completed_prompt_repairs_running_state_after_control_edit(
+    app_with_temp_stores, monkeypatch
+):
+    from app import routes as routes_module
+    from app.services.work_run_projection import delete_calendar_event_with_receipts
+    from app.utils import calendar_store, conversation_store
+    from workers import scheduled_tool_runner as runner
+
+    app, dummy = app_with_temp_stores
+    event_id = "prompt-control-edit-after-dispatch"
+    action_id = "prompt-control-edit-action"
+    session_id = "prompt-control-edit-session"
+
+    def edit_controls_then_return(*_args, **_kwargs):
+        def edit_latest(latest):
+            latest["actions"][0]["prompt"] = "Use this definition next time."
+            latest["actions"][0]["external_control_revision"] = 1
+            return latest
+
+        calendar_store.update_event(event_id, edit_latest)
+        return {"text": "Durable result from the claimed prompt.", "thought": ""}
+
+    monkeypatch.setattr(
+        routes_module.llm_service, "generate", edit_controls_then_return
+    )
+    calendar_store.save_event(
+        event_id,
+        {
+            "id": event_id,
+            "title": "Control edit during provider call",
+            "start_time": time.time() - 5,
+            "timezone": "UTC",
+            "status": "scheduled",
+            "actions": [
+                {
+                    "id": action_id,
+                    "kind": "prompt",
+                    "prompt": "Run the original claimed definition.",
+                    "status": "scheduled",
+                    "session_id": session_id,
+                    "external_control_revision": 0,
+                }
+            ],
+        },
+    )
+
+    result = await runner.run_scheduled_tools_for_event(app, event_id)
+
+    assert result["status"] == "invoked"
+    assert dummy.calls == []
+    stored = calendar_store.load_event(event_id)
+    action = stored["actions"][0]
+    receipt = stored["run_history"][0]
+    assert stored["status"] == "prompted"
+    assert action["status"] == "prompted"
+    assert action["prompt"] == "Use this definition next time."
+    assert action["external_control_revision"] == 1
+    assert action["run_control_revision"] == 0
+    assert action["result"] == "Durable result from the claimed prompt."
+    assert action["prompt_invoked"] is True
+    assert receipt["status"] == "prompted"
+    assert receipt["phase"] == "post_dispatch"
+    assert receipt["state_delta_certainty"] == "confirmed_output"
+    assert receipt["summary"] == (
+        "Provider output completed; newer control state remains authoritative."
+    )
+    activity = app.state.work_run_store.get(receipt["id"])
+    assert activity["status"] == "prompted"
+    assert activity["recovery_state"] == "terminal"
+    conversation = conversation_store.load_conversation(session_id)
+    assert (
+        sum(
+            item.get("role") == "ai"
+            and item.get("text") == "Durable result from the claimed prompt."
+            and (item.get("metadata") or {}).get("status") == "complete"
+            for item in conversation
+            if isinstance(item, dict)
+        )
+        == 1
+    )
+    assert (
+        delete_calendar_event_with_receipts(app.state.work_run_store, event_id)[
+            "deleted"
+        ]
+        is True
+    )
 
 
 @pytest.mark.anyio
@@ -2795,7 +3179,12 @@ async def test_prompt_only_provider_retry_is_journaled_without_effect(
     assert "updated in place" in retry_context
 
 
-def _save_restartable_prompt_event(calendar_store, event_id, *, prompt):
+def _save_restartable_prompt_event(
+    calendar_store, event_id, *, prompt, sandbox_processes=False
+):
+    background_job = {"patience": {"max_provider_retries": 1}}
+    if sandbox_processes:
+        background_job["execution"] = {"sandbox_processes": True}
     calendar_store.save_event(
         event_id,
         {
@@ -2804,7 +3193,7 @@ def _save_restartable_prompt_event(calendar_store, event_id, *, prompt):
             "start_time": time.time() - 5,
             "timezone": "UTC",
             "status": "scheduled",
-            "background_job": {"patience": {"max_provider_retries": 1}},
+            "background_job": background_job,
             "actions": [
                 {
                     "id": f"{event_id}-action",
@@ -3401,6 +3790,142 @@ async def test_prompt_cancellation_before_provider_dispatch_is_confirmed_no_chan
     assert app.state.work_run_store.count_attempts(receipt["id"]) == 0
     assert app.state.work_run_store.count_effects(receipt["id"]) == 0
     assert dummy.calls == []
+
+
+@pytest.mark.anyio
+async def test_isolated_prompt_process_stops_for_durable_cancellation(
+    app_with_temp_stores, monkeypatch
+):
+    from app import routes as routes_module
+    from app.services import process_isolation
+    from app.services.scheduled_action_cancellation import (
+        request_scheduled_action_cancellation,
+    )
+    from app.utils import calendar_store, conversation_store
+    from workers import scheduled_tool_runner as runner
+
+    app, dummy = app_with_temp_stores
+    event_id = "cancel-isolated-prompt"
+    action_id = f"{event_id}-action"
+
+    def must_not_generate(*_args, **_kwargs):
+        raise AssertionError("isolated generation ran in the parent process")
+
+    async def cancel_running_child(_module_name, _callable_name, _request, **kwargs):
+        latest = calendar_store.load_event(event_id)
+        running_action = latest["actions"][0]
+        request_scheduled_action_cancellation(
+            event_id,
+            action_id,
+            expected_run_id=running_action["run_id"],
+        )
+        assert kwargs["termination_check"]() == "cancel_requested"
+        raise process_isolation.IsolatedProcessTerminated("cancel_requested")
+
+    monkeypatch.setattr(routes_module.llm_service, "generate", must_not_generate)
+    monkeypatch.setattr(process_isolation, "run_isolated_process", cancel_running_child)
+    _save_restartable_prompt_event(
+        calendar_store,
+        event_id,
+        prompt="Stop this non-cooperative provider request.",
+        sandbox_processes=True,
+    )
+
+    result = await runner.run_scheduled_tools_for_event(app, event_id)
+
+    assert result["status"] == "cancelled"
+    stored = calendar_store.load_event(event_id)
+    action = stored["actions"][0]
+    receipt = stored["run_history"][0]
+    assert stored["status"] == "cancelled"
+    assert action["status"] == "cancelled"
+    assert action["prompt_invoked"] is True
+    assert receipt["summary"] == (
+        "Scheduled provider process was stopped; no canonical output was saved."
+    )
+    attempts = app.state.work_run_store.list_attempts(receipt["id"])
+    assert len(attempts) == 1
+    assert attempts[0]["status"] == "cancelled"
+    assert attempts[0]["error_code"] == "user_cancelled"
+    conversation = conversation_store.load_conversation(f"{event_id}-session")
+    assistant = next(item for item in conversation if item.get("role") == "ai")
+    assert assistant["text"] == ""
+    assert assistant["metadata"]["status"] == "cancelled"
+    assert assistant["metadata"]["provider_process_terminated"] is True
+    assert dummy.calls == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("isolated", [False, True])
+@pytest.mark.parametrize(
+    "model, expected",
+    [
+        ("thinkingmachines/Inkling", "thinkingmachines/Inkling"),
+        ("  thinkingmachines/Inkling  ", "thinkingmachines/Inkling"),
+        ("inherit", None),
+        (" INHERIT ", None),
+        ("", None),
+        (None, None),
+    ],
+)
+async def test_provider_forwards_execution_model(
+    monkeypatch, isolated, model, expected
+):
+    from types import SimpleNamespace
+
+    from workers import scheduled_tool_runner as runner
+
+    captured = {}
+
+    async def capture_request(_module, _callable, request, **_kwargs):
+        assert isolated
+        captured.update(request)
+        return {"text": "scheduled response"}
+
+    def capture_generate(messages, **kwargs):
+        assert not isolated
+        assert messages == []
+        captured.update(kwargs)
+        return {"text": "scheduled response"}
+
+    monkeypatch.setattr(
+        runner.process_isolation, "run_isolated_process", capture_request
+    )
+    service = SimpleNamespace(
+        mode="server", config={"api_model": "default-model"}, generate=capture_generate
+    )
+    routes_module = SimpleNamespace(llm_service=service)
+    context = SimpleNamespace(to_dict=lambda: {"messages": [], "tools": []})
+
+    result = await runner._generate_provider_response(
+        SimpleNamespace(),
+        event={
+            "background_job": {
+                "execution": {
+                    "sandbox_processes": isolated,
+                    "model": model,
+                }
+            }
+        },
+        event_id="explicit-isolated-model",
+        action={"run_id": "run-1", "run_control_revision": 0},
+        action_id="action-1",
+        occurrence_time=1.0,
+        phase="prompt",
+        tool_invoked=False,
+        session_id="session-1",
+        response_format=None,
+        context=context,
+        routes_module=routes_module,
+    )
+
+    assert result == {"text": "scheduled response"}
+    if isolated:
+        assert captured["mode"] == "server"
+    if expected is None:
+        assert "model" not in captured
+    else:
+        assert captured["model"] == expected
 
 
 @pytest.mark.anyio

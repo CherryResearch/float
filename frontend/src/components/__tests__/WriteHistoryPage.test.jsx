@@ -1,6 +1,6 @@
 import React from "react";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { Link, MemoryRouter } from "react-router-dom";
 import "@testing-library/jest-dom";
 import { afterEach, vi } from "vitest";
 import axios from "axios";
@@ -9,6 +9,54 @@ import WriteHistoryPage from "../WriteHistoryPage";
 describe("WriteHistoryPage", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it.each(["success", "failure"])("ignores a stale list %s after changing jobs", async (outcome) => {
+    let resolveOld;
+    let rejectOld;
+    const oldRequest = new Promise((resolve, reject) => {
+      resolveOld = resolve;
+      rejectOld = reject;
+    });
+    vi.spyOn(axios, "get").mockImplementation((_url, { params }) => {
+      if (params.job_id === "old") return oldRequest;
+      return Promise.resolve({
+        data: { runs: [{ id: "new-run", event_title: "Current job", status: "complete" }], count: 1 },
+      });
+    });
+    render(
+      <MemoryRouter initialEntries={["/activity?job_id=old"]}>
+        <Link to="/activity?job_id=new">Select next job</Link>
+        <WriteHistoryPage />
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByRole("link", { name: "Select next job" }));
+    expect(await screen.findByText("Current job")).toBeInTheDocument();
+    await act(async () => {
+      if (outcome === "failure") rejectOld(new Error("Old job failed"));
+      else resolveOld({ data: { runs: [{ id: "old-run", event_title: "Previous job" }], count: 9 } });
+    });
+    expect(screen.getByText("Current job")).toBeInTheDocument();
+    expect(screen.queryByText("Previous job")).not.toBeInTheDocument();
+    expect(screen.queryByText(/run history is unavailable/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Runs (1)" })).toBeInTheDocument();
+  });
+
+  it("clears the previous job's rows while the next job is loading", async () => {
+    vi.spyOn(axios, "get").mockImplementation((_url, { params }) => {
+      if (params.job_id === "new") return new Promise(() => {});
+      return Promise.resolve({ data: { runs: [{ id: "old-run", event_title: "Previous job" }], count: 1 } });
+    });
+    render(
+      <MemoryRouter initialEntries={["/activity?job_id=old"]}>
+        <Link to="/activity?job_id=new">Select next job</Link>
+        <WriteHistoryPage />
+      </MemoryRouter>,
+    );
+    expect(await screen.findByText("Previous job")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("link", { name: "Select next job" }));
+    expect(screen.queryByText("Previous job")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refreshing..." })).toBeDisabled();
   });
 
   it("separates runs from writes and expands metadata-only lifecycle details", async () => {

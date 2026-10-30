@@ -129,6 +129,18 @@ def _record_server_continuation(
             "chain_id": message_id,
             "server_recorded": True,
         }
+        if recorded_tool.get("name") == "recall" and status == "invoked":
+            # These continuation fixtures represent host-filtered external reads.
+            # Dedicated privacy tests keep legacy/local results without this authority.
+            mode = recorded_tool.get("mode") or metadata.get("mode") or "api"
+            routes._record_tool_data_policy(
+                app,
+                request_id,
+                session_id,
+                message_id,
+                routes._request_data_destination(app, mode),
+                completed=True,
+            )
 
 
 def _post_recorded_continuation(client, conv_store, routes, *, json):

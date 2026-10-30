@@ -11,13 +11,59 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
+import re
+import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-LOG_DIR = REPO_ROOT / "logs" / "oai_api"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
+# Raw content is sensitive: never capture unless deliberately enabled locally.
+CAPTURE_OPT_IN = "FLOAT_OAI_CAPTURE_CONTENT"
+MAX_CAPTURE_BYTES = 2 * 1024 * 1024
+MAX_TOTAL_BYTES = 20 * 1024 * 1024
+MAX_CAPTURE_FILES = 50
+MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+_CAPTURE_NAME = re.compile(r"capture-[0-9a-f]{32}\.json\Z")
+
+
+def _capture_directory() -> Path:
+    from app.config import load_config
+
+    root = Path(load_config()["data_dir"]).resolve()
+    directory = root
+    for component in ("diagnostics", "oai_api"):
+        directory = directory / component
+        if directory.is_symlink():
+            raise ValueError("Capture directory cannot be a symlink")
+        directory.mkdir(exist_ok=True)
+    return directory
+
+
+def _prune_captures(directory: Path, incoming_bytes: int) -> None:
+    """Only remove files owned by this capture format; never legacy/user files."""
+    retained = []
+    now = time.time()
+    for path in directory.iterdir():
+        if not _CAPTURE_NAME.fullmatch(path.name) or path.is_symlink():
+            continue
+        if not path.is_file():
+            continue
+        stat = path.stat()
+        if now - stat.st_mtime > MAX_AGE_SECONDS:
+            path.unlink()
+        else:
+            retained.append((stat.st_mtime, path.name, stat.st_size, path))
+    retained.sort()
+    total = sum(entry[2] for entry in retained)
+    while retained and (
+        len(retained) >= MAX_CAPTURE_FILES or total + incoming_bytes > MAX_TOTAL_BYTES
+    ):
+        _, _, size, path = retained.pop(0)
+        path.unlink()
+        total -= size
+
 
 _REQUEST_TOOL_CATALOG_REF = "#/request_payload/tools"
 _RESPONSE_SNAPSHOT_TYPES = {
@@ -256,31 +302,54 @@ def write_capture(
     session_id: Optional[str] = None,
     message_id: Optional[str] = None,
 ) -> Optional[str]:
-    (
-        request_capture,
-        response_capture,
-        tool_catalog,
-    ) = _deduplicate_response_tool_catalogs(request_payload, response_payload)
-    response_id = _response_id(response_capture)
-    stem = (
-        response_id
-        or f"capture-{int(datetime.now(tz=timezone.utc).timestamp() * 1000)}"
-    )
-    target = LOG_DIR / f"{stem}.json"
-    record = {
-        "captured_at": _now_iso(),
-        "endpoint": endpoint,
-        "session_id": str(session_id or "").strip() or None,
-        "message_id": str(message_id or "").strip() or None,
-        "request_payload": request_capture,
-        "response_payload": response_capture,
-    }
-    if tool_catalog is not None:
-        record["tool_catalog"] = tool_catalog
+    # Check before copying/serializing inputs or creating any capture directory.
+    if os.getenv(CAPTURE_OPT_IN, "").strip().lower() != "true":
+        return None
     try:
-        target.write_text(
-            json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        return str(target)
+        (
+            request_capture,
+            response_capture,
+            tool_catalog,
+        ) = _deduplicate_response_tool_catalogs(request_payload, response_payload)
+        record = {
+            "captured_at": _now_iso(),
+            "endpoint": endpoint,
+            "session_id": str(session_id or "").strip() or None,
+            "message_id": str(message_id or "").strip() or None,
+            "request_payload": request_capture,
+            "response_payload": response_capture,
+        }
+        if tool_catalog is not None:
+            record["tool_catalog"] = tool_catalog
+        encoded = json.dumps(record, ensure_ascii=False, indent=2).encode("utf-8")
+        if len(encoded) > min(MAX_CAPTURE_BYTES, MAX_TOTAL_BYTES):
+            return None
+        directory = _capture_directory()
+        # Exclusive creation serializes retention across processes. Busy/stale locks
+        # disable capture rather than interfering with an inference request.
+        lock = directory / ".capture.lock"
+        try:
+            lock_handle = lock.open("x")
+        except FileExistsError:
+            return None
+        try:
+            lock_handle.close()
+            _prune_captures(directory, len(encoded))
+            # Provider IDs are untrusted and must never become filesystem paths.
+            target = directory / f"capture-{uuid.uuid4().hex}.json"
+            created = False
+            try:
+                with target.open("xb") as handle:
+                    created = True
+                    handle.write(encoded)
+            except Exception:
+                if created:
+                    target.unlink(missing_ok=True)
+                raise
+            return str(target)
+        finally:
+            lock.unlink(missing_ok=True)
     except Exception:
+        # Diagnostics must not fail the user's original request, even for malformed
+        # payloads, full disks, unsafe destinations or retention failures.
         return None

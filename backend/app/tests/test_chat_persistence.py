@@ -156,6 +156,14 @@ def test_chat_persists_assistant_updates(monkeypatch, tmp_path):
     ai = next(m for m in messages if m.get("id") == "m1")
     assert ai.get("text") == "ok"
     assert (ai.get("metadata") or {}).get("status") == "complete"
+    timing = ai["metadata"]["timing"]
+    assert timing["completed_at"] >= timing["accepted_at"] > 0
+    assert resp.json()["metadata"]["timing"] == timing
+    status_events = app.state.agent_console_state["agents"]["m1"]["events"]
+    assert any(
+        event.get("type") == "stream_status" and event.get("status") == "complete"
+        for event in status_events
+    )
     assert ((ai.get("metadata") or {}).get("workflow") or {}).get("name") == ("default")
     scope = (ai.get("metadata") or {}).get("capability_scope") or {}
     assert scope.get("version") == 1
@@ -178,6 +186,7 @@ def test_chat_regenerate_replaces_only_latest_pair_and_rebuilds_context(
     from app.base_services import ModelContext
 
     _pin_default_workflow_settings(monkeypatch, tmp_path)
+    original_timing = {"accepted_at": 1700000000.0, "completed_at": 1700000010.0}
     conv_store.replace_conversation_content(
         "sess",
         [
@@ -195,7 +204,7 @@ def test_chat_regenerate_replaces_only_latest_pair_and_rebuilds_context(
                         "status": "invoked",
                     }
                 ],
-                "metadata": {"status": "complete"},
+                "metadata": {"status": "complete", "timing": original_timing},
             },
         ],
     )
@@ -219,7 +228,7 @@ def test_chat_regenerate_replaces_only_latest_pair_and_rebuilds_context(
             "text": "new answer",
             "thought": "",
             "tools_used": [],
-            "metadata": {},
+            "metadata": {"timing": dict(original_timing)},
         }
 
     monkeypatch.setattr(routes.llm_service, "generate", fake_generate)
@@ -260,6 +269,10 @@ def test_chat_regenerate_replaces_only_latest_pair_and_rebuilds_context(
     assert messages[2].get("text") == "updated question"
     assert messages[3].get("text") == "new answer"
     assert not messages[3].get("tools")
+    timing = messages[3]["metadata"]["timing"]
+    assert timing["accepted_at"] > original_timing["completed_at"]
+    assert timing["completed_at"] >= timing["accepted_at"]
+    assert response.json()["metadata"]["timing"] == timing
 
     duplicate = client.post(
         "/chat",
@@ -272,6 +285,7 @@ def test_chat_regenerate_replaces_only_latest_pair_and_rebuilds_context(
     )
     assert duplicate.status_code == 409
     assert "Message id already exists" in duplicate.json()["detail"]
+    assert conv_store.load_conversation("sess") == messages
 
 
 def test_chat_regenerate_rejects_a_turn_with_later_messages(monkeypatch, tmp_path):
@@ -350,13 +364,14 @@ def test_chat_regenerate_failure_preserves_saved_pair_and_terminal_tools(
     from app.base_services import ModelContext
 
     _pin_default_workflow_settings(monkeypatch, tmp_path)
+    original_timing = {"accepted_at": 1700000000.0, "completed_at": 1700000010.0}
     original_messages = [
         {"id": "m1:user", "role": "user", "text": "original question"},
         {
             "id": "m1",
             "role": "ai",
             "text": "original answer",
-            "metadata": {"status": "complete"},
+            "metadata": {"status": "complete", "timing": original_timing},
             "tools": [
                 {
                     "id": "old-terminal",
@@ -413,6 +428,9 @@ def test_chat_regenerate_failure_preserves_saved_pair_and_terminal_tools(
 
     assert response.status_code == 200
     assert conv_store.load_conversation("sess") == original_messages
+    failed_attempt_timing = response.json()["metadata"]["timing"]
+    assert failed_attempt_timing["accepted_at"] > original_timing["completed_at"]
+    assert "completed_at" not in failed_attempt_timing
     assert set(app.state.pending_tools) == {"old-terminal"}
     live_messages = routes.llm_service.get_context("sess").messages
     assert [item.get("content") for item in live_messages] == [
@@ -1973,6 +1991,8 @@ def test_chat_masks_completion_text_when_tools_are_only_proposed(monkeypatch, tm
     assert "Awaiting approval." in payload["message"]
     assert payload.get("metadata", {}).get("status") == "pending"
     assert payload.get("metadata", {}).get("tool_response_pending") is True
+    assert payload["metadata"]["timing"]["accepted_at"] > 0
+    assert "completed_at" not in payload["metadata"]["timing"]
 
 
 def test_chat_dedupes_duplicate_tool_proposals(monkeypatch, tmp_path):
@@ -2263,6 +2283,7 @@ def test_chat_continue_persists_text(monkeypatch, tmp_path):
     conv_store = importlib.import_module("app.utils.conversation_store")
     importlib.reload(conv_store)
 
+    original_timing = {"accepted_at": 1700000000.0, "completed_at": 1700000010.0}
     conv_store.save_conversation(
         "sess",
         [
@@ -2271,7 +2292,7 @@ def test_chat_continue_persists_text(monkeypatch, tmp_path):
                 "id": "m1",
                 "role": "ai",
                 "text": "Requested tool search_web.",
-                "metadata": {"status": "complete"},
+                "metadata": {"status": "complete", "timing": original_timing},
             },
         ],
     )
@@ -2280,10 +2301,12 @@ def test_chat_continue_persists_text(monkeypatch, tmp_path):
     from app.base_services import ModelContext
 
     routes.llm_service.contexts = {"default": ModelContext(system_prompt="")}
+    generation_calls = []
 
     def fake_generate(
         prompt, session_id=None, model=None, attachments=None, context=None, **kwargs
     ):
+        generation_calls.append(prompt)
         return {"text": "final answer", "thought": "", "tools_used": [], "metadata": {}}
 
     monkeypatch.setattr(routes.llm_service, "generate", fake_generate)
@@ -2300,21 +2323,30 @@ def test_chat_continue_persists_text(monkeypatch, tmp_path):
         result={"data": {"results": []}},
     )
     client = TestClient(app)
-    resp = client.post(
-        "/chat/continue",
-        json={
-            "session_id": "sess",
-            "message_id": "m1",
-            "model": None,
-            "tools": [terminal_tool],
-        },
-    )
+    continuation_request = {
+        "session_id": "sess",
+        "message_id": "m1",
+        "model": None,
+        "tools": [terminal_tool],
+    }
+    resp = client.post("/chat/continue", json=continuation_request)
     assert resp.status_code == 200
 
     messages = conv_store.load_conversation("sess")
     ai = next(m for m in messages if m.get("id") == "m1")
     assert ai.get("text") == "final answer"
     assert (ai.get("metadata") or {}).get("tool_continued") is True
+    timing = ai["metadata"]["timing"]
+    assert timing["accepted_at"] == original_timing["accepted_at"]
+    assert timing["continuation_started_at"] > original_timing["completed_at"]
+    assert timing["completed_at"] >= timing["continuation_started_at"]
+    assert resp.json()["metadata"]["timing"] == timing
+
+    replay = client.post("/chat/continue", json=continuation_request)
+    assert replay.status_code == 200
+    assert replay.json()["metadata"]["timing"] == timing
+    assert len(generation_calls) == 1
+    assert conv_store.load_conversation("sess") == messages
 
 
 def test_chat_continue_without_explicit_mode_uses_configured_mode_not_service_mode(

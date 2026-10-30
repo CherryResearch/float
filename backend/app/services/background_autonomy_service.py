@@ -197,6 +197,13 @@ class BackgroundAutonomyService:
         return {
             "enabled": self.enabled(),
             "sandbox_processes": self.sandbox_processes(),
+            "isolation": {
+                "requested": self.sandbox_processes(),
+                "available": False,
+                "active": False,
+                "scope": "reflection",
+                "runtime_enforcement": "cooperative_between_calls",
+            },
             "mode": self.mode() if self.enabled() else "manual",
             "configured_mode": self.mode(),
             "routine_enabled": self.routine_enabled(),
@@ -221,7 +228,8 @@ class BackgroundAutonomyService:
                 "scheduled_tool_runner": True,
                 "runtime_budget": True,
                 "satisfaction_stop": True,
-                "sandbox_background_processes": self.sandbox_processes(),
+                "sandbox_background_processes": False,
+                "hard_runtime_limit": False,
                 "opt_in_container_suite": True,
             },
         }
@@ -363,7 +371,7 @@ class BackgroundAutonomyService:
                 }:
                     break
             after = self._reflection_snapshot(reflection_service)
-            ran_count = sum(1 for item in runs if item.get("task_id"))
+            ran_count = sum(1 for item in runs if item.get("status") == "ran")
             status = "idle"
             if errors:
                 status = "error"
@@ -485,7 +493,12 @@ class BackgroundAutonomyService:
             "created_at": self.now(),
             "candidate_count": int(before.get("candidate_count") or 0),
             "selected": selected or [],
-            "ran_reflections": sum(1 for item in run_items if item.get("task_id")),
+            "ran_reflections": sum(
+                1 for item in run_items if item.get("status") == "ran"
+            ),
+            "attempted_reflections": sum(
+                1 for item in run_items if item.get("task_id")
+            ),
             "runs": run_items,
             "satisfaction_score": satisfaction_score,
             "satisfied": satisfied,
@@ -599,7 +612,7 @@ class BackgroundAutonomyService:
         task_id = str(result.get("task_id") or annotated.get("task_id") or "")
         run_id = str(result.get("run_id") or "")
         run = self._find_reflection_run(reflection_service, task_id, run_id)
-        if not run:
+        if not run or run.get("status") in {"error", "failed"}:
             annotated["satisfaction_score"] = None
             annotated["satisfied"] = False
             return annotated

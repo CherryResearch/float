@@ -9,7 +9,7 @@ This document outlines the steps to set up the development environment for the F
 - **Python 3.11+**
 - **Poetry** for Python package management.
 - **Node.js 20+** with npm for frontend development.
-- **Docker** (Optional, for containerized deployment).
+- **Docker** (Optional, for experimental backend images; the Compose stack is not a verified full-app deployment).
 - **Redis server** (Required for Celery/background workers; optional for backend/frontend-only local runs).
 
 ---
@@ -52,11 +52,11 @@ python -m pip install --upgrade kernels
 
 > Prefer to stay outside the subshell? Prefix the commands with `poetry run`
 > (for example, `poetry run python -m pip …`).
-> If pip stalls on large wheels, `poetry run uv pip …` also works.
+> If you have separately installed `uv`, `poetry run uv pip …` is an optional alternative for large wheels.
 
 CPU-only fallback (fixes `torchvision::nms` mismatch errors):
 ```bash
-poetry run uv pip install --upgrade --force-reinstall --index-url https://download.pytorch.org/whl/cpu torch==2.10.0 torchvision==0.25.0
+poetry run python -m pip install --upgrade --force-reinstall --index-url https://download.pytorch.org/whl/cpu torch==2.10.0 torchvision==0.25.0
 ```
 
 Verify that PyTorch now sees your GPU:
@@ -219,9 +219,9 @@ The frontend will be available at `http://localhost:5173` (or the next available
 
 ---
 
-## Docker Deployment (Optional)
+## Docker Backend Image (Experimental)
 
-A Dockerfile is provided for containerizing the backend application.
+The Poetry launcher is the supported alpha setup. A Dockerfile is available for backend-image experiments; the Compose stack is not a verified full-app deployment.
 
 ### Build and Run the Backend Image
 
@@ -233,10 +233,7 @@ docker build -f docker/backend.Dockerfile -t float-backend .
 docker run -p 8000:8000 --env-file .env float-backend
 ```
 
-For a full multi-container setup including the frontend and optional services, you can use the `docker-compose.yml` file:
-```bash
-docker-compose up --build
-```
+The Compose frontend is behind the `ui` profile, and its static nginx image does not provide Float's API proxy. Its `VITE_BACKEND_URL` setting also does not match the frontend's `VITE_API_BASE_URL` build-time configuration. Enabling the profile alone does not establish a working frontend/backend connection. Keep full-stack container work separate from the launcher setup above.
 
 ---
 

@@ -11,6 +11,7 @@ import "./styles/theme.css";
 import "@livekit/components-styles";
 import axios from "axios";
 import { ensureServiceWorker } from "./utils/push";
+import { useUserSettingsSync } from "./hooks/useUserSettingsSync";
 import {
   clearMissingConversationHydrationState,
   createConversationHydrationGate,
@@ -213,7 +214,7 @@ const applyBackendRuntimeSelection = (prev, data = {}) => {
 export const GlobalContext = createContext();
 
 // Create a Provider component
-const GlobalProvider = ({ children }) => {
+export const GlobalProvider = ({ children }) => {
   const [state, setState] = useState(() => {
     const storedConversation = localStorage.getItem("conversation");
     const storedConversationWindow = parseStoredConversationWindow(
@@ -428,14 +429,12 @@ const GlobalProvider = ({ children }) => {
   const [conversationHydrationRevision, setConversationHydrationRevision] =
     useState(0);
   const [conversationHydrationRetry, setConversationHydrationRetry] = useState(0);
-  const [userSettingsLoaded, setUserSettingsLoaded] = useState(false);
-  const lastUserSettingsRef = useRef(null);
+  useUserSettingsSync(state, setState);
   const apiProbeStateRef = useRef({
     apiModelsUpdatedAt: null,
     apiProviderStatus: "unknown",
     apiModel: state.apiModel,
   });
-  registerCustomThemes(Array.isArray(state.customThemes) ? state.customThemes : []);
 
   useEffect(() => {
     apiProbeStateRef.current = {
@@ -568,137 +567,6 @@ const GlobalProvider = ({ children }) => {
       }
     };
   }, [state.backendMode, setState]);
-
-  // Load persisted user settings from backend once API is ready
-  useEffect(() => {
-    if (!(state.apiStatus === "online" && state.backendMode === "api")) {
-      setUserSettingsLoaded(false);
-      lastUserSettingsRef.current = null;
-      return;
-    }
-    Promise.all([axios.get("/api/themes"), axios.get("/api/user-settings")])
-      .then(([themesRes, settingsRes]) => {
-        const customThemes = Array.isArray(themesRes?.data?.themes)
-          ? themesRes.data.themes
-          : [];
-        registerCustomThemes(customThemes);
-        const data = settingsRes.data;
-        setState((prev) => {
-          const nextCustomThemes = customThemes;
-          const nextApproval = data.approval_level || prev.approvalLevel;
-          const nextTheme = data.theme || prev.theme;
-          const nextVisualTheme = normalizeVisualTheme(
-            typeof data.visual_theme === "string" ? data.visual_theme : prev.visualTheme,
-          );
-          const nextToolDisplay = normalizeToolDisplayMode(
-            typeof data.tool_display_mode === "string"
-              ? data.tool_display_mode
-              : prev.toolDisplayMode,
-          );
-          const nextToolLink = normalizeToolLinkBehavior(
-            typeof data.tool_link_behavior === "string"
-              ? data.tool_link_behavior
-              : prev.toolLinkBehavior,
-          );
-          const nextLiveTranscriptEnabled =
-            typeof data.live_transcript_enabled === "boolean"
-              ? data.live_transcript_enabled
-              : prev.liveTranscriptEnabled;
-          const nextLiveCameraDefaultEnabled =
-            typeof data.live_camera_default_enabled === "boolean"
-              ? data.live_camera_default_enabled
-              : prev.liveCameraDefaultEnabled;
-          const nextWorkflowProfile =
-            typeof data.default_workflow === "string" && data.default_workflow.trim()
-              ? data.default_workflow.trim()
-              : prev.workflowProfile;
-          const nextCaptureRetentionDays =
-            typeof data.capture_retention_days === "number"
-              ? data.capture_retention_days
-              : prev.captureRetentionDays;
-          const nextCaptureDefaultSensitivity =
-            typeof data.capture_default_sensitivity === "string" &&
-            data.capture_default_sensitivity.trim()
-              ? data.capture_default_sensitivity.trim()
-              : prev.captureDefaultSensitivity;
-          const nextCaptureAllowRawImageAccess =
-            typeof data.capture_allow_model_raw_image_access === "boolean"
-              ? data.capture_allow_model_raw_image_access
-              : prev.captureAllowModelRawImageAccess;
-          const nextCaptureAllowSummaryFallback =
-            typeof data.capture_allow_summary_fallback === "boolean"
-              ? data.capture_allow_summary_fallback
-              : prev.captureAllowSummaryFallback;
-          const nextEnabledWorkflowModules = Array.isArray(
-            data.enabled_workflow_modules,
-          )
-            ? data.enabled_workflow_modules
-            : prev.enabledWorkflowModules;
-          const nextUserTimezone =
-            typeof data.user_timezone === "string"
-              ? data.user_timezone
-              : prev.userTimezone;
-          const nextRegisteredLocalModels = Array.isArray(
-            data.local_model_registrations,
-          )
-            ? data.local_model_registrations
-            : prev.registeredLocalModels;
-          const nextRagEmbeddingModel =
-            typeof data.rag_embedding_model === "string" && data.rag_embedding_model.trim()
-              ? data.rag_embedding_model.trim()
-              : prev.ragEmbeddingModel;
-          const nextRagClipModel =
-            typeof data.rag_clip_model === "string" && data.rag_clip_model.trim()
-              ? data.rag_clip_model.trim()
-              : prev.ragClipModel;
-          lastUserSettingsRef.current = {
-            approvalLevel: nextApproval,
-            theme: nextTheme,
-            visualTheme: nextVisualTheme,
-            toolDisplayMode: nextToolDisplay,
-            toolLinkBehavior: nextToolLink,
-            liveTranscriptEnabled: nextLiveTranscriptEnabled,
-            liveCameraDefaultEnabled: nextLiveCameraDefaultEnabled,
-            workflowProfile: nextWorkflowProfile,
-            captureRetentionDays: nextCaptureRetentionDays,
-            captureDefaultSensitivity: nextCaptureDefaultSensitivity,
-            captureAllowModelRawImageAccess: nextCaptureAllowRawImageAccess,
-            captureAllowSummaryFallback: nextCaptureAllowSummaryFallback,
-            enabledWorkflowModules: nextEnabledWorkflowModules,
-            userTimezone: nextUserTimezone,
-            ragEmbeddingModel: nextRagEmbeddingModel,
-            ragClipModel: nextRagClipModel,
-          };
-          return {
-            ...prev,
-            // Do not overwrite transcript history; backend returns list of session IDs here.
-            // If needed, wire this to a separate state key for a session picker.
-            approvalLevel: nextApproval,
-            theme: nextTheme,
-            visualTheme: nextVisualTheme,
-            customThemes: nextCustomThemes,
-            toolDisplayMode: nextToolDisplay,
-            toolLinkBehavior: nextToolLink,
-            liveTranscriptEnabled: nextLiveTranscriptEnabled,
-            liveCameraDefaultEnabled: nextLiveCameraDefaultEnabled,
-            workflowProfile: nextWorkflowProfile,
-            captureRetentionDays: nextCaptureRetentionDays,
-            captureDefaultSensitivity: nextCaptureDefaultSensitivity,
-            captureAllowModelRawImageAccess: nextCaptureAllowRawImageAccess,
-            captureAllowSummaryFallback: nextCaptureAllowSummaryFallback,
-            enabledWorkflowModules: nextEnabledWorkflowModules,
-            userTimezone: nextUserTimezone,
-            registeredLocalModels: nextRegisteredLocalModels,
-            ragEmbeddingModel: nextRagEmbeddingModel,
-            ragClipModel: nextRagClipModel,
-          };
-        });
-        setUserSettingsLoaded(true);
-      })
-      .catch(() => {
-        setUserSettingsLoaded(true);
-      });
-  }, [state.apiStatus, state.backendMode]);
 
   // Pre-register the service worker (push registration will still require a user gesture later)
   useEffect(() => {
@@ -888,11 +756,11 @@ const GlobalProvider = ({ children }) => {
   }, [state.theme]);
 
   useEffect(() => {
-    localStorage.setItem("visualTheme", normalizeVisualTheme(state.visualTheme));
+    // Keep a saved custom theme id while its catalog is still loading.
+    localStorage.setItem("visualTheme", state.visualTheme || DEFAULT_VISUAL_THEME);
   }, [state.visualTheme]);
 
   useEffect(() => {
-    registerCustomThemes(Array.isArray(state.customThemes) ? state.customThemes : []);
     localStorage.setItem(
       "customThemes",
       JSON.stringify(Array.isArray(state.customThemes) ? state.customThemes : []),
@@ -1168,103 +1036,6 @@ const GlobalProvider = ({ children }) => {
     }
   }, [state.streamIdleTimeoutSec]);
 
-  // Persist select user settings to backend with a small debounce to avoid spam
-  useEffect(() => {
-    if (!(state.apiStatus === "online" && state.backendMode === "api")) {
-      return undefined;
-    }
-    if (!userSettingsLoaded) {
-      return undefined;
-    }
-
-    const lastSent = lastUserSettingsRef.current;
-    if (
-      lastSent &&
-      lastSent.approvalLevel === state.approvalLevel &&
-      lastSent.theme === state.theme &&
-      lastSent.visualTheme === state.visualTheme &&
-      lastSent.toolDisplayMode === state.toolDisplayMode &&
-      lastSent.toolLinkBehavior === state.toolLinkBehavior &&
-      lastSent.liveTranscriptEnabled === state.liveTranscriptEnabled &&
-      lastSent.liveCameraDefaultEnabled === state.liveCameraDefaultEnabled &&
-      lastSent.workflowProfile === state.workflowProfile &&
-      lastSent.captureRetentionDays === state.captureRetentionDays &&
-      lastSent.captureDefaultSensitivity === state.captureDefaultSensitivity &&
-      lastSent.captureAllowModelRawImageAccess === state.captureAllowModelRawImageAccess &&
-      lastSent.captureAllowSummaryFallback === state.captureAllowSummaryFallback &&
-      JSON.stringify(lastSent.enabledWorkflowModules || []) ===
-        JSON.stringify(state.enabledWorkflowModules || []) &&
-      lastSent.userTimezone === state.userTimezone
-    ) {
-      return undefined;
-    }
-
-    const timeoutId = setTimeout(() => {
-      axios
-        .post("/api/user-settings", {
-          approval_level: state.approvalLevel,
-          theme: state.theme,
-          visual_theme: normalizeVisualTheme(state.visualTheme),
-          tool_display_mode: state.toolDisplayMode,
-          tool_link_behavior: state.toolLinkBehavior,
-          live_transcript_enabled: state.liveTranscriptEnabled !== false,
-          live_camera_default_enabled: state.liveCameraDefaultEnabled === true,
-          capture_retention_days: Math.max(0, Number(state.captureRetentionDays) || 0),
-          capture_default_sensitivity: state.captureDefaultSensitivity || "personal",
-          capture_allow_model_raw_image_access:
-            state.captureAllowModelRawImageAccess !== false,
-          capture_allow_summary_fallback:
-            state.captureAllowSummaryFallback !== false,
-          default_workflow: state.workflowProfile || "default",
-          enabled_workflow_modules: Array.isArray(state.enabledWorkflowModules)
-            ? state.enabledWorkflowModules
-            : [],
-          user_timezone: state.userTimezone || "",
-        })
-        .then(() => {
-          lastUserSettingsRef.current = {
-            approvalLevel: state.approvalLevel,
-            theme: state.theme,
-            visualTheme: normalizeVisualTheme(state.visualTheme),
-            toolDisplayMode: state.toolDisplayMode,
-            toolLinkBehavior: state.toolLinkBehavior,
-            liveTranscriptEnabled: state.liveTranscriptEnabled,
-            liveCameraDefaultEnabled: state.liveCameraDefaultEnabled,
-            workflowProfile: state.workflowProfile,
-            captureRetentionDays: state.captureRetentionDays,
-            captureDefaultSensitivity: state.captureDefaultSensitivity,
-            captureAllowModelRawImageAccess: state.captureAllowModelRawImageAccess,
-            captureAllowSummaryFallback: state.captureAllowSummaryFallback,
-            enabledWorkflowModules: Array.isArray(state.enabledWorkflowModules)
-              ? state.enabledWorkflowModules
-              : [],
-            userTimezone: state.userTimezone,
-          };
-        })
-        .catch(() => {});
-    }, 400);
-
-    return () => clearTimeout(timeoutId);
-  }, [
-    state.approvalLevel,
-    state.theme,
-    state.visualTheme,
-    state.toolDisplayMode,
-    state.toolLinkBehavior,
-    state.liveTranscriptEnabled,
-    state.liveCameraDefaultEnabled,
-    state.workflowProfile,
-    state.captureRetentionDays,
-    state.captureDefaultSensitivity,
-    state.captureAllowModelRawImageAccess,
-    state.captureAllowSummaryFallback,
-    state.enabledWorkflowModules,
-    state.userTimezone,
-    state.apiStatus,
-    state.backendMode,
-    userSettingsLoaded,
-  ]);
-
   const settingsSyncReady =
     state.backendMode !== "api" ||
     state.apiStatus === "online" ||
@@ -1336,17 +1107,26 @@ const GlobalProvider = ({ children }) => {
   }, [settingsSyncReady, state.apiStatus]);
 
   const muiTheme = useMemo(
-    () =>
-      createTheme({
+    () => {
+      registerCustomThemes(Array.isArray(state.customThemes) ? state.customThemes : []);
+      return createTheme({
         palette: getMuiPaletteOptions(state.visualTheme, state.theme),
-      }),
-    [state.theme, state.visualTheme],
+        typography: { fontFamily: "var(--font-stack)" },
+        components: {
+          MuiModal: { styleOverrides: { root: { zIndex: "var(--layer-modal)" } } },
+          MuiMenu: { styleOverrides: { root: { zIndex: "calc(var(--layer-modal) + 1)" } } },
+          MuiTooltip: { styleOverrides: { popper: { zIndex: "var(--layer-tooltip)" } } },
+          MuiSnackbar: { styleOverrides: { root: { zIndex: "var(--layer-notification)" } } },
+        },
+      });
+    },
+    [state.theme, state.visualTheme, state.customThemes],
   );
 
   useLayoutEffect(() => {
     const root = document.documentElement;
     applyVisualTheme(root, state.visualTheme, state.theme);
-  }, [state.theme, state.visualTheme]);
+  }, [state.theme, state.visualTheme, state.customThemes]);
 
   return (
     <GlobalContext.Provider value={{ state, setState }}>

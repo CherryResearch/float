@@ -43,7 +43,7 @@ def reflection_run_receipt(
     task: Mapping[str, Any],
     run: Mapping[str, Any],
 ) -> JsonDict:
-    """Build one completed reflection receipt without raw output or thought text."""
+    """Build a reflection outcome receipt without raw output or thought text."""
 
     metadata = task.get("metadata")
     metadata = metadata if isinstance(metadata, Mapping) else {}
@@ -96,6 +96,8 @@ def reflection_run_receipt(
         "model", execution.get("received_model") or execution.get("requested_model")
     )
     created_at = _epoch(run.get("created_at"))
+    # Older successful rows predate explicit run status and remain compatible.
+    status = "error" if run.get("status") in {"error", "failed"} else "complete"
     return {
         "id": run.get("id"),
         "source": "reflection",
@@ -108,11 +110,12 @@ def reflection_run_receipt(
         "action_name": "reflection",
         "occurrence_at": created_at,
         "occurrence_id": run.get("id"),
-        "started_at": created_at,
-        "finished_at": created_at,
-        "status": "complete",
-        "phase": "complete",
-        "summary": run.get("compact_note") or "Reflection completed.",
+        "started_at": _epoch(run.get("started_at")) or created_at,
+        "finished_at": _epoch(run.get("finished_at")) or created_at,
+        "status": status,
+        "phase": status,
+        "summary": run.get("compact_note")
+        or ("Reflection failed." if status == "error" else "Reflection completed."),
         "ownership": ownership,
         "patience": patience,
         "execution": execution,

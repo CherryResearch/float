@@ -191,6 +191,29 @@ def extract_response_text(payload: Any) -> str:
     return visible_text
 
 
+def extract_response_reasoning_summary(payload: Any) -> str:
+    """Read only provider-exposed summaries, never encrypted or raw reasoning."""
+    if not isinstance(payload, dict):
+        return ""
+    response = payload.get("response")
+    if isinstance(response, dict):
+        payload = response
+    parts = []
+    for item in _extract_output_list(payload):
+        if not isinstance(item, dict) or item.get("type") != "reasoning":
+            continue
+        summary = item.get("summary")
+        if not isinstance(summary, list):
+            continue
+        for part in summary:
+            if not isinstance(part, dict) or part.get("type") != "summary_text":
+                continue
+            text = part.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+    return "\n\n".join(parts)
+
+
 def extract_response_tool_text(payload: Any) -> str:
     _visible_text, tool_text = split_response_text(payload)
     return tool_text
@@ -774,6 +797,10 @@ class OpenAIResponsesWebSocketTransport:
             fallback_text = extract_response_text(final_response)
             if fallback_text:
                 text_parts.append(fallback_text)
+        if not thought_trace:
+            summary = extract_response_reasoning_summary(final_response)
+            if summary:
+                emit_thought(summary)
         if output_items and isinstance(final_response, dict):
             existing_output = final_response.get("output")
             if isinstance(existing_output, list):
